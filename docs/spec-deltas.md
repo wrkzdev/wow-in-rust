@@ -11,7 +11,7 @@ block on the chain. The rest are mostly summaries that lost a qualifier. They
 are recorded so the next person does not have to rediscover them, and so that if
 `specs/` is ever revised the list can be folded back in.
 
-Reference tree: `codeberg.org/wownero/wownero` at `9f4f22c72`.
+Reference tree: `github.com/wownero-project/wownero` at `9f4f22c72`.
 
 ---
 

@@ -19,7 +19,7 @@ This spec was written against the reference tree at commit **`9f4f22c72`**
 following any citation — line numbers move:
 
 ```sh
-git clone https://codeberg.org/wownero/wownero
+git clone https://github.com/wownero-project/wownero
 git -C wownero checkout 9f4f22c72
 ```
 
@@ -47,7 +47,7 @@ curl -sL https://codeberg.org/wownero/RandomWOW/raw/commit/27b099b6dd6fef6e17f58
 If the spec is ever moved to a machine without that checkout, clone it instead:
 
 ```sh
-git clone https://codeberg.org/wownero/wownero.git reference/wownero
+git clone https://github.com/wownero-project/wownero.git reference/wownero
 git -C reference/wownero checkout 9f4f22c72
 git -C reference/wownero submodule update --init external/randomwow
 ```
@@ -93,7 +93,7 @@ Read specs/ in full (17 documents, start with README.md). We're building the
 Rust Wownero suite it specifies.
 
 The C++ reference implementation is a clone of
-https://codeberg.org/wownero/wownero checked out at 9f4f22c72; put its path in
+https://github.com/wownero-project/wownero checked out at 9f4f22c72; put its path in
 $WOW_REF. The spec cites files in that tree, and it is the normative source for
 the three algorithm gaps listed in specs/README.md "Before you start": CLSAG,
 Bulletproofs+, CryptoNight.

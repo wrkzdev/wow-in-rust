@@ -8,7 +8,7 @@ drop-in compatible with the C++ tree at version `0.11.4.0` "Kunty Karen".
 >
 > * **Not affiliated with Wownero.** This project is not made, endorsed or
 >   maintained by the Wownero project or its developers. The official software
->   lives at [codeberg.org/wownero/wownero](https://codeberg.org/wownero/wownero).
+>   lives at [github.com/wownero-project/wownero](https://github.com/wownero-project/wownero).
 >   The Wownero name appears here only to say what this code aims to be
 >   compatible with. Please don't take problems with this code to the Wownero
 >   developers.
@@ -262,11 +262,11 @@ so it sets `#![deny(unsafe_op_in_unsafe_fn)]` and every `unsafe` block carries a
 
 ## Reference tree
 
-The spec was written against `codeberg.org/wownero/wownero` at commit
+The spec was written against `github.com/wownero-project/wownero` at commit
 `9f4f22c72`. To get one:
 
 ```sh
-git clone https://codeberg.org/wownero/wownero.git reference/wownero
+git clone https://github.com/wownero-project/wownero.git reference/wownero
 git -C reference/wownero checkout 9f4f22c72
 git -C reference/wownero submodule update --init external/randomwow
 ```

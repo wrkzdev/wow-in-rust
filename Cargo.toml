@@ -23,7 +23,7 @@ version = "0.11.4"
 edition = "2021"
 rust-version = "1.75"
 license = "BSD-3-Clause"
-repository = "https://codeberg.org/wownero/wownero"
+repository = "https://github.com/wrkzdev/wow-in-rust"
 
 [workspace.dependencies]
 wow-crypto = { path = "crates/wow-crypto" }
