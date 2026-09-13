@@ -3,13 +3,26 @@
 A Rust reimplementation of the Wownero suite — daemon, wallet CLI, wallet RPC —
 drop-in compatible with the C++ tree at version `0.11.4.0` "Kunty Karen".
 
+> [!WARNING]
+> **Unofficial, AI-assisted and experimental. Use it at your own risk.**
+>
+> * **Not affiliated with Wownero.** This project is not made, endorsed or
+>   maintained by the Wownero project or its developers. The official software
+>   lives at [codeberg.org/wownero/wownero](https://codeberg.org/wownero/wownero).
+>   The Wownero name appears here only to say what this code aims to be
+>   compatible with. Please don't take problems with this code to the Wownero
+>   developers.
+> * **Written largely with AI.** Much of the code, tests and documentation was
+>   produced with AI coding tools. It can be wrong in ways that look plausible.
+> * **Unaudited, and never used with real funds.** Nothing here has been
+>   audited, and the send path has never moved real money — see *Status* below
+>   for exactly what has and has not been exercised against the live network.
+>   It comes with no warranty. Don't use it with a wallet holding funds you
+>   can't afford to lose; for real use, run the official Wownero software.
+
 The normative specification is vendored in [`specs/`](specs/). Start with
 [`specs/README.md`](specs/README.md), then
 [`specs/00-overview.md`](specs/00-overview.md).
-
-> **A testing repo. Run and test at your own risk.** Nothing here has been
-> audited, and the send path has never moved real money — see *Status* below
-> for exactly what has and has not been exercised against the live network.
 
 > **The one hard requirement:** the Rust node must join the existing Wownero
 > mainnet and reach the same chain tip as the C++ node, byte-for-byte, without a
