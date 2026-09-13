@@ -15,7 +15,7 @@
 //!
 //! The windows were captured with `scripts/fetch-difficulty.py`. Each row is the
 //! exact input `get_difficulty_for_next_block` would assemble at that height:
-//! `difficulty_blocks_count(tip_version)` headers ending at `height - 1`.
+//! `difficulty_blocks_count(version)` headers ending at `height - 1`.
 
 use std::path::PathBuf;
 
@@ -27,7 +27,7 @@ use wow_types::{Difficulty, Network};
 struct Window {
     name: String,
     height: u64,
-    tip_version: u8,
+    version: u8,
     expected: Difficulty,
     timestamps: Vec<u64>,
     cumulative_difficulties: Vec<Difficulty>,
@@ -46,7 +46,7 @@ fn corpus() -> Vec<Window> {
             Window {
                 name: f[0].to_string(),
                 height: f[1].parse().expect("height"),
-                tip_version: f[2].parse().expect("version"),
+                version: f[2].parse().expect("version"),
                 expected: f[3].parse().expect("difficulty"),
                 timestamps: f[4].split(',').map(|x| x.parse().expect("ts")).collect(),
                 cumulative_difficulties: f[5].split(',').map(|x| x.parse().expect("cd")).collect(),
@@ -65,11 +65,11 @@ fn every_algorithm_matches_the_chain() {
     let mut failures = Vec::new();
 
     for w in &windows {
-        let algo = select_algorithm(w.tip_version);
+        let algo = select_algorithm(w.version);
         seen.insert(format!("{algo:?}"));
 
         // The window must be exactly what the C would have collected.
-        let count = difficulty_blocks_count(w.tip_version);
+        let count = difficulty_blocks_count(w.version);
         let offset = {
             let o = w.height - w.height.min(count as u64);
             if o == 0 {
@@ -92,7 +92,7 @@ fn every_algorithm_matches_the_chain() {
         );
 
         let got = next_difficulty(
-            w.tip_version,
+            w.version,
             w.timestamps.clone(),
             w.cumulative_difficulties.clone(),
             w.height,
@@ -101,7 +101,7 @@ fn every_algorithm_matches_the_chain() {
         if got != w.expected {
             failures.push(format!(
                 "{} (height {}, v{}, {algo:?}): got {got}, chain says {}",
-                w.name, w.height, w.tip_version, w.expected
+                w.name, w.height, w.version, w.expected
             ));
         }
     }
@@ -153,13 +153,48 @@ fn windows_have_monotonic_cumulative_difficulty() {
     }
 }
 
-/// The tip version, not the block's own version, selects the algorithm
-/// (`specs/07` §3). Feeding the same window through the wrong algorithm must
-/// give a different answer — otherwise the corpus would not be discriminating.
+/// The first block of a fork is judged by the new fork's version, because
+/// `get_current_hard_fork_version()` has already moved on when it is validated
+/// (`specs/07` §3). These rows are the heights where that changes the
+/// algorithm, so a node reading the parent block's version instead stores a
+/// different difficulty at every one of them.
+#[test]
+fn the_first_block_of_a_fork_takes_the_new_algorithm() {
+    let hf = wow_consensus::hardfork::HardFork::new(Network::Mainnet);
+    let firsts: Vec<Window> = corpus()
+        .into_iter()
+        .filter(|w| w.name.starts_with("first_"))
+        .collect();
+    assert_eq!(
+        firsts.len(),
+        6,
+        "one row per fork that changes the algorithm"
+    );
+
+    for w in &firsts {
+        assert_eq!(
+            hf.earliest_height(w.version),
+            Some(w.height),
+            "{}: not the first block of its fork",
+            w.name
+        );
+        let parent = hf.required_version(w.height - 1);
+        assert_ne!(
+            select_algorithm(parent),
+            select_algorithm(w.version),
+            "{}: the parent's version picks the same algorithm, so the row pins nothing",
+            w.name
+        );
+    }
+}
+
+/// Each window's own version selects the algorithm. Feeding the same window
+/// through the wrong algorithm must give a different answer — otherwise the
+/// corpus would not be discriminating.
 #[test]
 fn the_corpus_discriminates_between_algorithms() {
     for w in corpus() {
-        let right = select_algorithm(w.tip_version);
+        let right = select_algorithm(w.version);
         let mut differed = 0;
         for v in [7u8, 8, 9, 10, 11, 20] {
             if select_algorithm(v) == right {

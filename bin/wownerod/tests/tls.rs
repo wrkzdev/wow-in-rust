@@ -44,8 +44,17 @@ impl Scratch {
         let db = LmdbDb::open_with_map_size(&dir, OpenMode::default(), 2, 32 << 20).unwrap();
         let blob = wow_consensus::genesis::genesis_blob(Network::Mainnet);
         let blk = Block::from_blob(&blob).unwrap();
-        db.add_block(&blk, &blob, blob.len() as u64, blob.len() as u64, 1, 0, &[])
-            .unwrap();
+        let record = wow_consensus::genesis::genesis_record(Network::Mainnet);
+        db.add_block(
+            &blk,
+            &blob,
+            record.weight,
+            record.long_term_weight,
+            record.cumulative_difficulty,
+            record.already_generated_coins,
+            &[],
+        )
+        .unwrap();
         Scratch(p)
     }
 }

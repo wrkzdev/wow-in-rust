@@ -8,7 +8,9 @@
 //! # Two things that are easy to get wrong
 //!
 //! **`HEIGHT` is the current chain height, not the height of the block being
-//! validated, and `version` is the tip's version** (`specs/07` §3). Several
+//! validated, and `version` is `get_current_hard_fork_version()` — the version
+//! at that chain height, which is the next block's and not the tip block's**
+//! (`specs/07` §3). Several
 //! algorithms branch on `HEIGHT`, so during initial sync the branch taken
 //! depends on how far the chain has progressed. `recalculate_difficulties`
 //! reproduces this by passing `m_db->height()` — the *final* height — rather
@@ -660,8 +662,9 @@ fn zero_insignificant_digits_u128(mut d: u128) -> u128 {
 /// Dispatch to the algorithm `version` selects, with the window already
 /// collected per `specs/07` §1.
 ///
-/// `height` is the **current chain height** and `version` is the **tip's**
-/// version; neither is normalised (`specs/07` §3).
+/// `height` is the **current chain height** and `version` is the version at
+/// that height, `get_current_hard_fork_version()`; neither is normalised
+/// (`specs/07` §3).
 pub fn next_difficulty(
     version: u8,
     timestamps: Vec<u64>,

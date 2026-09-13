@@ -51,8 +51,6 @@ pub struct NextBlock {
     /// `m_current_block_cumul_weight_median`.
     pub median_weight: u64,
     pub already_generated_coins: u64,
-    /// The tip's version, which sizes the timestamp window.
-    pub tip_version: u8,
 }
 
 /// What the coinbase's extra nonce holds.
@@ -174,7 +172,7 @@ pub fn build(
 
     // Step 2: now, or the median of the recent timestamps when now is earlier
     // than it, so the block passes `check_block_timestamp`.
-    let window = timestamp_check_window(next.tip_version) as u64;
+    let window = timestamp_check_window(version) as u64;
     let timestamp = if height >= window {
         let mut recent = Vec::with_capacity(window as usize);
         for h in height - window..height {

@@ -284,6 +284,18 @@ impl NodeCore {
             }
             Err(Refusal::Malformed(reason)) => BlockVerdict::Rejected { reason, ban: true },
             Err(Refusal::Rejected(r)) => verdict(r),
+            // The sender is not at fault for a block the checkpoints name, so
+            // the sync stalls and retries rather than banning it.
+            Err(Refusal::Checkpointed(r)) => match verdict(r) {
+                BlockVerdict::Rejected { reason, .. } => BlockVerdict::Rejected {
+                    reason: format!(
+                        "{reason}; the block is the checkpointed one, so this node's rules \
+                         are wrong, not the peer"
+                    ),
+                    ban: false,
+                },
+                other => other,
+            },
         }
     }
 
@@ -499,7 +511,7 @@ fn fee_context_of(chain: &LocalChain) -> FeeContext {
     let bc = chain.blockchain();
     let state = bc.state();
     FeeContext {
-        version: bc.tip_version(),
+        version: bc.current_version(),
         cumulative_weight_limit: state.weights.limit,
         long_term_effective_median: state
             .weights
@@ -518,7 +530,6 @@ fn next_block_of(bc: &Blockchain<LmdbDb>) -> Result<NextBlock, String> {
         difficulty: bc.next_difficulty().map_err(|e| e.to_string())?,
         median_weight: state.weights.median,
         already_generated_coins: state.already_generated_coins,
-        tip_version: bc.tip_version(),
     })
 }
 

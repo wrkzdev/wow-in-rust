@@ -1,15 +1,18 @@
 # Difficulty windows
 
-Ten real mainnet windows, one or more per algorithm era, covering all six
-algorithms of `specs/07-difficulty.md`.
+Real mainnet windows: one or more per algorithm era, covering all six
+algorithms of `specs/07-difficulty.md`, plus the first block of every fork that
+changes the algorithm.
 
 ```
-name  height  tip_version  expected_difficulty  timestamps_csv  cumulative_difficulties_csv
+name  height  version  expected_difficulty  timestamps_csv  cumulative_difficulties_csv
 ```
 
 Each row is exactly what `get_difficulty_for_next_block` assembles at `height`:
-`difficulty_blocks_count(tip_version)` headers ending at `height - 1`
-(`specs/07` §1). `expected_difficulty` is what the chain actually recorded, from
+`difficulty_blocks_count(version)` headers ending at `height - 1`
+(`specs/07` §1). `version` is `get_current_hard_fork_version()`, which is the
+version at `height` itself, not the tip block's. `expected_difficulty` is what
+the chain actually recorded, from
 `get_block_header_by_height(height).difficulty`.
 
 | Row | Algorithm | What it pins |

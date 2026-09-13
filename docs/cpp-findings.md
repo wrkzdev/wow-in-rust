@@ -302,6 +302,18 @@ obvious from the call site.
 
 **Severity:** consensus (report, never "fix")
 
+> **Correction: the premise of this finding is wrong.** `get_current_version()`
+> is not the tip block's version. `BlockchainDB::add_block` calls
+> `m_hardfork->add(blk, height)`, and `HardFork::add` advances to
+> `get_voted_fork_index(height + 1)`, so while the block at height `H` is
+> validated it returns the version at `H` — the block's own. Forward sync and a
+> reorg (which pops first) both see the right version; nothing depends on an
+> accident. Taking the premise at face value, the Rust node read the version at
+> `H - 1` for the difficulty and timestamp rules and picked the wrong
+> difficulty algorithm on the first block of six mainnet forks; see
+> `wow_core::Blockchain::current_version`. The block-460 observation below still
+> holds, but it is §13's.
+
 `src/cryptonote_core/blockchain.cpp:3368`, in the `check_tx_inputs` that does
 the work:
 

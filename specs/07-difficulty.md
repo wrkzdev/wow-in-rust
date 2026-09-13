@@ -88,7 +88,9 @@ switch back to Monero's difficulty algorithm" item in the README.
 ## 3. The algorithms
 
 > **Critical: `HEIGHT` is the current chain height, not the height of the block
-> being validated, and `version` is the tip's version.** Several algorithms
+> being validated, and `version` is `get_current_hard_fork_version()` — the
+> version at that chain height, the next block's, not the tip block's.** Several
+> algorithms
 > branch on `HEIGHT`, so during initial sync the branch taken depends on how far
 > the chain has progressed. `recalculate_difficulties` reproduces this by passing
 > `m_db->height()` (the *final* height) rather than the loop height — meaning a
@@ -441,7 +443,7 @@ would exceed `u128::MAX`. Treat as a fatal error.
 timestamps and cumulative difficulties by walking the alt chain back from the tip
 and then continuing into the main chain, and feeds them to the same six
 algorithms with the same selection logic (`get_current_hard_fork_version()` — the
-*main chain's* tip version). It uses the same
+version of the *main chain's* next block). It uses the same
 `difficulty_blocks_count` derivation.
 
 ---
@@ -451,8 +453,9 @@ algorithms with the same selection logic (`get_current_hard_fork_version()` — 
 - [ ] All six algorithms implemented, selected exactly as in §2 — including
       versions 18 and 19 falling through to v1 with a 735-block collection and a
       720-block window.
-- [ ] `HEIGHT` is the current chain height and `version` is the tip's version;
-      call sites are not "corrected".
+- [ ] `HEIGHT` is the current chain height and `version` is
+      `get_current_hard_fork_version()` — the version at that height, not the
+      tip block's; call sites are not "corrected".
 - [ ] v1 and v6 truncate the window from the tail (dropping the lag) and sort
       only the timestamps, never the cumulative difficulties.
 - [ ] v2 uses `f64` with the exact operation order and `boost::math::round`

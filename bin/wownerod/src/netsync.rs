@@ -282,10 +282,20 @@ impl LocalChain {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let added = self
-            .chain
-            .handle_block(&block, blob, &parsed, now)
-            .map_err(Refusal::Rejected)?;
+        let height = self.db.height();
+        let added = match self.chain.handle_block(&block, blob, &parsed, now) {
+            Ok(added) => added,
+            Err(r)
+                if self
+                    .chain
+                    .checkpoints()
+                    .at(height)
+                    .is_some_and(|cp| block.block_id() == Some(cp.hash)) =>
+            {
+                return Err(Refusal::Checkpointed(r))
+            }
+            Err(r) => return Err(Refusal::Rejected(r)),
+        };
 
         match added {
             wow_core::Added::MainChain { .. } => {
@@ -407,13 +417,19 @@ pub enum Refusal {
     Malformed(String),
     /// The chain's rules refused it.
     Rejected(wow_core::Rejection),
+    /// The chain's rules refused the block a hard-coded checkpoint names at
+    /// this height. That block is on the real chain by definition, so the
+    /// rule that refused it is this node's bug and never grounds to ban the
+    /// sender -- which is how a wrong reward rule once cost a node every peer
+    /// at the HF 16 block.
+    Checkpointed(wow_core::Rejection),
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refusal::Malformed(r) => f.write_str(r),
-            Refusal::Rejected(r) => write!(f, "{r}"),
+            Refusal::Rejected(r) | Refusal::Checkpointed(r) => write!(f, "{r}"),
         }
     }
 }

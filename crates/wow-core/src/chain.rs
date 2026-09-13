@@ -7,8 +7,9 @@
 //!
 //! Two orderings are easy to get wrong and are called out where they happen:
 //!
-//! * the difficulty algorithm is chosen by the **tip's** hard-fork version, not
-//!   the incoming block's (`specs/07` §3, `specs/06` §9.4);
+//! * the difficulty algorithm is chosen by `get_current_hard_fork_version()`,
+//!   which despite its name is the version at the incoming block's height, not
+//!   the tip block's ([`Blockchain::current_version`], `specs/07` §3);
 //! * the weight limit used to validate a block is the one computed **after the
 //!   previous block**, not one derived from this block (`specs/06` §3.4).
 //!
@@ -366,7 +367,7 @@ impl<D: BlockchainDb> Blockchain<D> {
 
         // Both windows below are sized by the main chain's current version,
         // as `get_current_hard_fork_version()` sizes them in the C++.
-        let version = self.tip_version();
+        let version = self.current_version();
 
         // 4. Timestamp: at least the median of the alternative chain's own
         // timestamps, topped up from the main chain below the split.
@@ -749,14 +750,23 @@ impl<D: BlockchainDb> Blockchain<D> {
         self.db.get_block_hash(h - 1).ok()
     }
 
-    /// The hard-fork version in force at the tip.
+    /// The hard-fork version the next block must carry.
     ///
-    /// This is what `get_current_hard_fork_version()` returns, and it is what
-    /// several rules read where a reader would expect the block's own version
-    /// (`specs/06` §9.4).
-    pub fn tip_version(&self) -> u8 {
-        self.hardfork
-            .required_version(self.height().saturating_sub(1))
+    /// This is what `get_current_hard_fork_version()` returns. The name reads
+    /// as the tip block's version, but `BlockchainDB::add_block` ends with
+    /// `m_hardfork->add(blk, height)`, and `HardFork::add` moves on to
+    /// `get_voted_fork_index(height + 1)`; startup and `pop_block` land in the
+    /// same place. So while the C++ validates the block at height `H`, every
+    /// rule that reads it -- the difficulty algorithm and window, the timestamp
+    /// window and limit, `check_fee` -- sees the version at `H`.
+    ///
+    /// Reading the version at `H - 1` instead picks the wrong difficulty
+    /// algorithm on the first block of six mainnet forks (6969, 53,666, 63,469,
+    /// 81,769, 331,170 and 514,000), and the stored difficulty then disagrees
+    /// with the chain from there on. `tests/corpus/difficulty` has the real
+    /// windows.
+    pub fn current_version(&self) -> u8 {
+        self.hardfork.required_version(self.height())
     }
 
     /// Rebuild the cached state from the store.
@@ -797,7 +807,7 @@ impl<D: BlockchainDb> Blockchain<D> {
                     .push_back((info.timestamp, info.cumulative_difficulty));
             }
 
-            state.weights = self.compute_weight_limits(&state, self.tip_version());
+            state.weights = self.compute_weight_limits(&state, self.current_version());
         }
 
         self.state = state;
@@ -811,8 +821,8 @@ impl<D: BlockchainDb> Blockchain<D> {
 
     /// The difficulty the next block must meet (`specs/07` §1).
     ///
-    /// The algorithm is chosen by the **tip's** version, not by the block being
-    /// validated (`specs/07` §3).
+    /// The algorithm is chosen by [`Blockchain::current_version`], the version at
+    /// the height being validated (`specs/07` §3).
     pub fn next_difficulty(&self) -> Result<Difficulty, BlockError> {
         let height = self.height();
         if height == 0 {
@@ -821,7 +831,7 @@ impl<D: BlockchainDb> Blockchain<D> {
         if let Some(d) = self.fixed_difficulty {
             return Ok(d);
         }
-        let version = self.tip_version();
+        let version = self.current_version();
         let count = difficulty_blocks_count(version) as u64;
 
         let offset = {
@@ -926,12 +936,12 @@ impl<D: BlockchainDb> Blockchain<D> {
             ));
         }
 
-        // 4. Timestamp. The window and the limit come from the *tip's* version.
-        let tip_version = self.tip_version();
+        // 4. Timestamp. The window and the limit come from the current version.
+        let version = self.current_version();
         let mut recent = self
-            .recent_timestamps(tip_version)
+            .recent_timestamps(version)
             .map_err(|e| reject(Step::Timestamp, e))?;
-        check_block_timestamp(tip_version, blk.header.timestamp, now, &mut recent)
+        check_block_timestamp(version, blk.header.timestamp, now, &mut recent)
             .map_err(|e| reject(Step::Timestamp, BlockError::Timestamp(e)))?;
 
         // 5. Difficulty.

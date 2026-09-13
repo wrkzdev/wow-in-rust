@@ -71,8 +71,17 @@ fn seed_genesis(data_dir: &Path, network: Network) {
 
     let blob = wow_consensus::genesis::genesis_blob(network);
     let blk = Block::from_blob(&blob).expect("genesis parses");
-    db.add_block(&blk, &blob, blob.len() as u64, blob.len() as u64, 1, 0, &[])
-        .expect("add genesis");
+    let record = wow_consensus::genesis::genesis_record(network);
+    db.add_block(
+        &blk,
+        &blob,
+        record.weight,
+        record.long_term_weight,
+        record.cumulative_difficulty,
+        record.already_generated_coins,
+        &[],
+    )
+    .expect("add genesis");
 }
 
 #[test]
