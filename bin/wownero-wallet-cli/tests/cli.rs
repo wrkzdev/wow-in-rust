@@ -10,8 +10,9 @@
 //! offline, which is itself worth checking: a wallet that cannot reach a node
 //! should still open and show its address.
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 struct Scratch(PathBuf);
 
@@ -43,6 +44,51 @@ fn cli(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("run the wallet")
+}
+
+/// Run the wallet with `input` piped to standard input, the way a script
+/// answers its questions.
+fn cli_with_input(args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wownero-wallet-cli"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the wallet");
+    // Dropped after writing, so the wallet sees the end of its input.
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write the answers");
+    child.wait_with_output().expect("wait for the wallet")
+}
+
+/// The 25-word seed a new wallet printed.
+fn seed_in(text: &str) -> String {
+    text.lines()
+        .find(|l| l.split_whitespace().count() == 25)
+        .unwrap_or_else(|| panic!("no 25-word seed in:\n{text}"))
+        .trim()
+        .to_string()
+}
+
+fn address_of(scratch: &Scratch, name: &str) -> String {
+    std::fs::read_to_string(scratch.wallet(&format!("{name}.address.txt")))
+        .expect("address file")
+        .trim()
+        .to_string()
+}
+
+/// The hex key a `viewkey` or `spendkey` command printed.
+fn key_in(o: &Output) -> String {
+    stdout(o)
+        .split_whitespace()
+        .last()
+        .expect("a key")
+        .to_string()
 }
 
 fn stdout(o: &Output) -> String {
@@ -467,4 +513,186 @@ fn a_wallet_knows_its_own_network() {
         "{}",
         all_output(&wrong)
     );
+}
+
+/// With no wallet named, the wallet asks for one: a new name offers to create
+/// or restore, and an existing name opens.
+#[test]
+fn with_no_wallet_named_it_asks_for_one() {
+    let s = Scratch::new("ask");
+    let path = s.wallet("w");
+    let path = path.to_str().expect("utf-8");
+
+    // The name, choice 0 (a new wallet), then its password.
+    let out = cli_with_input(
+        &["--daemon-address", NO_DAEMON, "--command", "address"],
+        &format!("{path}\n0\nhunter2\n"),
+    );
+    assert!(out.status.success(), "{}", all_output(&out));
+    assert!(s.wallet("w.keys").exists(), "{}", all_output(&out));
+    assert!(stdout(&out).contains("Write this down"), "{}", stdout(&out));
+
+    // The same name again, then the password.
+    let out = cli_with_input(
+        &["--daemon-address", NO_DAEMON, "--command", "address"],
+        &format!("{path}\nhunter2\n"),
+    );
+    assert!(out.status.success(), "{}", all_output(&out));
+    assert!(
+        stdout(&out).contains(&address_of(&s, "w")),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// A seed left off the command line is asked for, so a script can pipe it in
+/// rather than put it in the process list.
+#[test]
+fn a_seed_can_be_given_on_standard_input() {
+    let s = Scratch::new("seedstdin");
+    let seed = seed_in(&stdout(&create(&s, "original", &["--command", "address"])));
+
+    let restored = s.wallet("restored");
+    // The seed, an empty seed offset passphrase, then the password.
+    let out = cli_with_input(
+        &[
+            "--generate-new-wallet",
+            restored.to_str().expect("utf-8"),
+            "--restore-deterministic-wallet",
+            "--daemon-address",
+            NO_DAEMON,
+            "--command",
+            "address",
+        ],
+        &format!("{seed}\n\nhunter2\n"),
+    );
+    assert!(out.status.success(), "{}", all_output(&out));
+    assert!(
+        stdout(&out).contains(&address_of(&s, "original")),
+        "the restored wallet has the same address\n{}",
+        stdout(&out)
+    );
+
+    let reopened = run_in(&s, "restored", &["address"]);
+    assert!(reopened.status.success(), "{}", all_output(&reopened));
+}
+
+/// A seed written with an offset passphrase (the C++ `encrypted_seed`)
+/// restores the wallet it came from once the passphrase is given.
+#[test]
+fn a_seed_offset_passphrase_is_taken_off() {
+    let s = Scratch::new("offset");
+    create(&s, "original", &["--command", "address"]);
+    let spend: [u8; 32] = wow_crypto::hex::decode(&key_in(&run_in(&s, "original", &["spendkey"])))
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+
+    // `cryptonote::encrypt_key`: the key plus `cn_slow_hash(passphrase)`.
+    let offset = wow_crypto::cn::slow_hash::cn_slow_hash(b"correct horse");
+    let offset_key = wow_crypto::types::SecretKey(wow_crypto::ops::sc_add(&spend, &offset));
+    let words = wow_crypto::mnemonic::key_to_words(&offset_key, wow_crypto::mnemonic::english());
+
+    let restored = s.wallet("restored");
+    let out = cli_with_input(
+        &[
+            "--generate-new-wallet",
+            restored.to_str().expect("utf-8"),
+            "--restore-deterministic-wallet",
+            "--daemon-address",
+            NO_DAEMON,
+            "--command",
+            "address",
+        ],
+        &format!("{words}\ncorrect horse\nhunter2\n"),
+    );
+    assert!(out.status.success(), "{}", all_output(&out));
+    assert!(
+        stdout(&out).contains(&address_of(&s, "original")),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// An address and view key left off the command line are asked for.
+#[test]
+fn keys_can_be_given_on_standard_input() {
+    let s = Scratch::new("keysstdin");
+    create(&s, "full", &["--command", "address"]);
+    let address = address_of(&s, "full");
+    let view = key_in(&run_in(&s, "full", &["viewkey"]));
+
+    let watch = s.wallet("watch");
+    let out = cli_with_input(
+        &[
+            "--generate-from-view-key",
+            watch.to_str().expect("utf-8"),
+            "--daemon-address",
+            NO_DAEMON,
+            "--command",
+            "wallet_info",
+        ],
+        &format!("{address}\n{view}\nhunter2\n"),
+    );
+    assert!(out.status.success(), "{}", all_output(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("view-only") && text.contains(&address),
+        "{text}"
+    );
+}
+
+/// A key that belongs to another wallet is refused, and nothing is written.
+#[test]
+fn a_key_for_another_wallet_is_refused() {
+    let s = Scratch::new("wrongkey");
+    create(&s, "a", &["--command", "address"]);
+    create(&s, "b", &["--command", "address"]);
+    let address = address_of(&s, "a");
+    let other_view = key_in(&run_in(&s, "b", &["viewkey"]));
+
+    let watch = s.wallet("watch");
+    let out = cli_with_input(
+        &[
+            "--generate-from-view-key",
+            watch.to_str().expect("utf-8"),
+            "--daemon-address",
+            NO_DAEMON,
+            "--command",
+            "address",
+        ],
+        &format!("{address}\n{other_view}\nhunter2\n"),
+    );
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert!(
+        all_output(&out).contains("does not belong"),
+        "{}",
+        all_output(&out)
+    );
+    assert!(!s.wallet("watch.keys").exists(), "nothing was written");
+}
+
+/// A restore with nothing to restore from, and nobody to ask, writes nothing.
+#[test]
+fn a_restore_with_no_seed_writes_nothing() {
+    let s = Scratch::new("noseed");
+    let path = s.wallet("w");
+    let out = cli(&[
+        "--generate-new-wallet",
+        path.to_str().expect("utf-8"),
+        "--restore-deterministic-wallet",
+        "--password",
+        "hunter2",
+        "--daemon-address",
+        NO_DAEMON,
+        "--command",
+        "address",
+    ]);
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert!(
+        all_output(&out).contains("cancelled"),
+        "{}",
+        all_output(&out)
+    );
+    assert!(!s.wallet("w.keys").exists());
 }

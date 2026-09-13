@@ -3,6 +3,13 @@
 //! `specs/13`. The M4 minimum set from §4: open, create and restore a wallet,
 //! show its keys and addresses, sync against a daemon, and send.
 //!
+//! # Options or questions
+//!
+//! Anything needed to open or restore a wallet can be given as an option, and
+//! whatever is not given is asked for ([`startup`]). A seed or key typed at a
+//! prompt stays out of the process list and the shell history; an option does
+//! not.
+//!
 //! # `--command` is the one that matters for testing
 //!
 //! `specs/13` §3 asks for a way to run a single command and exit with a status,
@@ -12,26 +19,36 @@
 mod commands;
 mod fmt;
 mod session;
+mod startup;
 mod term;
 
 use std::path::PathBuf;
 
+use wow_crypto::mnemonic::Language;
 use wow_types::Network;
-use wow_wallet::AccountBase;
 
-use session::{Paths, Session};
-
-/// How the wallet was asked to get its keys.
-#[derive(Debug)]
+/// How the wallet gets its keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
+    /// Open an existing wallet.
     Open,
+    /// Make up new keys.
     GenerateNew,
-    RestoreSeed(String),
-    RestoreKeys {
-        address: String,
-        view: String,
-        spend: Option<String>,
-    },
+    /// Restore from a 25-word seed.
+    Seed,
+    /// Restore from the secret spend key, deriving the view key from it.
+    SpendKey,
+    /// Restore from an address and both secret keys.
+    Keys,
+    /// A view-only wallet, from an address and the secret view key.
+    ViewKey,
+}
+
+impl Source {
+    /// Whether this brings back a wallet that may already own funds.
+    fn restores(self) -> bool {
+        !matches!(self, Source::Open | Source::GenerateNew)
+    }
 }
 
 struct Options {
@@ -39,29 +56,34 @@ struct Options {
     source: Source,
     network: Network,
     password: Option<String>,
+    seed: Option<String>,
+    address: Option<String>,
+    view_key: Option<String>,
+    spend_key: Option<String>,
     daemon: Option<String>,
-    restore_height: u64,
+    /// `None` when not given, so a restore knows to ask.
+    restore_height: Option<u64>,
     kdf_rounds: u64,
-    language: String,
+    /// `None` when not given, so a new wallet knows to ask.
+    language: Option<String>,
     commands: Vec<String>,
     no_initial_sync: bool,
 }
 
-/// Written by hand rather than derived, so a password cannot reach a log
-/// through a `{:?}`. A seed phrase is redacted for the same reason.
+/// Written by hand rather than derived, so a password, seed or secret key
+/// cannot reach a log through a `{:?}`.
 impl std::fmt::Debug for Options {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
         f.debug_struct("Options")
             .field("wallet", &self.wallet)
-            .field(
-                "source",
-                &match &self.source {
-                    Source::RestoreSeed(_) => "RestoreSeed(<redacted>)".to_string(),
-                    other => format!("{other:?}"),
-                },
-            )
+            .field("source", &self.source)
             .field("network", &self.network)
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("password", &redacted(&self.password))
+            .field("seed", &redacted(&self.seed))
+            .field("address", &self.address)
+            .field("view_key", &redacted(&self.view_key))
+            .field("spend_key", &redacted(&self.spend_key))
             .field("daemon", &self.daemon)
             .field("restore_height", &self.restore_height)
             .field("kdf_rounds", &self.kdf_rounds)
@@ -79,10 +101,14 @@ impl Default for Options {
             source: Source::Open,
             network: Network::Mainnet,
             password: None,
+            seed: None,
+            address: None,
+            view_key: None,
+            spend_key: None,
             daemon: None,
-            restore_height: 0,
+            restore_height: None,
             kdf_rounds: 1,
-            language: "English".into(),
+            language: None,
             commands: Vec::new(),
             no_initial_sync: false,
         }
@@ -92,12 +118,22 @@ impl Default for Options {
 const USAGE: &str = "\
 wownero-wallet-cli — the Wownero command-line wallet
 
+Run it with no options to be asked which wallet to open, create or restore.
+Whatever the options below leave out is asked for.
+
   --wallet-file <name>              open an existing wallet
   --generate-new-wallet <name>      create one
   --restore-deterministic-wallet    restore from a 25-word seed
-  --electrum-seed \"<25 words>\"      the seed, for the above
-  --restore-from-keys               restore from an address and keys
-  --address <addr> --viewkey <hex> [--spendkey <hex>]
+  --generate-from-spend-key <name>  restore from a secret spend key
+  --generate-from-keys <name>       restore from an address and both secret keys
+  --generate-from-view-key <name>   restore a view-only wallet
+  --restore-from-keys               restore from keys, named by
+                                    --generate-new-wallet; view-only when
+                                    --viewkey is given without --spendkey
+
+  --electrum-seed \"<25 words>\"      the seed, instead of being asked for it
+  --address <addr>                  the address, likewise
+  --viewkey <hex> --spendkey <hex>  the secret keys, likewise
 
   --password <pass>                 (a password file is safer; see below)
   --password-file <path>
@@ -110,17 +146,23 @@ wownero-wallet-cli — the Wownero command-line wallet
   --command <cmd ...>               run one command and exit
   --help
 
-A wallet with no --wallet-file and no --generate-new-wallet has nothing to do,
-so it says what its options are rather than starting an empty prompt.";
+A seed, key or password given as an option can be read from the process list
+by other users, and stays in the shell history. Leave it out to be asked.";
+
+/// The options that name a new wallet and say what to restore it from, as the
+/// C++ wallet spells them.
+const GENERATE_FROM: [(&str, Source); 3] = [
+    ("--generate-from-spend-key", Source::SpendKey),
+    ("--generate-from-keys", Source::Keys),
+    ("--generate-from-view-key", Source::ViewKey),
+];
 
 fn parse(args: Vec<String>) -> Result<Options, String> {
     let mut o = Options::default();
-    let mut address = None;
-    let mut view = None;
-    let mut spend = None;
-    let mut seed = None;
-    let mut restore_seed = false;
-    let mut restore_keys = false;
+    // Every option that named the wallet, so two names can be refused.
+    let mut named_by: Vec<&'static str> = Vec::new();
+    // What to restore from, and the option that said so.
+    let mut restore: Option<(Source, &'static str)> = None;
 
     let mut it = args.into_iter().skip(1);
     while let Some(arg) = it.next() {
@@ -129,17 +171,24 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
         };
         match arg.as_str() {
             "--help" | "-h" => return Err(USAGE.into()),
-            "--wallet-file" => o.wallet = Some(PathBuf::from(next("--wallet-file")?)),
+            "--wallet-file" => {
+                o.wallet = Some(PathBuf::from(next("--wallet-file")?));
+                named_by.push("--wallet-file");
+            }
             "--generate-new-wallet" => {
                 o.wallet = Some(PathBuf::from(next("--generate-new-wallet")?));
-                o.source = Source::GenerateNew;
+                named_by.push("--generate-new-wallet");
             }
-            "--restore-deterministic-wallet" => restore_seed = true,
-            "--restore-from-keys" | "--generate-from-keys" => restore_keys = true,
-            "--electrum-seed" => seed = Some(next("--electrum-seed")?),
-            "--address" => address = Some(next("--address")?),
-            "--viewkey" => view = Some(next("--viewkey")?),
-            "--spendkey" => spend = Some(next("--spendkey")?),
+            "--restore-deterministic-wallet" | "--restore-from-seed" => {
+                restore_from(&mut restore, Source::Seed, "--restore-deterministic-wallet")?
+            }
+            "--restore-from-keys" => {
+                restore_from(&mut restore, Source::Keys, "--restore-from-keys")?
+            }
+            "--electrum-seed" => o.seed = Some(next("--electrum-seed")?),
+            "--address" => o.address = Some(next("--address")?),
+            "--viewkey" => o.view_key = Some(next("--viewkey")?),
+            "--spendkey" => o.spend_key = Some(next("--spendkey")?),
             "--password" => o.password = Some(next("--password")?),
             "--password-file" => {
                 let path = next("--password-file")?;
@@ -155,9 +204,10 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             "--testnet" => o.network = Network::Testnet,
             "--stagenet" => o.network = Network::Stagenet,
             "--restore-height" => {
-                o.restore_height = next("--restore-height")?
+                let height = next("--restore-height")?
                     .parse()
                     .map_err(|_| "--restore-height needs a number".to_string())?;
+                o.restore_height = Some(height);
             }
             "--kdf-rounds" => {
                 o.kdf_rounds = next("--kdf-rounds")?
@@ -167,7 +217,17 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
                     return Err("--kdf-rounds must be at least 1".into());
                 }
             }
-            "--mnemonic-language" => o.language = next("--mnemonic-language")?,
+            "--mnemonic-language" => {
+                let name = next("--mnemonic-language")?;
+                // Either name of a language is accepted; the keys file gets
+                // its own name for itself, as the C++ writes it.
+                match wow_crypto::mnemonic::by_name(&name) {
+                    Some(l) if l.language != Language::EnglishOld => {
+                        o.language = Some(l.name.to_string())
+                    }
+                    _ => return Err(format!("`{name}` is not a seed language")),
+                }
+            }
             "--no-initial-sync" => o.no_initial_sync = true,
             // Everything after `--command` is one command line.
             "--command" => {
@@ -178,22 +238,55 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
                 o.commands.push(rest.join(" "));
                 break;
             }
-            other => return Err(format!("unknown option `{other}`. Try --help.")),
+            other => {
+                let Some(&(flag, source)) = GENERATE_FROM.iter().find(|(f, _)| *f == other) else {
+                    return Err(format!("unknown option `{other}`. Try --help."));
+                };
+                o.wallet = Some(PathBuf::from(next(flag)?));
+                named_by.push(flag);
+                restore_from(&mut restore, source, flag)?;
+            }
         }
     }
 
-    if restore_seed {
-        let s = seed.ok_or("--restore-deterministic-wallet needs --electrum-seed")?;
-        o.source = Source::RestoreSeed(s);
-    } else if restore_keys {
-        o.source = Source::RestoreKeys {
-            address: address.ok_or("--restore-from-keys needs --address")?,
-            view: view.ok_or("--restore-from-keys needs --viewkey")?,
-            spend,
-        };
+    if let &[first, second, ..] = named_by.as_slice() {
+        return Err(format!("{first} and {second} both name a wallet; give one"));
+    }
+    match restore {
+        Some((_, flag)) if named_by == ["--wallet-file"] => {
+            return Err(format!(
+                "{flag} makes a new wallet: name it with --generate-new-wallet, not --wallet-file"
+            ));
+        }
+        Some((source, flag)) => {
+            o.source = source;
+            if flag == "--restore-from-keys" && o.view_key.is_some() && o.spend_key.is_none() {
+                o.source = Source::ViewKey;
+            }
+        }
+        None if named_by == ["--generate-new-wallet"] => o.source = Source::GenerateNew,
+        None => {}
     }
 
     Ok(o)
+}
+
+/// Record what to restore from, refusing a second, different answer.
+fn restore_from(
+    slot: &mut Option<(Source, &'static str)>,
+    source: Source,
+    flag: &'static str,
+) -> Result<(), String> {
+    match *slot {
+        Some((s, first)) if s != source => Err(format!(
+            "{first} and {flag} are different ways to restore; give one"
+        )),
+        Some(_) => Ok(()),
+        None => {
+            *slot = Some((source, flag));
+            Ok(())
+        }
+    }
 }
 
 fn main() {
@@ -214,47 +307,8 @@ fn main() {
     }
 }
 
-fn run(options: Options) -> Result<(), String> {
-    let Some(path) = options.wallet.clone() else {
-        eprintln!("{USAGE}");
-        return Err("no wallet named".into());
-    };
-    let paths = Paths::new(path);
-
-    let password = match options.password.clone() {
-        Some(p) => p,
-        None => term::read_password("Wallet password: ").ok_or("no password given")?,
-    };
-
-    let mut session = match &options.source {
-        Source::Open => Session::open(paths, password, options.kdf_rounds, Some(options.network))?,
-        _ => {
-            let account = build_account(&options)?;
-            let s = Session::create(
-                paths,
-                options.network,
-                password,
-                options.kdf_rounds,
-                account,
-                &options.language,
-                options.restore_height,
-            )?;
-            println!("Created {}", s.paths.keys().display());
-            println!("Address: {}", s.primary_address());
-            if matches!(options.source, Source::GenerateNew) {
-                match s.seed(&options.language) {
-                    Ok(seed) => {
-                        println!();
-                        println!("Write this down. It is the only way to recover this wallet:");
-                        println!("  {seed}");
-                        println!();
-                    }
-                    Err(e) => println!("(no seed phrase: {e})"),
-                }
-            }
-            s
-        }
-    };
+fn run(mut options: Options) -> Result<(), String> {
+    let mut session = startup::start(&mut options)?;
 
     // Connect, and sync unless told not to.
     let daemon = options
@@ -275,11 +329,11 @@ fn run(options: Options) -> Result<(), String> {
             // reading the whole chain to find nothing. `wallet2::generate`
             // does the same.
             //
-            // Only for `--generate-new-wallet`, and only when no
-            // `--restore-height` was given: a wallet restored from a seed may
-            // own old outputs, and starting it at the tip would hide them
-            // behind a balance of zero that looks perfectly correct.
-            if matches!(options.source, Source::GenerateNew) && options.restore_height == 0 {
+            // Only for a new wallet, and only when no `--restore-height` was
+            // given: a wallet restored from a seed may own old outputs, and
+            // starting it at the tip would hide them behind a balance of zero
+            // that looks perfectly correct.
+            if options.source == Source::GenerateNew && options.restore_height.unwrap_or(0) == 0 {
                 let tip = session.chain_height();
                 session.start_at_tip(tip);
                 if tip > 0 {
@@ -335,68 +389,6 @@ fn run(options: Options) -> Result<(), String> {
     Ok(())
 }
 
-fn build_account(options: &Options) -> Result<AccountBase, String> {
-    let created = session::now();
-    match &options.source {
-        Source::GenerateNew => {
-            let mut rng = term::seeded_rng()?;
-            let spend = wow_crypto::types::SecretKey(rng.random_scalar());
-            AccountBase::from_spend_key(spend, created)
-                .ok_or_else(|| "could not derive keys from the generated secret".into())
-        }
-        Source::RestoreSeed(phrase) => {
-            let (spend, list) = wow_crypto::mnemonic::words_to_key(phrase)
-                .map_err(|e| format!("that seed phrase is not valid: {e}"))?;
-            println!("Seed language: {}", list.name);
-            AccountBase::from_spend_key(spend, created)
-                .ok_or_else(|| "that seed does not produce a valid key".into())
-        }
-        Source::RestoreKeys {
-            address,
-            view,
-            spend,
-        } => {
-            let decoded = wow_types::address::Address::decode_for(address, options.network)
-                .map_err(|e| format!("that address is not valid: {e}"))?;
-            let view = secret_from_hex(view, "view key")?;
-
-            match spend {
-                Some(s) => {
-                    let spend = secret_from_hex(s, "spend key")?;
-                    let a = AccountBase::from_keys(spend, view, created)
-                        .ok_or("those keys are not valid")?;
-                    if a.keys.account_address != decoded.keys {
-                        return Err(
-                            "those keys do not belong to that address; nothing was written".into(),
-                        );
-                    }
-                    Ok(a)
-                }
-                None => {
-                    let a = AccountBase::view_only(decoded.keys, view, created);
-                    a.keys
-                        .verify()
-                        .map_err(|e| format!("that view key does not match that address: {e}"))?;
-                    println!("(view-only: this wallet can watch but not spend)");
-                    Ok(a)
-                }
-            }
-        }
-        Source::Open => unreachable!("handled above"),
-    }
-}
-
-fn secret_from_hex(s: &str, what: &str) -> Result<wow_crypto::types::SecretKey, String> {
-    let bytes = wow_crypto::hex::decode(s).ok_or(format!("the {what} is not hex"))?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| format!("the {what} is not 32 bytes"))?;
-    if !wow_crypto::sc_check(&bytes) {
-        return Err(format!("the {what} is not a valid scalar"));
-    }
-    Ok(wow_crypto::types::SecretKey(bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,10 +402,11 @@ mod tests {
     #[test]
     fn the_defaults_are_the_documented_ones() {
         let o = opts(&["--wallet-file", "w"]).expect("parses");
+        assert_eq!(o.source, Source::Open);
         assert_eq!(o.network, Network::Mainnet);
         assert_eq!(o.kdf_rounds, 1);
-        assert_eq!(o.language, "English");
-        assert_eq!(o.restore_height, 0);
+        assert!(o.language.is_none(), "a new wallet asks, or uses English");
+        assert!(o.restore_height.is_none(), "a restore asks, or starts at 0");
         assert!(o.daemon.is_none(), "the default is applied at connect time");
     }
 
@@ -452,6 +445,7 @@ mod tests {
     #[test]
     fn a_missing_value_is_an_error() {
         assert!(opts(&["--wallet-file"]).is_err());
+        assert!(opts(&["--generate-from-keys"]).is_err());
         assert!(opts(&["--restore-height"]).is_err());
         assert!(opts(&["--command"]).is_err());
         assert!(opts(&["--kdf-rounds", "0"]).is_err());
@@ -463,50 +457,131 @@ mod tests {
         assert!(e.contains("--mine-please"), "{e}");
     }
 
-    /// Restoring needs the material it says it needs, rather than silently
-    /// creating a different wallet.
+    /// A restore needs nothing up front: the name, seed and keys it is not
+    /// given are asked for.
     #[test]
-    fn restoring_needs_its_inputs() {
-        let e = opts(&["--wallet-file", "w", "--restore-deterministic-wallet"])
-            .expect_err("needs a seed");
-        assert!(e.contains("--electrum-seed"), "{e}");
+    fn a_restore_parses_without_its_material() {
+        let o = opts(&["--restore-deterministic-wallet"]).expect("parses");
+        assert_eq!(o.source, Source::Seed);
+        assert!(o.wallet.is_none() && o.seed.is_none());
 
-        let e = opts(&["--wallet-file", "w", "--restore-from-keys"]).expect_err("needs an address");
-        assert!(e.contains("--address"), "{e}");
+        let o = opts(&["--generate-from-keys", "w"]).expect("parses");
+        assert_eq!(o.source, Source::Keys);
+        assert_eq!(o.wallet, Some(PathBuf::from("w")));
+
+        let o = opts(&["--generate-from-view-key", "w"]).expect("parses");
+        assert_eq!(o.source, Source::ViewKey);
+    }
+
+    /// One name, and one thing to restore from. `--wallet-file` opens a wallet,
+    /// so it cannot name one being restored.
+    #[test]
+    fn a_wallet_is_named_once_and_restored_one_way() {
+        let e = opts(&["--wallet-file", "a", "--generate-new-wallet", "b"]).expect_err("two names");
+        assert!(
+            e.contains("--wallet-file") && e.contains("--generate-new-wallet"),
+            "{e}"
+        );
+
+        let e = opts(&["--wallet-file", "w", "--restore-deterministic-wallet"])
+            .expect_err("--wallet-file opens");
+        assert!(e.contains("--generate-new-wallet"), "{e}");
 
         let e = opts(&[
-            "--wallet-file",
+            "--generate-new-wallet",
+            "w",
+            "--restore-deterministic-wallet",
+            "--restore-from-keys",
+        ])
+        .expect_err("two ways to restore");
+        assert!(e.contains("different ways"), "{e}");
+    }
+
+    /// `--restore-from-keys` with a view key and no spend key has always meant
+    /// a view-only wallet. With neither, the spend key is asked for.
+    #[test]
+    fn restore_from_keys_is_view_only_without_a_spend_key() {
+        let o = opts(&[
+            "--generate-new-wallet",
             "w",
             "--restore-from-keys",
             "--address",
             "Wo1",
+            "--viewkey",
+            "00",
         ])
-        .expect_err("needs a view key");
-        assert!(e.contains("--viewkey"), "{e}");
+        .expect("parses");
+        assert_eq!(o.source, Source::ViewKey);
+
+        let o = opts(&["--generate-new-wallet", "w", "--restore-from-keys"]).expect("parses");
+        assert_eq!(o.source, Source::Keys);
     }
 
     #[test]
     fn a_seed_restore_is_recognised() {
         let o = opts(&[
-            "--wallet-file",
+            "--generate-new-wallet",
             "w",
             "--restore-deterministic-wallet",
             "--electrum-seed",
             "one two three",
         ])
         .expect("parses");
-        assert!(matches!(o.source, Source::RestoreSeed(s) if s == "one two three"));
+        assert_eq!(o.source, Source::Seed);
+        assert_eq!(o.seed.as_deref(), Some("one two three"));
     }
 
-    /// A hex key that is not a canonical scalar is refused. Accepting one would
-    /// build a wallet whose keys do not behave.
     #[test]
-    fn a_bad_secret_key_is_refused() {
-        assert!(secret_from_hex("not hex", "view key").is_err());
-        assert!(secret_from_hex("00", "view key").is_err());
-        assert!(secret_from_hex(&"ff".repeat(32), "view key").is_err());
-        // A valid one.
-        let ok = wow_crypto::hex::encode(&wow_crypto::ops::sc_reduce32(&[7u8; 32]));
-        assert!(secret_from_hex(&ok, "view key").is_ok());
+    fn the_seed_language_is_checked() {
+        let o = opts(&[
+            "--generate-new-wallet",
+            "w",
+            "--mnemonic-language",
+            "Spanish",
+        ])
+        .expect("the English name works");
+        assert_eq!(
+            o.language.as_deref(),
+            Some("Español"),
+            "stored by its own name"
+        );
+
+        assert!(opts(&[
+            "--generate-new-wallet",
+            "w",
+            "--mnemonic-language",
+            "Klingon"
+        ])
+        .is_err());
+        assert!(
+            opts(&[
+                "--generate-new-wallet",
+                "w",
+                "--mnemonic-language",
+                "EnglishOld"
+            ])
+            .is_err(),
+            "the old list is not offered for new seeds"
+        );
+    }
+
+    #[test]
+    fn debug_output_hides_secrets() {
+        let o = opts(&[
+            "--generate-new-wallet",
+            "w",
+            "--restore-from-keys",
+            "--password",
+            "secret-password",
+            "--spendkey",
+            "secret-spend",
+            "--viewkey",
+            "secret-view",
+            "--electrum-seed",
+            "secret-seed",
+        ])
+        .expect("parses");
+        let shown = format!("{o:?}");
+        assert!(!shown.contains("secret-"), "{shown}");
     }
 }
