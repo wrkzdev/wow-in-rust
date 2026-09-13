@@ -87,6 +87,14 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 const MAX_DIALING: usize = 8;
 /// How often the peer lists are written out while running.
 const SAVE_EVERY: Duration = Duration::from_secs(30 * 60);
+/// How long the applier first waits before retrying blocks that failed through
+/// no fault of their sender. The wait doubles each time the failure recurs.
+const STALL_RETRY: Duration = Duration::from_secs(1);
+/// The longest it waits.
+const STALL_RETRY_MAX: Duration = Duration::from_secs(60);
+/// The same failure again within this long is logged at debug level rather
+/// than warned about again.
+const STALL_QUIET: Duration = Duration::from_secs(5 * 60);
 
 /// `CRYPTONOTE_DANDELIONPP_STEMS`.
 const DANDELION_STEMS: usize = 2;
@@ -1365,8 +1373,69 @@ fn dial(
     }
 }
 
+/// A sync held up by something that is not the sender's fault: a full disk, a
+/// proof this build cannot check, a clock that disagrees.
+///
+/// Every peer's copy of the next blocks fails the same way, so trying again at
+/// once only repeats the failure as fast as the blocks download -- several
+/// times a second, each time with a warning and a dropped peer. This paces the
+/// attempts and says the same thing once.
+#[derive(Debug, Default)]
+struct Stall {
+    /// Failures since the chain last grew, for the back-off.
+    streak: u32,
+    /// The applier does not try again before this.
+    retry_at: Option<Instant>,
+    /// The failure last warned about, and when.
+    warned: Option<(String, Instant)>,
+    /// How often it has recurred since, logged at debug level only.
+    quieted: u64,
+}
+
+/// How [`Stall::failed`] says to log a failure.
+#[derive(Debug, PartialEq, Eq)]
+enum StallReport {
+    /// A warning, counting the recurrences not warned about since the last.
+    Warn { quieted: u64 },
+    /// The failure a recent warning was about: debug level.
+    Quiet,
+}
+
+impl Stall {
+    fn waiting(&self, now: Instant) -> bool {
+        self.retry_at.is_some_and(|t| now < t)
+    }
+
+    /// Another failure: how long to wait before trying again, and how loudly
+    /// to say so.
+    fn failed(&mut self, reason: &str, now: Instant) -> (Duration, StallReport) {
+        let wait = STALL_RETRY
+            .saturating_mul(1 << self.streak.min(6))
+            .min(STALL_RETRY_MAX);
+        self.streak = self.streak.saturating_add(1);
+        self.retry_at = Some(now + wait);
+
+        let same = self.warned.as_ref().filter(|(r, _)| r == reason);
+        if same.is_some_and(|(_, at)| now.duration_since(*at) < STALL_QUIET) {
+            self.quieted += 1;
+            return (wait, StallReport::Quiet);
+        }
+        let quieted = if same.is_some() { self.quieted } else { 0 };
+        self.quieted = 0;
+        self.warned = Some((reason.to_string(), now));
+        (wait, StallReport::Warn { quieted })
+    }
+
+    /// The chain grew. Returns whether it had been stalled.
+    fn cleared(&mut self) -> bool {
+        self.retry_at = None;
+        std::mem::take(&mut self.streak) > 0
+    }
+}
+
 /// The one thread that adds synced blocks to the chain.
 fn apply_loop(shared: Arc<Shared>) {
+    let mut stall = Stall::default();
     while !shared.stopping() {
         {
             let (flag, cv) = &shared.apply_wake;
@@ -1379,7 +1448,12 @@ fn apply_loop(shared: Arc<Shared>) {
             }
             *woken = false;
         }
-        drain_queue(&shared);
+        // After a failure that was not the sender's fault, wait out the
+        // back-off rather than fail again as fast as blocks arrive.
+        if stall.waiting(Instant::now()) {
+            continue;
+        }
+        drain_queue(&shared, &mut stall);
     }
 }
 
@@ -1388,18 +1462,26 @@ fn apply_loop(shared: Arc<Shared>) {
 ///
 /// What a failure costs depends on whose fault it is. A block that shows its
 /// sender lied bans the sender and gives back everything it delivered; one
-/// this node could not check drops the sender without a ban; and spans that no
-/// longer attach to the chain -- it moved under the queue -- throw the queue
-/// away so every connection reads its peer's chain afresh.
-fn drain_queue(shared: &Shared) {
+/// this node could not take drops the sender without a ban and pauses the sync
+/// ([`Stall`]); and spans that no longer attach to the chain -- it moved under
+/// the queue -- throw the queue away so every connection reads its peer's
+/// chain afresh.
+fn drain_queue(shared: &Shared, stall: &mut Stall) {
     while !shared.stopping() {
         let height = shared.core.sync_data().current_height;
         let span = lock(&shared.queue).take_next(height, |id| shared.core.have_block(id));
         let Some(span) = span else {
             return;
         };
-        let (_, stop) = shared.core.apply_blocks(&span.blocks);
+        let (taken, stop) = shared.core.apply_blocks(&span.blocks);
         lock(&shared.queue).applied(&span);
+        if taken > 0 && stall.cleared() {
+            wow_log::info!(
+                LOG,
+                "sync resumed at height {}",
+                shared.core.sync_data().current_height
+            );
+        }
         match stop {
             None
             | Some(BlockVerdict::Added | BlockVerdict::Alternative | BlockVerdict::AlreadyHave) => {
@@ -1434,16 +1516,31 @@ fn drain_queue(shared: &Shared) {
                 shared.ban(BanTarget::Host(span.origin.ip()), IP_BLOCKTIME);
             }
             Some(BlockVerdict::Rejected { reason, .. }) => {
-                // Not the peer's fault, and not something asking again fixes.
-                wow_log::warn!(
-                    LOG,
-                    "sync stopped in the span from height {}: {reason}",
-                    span.start
-                );
+                // Not the peer's fault, and not something asking again at once
+                // fixes: another peer's copy of these blocks fails the same way.
+                let at = span.start + taken as u64;
+                let (wait, report) = stall.failed(&reason, Instant::now());
+                let wait = wait.as_secs();
+                match report {
+                    StallReport::Warn { quieted: 0 } => wow_log::warn!(
+                        LOG,
+                        "sync stalled at height {at}: {reason}; retrying in {wait} s"
+                    ),
+                    StallReport::Warn { quieted } => wow_log::warn!(
+                        LOG,
+                        "sync still stalled at height {at} after {quieted} more attempt(s): \
+                         {reason}; retrying in {wait} s"
+                    ),
+                    StallReport::Quiet => wow_log::debug!(
+                        LOG,
+                        "sync stalled at height {at} again: {reason}; retrying in {wait} s"
+                    ),
+                }
                 lock(&shared.queue).flush(span.conn, true);
                 if let Some(c) = lock(&shared.conns).get(&span.conn) {
                     c.close();
                 }
+                return;
             }
         }
     }
@@ -2258,6 +2355,50 @@ mod tests {
         assert_eq!(seed_nodes(Network::Mainnet).len(), 6);
         assert!(seed_nodes(Network::Testnet).is_empty());
         assert!(seed_nodes(Network::Stagenet).is_empty());
+    }
+
+    /// A failure that keeps recurring is retried after a doubling wait, with a
+    /// cap, and warned about once until it has been quiet for a while.
+    #[test]
+    fn a_stalled_sync_backs_off_and_warns_once() {
+        let t0 = Instant::now();
+        let mut stall = Stall::default();
+        let full = "step 12 (Commit): storage: backend: mdb_put: MDB_MAP_FULL";
+
+        let (wait, report) = stall.failed(full, t0);
+        assert_eq!(
+            (wait, report),
+            (Duration::from_secs(1), StallReport::Warn { quieted: 0 })
+        );
+        assert!(stall.waiting(t0));
+        assert!(!stall.waiting(t0 + wait));
+
+        let waits: Vec<u64> = (0..8)
+            .map(|i| {
+                let (wait, report) = stall.failed(full, t0 + Duration::from_secs(i));
+                assert_eq!(report, StallReport::Quiet);
+                wait.as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [2, 4, 8, 16, 32, 60, 60, 60]);
+
+        // Once the quiet period is over it is warned about again, with a count.
+        let later = t0 + STALL_QUIET;
+        assert_eq!(
+            stall.failed(full, later).1,
+            StallReport::Warn { quieted: 8 }
+        );
+        // A different failure is warned about at once, without that count.
+        assert_eq!(
+            stall.failed("clock", later).1,
+            StallReport::Warn { quieted: 0 }
+        );
+
+        // Progress ends the stall and starts the back-off over.
+        assert!(stall.cleared());
+        assert!(!stall.waiting(later));
+        assert!(!stall.cleared(), "only once");
+        assert_eq!(stall.failed("clock", later).0, Duration::from_secs(1));
     }
 
     #[test]

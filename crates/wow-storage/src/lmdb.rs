@@ -12,7 +12,9 @@
 //! prefix rather than a whole record. [`LmdbDb::zerokval_get`] is that, once.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use wow_crypto::types::{Hash256, KeyImage};
 use wow_types::{Block, Transaction};
@@ -21,14 +23,24 @@ use crate::comparator::{assert_little_endian, ZEROKEY};
 use crate::db::{
     AltBlockData, BlockchainDb, DbError, HistogramEntry, OutputData, Result, TxData, TxPoolVisitor,
 };
-use crate::env::{check_version, OpenMode, VersionVerdict, DEFAULT_MAPSIZE, VERSION};
-use crate::raw::{Db, Env, LmdbError, RoTxn, RwTxn};
+use crate::env::{
+    check_version, need_resize, resized_mapsize, OpenMode, VersionVerdict, DEFAULT_MAPSIZE,
+    RESIZE_ADD_SIZE, VERSION,
+};
+use crate::raw::{Db, Env, LmdbError, MapInfo, RoTxn, RwTxn};
 use crate::records::{
     property_key, AltBlock, BlockHeight, BlockInfo, OutKey, OutTx, TxIndex, TxPoolMeta,
     PROPERTY_VERSION,
 };
 use crate::semantics::{next_amount_index, spent_key_images, split_tx_blob, stored_outputs};
 use crate::tables::{table, Table, TABLES};
+
+/// Where the database's own notices go. The C++ logs its resizes with
+/// `MGINFO`, in the global category, so they show at the default log level.
+const LOG: &str = "global";
+
+/// How often a map that cannot grow is warned about while writes still fit.
+const GROWTH_WARNING_EVERY: Duration = Duration::from_secs(10 * 60);
 
 impl From<LmdbError> for DbError {
     fn from(e: LmdbError) -> Self {
@@ -75,6 +87,11 @@ pub struct LmdbDb {
     dbs: Dbs,
     version: VersionVerdict,
     read_only: bool,
+    /// The directory holding `data.mdb`, for the free-space check before the
+    /// map grows.
+    dir: PathBuf,
+    /// When a map that could not grow was last warned about.
+    growth_warned: Mutex<Option<Instant>>,
 }
 
 impl LmdbDb {
@@ -105,6 +122,15 @@ impl LmdbDb {
             crate::env::max_readers(threads),
             map_size,
         )?;
+
+        // `specs/10` §2.2 checks the map on open too. A database that filled
+        // its map last time reopens with no room at all, and opening its tables
+        // read-write already needs a page or two.
+        if !mode.read_only && env.size_info().is_ok_and(|m| nearly_full(&m)) {
+            if let Err(e) = grow_map(&env, db_dir, nearly_full) {
+                wow_log::warn!(LOG, "{e}");
+            }
+        }
 
         let (dbs, version) = if mode.read_only {
             let rtxn = env.read_txn()?;
@@ -147,6 +173,8 @@ impl LmdbDb {
             dbs,
             version,
             read_only: mode.read_only,
+            dir: db_dir.to_path_buf(),
+            growth_warned: Mutex::new(None),
         })
     }
 
@@ -276,6 +304,9 @@ impl LmdbDb {
     /// exactly what `specs/10` §6.2 describes: "The **writer task** owns the
     /// single write transaction. One `RwTxn` per block (or per batch during
     /// bulk sync). Commit is the atomic unit."
+    ///
+    /// A `Writer` used directly does not grow the map. The `BlockchainDb`
+    /// methods do, through [`LmdbDb::write`].
     pub fn writer(&self) -> Result<Writer<'_>> {
         if self.read_only {
             return Err(DbError::ReadOnly);
@@ -285,7 +316,146 @@ impl LmdbDb {
             dbs: self.dbs,
         })
     }
+
+    /// One write transaction around `f`, committed, with the map grown as it
+    /// fills (`specs/10` §2.2).
+    ///
+    /// LMDB will not grow the map by itself: a write that does not fit fails
+    /// with `MDB_MAP_FULL`, and so does every write after it. So the map grows
+    /// *before* a write once more than 90% of it is in use -- the check the C++
+    /// makes ahead of a batch -- and once more if a write still does not fit,
+    /// in which case `f` runs again in a fresh transaction. The first run's
+    /// writes went with the transaction it aborted.
+    fn write<T>(&self, mut f: impl FnMut(&mut Writer<'_>) -> Result<T>) -> Result<T> {
+        if self.read_only {
+            return Err(DbError::ReadOnly);
+        }
+        self.grow_if_nearly_full();
+        let mapped = self.env.size_info()?.map_size;
+        match self.write_once(&mut f) {
+            Err(e) if is_map_full(&e) => {
+                match grow_map(&self.env, &self.dir, |m| m.map_size <= mapped) {
+                    Ok(()) => self.write_once(&mut f),
+                    // The caller holds a transaction of its own, and the map
+                    // cannot grow under it.
+                    Err(DbError::ResizeWhileOpen) => Err(e),
+                    Err(g) => Err(g),
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn write_once<T>(&self, f: &mut impl FnMut(&mut Writer<'_>) -> Result<T>) -> Result<T> {
+        let mut w = self.writer()?;
+        let out = f(&mut w)?;
+        w.commit()?;
+        Ok(out)
+    }
+
+    /// Grow the map ahead of a write once it is nearly full.
+    ///
+    /// Not being able to is only a warning: the write may still fit, and one
+    /// that does not fails with the reason.
+    fn grow_if_nearly_full(&self) {
+        if !self.env.size_info().is_ok_and(|m| nearly_full(&m)) {
+            return;
+        }
+        match grow_map(&self.env, &self.dir, nearly_full) {
+            Ok(()) | Err(DbError::ResizeWhileOpen) => {}
+            Err(e) => {
+                // Every write would say it again.
+                let mut last = self.growth_warned.lock().unwrap_or_else(|p| p.into_inner());
+                if last.is_none_or(|t| t.elapsed() >= GROWTH_WARNING_EVERY) {
+                    *last = Some(Instant::now());
+                    wow_log::warn!(LOG, "{e}");
+                }
+            }
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// map size
+// ---------------------------------------------------------------------------
+
+/// `need_resize()` with no threshold: more than 90% of the map in use.
+fn nearly_full(m: &MapInfo) -> bool {
+    need_resize(m.map_size, m.page_size, m.last_pgno, 0)
+}
+
+/// `do_resize`: add [`RESIZE_ADD_SIZE`] to the map, provided `wanted` still
+/// agrees once every transaction has drained -- another writer may have grown
+/// it in the meantime.
+fn grow_map(env: &Env, dir: &Path, wanted: impl FnOnce(&MapInfo) -> bool) -> Result<()> {
+    if env.holds_txn() {
+        return Err(DbError::ResizeWhileOpen);
+    }
+    // The map costs no disk by itself, but what fills it will. The C++ wants
+    // room for a whole increment first, and so does this.
+    let needed = RESIZE_ADD_SIZE as u64;
+    if let Some(available) = crate::raw::available_space(dir) {
+        if available < needed {
+            return Err(DbError::Backend(Box::new(NoRoomToGrow {
+                dir: dir.to_path_buf(),
+                available,
+                needed,
+            })));
+        }
+    }
+    let mut from = None;
+    let after = env.resize(|m| {
+        if !wanted(m) {
+            return None;
+        }
+        let to = usize::try_from(resized_mapsize(m.map_size, m.page_size, 0)).ok()?;
+        from = Some(m.map_size);
+        Some(to)
+    })?;
+    if let Some(from) = from {
+        wow_log::info!(
+            LOG,
+            "database map grown from {} to {} ({} in use)",
+            gib(from),
+            gib(after.map_size),
+            gib(after.used())
+        );
+    }
+    Ok(())
+}
+
+/// A write failed because the map is full.
+fn is_map_full(e: &DbError) -> bool {
+    matches!(e, DbError::Backend(b)
+        if b.downcast_ref::<LmdbError>().is_some_and(LmdbError::is_map_full))
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// The map has to grow and the disk has no room for it.
+#[derive(Debug)]
+struct NoRoomToGrow {
+    dir: PathBuf,
+    available: u64,
+    needed: u64,
+}
+
+impl std::fmt::Display for NoRoomToGrow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the database map is nearly full and cannot grow: the disk holding {} has {} free \
+             and growing takes {}. Free some space, or move the data directory to a larger disk",
+            self.dir.display(),
+            gib(self.available),
+            gib(self.needed)
+        )
+    }
+}
+
+impl std::error::Error for NoRoomToGrow {}
 
 /// A failed schema-version check, as an error the trait can carry.
 #[derive(Debug)]
@@ -674,10 +844,11 @@ impl BlockchainDb for LmdbDb {
     // ------------------------------------------------------------- hard fork
 
     fn set_hard_fork_version(&self, height: u64, version: u8) -> Result<()> {
-        let mut w = self.writer()?;
-        w.txn
-            .put(self.dbs.hf_versions, &height.to_ne_bytes(), &[version], 0)?;
-        w.commit()
+        self.write(|w| {
+            w.txn
+                .put(self.dbs.hf_versions, &height.to_ne_bytes(), &[version], 0)?;
+            Ok(())
+        })
     }
 
     fn get_hard_fork_version(&self, height: u64) -> Result<u8> {
@@ -691,23 +862,26 @@ impl BlockchainDb for LmdbDb {
     // --------------------------------------------------------------- mempool
 
     fn add_txpool_tx(&self, h: &Hash256, blob: &[u8], meta: &TxPoolMeta) -> Result<()> {
-        let mut w = self.writer()?;
-        w.txn.put(self.dbs.txpool_meta, h, &meta.encode(), 0)?;
-        w.txn.put(self.dbs.txpool_blob, h, blob, 0)?;
-        w.commit()
+        self.write(|w| {
+            w.txn.put(self.dbs.txpool_meta, h, &meta.encode(), 0)?;
+            w.txn.put(self.dbs.txpool_blob, h, blob, 0)?;
+            Ok(())
+        })
     }
 
     fn update_txpool_tx(&self, h: &Hash256, meta: &TxPoolMeta) -> Result<()> {
-        let mut w = self.writer()?;
-        w.txn.put(self.dbs.txpool_meta, h, &meta.encode(), 0)?;
-        w.commit()
+        self.write(|w| {
+            w.txn.put(self.dbs.txpool_meta, h, &meta.encode(), 0)?;
+            Ok(())
+        })
     }
 
     fn remove_txpool_tx(&self, h: &Hash256) -> Result<()> {
-        let mut w = self.writer()?;
-        w.txn.del(self.dbs.txpool_meta, h, None)?;
-        w.txn.del(self.dbs.txpool_blob, h, None)?;
-        w.commit()
+        self.write(|w| {
+            w.txn.del(self.dbs.txpool_meta, h, None)?;
+            w.txn.del(self.dbs.txpool_blob, h, None)?;
+            Ok(())
+        })
     }
 
     fn get_txpool_tx_meta(&self, h: &Hash256) -> Result<TxPoolMeta> {
@@ -757,9 +931,11 @@ impl BlockchainDb for LmdbDb {
             already_generated_coins: data.already_generated_coins,
             blob: blob.to_vec(),
         };
-        let mut w = self.writer()?;
-        w.txn.put(self.dbs.alt_blocks, h, &rec.encode(), 0)?;
-        w.commit()
+        let rec = rec.encode();
+        self.write(|w| {
+            w.txn.put(self.dbs.alt_blocks, h, &rec, 0)?;
+            Ok(())
+        })
     }
 
     fn get_alt_block(&self, h: &Hash256) -> Result<(AltBlockData, Vec<u8>)> {
@@ -770,9 +946,10 @@ impl BlockchainDb for LmdbDb {
     }
 
     fn remove_alt_block(&self, h: &Hash256) -> Result<()> {
-        let mut w = self.writer()?;
-        w.txn.del(self.dbs.alt_blocks, h, None)?;
-        w.commit()
+        self.write(|w| {
+            w.txn.del(self.dbs.alt_blocks, h, None)?;
+            Ok(())
+        })
     }
 
     fn get_alt_block_count(&self) -> Result<u64> {
@@ -781,9 +958,10 @@ impl BlockchainDb for LmdbDb {
     }
 
     fn drop_alt_blocks(&self) -> Result<()> {
-        let mut w = self.writer()?;
-        w.txn.clear_db(self.dbs.alt_blocks)?;
-        w.commit()
+        self.write(|w| {
+            w.txn.clear_db(self.dbs.alt_blocks)?;
+            Ok(())
+        })
     }
 
     // -------------------------------------------------------------- mutation
@@ -798,45 +976,42 @@ impl BlockchainDb for LmdbDb {
         coins_generated: u64,
         txs: &[(Transaction, Vec<u8>)],
     ) -> Result<u64> {
-        let mut w = self.writer()?;
-        let h = w.add_block(
-            blk,
-            blk_blob,
-            block_weight,
-            long_term_block_weight,
-            cumulative_difficulty,
-            coins_generated,
-            txs,
-        )?;
-        w.commit()?;
-        Ok(h)
+        self.write(|w| {
+            w.add_block(
+                blk,
+                blk_blob,
+                block_weight,
+                long_term_block_weight,
+                cumulative_difficulty,
+                coins_generated,
+                txs,
+            )
+        })
     }
 
     fn pop_block(&self) -> Result<(Block, Vec<Transaction>)> {
-        let mut w = self.writer()?;
-        let popped = w.pop_block()?;
-        w.commit()?;
-        Ok(popped)
+        self.write(|w| w.pop_block())
     }
 
     fn correct_block_cumulative_difficulties(&self, start: u64, values: &[u128]) -> Result<()> {
-        let mut w = self.writer()?;
-        for (i, d) in values.iter().enumerate() {
-            let height = start + i as u64;
-            let mut info = {
-                let mut c = w.txn.cursor(self.dbs.block_info)?;
-                let raw = c
-                    .get_both(&ZEROKEY, &height.to_ne_bytes())?
-                    .ok_or(DbError::NotFound)?;
-                BlockInfo::decode(raw)?
-            };
-            w.txn
-                .del(self.dbs.block_info, &ZEROKEY, Some(&info.encode()))?;
-            info.cumulative_difficulty = *d;
-            w.txn
-                .put(self.dbs.block_info, &ZEROKEY, &info.encode(), 0)?;
-        }
-        w.commit()
+        self.write(|w| {
+            for (i, d) in values.iter().enumerate() {
+                let height = start + i as u64;
+                let mut info = {
+                    let mut c = w.txn.cursor(self.dbs.block_info)?;
+                    let raw = c
+                        .get_both(&ZEROKEY, &height.to_ne_bytes())?
+                        .ok_or(DbError::NotFound)?;
+                    BlockInfo::decode(raw)?
+                };
+                w.txn
+                    .del(self.dbs.block_info, &ZEROKEY, Some(&info.encode()))?;
+                info.cumulative_difficulty = *d;
+                w.txn
+                    .put(self.dbs.block_info, &ZEROKEY, &info.encode(), 0)?;
+            }
+            Ok(())
+        })
     }
 
     // ------------------------------------------------------------- lifecycle
@@ -855,10 +1030,14 @@ impl BlockchainDb for LmdbDb {
     }
 
     fn resize_barrier(&self) -> Result<()> {
-        // Growing the map needs `&mut Env` (`specs/10` §2.2: every outstanding
-        // pointer is invalidated), which `&self` cannot provide. The writer
-        // task owns the environment and calls `Env::set_map_size` directly.
-        Err(DbError::ResizeWhileOpen)
+        // The environment's gate drains every transaction in the process and
+        // holds new ones back while the map grows (`raw::Env::resize`). From a
+        // thread holding a transaction of its own, that could never finish, so
+        // it is `ResizeWhileOpen` instead.
+        if self.read_only {
+            return Err(DbError::ReadOnly);
+        }
+        grow_map(&self.env, &self.dir, |_| true)
     }
 
     fn sync(&self) -> Result<()> {
