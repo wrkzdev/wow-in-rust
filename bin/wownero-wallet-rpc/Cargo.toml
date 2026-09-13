@@ -1,0 +1,20 @@
+[package]
+name = "wownero-wallet-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wownero wallet RPC server (specs/14)"
+
+[[bin]]
+name = "wownero-wallet-rpc"
+path = "src/main.rs"
+
+[dependencies]
+wow-crypto.workspace = true
+wow-types.workspace = true
+wow-wallet.workspace = true
+wow-daemon-client.workspace = true
+wow-serialize.workspace = true
+serde_json.workspace = true
+curve25519-dalek.workspace = true

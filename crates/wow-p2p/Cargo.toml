@@ -1,0 +1,11 @@
+[package]
+name = "wow-p2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wow-crypto.workspace = true
+wow-serialize.workspace = true
+wow-types.workspace = true

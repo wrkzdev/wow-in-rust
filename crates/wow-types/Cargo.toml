@@ -1,0 +1,15 @@
+[package]
+name = "wow-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wownero block, transaction, RingCT and address types with their binary-archive encoding"
+
+[dependencies]
+wow-crypto.workspace = true
+wow-serialize.workspace = true
+
+[dev-dependencies]
+wow-serialize.workspace = true
+hex.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "wow-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wownero cryptographic primitives: Keccak, ed25519, key derivation, view tags, base58, mnemonics"
+
+[dependencies]
+curve25519-dalek.workspace = true
+wow-serialize.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

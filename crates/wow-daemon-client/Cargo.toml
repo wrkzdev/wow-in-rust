@@ -1,0 +1,19 @@
+[package]
+name = "wow-daemon-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A client for a Wownero daemon's RPC (specs/11)"
+
+[dependencies]
+wow-crypto.workspace = true
+wow-serialize.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Only the live-node tests need these, and only to build the request a real
+# wallet would send.
+wow-consensus.workspace = true
+wow-types.workspace = true

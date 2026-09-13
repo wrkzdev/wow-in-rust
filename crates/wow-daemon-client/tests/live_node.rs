@@ -1,0 +1,155 @@
+//! Checks against a **real** Wownero node, run on demand.
+//!
+//! Every test here is `#[ignore]`: they need the network and a third party's
+//! server, so they must never run in an ordinary `cargo test`. Run them when
+//! something is about to be pointed at a live daemon:
+//!
+//! ```sh
+//! WOW_LIVE_NODE=node2.monerodevs.org:34568 \
+//!   cargo test -p wow-daemon-client --test live_node -- --ignored --nocapture
+//! ```
+//!
+//! They exist because the bugs that matter here are interoperation bugs. Our
+//! own daemon is lenient in several places the reference is not -- it accepts
+//! an empty `block_ids`, and it writes fields the reference omits -- so a test
+//! suite that only ever talks to our daemon agrees with itself and says
+//! nothing about whether a wallet can reach the network.
+
+use wow_daemon_client::DaemonClient;
+
+fn node() -> Option<String> {
+    std::env::var("WOW_LIVE_NODE").ok()
+}
+
+fn client() -> Option<DaemonClient> {
+    node().map(|a| DaemonClient::new(&a))
+}
+
+#[test]
+#[ignore = "needs a live node; set WOW_LIVE_NODE"]
+fn the_node_reports_a_mainnet_tip() {
+    let Some(c) = client() else {
+        eprintln!("set WOW_LIVE_NODE to run this");
+        return;
+    };
+    let info = c.get_info().expect("get_info");
+    eprintln!(
+        "height {} nettype {} synchronized {}",
+        info.height, info.nettype, info.synchronized
+    );
+    assert!(info.height > 800_000, "a mainnet node is past 800k");
+    assert_eq!(info.nettype, "mainnet");
+}
+
+/// The two calls a **send** depends on, which no offline test reaches.
+///
+/// Picking ring members means asking the daemon where the RingCT outputs are
+/// (`get_output_distribution`) and then fetching the chosen ones
+/// (`get_outs`). If either is wrong, a wallet builds transactions the network
+/// rejects -- and it will not find out until it tries to spend.
+#[test]
+#[ignore = "needs a live node; set WOW_LIVE_NODE"]
+fn the_decoy_endpoints_answer() {
+    let Some(c) = client() else {
+        eprintln!("set WOW_LIVE_NODE to run this");
+        return;
+    };
+    let info = c.get_info().expect("get_info");
+    let tip = info.height - 1;
+
+    // Amount zero is the RingCT pool, which is the only one a modern wallet
+    // draws from.
+    let dist = c
+        .get_output_distribution(0, 0, tip)
+        .expect("get_output_distribution");
+    assert!(
+        dist.len() > 1000,
+        "the distribution covers the chain: {} entries",
+        dist.len()
+    );
+
+    // It is cumulative, so it never decreases, and its last entry is the total
+    // number of RingCT outputs ever made.
+    let mut prev = 0u64;
+    for (i, v) in dist.iter().enumerate() {
+        assert!(*v >= prev, "the distribution went backwards at {i}");
+        prev = *v;
+    }
+    let total = *dist.last().expect("non-empty");
+    eprintln!("{} RingCT outputs over {} entries", total, dist.len());
+    assert!(total > 1_000_000, "a chain this old has millions");
+
+    // Fetch a handful spread across the pool. These are what a ring is made
+    // of, so a wrong key or a missing commitment here is a transaction the
+    // network will refuse.
+    let wanted: Vec<(u64, u64)> = [0u64, total / 4, total / 2, total - 1]
+        .iter()
+        .map(|i| (0u64, *i))
+        .collect();
+    let outs = c.get_outs(&wanted, false).expect("get_outs");
+    assert_eq!(outs.len(), wanted.len(), "one answer per request");
+
+    for (i, o) in outs.iter().enumerate() {
+        assert_ne!(o.key, [0u8; 32], "output {i} has no one-time key");
+        assert_ne!(o.mask, [0u8; 32], "output {i} has no commitment");
+        assert!(o.height <= tip, "output {i} claims height {}", o.height);
+    }
+    eprintln!("fetched {} ring members, all well formed", outs.len());
+}
+
+/// A wallet's refresh call, against the real thing.
+#[test]
+#[ignore = "needs a live node; set WOW_LIVE_NODE"]
+fn a_refresh_from_the_tip_returns_blocks() {
+    let Some(c) = client() else {
+        eprintln!("set WOW_LIVE_NODE to run this");
+        return;
+    };
+    let info = c.get_info().expect("get_info");
+    let from = info.height - 1;
+
+    // What a freshly created wallet sends: a start height at the tip block and
+    // a history holding only genesis.
+    let genesis = wow_consensus::genesis::genesis_id(wow_types::Network::Mainnet);
+    let got = c
+        .get_blocks(&[genesis], from, false, false)
+        .expect("get_blocks");
+    assert!(!got.blocks.is_empty(), "the tip block comes back");
+    assert_eq!(got.start_height, from);
+    eprintln!(
+        "{} block(s) from height {}, daemon at {}",
+        got.blocks.len(),
+        got.start_height,
+        got.current_height
+    );
+}
+
+/// The relay endpoint answers, and rejects a transaction it cannot parse.
+///
+/// One malformed blob, sent with `do_not_relay` so nothing is propagated. The
+/// point is not the rejection -- it is that the *plumbing* works: the request
+/// is shaped right, the response parses, and a refusal comes back as a value
+/// with a reason rather than as a transport error. That is the last link in
+/// the send path that can be checked without funds.
+#[test]
+#[ignore = "needs a live node; set WOW_LIVE_NODE"]
+fn the_relay_endpoint_rejects_a_malformed_transaction() {
+    let Some(c) = client() else {
+        eprintln!("set WOW_LIVE_NODE to run this");
+        return;
+    };
+
+    let res = c
+        .send_raw_transaction(&[0u8; 16], true)
+        .expect("the call itself must succeed; the transaction is what fails");
+
+    eprintln!("status {:?} reason {:?}", res.status, res.reason);
+    assert_ne!(
+        res.status, "OK",
+        "sixteen zero bytes are not a transaction: {res:?}"
+    );
+    assert!(
+        !res.status.is_empty(),
+        "a rejection names itself rather than coming back blank"
+    );
+}

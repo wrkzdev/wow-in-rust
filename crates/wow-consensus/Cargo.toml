@@ -1,0 +1,15 @@
+[package]
+name = "wow-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wownero consensus rules: constants, hard forks, checkpoints, difficulty, emission, weights, fees"
+
+[dependencies]
+wow-crypto.workspace = true
+wow-types.workspace = true
+wow-randomwow.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "wow-randomwow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RandomWOW proof of work: FFI to the pinned RandomWOW library, seed epochs, VM lifecycle"
+build = "build.rs"
+links = "randomx"
+
+[dependencies]
+
+[dev-dependencies]
+wow-crypto.workspace = true
+wow-types.workspace = true
+
+[build-dependencies]
+cmake = "0.1"
+cc = "1.0"

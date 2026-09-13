@@ -1,0 +1,27 @@
+[package]
+name = "wownerod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wownerod"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+wow-consensus.workspace = true
+wow-core.workspace = true
+wow-crypto.workspace = true
+wow-storage.workspace = true
+wow-serialize.workspace = true
+wow-types.workspace = true
+wow-p2p.workspace = true
+wow-randomwow.workspace = true
+wow-wallet.workspace = true
+curve25519-dalek.workspace = true
+
+[dev-dependencies]
+wow-daemon-client.workspace = true
+wow-wallet.workspace = true

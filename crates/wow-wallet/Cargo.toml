@@ -1,0 +1,21 @@
+[package]
+name = "wow-wallet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wow-crypto.workspace = true
+wow-serialize.workspace = true
+wow-types.workspace = true
+wow-consensus.workspace = true
+wow-daemon-client.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+curve25519-dalek.workspace = true
+
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

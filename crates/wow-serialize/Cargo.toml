@@ -1,0 +1,12 @@
+[package]
+name = "wow-serialize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wownero wire formats: the consensus binary archive and epee portable storage"
+
+[dependencies]
+
+[dev-dependencies]
+hex.workspace = true

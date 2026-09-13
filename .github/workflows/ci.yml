@@ -1,0 +1,73 @@
+# CI per specs/15-testing-and-conformance.md §6.
+#
+# The jobs that need a synced C++ node (the full-resync differ, the interop
+# matrix, the regtest functional suite) are M2/M3 work and are not wired up
+# yet; the budgets from §6 are noted so they are not forgotten.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # specs/15 §6: "< 2 min"
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true          # third_party/randomwow
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # specs/15 §6: "< 5 min". Dominated by the 5,545 crypto vectors, which is why
+  # the workspace pins opt-level = 3 for dependencies in the test profile.
+  #
+  # Includes the committed HF 18+ fixture, so the block-header signature rule
+  # (specs/06 §4) is covered without generating the big corpus.
+  test:
+    name: unit tests + reference vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true          # third_party/randomwow
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+      - run: cargo test --workspace
+
+  # Guards against a silently truncated or swapped corpus: the M1 gate is only
+  # meaningful if the vectors are the ones the reference tree ships.
+  corpus-integrity:
+    name: corpus integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tests/crypto/tests.txt is intact
+        run: |
+          test "$(wc -l < tests/corpus/crypto/tests.txt)" -eq 5545
+          sha256sum -c tests/corpus/SHA256SUMS
+
+  # specs/15 §2.2: the real M1 round-trip gate needs ~10k mainnet blocks, which
+  # are generated rather than committed. Enable this once a daemon is reachable
+  # from CI (a cached data directory is the intended shape -- see §3.1).
+  #
+  # mainnet-roundtrip:
+  #   name: 10k-block round-trip
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: python scripts/fetch-corpus.py --daemon ${{ secrets.WOW_DAEMON }}
+  #     - run: cargo test -p wow-types --test roundtrip

@@ -1,0 +1,7 @@
+# Keep everything LF in the repository. The corpus and word lists are compared
+# byte-for-byte against SHA256SUMS, so a CRLF rewrite would break them.
+* text=auto eol=lf
+*.txt text eol=lf
+*.tsv text eol=lf
+tests/corpus/** -text
+crates/wow-crypto/wordlists/*.txt text eol=lf

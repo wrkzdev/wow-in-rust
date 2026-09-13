@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wow-crypto",
+    "crates/wow-serialize",
+    "crates/wow-types",
+    "crates/wow-randomwow",
+    "crates/wow-consensus",
+    "crates/wow-storage",
+    "crates/wow-core",
+    "crates/wow-p2p",
+    "crates/wow-rpc-types",
+    "crates/wow-rpc-server",
+    "crates/wow-wallet",
+    "crates/wow-daemon-client",
+    "bin/wownerod",
+    "bin/wownero-wallet-cli",
+    "bin/wownero-wallet-rpc",
+]
+
+[workspace.package]
+version = "0.11.4"
+edition = "2021"
+rust-version = "1.75"
+license = "BSD-3-Clause"
+repository = "https://codeberg.org/wownero/wownero"
+
+[workspace.dependencies]
+wow-crypto = { path = "crates/wow-crypto" }
+wow-serialize = { path = "crates/wow-serialize" }
+wow-types = { path = "crates/wow-types" }
+wow-randomwow = { path = "crates/wow-randomwow" }
+wow-consensus = { path = "crates/wow-consensus" }
+wow-storage = { path = "crates/wow-storage" }
+wow-core = { path = "crates/wow-core" }
+wow-p2p = { path = "crates/wow-p2p" }
+wow-rpc-types = { path = "crates/wow-rpc-types" }
+wow-daemon-client = { path = "crates/wow-daemon-client" }
+wow-wallet = { path = "crates/wow-wallet" }
+
+curve25519-dalek = { version = "4.1.3", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+subtle = { version = "2.5", default-features = false }
+zeroize = { version = "1.7", default-features = false }
+lmdb-master-sys = "0.2"
+libc = "0.2"
+serde_json = "1.0"
+thiserror = "1.0"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Tests iterate 5,545 crypto vectors and 10k block blobs; unoptimised ed25519 is
+# too slow to keep the `cargo test` budget in 15 Sec 6 (< 5 min).
+[profile.test.package."*"]
+opt-level = 3
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+# `package."*"` covers dependencies but not workspace members, and wow-crypto's
+# own tests run CryptoNight: 2 MiB and ~2.6M AES rounds per vector. Unoptimised
+# that is 22 s for four vectors.
+[profile.test.package.wow-crypto]
+opt-level = 3

@@ -1,0 +1,14 @@
+[package]
+name = "wow-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lmdb-master-sys.workspace = true
+libc.workspace = true
+wow-consensus.workspace = true
+wow-crypto.workspace = true
+wow-serialize.workspace = true
+wow-types.workspace = true
