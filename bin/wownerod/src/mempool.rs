@@ -1,13 +1,15 @@
 //! The transaction pool (`specs/09` §2.2).
 //!
-//! # In memory, not on disk
+//! # In memory, saved on the way down
 //!
 //! `specs/09` §2.2 describes an in-memory index backed by two persisted tables
-//! so the pool survives a restart. This is the index without the tables: a
-//! restart empties the pool. That is a real limitation and it is a safe one —
-//! a dropped pool loses unconfirmed transactions, which senders re-broadcast,
-//! where a *wrongly persisted* pool would keep serving transactions the chain
-//! has moved past.
+//! so the pool survives a restart. This keeps the index in memory and writes
+//! the tables when the node stops ([`TxPool::save`]), reading them back when it
+//! starts ([`TxPool::load`]). A crash therefore loses the pool, which is the
+//! safe way round: senders re-broadcast a dropped transaction, where a pool
+//! trusted blindly after a restart would keep serving transactions the chain
+//! has since moved past -- which is why a load re-checks each one against the
+//! chain rather than believing the tables.
 //!
 //! # Admission is the interesting part
 //!
@@ -40,6 +42,13 @@ const MAX_TX_EXTRA_SIZE: usize = 1_060;
 const MAX_POOL_WEIGHT: u64 = 648_000_000;
 /// `CRYPTONOTE_MEMPOOL_TX_LIVETIME`, three days.
 const TX_LIVETIME: u64 = 3 * 86_400;
+/// `CRYPTONOTE_MEMPOOL_TX_FROM_ALT_BLOCK_LIVETIME`, a week: a transaction that
+/// came back out of a replaced block gets longer to be mined again.
+const TX_FROM_ALT_BLOCK_LIVETIME: u64 = 7 * 86_400;
+/// How long a transaction stays out of `NOTIFY_GET_TXPOOL_COMPLEMENT` answers,
+/// so one still in its Dandelion++ stem phase (embargo mean 39 s) is not
+/// handed to a peer that did not get it through the stem.
+const COMPLEMENT_QUIET_SECS: u64 = 120;
 
 /// Why a transaction was not admitted.
 ///
@@ -137,25 +146,46 @@ pub struct PoolEntry {
     pub fee: u64,
     pub receive_time: u64,
     /// Set when the submitter asked for the transaction not to be broadcast.
-    /// There is no peer-to-peer layer yet, so nothing acts on it; it is
-    /// reported back so a caller can see its request was understood.
     pub do_not_relay: bool,
+    /// Whether it has actually been sent to a peer. Separate from
+    /// `do_not_relay`: a transaction nobody forbade relaying has still not
+    /// been relayed until something sends it.
+    pub relayed: bool,
     pub double_spend_seen: bool,
+    /// It came back out of a block a reorganisation replaced.
+    pub kept_by_block: bool,
 }
 
 /// The pool.
-#[derive(Default)]
 pub struct TxPool {
     by_id: HashMap<Hash256, PoolEntry>,
     /// Key images spent by pooled transactions, so a second spend of the same
     /// output is caught before it is verified.
     spent: HashMap<KeyImage, Hash256>,
     weight: u64,
+    /// `--max-txpool-weight`.
+    max_weight: u64,
+}
+
+impl Default for TxPool {
+    fn default() -> Self {
+        TxPool::new()
+    }
 }
 
 impl TxPool {
     pub fn new() -> TxPool {
-        TxPool::default()
+        TxPool {
+            by_id: HashMap::new(),
+            spent: HashMap::new(),
+            weight: 0,
+            max_weight: MAX_POOL_WEIGHT,
+        }
+    }
+
+    /// `--max-txpool-weight`. Takes effect at the next admission.
+    pub fn set_max_weight(&mut self, max_weight: u64) {
+        self.max_weight = max_weight;
     }
 
     pub fn len(&self) -> usize {
@@ -187,11 +217,6 @@ impl TxPool {
 
     /// In the order a block template wants them: descending fee per weight,
     /// then oldest first (`specs/09` §2.2).
-    ///
-    /// Nothing calls this yet -- there is no miner -- but the ordering is a
-    /// documented property of the pool and is cheaper to keep correct here than
-    /// to reconstruct later.
-    #[allow(dead_code, reason = "the block template is not built yet")]
     pub fn by_fee(&self) -> Vec<(Hash256, &PoolEntry)> {
         let mut v: Vec<(Hash256, &PoolEntry)> = self.by_id.iter().map(|(id, e)| (*id, e)).collect();
         v.sort_by(|a, b| {
@@ -211,12 +236,20 @@ impl TxPool {
         Some(entry)
     }
 
-    /// Drop transactions older than `CRYPTONOTE_MEMPOOL_TX_LIVETIME`.
+    /// Drop transactions older than `CRYPTONOTE_MEMPOOL_TX_LIVETIME`, or the
+    /// week a transaction from a replaced block gets.
     pub fn expire(&mut self, now: u64) -> usize {
         let stale: Vec<Hash256> = self
             .by_id
             .iter()
-            .filter(|(_, e)| now.saturating_sub(e.receive_time) > TX_LIVETIME)
+            .filter(|(_, e)| {
+                let life = if e.kept_by_block {
+                    TX_FROM_ALT_BLOCK_LIVETIME
+                } else {
+                    TX_LIVETIME
+                };
+                now.saturating_sub(e.receive_time) > life
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in &stale {
@@ -230,7 +263,7 @@ impl TxPool {
     /// Lowest fee per weight first, which is the reverse of the template
     /// order — the pool keeps what a miner would take.
     pub fn evict_to_fit(&mut self) -> usize {
-        if self.weight <= MAX_POOL_WEIGHT {
+        if self.weight <= self.max_weight {
             return 0;
         }
         let mut order: Vec<(Hash256, f64)> = self
@@ -242,7 +275,7 @@ impl TxPool {
 
         let mut dropped = 0;
         for (id, _) in order {
-            if self.weight <= MAX_POOL_WEIGHT {
+            if self.weight <= self.max_weight {
                 break;
             }
             self.remove(&id);
@@ -345,11 +378,245 @@ impl TxPool {
                 fee,
                 receive_time: now,
                 do_not_relay,
+                relayed: false,
                 double_spend_seen: false,
+                kept_by_block: false,
             },
         );
         self.evict_to_fit();
         Ok(id)
+    }
+
+    /// `add_tx` with `kept_by_block`: a transaction coming back out of a block
+    /// that left the main chain (`specs/06` §7 step 4).
+    ///
+    /// The relay-policy checks do not apply -- it was valid in a block, and
+    /// policy is not consensus -- but it is still verified against the chain
+    /// as it now stands, which may no longer hold the outputs it spends.
+    pub fn add_kept_by_block(
+        &mut self,
+        db: &LmdbDb,
+        tx: &Transaction,
+        blob: &[u8],
+        now: u64,
+    ) -> Result<Hash256, Rejection> {
+        let id = wow_types::hashes::transaction_hash_from_blob(tx, blob)
+            .ok_or_else(|| Rejection::NotParseable("no transaction hash".into()))?;
+        if self.contains(&id) {
+            return Err(Rejection::AlreadyInPool);
+        }
+        for input in &tx.prefix.vin {
+            if let TxIn::ToKey { k_image, .. } = input {
+                if db.has_key_image(k_image).unwrap_or(false) || self.spent.contains_key(k_image) {
+                    return Err(Rejection::DoubleSpend {
+                        key_image: *k_image,
+                    });
+                }
+            }
+        }
+        verify(db, tx)?;
+        self.insert(
+            id,
+            tx,
+            PoolEntry {
+                blob: blob.to_vec(),
+                weight: wow_types::weight::get_transaction_weight(tx, blob.len()),
+                fee: tx.rct_signatures.txn_fee,
+                receive_time: now,
+                do_not_relay: false,
+                relayed: false,
+                double_spend_seen: false,
+                kept_by_block: true,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Take out what a new main-chain block made redundant: the transactions
+    /// it contains, and any other that spends a key image it spent.
+    pub fn remove_mined(&mut self, included: &[Hash256], spent: &[KeyImage]) -> usize {
+        let mut gone = 0;
+        for id in included {
+            if self.remove(id).is_some() {
+                gone += 1;
+            }
+        }
+        for ki in spent {
+            if let Some(owner) = self.spent.get(ki).copied() {
+                if self.remove(&owner).is_some() {
+                    gone += 1;
+                }
+            }
+        }
+        gone
+    }
+
+    /// After a reorganisation, drop whatever the new chain confirmed or spent.
+    pub fn remove_confirmed(&mut self, db: &LmdbDb) -> usize {
+        let mut stale: Vec<Hash256> = self
+            .by_id
+            .keys()
+            .filter(|id| db.tx_exists(id).unwrap_or(false))
+            .copied()
+            .collect();
+        stale.extend(
+            self.spent
+                .iter()
+                .filter(|(ki, _)| db.has_key_image(ki).unwrap_or(false))
+                .map(|(_, owner)| *owner),
+        );
+        stale.sort();
+        stale.dedup();
+        stale.iter().filter(|id| self.remove(id).is_some()).count()
+    }
+
+    /// Transactions that may be relayed.
+    pub fn relayable_ids(&self) -> Vec<Hash256> {
+        self.by_id
+            .iter()
+            .filter(|(_, e)| !e.do_not_relay)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Relayed transactions whose hashes are not in `known`, for a peer's
+    /// `NOTIFY_GET_TXPOOL_COMPLEMENT`.
+    ///
+    /// A transaction received in the last [`COMPLEMENT_QUIET_SECS`] is held
+    /// back: it may still be in its Dandelion++ stem, and answering with it
+    /// would publish what the stem is there to hide.
+    pub fn public_txs_except(
+        &self,
+        known: &std::collections::HashSet<Hash256>,
+        now: u64,
+    ) -> Vec<Vec<u8>> {
+        self.by_id
+            .iter()
+            .filter(|(id, e)| {
+                e.relayed
+                    && !e.do_not_relay
+                    && now.saturating_sub(e.receive_time) >= COMPLEMENT_QUIET_SECS
+                    && !known.contains(*id)
+            })
+            .map(|(_, e)| e.blob.clone())
+            .collect()
+    }
+
+    pub fn mark_relayed(&mut self, ids: &[Hash256]) {
+        for id in ids {
+            if let Some(e) = self.by_id.get_mut(id) {
+                e.relayed = true;
+            }
+        }
+    }
+
+    /// `flush_txpool`: drop the named transactions, or every one when none are
+    /// named. Returns how many went.
+    pub fn flush(&mut self, ids: &[Hash256]) -> usize {
+        if ids.is_empty() {
+            let n = self.by_id.len();
+            self.by_id.clear();
+            self.spent.clear();
+            self.weight = 0;
+            return n;
+        }
+        ids.iter().filter(|id| self.remove(id).is_some()).count()
+    }
+
+    /// Every entry, in no particular order.
+    pub fn entries(&self) -> impl Iterator<Item = (&Hash256, &PoolEntry)> {
+        self.by_id.iter()
+    }
+
+    /// Whether a pooled transaction spends this key image.
+    pub fn spends(&self, ki: &KeyImage) -> bool {
+        self.spent.contains_key(ki)
+    }
+
+    /// Key images spent by pooled transactions, with the transaction spending
+    /// each.
+    pub fn spent_key_images(&self) -> Vec<(KeyImage, Hash256)> {
+        self.spent.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// Write the pool to `txpool_meta` / `txpool_blob`, replacing what they
+    /// held (`specs/10` §4.9).
+    pub fn save(&self, db: &LmdbDb) -> Result<usize, String> {
+        let mut stored: Vec<Hash256> = Vec::new();
+        db.for_all_txpool_txes(&mut |h, _, _| {
+            stored.push(*h);
+            true
+        })
+        .map_err(|e| format!("cannot read the stored pool: {e}"))?;
+        for h in stored.iter().filter(|h| !self.by_id.contains_key(*h)) {
+            db.remove_txpool_tx(h)
+                .map_err(|e| format!("cannot clear the stored pool: {e}"))?;
+        }
+        for (id, e) in &self.by_id {
+            let meta = wow_storage::records::TxPoolMeta {
+                weight: e.weight,
+                fee: e.fee,
+                receive_time: e.receive_time,
+                kept_by_block: e.kept_by_block,
+                relayed: e.relayed,
+                do_not_relay: e.do_not_relay,
+                double_spend_seen: e.double_spend_seen,
+                ..Default::default()
+            };
+            db.add_txpool_tx(id, &e.blob, &meta)
+                .map_err(|e| format!("cannot store the pool: {e}"))?;
+        }
+        Ok(self.by_id.len())
+    }
+
+    /// Read a saved pool back, dropping what no longer belongs: a transaction
+    /// that does not parse, is already in the chain, spends a key image the
+    /// chain has spent, or has outlived its welcome.
+    pub fn load(db: &LmdbDb, now: u64) -> TxPool {
+        let mut stored: Vec<(Hash256, wow_storage::records::TxPoolMeta, Vec<u8>)> = Vec::new();
+        let _ = db.for_all_txpool_txes(&mut |h, meta, blob| {
+            if let Some(b) = blob {
+                stored.push((*h, *meta, b.to_vec()));
+            }
+            true
+        });
+
+        let mut pool = TxPool::new();
+        for (id, meta, blob) in stored {
+            let Ok(tx) = Transaction::from_blob(&blob) else {
+                continue;
+            };
+            if wow_types::hashes::transaction_hash_from_blob(&tx, &blob) != Some(id)
+                || db.tx_exists(&id).unwrap_or(false)
+            {
+                continue;
+            }
+            let spent_on_chain = tx.prefix.vin.iter().any(|i| match i {
+                TxIn::ToKey { k_image, .. } => {
+                    db.has_key_image(k_image).unwrap_or(false) || pool.spent.contains_key(k_image)
+                }
+                _ => false,
+            });
+            if spent_on_chain {
+                continue;
+            }
+            pool.insert(
+                id,
+                &tx,
+                PoolEntry {
+                    blob,
+                    weight: meta.weight,
+                    fee: meta.fee,
+                    receive_time: meta.receive_time,
+                    do_not_relay: meta.do_not_relay,
+                    relayed: meta.relayed,
+                    double_spend_seen: meta.double_spend_seen,
+                    kept_by_block: meta.kept_by_block,
+                },
+            );
+        }
+        pool.expire(now);
+        pool
     }
 }
 
@@ -525,8 +792,85 @@ mod tests {
             fee,
             receive_time,
             do_not_relay: false,
+            relayed: false,
             double_spend_seen: false,
+            kept_by_block: false,
         }
+    }
+
+    /// A transaction mined in a block leaves the pool, and so does one that
+    /// spends a key image the block spent.
+    #[test]
+    fn a_mined_block_clears_what_it_made_redundant() {
+        let mut pool = TxPool::new();
+        pool.by_id.insert(id(1), entry(100, 10, 0));
+        pool.by_id.insert(id(2), entry(100, 10, 0));
+        pool.by_id.insert(id(3), entry(100, 10, 0));
+        pool.weight = 30;
+        pool.spent.insert(KeyImage([7u8; 32]), id(2));
+
+        let gone = pool.remove_mined(&[id(1)], &[KeyImage([7u8; 32])]);
+        assert_eq!(gone, 2);
+        assert!(!pool.contains(&id(1)), "mined");
+        assert!(!pool.contains(&id(2)), "double-spends the block");
+        assert!(pool.contains(&id(3)));
+    }
+
+    /// A transaction from a replaced block lives a week, not three days.
+    #[test]
+    fn a_transaction_from_a_replaced_block_lives_longer() {
+        let mut pool = TxPool::new();
+        let mut kept = entry(100, 10, 0);
+        kept.kept_by_block = true;
+        pool.by_id.insert(id(1), kept);
+        pool.by_id.insert(id(2), entry(100, 10, 0));
+        pool.weight = 20;
+
+        assert_eq!(pool.expire(TX_LIVETIME + 1), 1);
+        assert!(pool.contains(&id(1)));
+        assert_eq!(pool.expire(TX_FROM_ALT_BLOCK_LIVETIME + 1), 1);
+    }
+
+    /// The complement a peer asks for holds relayed transactions only, and
+    /// none still young enough to be in a Dandelion++ stem.
+    #[test]
+    fn the_complement_leaves_out_what_is_not_public() {
+        let mut pool = TxPool::new();
+        let mut relayed_old = entry(100, 10, 0);
+        relayed_old.relayed = true;
+        let mut relayed_new = entry(100, 11, 1_000);
+        relayed_new.relayed = true;
+        let mut private = entry(100, 12, 0);
+        private.relayed = true;
+        private.do_not_relay = true;
+        pool.by_id.insert(id(1), relayed_old);
+        pool.by_id.insert(id(2), relayed_new);
+        pool.by_id.insert(id(3), private);
+        pool.by_id.insert(id(4), entry(100, 13, 0));
+
+        let out = pool.public_txs_except(&Default::default(), 1_000 + COMPLEMENT_QUIET_SECS - 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), 10);
+
+        let known = [id(1)].into_iter().collect();
+        assert!(pool
+            .public_txs_except(&known, 1_000 + COMPLEMENT_QUIET_SECS - 1)
+            .is_empty());
+    }
+
+    #[test]
+    fn flushing_with_no_ids_empties_the_pool() {
+        let mut pool = TxPool::new();
+        pool.by_id.insert(id(1), entry(100, 10, 0));
+        pool.by_id.insert(id(2), entry(100, 10, 0));
+        pool.spent.insert(KeyImage([1u8; 32]), id(1));
+        pool.weight = 20;
+
+        assert_eq!(pool.flush(&[id(2), id(9)]), 1);
+        assert_eq!(pool.flush(&[]), 1);
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.weight(), 0);
+        assert!(pool.spent_key_images().is_empty());
     }
 
     fn id(n: u8) -> Hash256 {

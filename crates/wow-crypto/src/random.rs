@@ -80,12 +80,12 @@ impl Rng {
 
     fn permute(&mut self) {
         let mut w = [0u64; 25];
-        for (i, word) in self.state.chunks_exact(8).enumerate() {
-            w[i] = u64::from_le_bytes(word.try_into().unwrap());
+        for (i, word) in self.state.as_chunks::<8>().0.iter().enumerate() {
+            w[i] = u64::from_le_bytes(*word);
         }
         keccakf(&mut w);
-        for (i, word) in self.state.chunks_exact_mut(8).enumerate() {
-            word.copy_from_slice(&w[i].to_le_bytes());
+        for (i, word) in self.state.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            *word = w[i].to_le_bytes();
         }
     }
 

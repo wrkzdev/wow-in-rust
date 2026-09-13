@@ -150,16 +150,14 @@ pub fn groestl256(input: &[u8]) -> [u8; 32] {
     h[62] = 0x01; // 256 bits
 
     let mut blocks: u64 = 0;
-    let mut chunks = input.chunks_exact(BLOCK);
-    for c in chunks.by_ref() {
-        let block: [u8; BLOCK] = c.try_into().expect("chunks_exact(64)");
-        compress(&mut h, &block);
+    let (chunks, rest) = input.as_chunks::<BLOCK>();
+    for c in chunks {
+        compress(&mut h, c);
         blocks += 1;
     }
 
     // Padding: 0x80, zeros, then the **block count including padding** as a
     // big-endian u64 — a block counter, not a bit length.
-    let rest = chunks.remainder();
     let mut buf = [0u8; BLOCK];
     buf[..rest.len()].copy_from_slice(rest);
     let mut ptr = rest.len();

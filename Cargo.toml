@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/wow-crypto",
+    "crates/wow-log",
     "crates/wow-serialize",
     "crates/wow-types",
     "crates/wow-randomwow",
@@ -9,6 +10,7 @@ members = [
     "crates/wow-storage",
     "crates/wow-core",
     "crates/wow-p2p",
+    "crates/wow-zmq",
     "crates/wow-rpc-types",
     "crates/wow-rpc-server",
     "crates/wow-wallet",
@@ -21,12 +23,13 @@ members = [
 [workspace.package]
 version = "0.11.4"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.89"
 license = "BSD-3-Clause"
 repository = "https://github.com/wrkzdev/wow-in-rust"
 
 [workspace.dependencies]
 wow-crypto = { path = "crates/wow-crypto" }
+wow-log = { path = "crates/wow-log" }
 wow-serialize = { path = "crates/wow-serialize" }
 wow-types = { path = "crates/wow-types" }
 wow-randomwow = { path = "crates/wow-randomwow" }
@@ -34,6 +37,7 @@ wow-consensus = { path = "crates/wow-consensus" }
 wow-storage = { path = "crates/wow-storage" }
 wow-core = { path = "crates/wow-core" }
 wow-p2p = { path = "crates/wow-p2p" }
+wow-zmq = { path = "crates/wow-zmq" }
 wow-rpc-types = { path = "crates/wow-rpc-types" }
 wow-daemon-client = { path = "crates/wow-daemon-client" }
 wow-wallet = { path = "crates/wow-wallet" }
@@ -43,6 +47,14 @@ subtle = { version = "2.5", default-features = false }
 zeroize = { version = "1.7", default-features = false }
 lmdb-master-sys = "0.2"
 libc = "0.2"
+# IPv6-only listeners, so IPv4 and IPv6 can share a port (`wow-p2p::net`).
+socket2 = "0.6"
+# RPC over TLS (`wownerod`'s `rpc::tls`). ring rather than aws-lc-rs: it
+# builds with the C toolchain the RandomWOW build already needs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+ring = "0.17"
+time = "0.3"
 serde_json = "1.0"
 thiserror = "1.0"
 hex = "0.4"
@@ -57,6 +69,11 @@ codegen-units = 1
 [profile.test.package."*"]
 opt-level = 3
 [profile.dev.package.curve25519-dalek]
+opt-level = 3
+# wow-crypto's CryptoNight verifies pre-RandomWOW proofs of work during a sync.
+# Unoptimised that is seconds a block, which makes a debug `wownerod` unusable
+# against a real chain and its peer-to-peer tests too slow to run.
+[profile.dev.package.wow-crypto]
 opt-level = 3
 # `package."*"` covers dependencies but not workspace members, and wow-crypto's
 # own tests run CryptoNight: 2 MiB and ~2.6M AES rounds per vector. Unoptimised

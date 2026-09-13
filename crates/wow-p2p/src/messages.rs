@@ -104,6 +104,43 @@ fn missing(what: &'static str) -> MessageError {
     MessageError::Malformed(what)
 }
 
+/// An integer entry of any width or sign, as `i64`.
+///
+/// `last_seen` is an `int64_t` in the C++, so it arrives as `INT64`; an
+/// unsigned reader would see nothing and report every peer as never seen.
+fn int_of(v: &Value) -> Option<i64> {
+    match *v {
+        Value::I64(x) => Some(x),
+        Value::I32(x) => Some(i64::from(x)),
+        Value::I16(x) => Some(i64::from(x)),
+        Value::I8(x) => Some(i64::from(x)),
+        _ => v.as_u64().map(|x| x as i64),
+    }
+}
+
+/// A `CONTAINER_POD_AS_BLOB` of 32-byte hashes, bounded.
+fn hashes_of(s: &Section, name: &'static str, max: usize) -> Result<Vec<[u8; 32]>> {
+    let raw = s.get(name).and_then(Value::as_bytes).unwrap_or(&[]);
+    if !raw.len().is_multiple_of(32) {
+        return Err(missing("a hash list is not a whole number of hashes"));
+    }
+    if raw.len() / 32 > max {
+        return Err(missing("too many hashes"));
+    }
+    Ok(raw.as_chunks::<32>().0.to_vec())
+}
+
+fn packed_hashes(hashes: &[[u8; 32]]) -> Value {
+    Value::String(hashes.iter().flatten().copied().collect())
+}
+
+fn strings(items: &[Vec<u8>]) -> Value {
+    Value::Array(Array {
+        elem_type: epee::ty::STRING,
+        items: items.iter().cloned().map(Value::String).collect(),
+    })
+}
+
 /// `basic_node_data` (`specs/08` §3.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BasicNodeData {
@@ -241,6 +278,22 @@ pub enum NetworkAddress {
 }
 
 impl NetworkAddress {
+    /// The wire form of a socket address.
+    pub fn from_socket_addr(addr: std::net::SocketAddr) -> NetworkAddress {
+        match addr {
+            // The inverse of `socket_addr`: the octets in wire order, read as
+            // a little-endian `u32`.
+            std::net::SocketAddr::V4(a) => NetworkAddress::V4 {
+                ip: u32::from_le_bytes(a.ip().octets()),
+                port: a.port(),
+            },
+            std::net::SocketAddr::V6(a) => NetworkAddress::V6 {
+                addr: a.ip().octets(),
+                port: a.port(),
+            },
+        }
+    }
+
     /// The socket address to dial, for the kinds this node can reach.
     pub fn socket_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
@@ -334,10 +387,414 @@ impl PeerlistEntry {
         Ok(PeerlistEntry {
             address: NetworkAddress::from_section(addr)?,
             id: s.get("id").and_then(Value::as_u64).unwrap_or(0),
-            last_seen: s.get("last_seen").and_then(Value::as_u64).unwrap_or(0) as i64,
+            last_seen: s.get("last_seen").and_then(int_of).unwrap_or(0),
             pruning_seed: s.get("pruning_seed").and_then(Value::as_u64).unwrap_or(0) as u32,
             rpc_port: s.get("rpc_port").and_then(Value::as_u64).unwrap_or(0) as u16,
         })
+    }
+
+    /// `peerlist_entry` as the C++ writes it (`specs/08` §3.2).
+    pub fn to_section(&self) -> Section {
+        let mut s = Section::new();
+        s.insert("adr".into(), Value::Object(self.address.to_section()));
+        s.insert("id".into(), Value::U64(self.id));
+        s.insert("last_seen".into(), Value::I64(self.last_seen));
+        s.insert("pruning_seed".into(), Value::U32(self.pruning_seed));
+        s.insert("rpc_port".into(), Value::U16(self.rpc_port));
+        s.insert("rpc_credits_per_hash".into(), Value::U32(0));
+        s
+    }
+}
+
+/// A peer list as an epee array of `peerlist_entry`.
+pub fn peer_list_value(peers: &[PeerlistEntry]) -> Value {
+    section_array(peers.iter().map(PeerlistEntry::to_section).collect())
+}
+
+/// Read a `local_peerlist_new`, refusing one over the documented maximum and
+/// skipping entries this node cannot parse.
+fn peer_list_of(s: &Section) -> Result<Vec<PeerlistEntry>> {
+    match s.get("local_peerlist_new").and_then(Value::as_array) {
+        None => Ok(Vec::new()),
+        Some(a) => {
+            if a.items.len() > MAX_PEERS_IN_HANDSHAKE {
+                return Err(missing("too many peers in a peer list"));
+            }
+            Ok(a.items
+                .iter()
+                .filter_map(Value::as_object)
+                .filter_map(|e| PeerlistEntry::from_section(e).ok())
+                .collect())
+        }
+    }
+}
+
+/// A `COMMAND_HANDSHAKE` request, as the responder reads it (`specs/08` §4.1).
+#[derive(Clone, Debug)]
+pub struct HandshakeRequest {
+    pub node_data: BasicNodeData,
+    pub payload_data: CoreSyncData,
+}
+
+impl HandshakeRequest {
+    pub fn parse(body: &[u8]) -> Result<HandshakeRequest> {
+        let s = epee::from_bytes(body)?;
+        let node = s
+            .get("node_data")
+            .and_then(Value::as_object)
+            .ok_or(missing("node_data"))?;
+        let payload = s
+            .get("payload_data")
+            .and_then(Value::as_object)
+            .ok_or(missing("payload_data"))?;
+        Ok(HandshakeRequest {
+            node_data: BasicNodeData::from_section(node)?,
+            payload_data: CoreSyncData::from_section(payload)?,
+        })
+    }
+}
+
+/// A `COMMAND_HANDSHAKE` response.
+pub fn handshake_response(
+    node: &BasicNodeData,
+    sync: &CoreSyncData,
+    peers: &[PeerlistEntry],
+) -> Vec<u8> {
+    let mut s = Section::new();
+    s.insert("node_data".into(), Value::Object(node.to_section()));
+    s.insert("payload_data".into(), Value::Object(sync.to_section()));
+    s.insert("local_peerlist_new".into(), peer_list_value(peers));
+    epee::to_bytes(&s).unwrap_or_default()
+}
+
+/// A `COMMAND_TIMED_SYNC` request or response (`specs/08` §4.4). A request
+/// carries no peer list, which reads as an empty one.
+#[derive(Clone, Debug)]
+pub struct TimedSync {
+    pub payload_data: CoreSyncData,
+    pub peers: Vec<PeerlistEntry>,
+}
+
+impl TimedSync {
+    pub fn parse(body: &[u8]) -> Result<TimedSync> {
+        let s = epee::from_bytes(body)?;
+        let payload = s
+            .get("payload_data")
+            .and_then(Value::as_object)
+            .ok_or(missing("payload_data"))?;
+        Ok(TimedSync {
+            payload_data: CoreSyncData::from_section(payload)?,
+            peers: peer_list_of(&s)?,
+        })
+    }
+}
+
+/// A `COMMAND_TIMED_SYNC` response that offers peers.
+pub fn timed_sync_response_with_peers(sync: &CoreSyncData, peers: &[PeerlistEntry]) -> Vec<u8> {
+    let mut s = Section::new();
+    s.insert("payload_data".into(), Value::Object(sync.to_section()));
+    s.insert("local_peerlist_new".into(), peer_list_value(peers));
+    epee::to_bytes(&s).unwrap_or_default()
+}
+
+/// A `COMMAND_PING` response, as the node that pinged reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PingResponse {
+    pub status: String,
+    pub peer_id: u64,
+}
+
+impl PingResponse {
+    pub fn parse(body: &[u8]) -> Result<PingResponse> {
+        let s = epee::from_bytes(body)?;
+        Ok(PingResponse {
+            status: s
+                .get("status")
+                .and_then(Value::as_bytes)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default(),
+            peer_id: s.get("peer_id").and_then(Value::as_u64).unwrap_or(0),
+        })
+    }
+
+    /// Whether this answers a ping-back for `peer_id` (`specs/08` §4.2).
+    pub fn confirms(&self, peer_id: u64) -> bool {
+        self.status == PING_OK && self.peer_id == peer_id
+    }
+}
+
+/// The `support_flags` a `COMMAND_REQUEST_SUPPORT_FLAGS` response carries.
+pub fn support_flags_of(body: &[u8]) -> Result<u32> {
+    let s = epee::from_bytes(body)?;
+    Ok(s.get("support_flags").and_then(Value::as_u64).unwrap_or(0) as u32)
+}
+
+/// A `COMMAND_REQUEST_SUPPORT_FLAGS` response advertising `flags`.
+pub fn support_flags_response_with(flags: u32) -> Vec<u8> {
+    let mut s = Section::new();
+    s.insert("support_flags".into(), Value::U32(flags));
+    epee::to_bytes(&s).unwrap_or_default()
+}
+
+/// `NOTIFY_REQUEST_CHAIN`, as the responder reads it (`specs/08` §5.2).
+#[derive(Clone, Debug, Default)]
+pub struct ChainRequest {
+    pub block_ids: Vec<[u8; 32]>,
+    pub prune: bool,
+}
+
+impl ChainRequest {
+    pub fn parse(body: &[u8]) -> Result<ChainRequest> {
+        let s = epee::from_bytes(body)?;
+        Ok(ChainRequest {
+            block_ids: hashes_of(&s, "block_ids", BLOCK_IDS_MAX_COUNT)?,
+            prune: s.get("prune").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+}
+
+/// `NOTIFY_RESPONSE_CHAIN_ENTRY` (`specs/08` §5.3).
+///
+/// `block_weights` is one `u64` per id, packed; `first_block` is the blob of
+/// the block at `start_height`.
+pub fn chain_entry_response(
+    start_height: u64,
+    total_height: u64,
+    cumulative_difficulty: u128,
+    block_ids: &[[u8; 32]],
+    block_weights: &[u64],
+    first_block: &[u8],
+) -> Vec<u8> {
+    let mut s = Section::new();
+    s.insert("start_height".into(), Value::U64(start_height));
+    s.insert("total_height".into(), Value::U64(total_height));
+    s.insert(
+        "cumulative_difficulty".into(),
+        Value::U64(cumulative_difficulty as u64),
+    );
+    s.insert(
+        "cumulative_difficulty_top64".into(),
+        Value::U64((cumulative_difficulty >> 64) as u64),
+    );
+    s.insert("m_block_ids".into(), packed_hashes(block_ids));
+    s.insert(
+        "m_block_weights".into(),
+        Value::String(block_weights.iter().flat_map(|w| w.to_le_bytes()).collect()),
+    );
+    s.insert("first_block".into(), Value::String(first_block.to_vec()));
+    epee::to_bytes(&s).unwrap_or_default()
+}
+
+/// `NOTIFY_REQUEST_GET_OBJECTS`, as the responder reads it (`specs/08` §5.4).
+///
+/// The count is not capped here: the reference drops a peer that asks for
+/// more than [`MAX_OBJECT_REQUEST_COUNT`], and that is the caller's decision.
+#[derive(Clone, Debug, Default)]
+pub struct ObjectsRequest {
+    pub blocks: Vec<[u8; 32]>,
+    pub prune: bool,
+}
+
+impl ObjectsRequest {
+    pub fn parse(body: &[u8]) -> Result<ObjectsRequest> {
+        let s = epee::from_bytes(body)?;
+        Ok(ObjectsRequest {
+            blocks: hashes_of(&s, "blocks", BLOCKS_MAX_COUNT)?,
+            prune: s.get("prune").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+}
+
+impl BlockEntry {
+    /// `block_complete_entry`, unpruned (`specs/08` §3.5).
+    pub fn to_section(&self) -> Section {
+        let mut s = Section::new();
+        s.insert("pruned".into(), Value::Bool(false));
+        s.insert("block".into(), Value::String(self.block.clone()));
+        s.insert("block_weight".into(), Value::U64(self.block_weight));
+        s.insert("txs".into(), strings(&self.txs));
+        s
+    }
+}
+
+/// `NOTIFY_RESPONSE_GET_OBJECTS` (`specs/08` §5.5).
+pub fn objects_response(
+    blocks: &[BlockEntry],
+    missed_ids: &[[u8; 32]],
+    current_blockchain_height: u64,
+) -> Vec<u8> {
+    let mut s = Section::new();
+    s.insert(
+        "blocks".into(),
+        section_array(blocks.iter().map(BlockEntry::to_section).collect()),
+    );
+    s.insert("missed_ids".into(), packed_hashes(missed_ids));
+    s.insert(
+        "current_blockchain_height".into(),
+        Value::U64(current_blockchain_height),
+    );
+    epee::to_bytes(&s).unwrap_or_default()
+}
+
+/// `NOTIFY_NEW_BLOCK` and `NOTIFY_NEW_FLUFFY_BLOCK`, which share a layout
+/// (`specs/08` §6). In the fluffy form `b.txs` holds only the transactions the
+/// sender thinks the receiver may lack.
+#[derive(Clone, Debug, Default)]
+pub struct NewBlock {
+    pub entry: BlockEntry,
+    pub current_blockchain_height: u64,
+}
+
+impl NewBlock {
+    pub fn parse(body: &[u8]) -> Result<NewBlock> {
+        let s = epee::from_bytes(body)?;
+        let b = s.get("b").and_then(Value::as_object).ok_or(missing("b"))?;
+        Ok(NewBlock {
+            entry: BlockEntry::from_section(b)?,
+            current_blockchain_height: s
+                .get("current_blockchain_height")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut s = Section::new();
+        s.insert("b".into(), Value::Object(self.entry.to_section()));
+        s.insert(
+            "current_blockchain_height".into(),
+            Value::U64(self.current_blockchain_height),
+        );
+        epee::to_bytes(&s).unwrap_or_default()
+    }
+}
+
+/// `NOTIFY_REQUEST_FLUFFY_MISSING_TX` (`specs/08` §6.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FluffyMissingTxs {
+    pub block_hash: [u8; 32],
+    pub current_blockchain_height: u64,
+    /// Indices into the block's `tx_hashes`.
+    pub missing_tx_indices: Vec<u64>,
+}
+
+impl FluffyMissingTxs {
+    pub fn parse(body: &[u8]) -> Result<FluffyMissingTxs> {
+        let s = epee::from_bytes(body)?;
+        let hash = s
+            .get("block_hash")
+            .and_then(Value::as_bytes)
+            .ok_or(missing("block_hash"))?;
+        let raw = s
+            .get("missing_tx_indices")
+            .and_then(Value::as_bytes)
+            .unwrap_or(&[]);
+        if raw.len() % 8 != 0 {
+            return Err(missing("missing_tx_indices is not a whole number of u64s"));
+        }
+        Ok(FluffyMissingTxs {
+            block_hash: hash.try_into().map_err(|_| missing("block_hash length"))?,
+            current_blockchain_height: s
+                .get("current_blockchain_height")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            missing_tx_indices: raw
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
+                .collect(),
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut s = Section::new();
+        s.insert("block_hash".into(), Value::String(self.block_hash.to_vec()));
+        s.insert(
+            "current_blockchain_height".into(),
+            Value::U64(self.current_blockchain_height),
+        );
+        s.insert(
+            "missing_tx_indices".into(),
+            Value::String(
+                self.missing_tx_indices
+                    .iter()
+                    .flat_map(|i| i.to_le_bytes())
+                    .collect(),
+            ),
+        );
+        epee::to_bytes(&s).unwrap_or_default()
+    }
+}
+
+/// `NOTIFY_NEW_TRANSACTIONS` (`specs/08` §7.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewTransactions {
+    pub txs: Vec<Vec<u8>>,
+    /// **Defaults to true when absent** -- a peer from before Dandelion++ is
+    /// fluffing, and reading its silence as "stem" would hold its transactions
+    /// back.
+    pub dandelionpp_fluff: bool,
+}
+
+impl NewTransactions {
+    pub fn parse(body: &[u8]) -> Result<NewTransactions> {
+        let s = epee::from_bytes(body)?;
+        let txs = match s.get("txs") {
+            None => Vec::new(),
+            Some(Value::Array(a)) => a
+                .items
+                .iter()
+                .map(|t| t.as_bytes().map(<[u8]>::to_vec).ok_or(missing("tx blob")))
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => return Err(missing("txs is not an array")),
+        };
+        Ok(NewTransactions {
+            txs,
+            dandelionpp_fluff: s
+                .get("dandelionpp_fluff")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut s = Section::new();
+        s.insert("txs".into(), strings(&self.txs));
+        // The padding field exists for traffic analysis resistance; an empty
+        // one is what an unpadded message carries.
+        s.insert("_".into(), Value::String(Vec::new()));
+        s.insert(
+            "dandelionpp_fluff".into(),
+            Value::Bool(self.dandelionpp_fluff),
+        );
+        epee::to_bytes(&s).unwrap_or_default()
+    }
+}
+
+/// `NOTIFY_GET_TXPOOL_COMPLEMENT` (`specs/08` §6.3): the pool hashes the sender
+/// already has.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TxpoolComplement {
+    pub hashes: Vec<[u8; 32]>,
+}
+
+/// Far above any real pool, and below what would let one message allocate
+/// without bound.
+const MAX_COMPLEMENT_HASHES: usize = 1_000_000;
+
+impl TxpoolComplement {
+    pub fn parse(body: &[u8]) -> Result<TxpoolComplement> {
+        let s = epee::from_bytes(body)?;
+        Ok(TxpoolComplement {
+            hashes: hashes_of(&s, "hashes", MAX_COMPLEMENT_HASHES)?,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut s = Section::new();
+        s.insert("hashes".into(), packed_hashes(&self.hashes));
+        epee::to_bytes(&s).unwrap_or_default()
     }
 }
 
@@ -445,10 +902,7 @@ impl ChainEntry {
             start_height: s.get("start_height").and_then(Value::as_u64).unwrap_or(0),
             total_height: s.get("total_height").and_then(Value::as_u64).unwrap_or(0),
             cumulative_difficulty: (high << 64) | low,
-            block_ids: ids
-                .chunks_exact(32)
-                .map(|c| c.try_into().expect("32 bytes"))
-                .collect(),
+            block_ids: ids.as_chunks::<32>().0.to_vec(),
         })
     }
 }
@@ -542,10 +996,7 @@ impl ObjectsResponse {
 
         Ok(ObjectsResponse {
             blocks,
-            missed_ids: missed
-                .chunks_exact(32)
-                .map(|c| c.try_into().expect("32 bytes"))
-                .collect(),
+            missed_ids: missed.as_chunks::<32>().0.to_vec(),
             current_blockchain_height: s
                 .get("current_blockchain_height")
                 .and_then(Value::as_u64)
@@ -566,13 +1017,17 @@ pub fn empty_body() -> Vec<u8> {
     epee::to_bytes(&Section::new()).unwrap_or_default()
 }
 
-/// This node's support flags.
+/// The support flags a one-shot [`crate::Peer`] advertises.
 ///
 /// `specs/01` §11.1: `P2P_SUPPORT_FLAG_FLUFFY_BLOCKS` is `0x01` and is the only
-/// flag defined. This node advertises **nothing**: it does not accept inbound
-/// connections and does not reconstruct fluffy blocks, and claiming a flag it
-/// cannot honour would have peers send it blocks it must then throw away.
+/// flag defined. A bare `Peer` advertises **nothing**: it does not reconstruct
+/// fluffy blocks, and claiming a flag it cannot honour would have peers send it
+/// blocks it must then throw away. [`crate::node::Node`] does, and advertises
+/// [`SUPPORT_FLAG_FLUFFY_BLOCKS`].
 pub const SUPPORT_FLAGS: u32 = 0;
+
+/// `P2P_SUPPORT_FLAG_FLUFFY_BLOCKS`.
+pub const SUPPORT_FLAG_FLUFFY_BLOCKS: u32 = 0x01;
 
 /// A `COMMAND_REQUEST_SUPPORT_FLAGS` response.
 ///
@@ -901,6 +1356,184 @@ mod tests {
         assert_eq!(packed.len(), 64);
         assert_eq!(&packed[..32], &[1u8; 32]);
         assert_eq!(&packed[32..], &[2u8; 32]);
+    }
+
+    /// The responder's side of every exchange round-trips through the parser
+    /// the requester uses, field by field.
+    #[test]
+    fn the_serving_messages_round_trip() {
+        let node = BasicNodeData {
+            network_id: NETWORK_ID_MAINNET,
+            peer_id: 9,
+            my_port: 34_567,
+            rpc_port: 0,
+            rpc_credits_per_hash: 0,
+            support_flags: SUPPORT_FLAG_FLUFFY_BLOCKS,
+        };
+        let sync = CoreSyncData {
+            current_height: 77,
+            cumulative_difficulty: (1u128 << 64) | 5,
+            top_id: [3u8; 32],
+            top_version: 20,
+            pruning_seed: 0,
+        };
+        let peer = PeerlistEntry {
+            address: NetworkAddress::V4 {
+                ip: u32::from_le_bytes([10, 0, 0, 1]),
+                port: 34_567,
+            },
+            id: 42,
+            last_seen: 1_700_000_000,
+            pruning_seed: 0,
+            rpc_port: 34_568,
+        };
+
+        // Handshake: the request the responder reads, the response the
+        // requester reads.
+        let req = HandshakeRequest::parse(&handshake_request(&node, &sync)).expect("request");
+        assert_eq!(req.node_data, node);
+        assert_eq!(req.payload_data, sync);
+        let res = HandshakeResponse::parse(&handshake_response(
+            &node,
+            &sync,
+            std::slice::from_ref(&peer),
+        ))
+        .expect("response");
+        assert_eq!(res.peers, vec![peer.clone()]);
+        assert_eq!(
+            res.peers[0].last_seen, 1_700_000_000,
+            "an INT64 last_seen is read, not dropped"
+        );
+
+        // Timed sync, with and without peers.
+        let t = TimedSync::parse(&timed_sync_response_with_peers(
+            &sync,
+            std::slice::from_ref(&peer),
+        ))
+        .unwrap();
+        assert_eq!(t.payload_data, sync);
+        assert_eq!(t.peers.len(), 1);
+        assert!(TimedSync::parse(&timed_sync_request(&sync))
+            .unwrap()
+            .peers
+            .is_empty());
+
+        // Ping.
+        let p = PingResponse::parse(&ping_response(9)).unwrap();
+        assert!(p.confirms(9));
+        assert!(!p.confirms(10), "a ping-back must match the handshake's id");
+
+        // Chain request and entry.
+        let ids = [[1u8; 32], [2u8; 32]];
+        let r = ChainRequest::parse(&request_chain(&ids, false)).unwrap();
+        assert_eq!(r.block_ids, ids.to_vec());
+        let e = ChainEntry::parse(&chain_entry_response(
+            5,
+            99,
+            (2u128 << 64) | 1,
+            &ids,
+            &[10, 20],
+            b"blob",
+        ))
+        .unwrap();
+        assert_eq!(e.start_height, 5);
+        assert_eq!(e.total_height, 99);
+        assert_eq!(e.cumulative_difficulty, (2u128 << 64) | 1);
+        assert_eq!(e.block_ids, ids.to_vec());
+
+        // Objects.
+        assert_eq!(
+            ObjectsRequest::parse(&request_objects(&ids, false))
+                .unwrap()
+                .blocks,
+            ids.to_vec()
+        );
+        let entry = BlockEntry {
+            block: vec![1, 2, 3],
+            txs: vec![vec![4], vec![5, 6]],
+            block_weight: 3,
+        };
+        let o = ObjectsResponse::parse(&objects_response(
+            std::slice::from_ref(&entry),
+            &[[7u8; 32]],
+            100,
+        ))
+        .unwrap();
+        assert_eq!(o.blocks.len(), 1);
+        assert_eq!(o.blocks[0].block, entry.block);
+        assert_eq!(o.blocks[0].txs, entry.txs);
+        assert_eq!(o.missed_ids, vec![[7u8; 32]]);
+        assert_eq!(o.current_blockchain_height, 100);
+
+        // Block announcements.
+        let nb = NewBlock {
+            entry: entry.clone(),
+            current_blockchain_height: 101,
+        };
+        let back = NewBlock::parse(&nb.to_bytes()).unwrap();
+        assert_eq!(back.entry.block, entry.block);
+        assert_eq!(back.entry.txs, entry.txs);
+        assert_eq!(back.current_blockchain_height, 101);
+
+        let m = FluffyMissingTxs {
+            block_hash: [8u8; 32],
+            current_blockchain_height: 101,
+            missing_tx_indices: vec![0, 3, 7],
+        };
+        assert_eq!(FluffyMissingTxs::parse(&m.to_bytes()).unwrap(), m);
+
+        let c = TxpoolComplement {
+            hashes: vec![[9u8; 32]],
+        };
+        assert_eq!(TxpoolComplement::parse(&c.to_bytes()).unwrap(), c);
+
+        assert_eq!(
+            support_flags_of(&support_flags_response_with(SUPPORT_FLAG_FLUFFY_BLOCKS)).unwrap(),
+            1
+        );
+    }
+
+    /// `dandelionpp_fluff` defaults to **true** when absent (`specs/08` §7.1,
+    /// and its conformance checklist).
+    #[test]
+    fn new_transactions_default_to_fluff() {
+        let stem = NewTransactions {
+            txs: vec![vec![1, 2]],
+            dandelionpp_fluff: false,
+        };
+        assert_eq!(NewTransactions::parse(&stem.to_bytes()).unwrap(), stem);
+
+        let mut s = Section::new();
+        s.insert("txs".into(), strings(&[vec![1]]));
+        let body = epee::to_bytes(&s).unwrap();
+        assert!(
+            NewTransactions::parse(&body).unwrap().dandelionpp_fluff,
+            "an absent flag is fluff"
+        );
+    }
+
+    /// A socket address and its wire form convert both ways.
+    #[test]
+    fn socket_addresses_convert_both_ways() {
+        for text in ["1.2.3.4:34567", "[2001:db8::1]:28080"] {
+            let a: std::net::SocketAddr = text.parse().unwrap();
+            assert_eq!(NetworkAddress::from_socket_addr(a).socket_addr(), Some(a));
+        }
+    }
+
+    /// A list of hashes that is not whole, or is too long, is refused.
+    #[test]
+    fn hash_lists_are_bounded() {
+        let mut s = Section::new();
+        s.insert("hashes".into(), Value::String(vec![0u8; 31]));
+        assert!(TxpoolComplement::parse(&epee::to_bytes(&s).unwrap()).is_err());
+
+        let mut s = Section::new();
+        s.insert(
+            "blocks".into(),
+            Value::String(vec![0u8; 32 * (BLOCKS_MAX_COUNT + 1)]),
+        );
+        assert!(ObjectsRequest::parse(&epee::to_bytes(&s).unwrap()).is_err());
     }
 
     /// The batch limits are the documented ones.

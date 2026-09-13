@@ -92,8 +92,10 @@ impl<'a> Fields<'a> {
             ));
         }
         Ok(raw
-            .chunks_exact(64)
-            .map(|c| Signature::from_bytes(&c.try_into().unwrap()))
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .map(Signature::from_bytes)
             .collect())
     }
 

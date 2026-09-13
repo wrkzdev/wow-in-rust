@@ -5,11 +5,13 @@
 //!
 //! # What is implemented
 //!
-//! The read-only part of `specs/11` §7's minimum set. Anything needing the
-//! mempool, peers or the miner is not built, and those methods return
+//! `specs/11` §7's minimum set. Anything not built returns
 //! `UNSUPPORTED_RPC` rather than a plausible-looking empty answer. A wallet
-//! that got `{"status":"OK","tx_pool_size":0}` from a node with no mempool
-//! would draw the wrong conclusion.
+//! that got `{"status":"OK"}` from a method that did nothing would draw the
+//! wrong conclusion. The node-management endpoints are in [`super::admin`], the
+//! mining ones in [`super::mining`].
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{json, Value};
 use wow_consensus::checkpoints::Checkpoints;
@@ -24,12 +26,26 @@ use crate::cli::Config;
 pub mod error {
     pub const WRONG_PARAM: i32 = -1;
     pub const TOO_BIG_HEIGHT: i32 = -2;
+    pub const TOO_BIG_RESERVE_SIZE: i32 = -3;
+    pub const WRONG_WALLET_ADDRESS: i32 = -4;
     pub const INTERNAL_ERROR: i32 = -5;
+    pub const WRONG_BLOCKBLOB: i32 = -6;
+    pub const BLOCK_NOT_ACCEPTED: i32 = -7;
+    pub const CORE_BUSY: i32 = -9;
     pub const UNSUPPORTED_RPC: i32 = -11;
+    pub const MINING_TO_SUBADDRESS: i32 = -12;
+    pub const REGTEST_REQUIRED: i32 = -13;
+    /// Restricted endpoints are not routed at all (`specs/11` §1.3), so they
+    /// answer as unsupported; the code is kept for the table's sake.
+    #[allow(
+        dead_code,
+        reason = "specs/11 §6 lists it; restricted routes answer UNSUPPORTED_RPC"
+    )]
     pub const RESTRICTED: i32 = -19;
 }
 
 /// A method failed.
+#[derive(Debug)]
 pub struct RpcError {
     pub code: i32,
     pub message: String,
@@ -43,13 +59,13 @@ impl RpcError {
         }
     }
 
-    /// `specs/11` §7 does not cover this method yet.
+    /// A method this node does not route: not implemented, or restricted.
     pub fn unsupported(method: &str) -> RpcError {
         RpcError::new(
             error::UNSUPPORTED_RPC,
             format!(
-                "{method} is not implemented by this node. It needs the mempool, \
-                 peer-to-peer sync or the miner, none of which are built yet."
+                "{method} is not available on this node: it is either not \
+                 implemented yet (see `wownerod --help`) or restricted"
             ),
         )
     }
@@ -69,7 +85,11 @@ fn difficulty_fields(prefix: &str, d: u128) -> Vec<(String, Value)> {
     ]
 }
 
-fn with_difficulty(mut obj: serde_json::Map<String, Value>, prefix: &str, d: u128) -> Value {
+pub(crate) fn with_difficulty(
+    mut obj: serde_json::Map<String, Value>,
+    prefix: &str,
+    d: u128,
+) -> Value {
     for (k, v) in difficulty_fields(prefix, d) {
         obj.insert(k, v);
     }
@@ -78,7 +98,7 @@ fn with_difficulty(mut obj: serde_json::Map<String, Value>, prefix: &str, d: u12
 
 /// `specs/11` §2: every response carries `status` and `untrusted`, and
 /// `credits` / `top_hash` so clients that read them do not break.
-fn base(status: &str, untrusted: bool) -> serde_json::Map<String, Value> {
+pub(crate) fn base(status: &str, untrusted: bool) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
     m.insert("status".into(), json!(status));
     m.insert("untrusted".into(), json!(untrusted));
@@ -97,22 +117,56 @@ fn nettype(n: Network) -> &'static str {
     }
 }
 
-/// This node is never synced — it has no peers — so every answer is
-/// `untrusted`.
+/// Whether answers are `untrusted` right now.
 ///
 /// `specs/11` §2 defines the flag as "true if the answer came from a bootstrap
-/// daemon **or the node is not yet synced**". Reporting `false` would tell a
-/// wallet the tip is authoritative.
-const UNTRUSTED: bool = true;
+/// daemon **or the node is not yet synced**". Reporting `false` from a node
+/// still catching up would tell a wallet the tip is authoritative, so this
+/// stays true until the peer-to-peer node says it is synchronised. The router
+/// refreshes it on every request.
+static UNTRUSTED: AtomicBool = AtomicBool::new(true);
 
-fn hex(h: &[u8]) -> String {
+pub(crate) fn set_untrusted(untrusted: bool) {
+    UNTRUSTED.store(untrusted, Ordering::Relaxed);
+}
+
+pub(crate) fn untrusted() -> bool {
+    UNTRUSTED.load(Ordering::Relaxed)
+}
+
+/// `target_height` as the C++ reports it: zero once caught up, which is how a
+/// wallet tells that it is.
+pub(crate) fn target_height(sync: &wow_p2p::node::SyncStatus) -> u64 {
+    if sync.synchronized || sync.target_height <= sync.height {
+        0
+    } else {
+        sync.target_height
+    }
+}
+
+/// The fee inputs for a node with no chain state of its own -- a read-only
+/// server: the protocol floor for the weight limits.
+pub(crate) fn floor_fee_context(db: &LmdbDb, network: Network) -> wow_consensus::fee::FeeContext {
+    let height = db.height();
+    wow_consensus::fee::FeeContext {
+        version: HardFork::new(network).required_version(height.saturating_sub(1)),
+        cumulative_weight_limit: 600_000,
+        long_term_effective_median: 300_000,
+        already_generated_coins: match height {
+            0 => 0,
+            h => db.get_block_info(h - 1).map(|i| i.coins).unwrap_or(0),
+        },
+    }
+}
+
+pub(crate) fn hex(h: &[u8]) -> String {
     wow_crypto::hex::encode(h)
 }
 
 /// `/get_height` (`specs/11` §3).
 pub fn get_height(db: &LmdbDb) -> RpcResult {
     let height = db.height();
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("height".into(), json!(height));
     m.insert(
         "hash".into(),
@@ -125,46 +179,51 @@ pub fn get_height(db: &LmdbDb) -> RpcResult {
     Ok(Value::Object(m))
 }
 
-fn internal(e: impl std::fmt::Display) -> RpcError {
+pub(crate) fn internal(e: impl std::fmt::Display) -> RpcError {
     RpcError::new(error::INTERNAL_ERROR, e.to_string())
 }
 
 /// `/get_info` and the `get_info` JSON-RPC method (`specs/11` §3.2).
 ///
-/// Every field clients depend on is emitted. The ones this node cannot know —
-/// peer counts, the pool, bootstrap state — are zero or false, which is
-/// *accurate* for a node with no peers and no mempool, not a placeholder.
-pub fn get_info(db: &LmdbDb, cfg: &Config, start_time: u64, pool_size: usize) -> RpcResult {
+/// Every field clients depend on is emitted. The ones this node cannot know
+/// -- bootstrap state, update checks -- are zero or false, which is accurate
+/// for a node with neither, not a placeholder.
+pub fn get_info(server: &super::Server) -> RpcResult {
+    let db = server.db();
+    let cfg = server.config();
     let height = db.height();
-    let hf = HardFork::new(cfg.network);
+    let sync = server.sync_status();
+    let fee = server.fee_context();
 
-    let (top_hash, cumulative_difficulty, difficulty, block_weight_limit, block_weight_median) =
-        if height == 0 {
-            (String::new(), 0u128, 0u128, 600_000u64, 300_000u64)
+    let (top_hash, cumulative_difficulty, difficulty) = if height == 0 {
+        (String::new(), 0u128, 0u128)
+    } else {
+        let tip = db.get_block_info(height - 1).map_err(internal)?;
+        let prev = if height >= 2 {
+            db.get_block_info(height - 2)
+                .map_err(internal)?
+                .cumulative_difficulty
         } else {
-            let tip = db.get_block_info(height - 1).map_err(internal)?;
-            let prev = if height >= 2 {
-                db.get_block_info(height - 2)
-                    .map_err(internal)?
-                    .cumulative_difficulty
-            } else {
-                0
-            };
-            (
-                hex(&tip.hash),
-                tip.cumulative_difficulty,
-                tip.cumulative_difficulty.saturating_sub(prev),
-                // The limit and median for the *next* block are cached state a
-                // syncing node carries; this build reports the floor, which is
-                // what an un-synced node knows.
-                600_000,
-                300_000,
-            )
+            0
         };
+        (
+            hex(&tip.hash),
+            tip.cumulative_difficulty,
+            tip.cumulative_difficulty.saturating_sub(prev),
+        )
+    };
+    let (block_weight_limit, block_weight_median) = (fee.cumulative_weight_limit, fee.median());
+    let (white, grey) = server
+        .p2p()
+        .map(|p| {
+            let (w, g) = p.peer_lists();
+            (w.len(), g.len())
+        })
+        .unwrap_or((0, 0));
 
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("height".into(), json!(height));
-    m.insert("target_height".into(), json!(0));
+    m.insert("target_height".into(), json!(target_height(&sync)));
     m.insert(
         "target".into(),
         json!(wow_consensus::constants::DIFFICULTY_TARGET_V2),
@@ -172,18 +231,21 @@ pub fn get_info(db: &LmdbDb, cfg: &Config, start_time: u64, pool_size: usize) ->
     m.insert("top_block_hash".into(), json!(top_hash));
     m.insert("top_hash".into(), json!(""));
 
-    // Counts this node genuinely has none of.
+    // The store keeps no transaction count this node can read cheaply.
     m.insert("tx_count".into(), json!(0));
-    m.insert("tx_pool_size".into(), json!(pool_size));
+    m.insert("tx_pool_size".into(), json!(server.pool_size()));
     m.insert(
         "alt_blocks_count".into(),
         json!(db.get_alt_block_count().unwrap_or(0)),
     );
-    m.insert("outgoing_connections_count".into(), json!(0));
-    m.insert("incoming_connections_count".into(), json!(0));
-    m.insert("rpc_connections_count".into(), json!(0));
-    m.insert("white_peerlist_size".into(), json!(0));
-    m.insert("grey_peerlist_size".into(), json!(0));
+    m.insert("outgoing_connections_count".into(), json!(sync.outgoing));
+    m.insert("incoming_connections_count".into(), json!(sync.incoming));
+    m.insert(
+        "rpc_connections_count".into(),
+        json!(server.rpc_connections()),
+    );
+    m.insert("white_peerlist_size".into(), json!(white));
+    m.insert("grey_peerlist_size".into(), json!(grey));
 
     m.insert("mainnet".into(), json!(cfg.network == Network::Mainnet));
     m.insert("testnet".into(), json!(cfg.network == Network::Testnet));
@@ -197,21 +259,19 @@ pub fn get_info(db: &LmdbDb, cfg: &Config, start_time: u64, pool_size: usize) ->
     m.insert("block_weight_median".into(), json!(block_weight_median));
     m.insert("block_size_median".into(), json!(block_weight_median));
 
-    m.insert("start_time".into(), json!(start_time));
+    m.insert("start_time".into(), json!(server.start_time()));
     m.insert("adjusted_time".into(), json!(now()));
     m.insert("free_space".into(), json!(0));
     m.insert("database_size".into(), json!(database_size(cfg)));
-    m.insert("offline".into(), json!(true));
+    m.insert("offline".into(), json!(server.p2p().is_none()));
     m.insert("bootstrap_daemon_address".into(), json!(""));
     m.insert("height_without_bootstrap".into(), json!(height));
     m.insert("was_bootstrap_ever_used".into(), json!(false));
     m.insert("update_available".into(), json!(false));
     m.insert("version".into(), json!(crate::cli::VERSION));
-    // No peers, so never synchronised and never syncing.
-    m.insert("synchronized".into(), json!(false));
-    m.insert("busy_syncing".into(), json!(false));
+    m.insert("synchronized".into(), json!(sync.synchronized));
+    m.insert("busy_syncing".into(), json!(sync.busy_syncing));
     m.insert("restricted".into(), json!(cfg.restricted_rpc));
-    let _ = hf;
 
     let m = match with_difficulty(m, "difficulty", difficulty) {
         Value::Object(m) => m,
@@ -239,7 +299,9 @@ fn database_size(cfg: &Config) -> u64 {
 }
 
 /// `get_version` (`specs/11` §4).
-pub fn get_version(db: &LmdbDb, cfg: &Config) -> RpcResult {
+pub fn get_version(server: &super::Server) -> RpcResult {
+    let db = server.db();
+    let cfg = server.config();
     let hf = HardFork::new(cfg.network);
     let forks: Vec<Value> = hf
         .forks()
@@ -247,12 +309,15 @@ pub fn get_version(db: &LmdbDb, cfg: &Config) -> RpcResult {
         .map(|f| json!({"hf_version": f.version, "height": f.height}))
         .collect();
 
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     // The C++ packs major/minor into one integer; keep the same shape.
     m.insert("version".into(), json!((3u32 << 16) | 14));
     m.insert("release".into(), json!(false));
     m.insert("current_height".into(), json!(db.height()));
-    m.insert("target_height".into(), json!(0));
+    m.insert(
+        "target_height".into(),
+        json!(target_height(&server.sync_status())),
+    );
     m.insert("hard_forks".into(), json!(forks));
     Ok(Value::Object(m))
 }
@@ -272,7 +337,7 @@ pub fn hard_fork_info(db: &LmdbDb, cfg: &Config, params: &Value) -> RpcResult {
     let earliest = hf.earliest_height(version).unwrap_or(0);
     let enabled = hf.is_active(version, height.saturating_sub(1));
 
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("version".into(), json!(version));
     m.insert("enabled".into(), json!(enabled));
     // The vote window exists in the C++ but is inert with a zero threshold.
@@ -286,7 +351,11 @@ pub fn hard_fork_info(db: &LmdbDb, cfg: &Config, params: &Value) -> RpcResult {
 }
 
 /// `get_fee_estimate` (`specs/11` §4.5, `specs/06` §6.4).
-pub fn get_fee_estimate(db: &LmdbDb, cfg: &Config, params: &Value) -> RpcResult {
+///
+/// From the chain's cached weight state when the node holds the chain; a
+/// read-only server has none, and reports the floor, which is what it can
+/// honestly say.
+pub fn get_fee_estimate(server: &super::Server, params: &Value) -> RpcResult {
     use wow_consensus::fee;
 
     let grace = params
@@ -300,29 +369,12 @@ pub fn get_fee_estimate(db: &LmdbDb, cfg: &Config, params: &Value) -> RpcResult 
         ));
     }
 
-    let height = db.height();
-    let hf = HardFork::new(cfg.network);
-    let version = hf.required_version(height.saturating_sub(1));
-
-    let coins = if height == 0 {
-        0
-    } else {
-        db.get_block_info(height - 1).map_err(internal)?.coins
-    };
-
-    // An un-synced node has no weight medians to work from, so the floor is
-    // what it can honestly report.
-    let ctx = fee::FeeContext {
-        version,
-        cumulative_weight_limit: 600_000,
-        long_term_effective_median: 300_000,
-        already_generated_coins: coins,
-    };
+    let ctx = server.fee_context();
     let base_reward = ctx.base_reward().map_err(|e| internal(format!("{e:?}")))?;
-    let per_byte = fee::get_dynamic_base_fee(base_reward, ctx.fee_median(), version);
-    let tiers = fee::fee_tiers_2021(base_reward, 600_000 / 2, 300_000);
+    let per_byte = fee::get_dynamic_base_fee(base_reward, ctx.fee_median(), ctx.version);
+    let tiers = fee::fee_tiers_2021(base_reward, ctx.median(), ctx.long_term_effective_median);
 
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("fee".into(), json!(per_byte));
     m.insert(
         "fees".into(),
@@ -429,7 +481,7 @@ pub fn get_last_block_header(db: &LmdbDb, cfg: &Config) -> RpcResult {
     if height == 0 {
         return Err(RpcError::new(error::INTERNAL_ERROR, "the chain is empty"));
     }
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("block_header".into(), block_header(db, cfg, height - 1)?);
     Ok(Value::Object(m))
 }
@@ -440,7 +492,7 @@ pub fn get_block_header_by_height(db: &LmdbDb, cfg: &Config, params: &Value) -> 
         .get("height")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| RpcError::new(error::WRONG_PARAM, "expected `height`"))?;
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("block_header".into(), block_header(db, cfg, height)?);
     Ok(Value::Object(m))
 }
@@ -458,7 +510,7 @@ pub fn get_block_header_by_hash(db: &LmdbDb, cfg: &Config, params: &Value) -> Rp
     let height = db
         .get_block_height(&hash)
         .map_err(|_| RpcError::new(error::WRONG_PARAM, "no block with that hash"))?;
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("block_header".into(), block_header(db, cfg, height)?);
     Ok(Value::Object(m))
 }
@@ -497,7 +549,7 @@ pub fn get_block_headers_range(db: &LmdbDb, cfg: &Config, params: &Value) -> Rpc
     for h in start..=end {
         headers.push(block_header(db, cfg, h)?);
     }
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("headers".into(), json!(headers));
     Ok(Value::Object(m))
 }
@@ -523,7 +575,7 @@ pub fn get_block(db: &LmdbDb, cfg: &Config, params: &Value) -> RpcResult {
     let blob = db.get_block_blob(height).map_err(internal)?;
     let blk = wow_types::Block::from_blob(&blob).map_err(|e| internal(format!("{e:?}")))?;
 
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("block_header".into(), header);
     m.insert("blob".into(), json!(hex(&blob)));
     m.insert(
@@ -562,7 +614,7 @@ pub fn get_checkpoints(db: &LmdbDb, cfg: &Config) -> RpcResult {
         }));
     }
 
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("total".into(), json!(cps.all().len()));
     m.insert("checked".into(), json!(rows.len()));
     m.insert("matched".into(), json!(matched));
@@ -601,36 +653,36 @@ pub fn send_raw_transaction(server: &super::Server, body: &[u8]) -> String {
         .unwrap_or(false);
 
     let db = server.db();
-    let cfg = server.config();
-    let height = db.height();
-    let hf = HardFork::new(cfg.network);
-    let version = hf.required_version(height.saturating_sub(1));
-    let coins = match height {
-        0 => 0,
-        h => match db.get_block_info(h - 1) {
-            Ok(i) => i.coins,
-            Err(e) => return failed_relay(&format!("cannot read the tip: {e}"), None),
-        },
-    };
-    let fee_context = wow_consensus::fee::FeeContext {
-        version,
-        cumulative_weight_limit: 600_000,
-        long_term_effective_median: 300_000,
-        already_generated_coins: coins,
-    };
+    let fee_context = server.fee_context();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let mut pool = server.pool();
-    match pool.add(db, &blob, &fee_context, now, do_not_relay) {
+    // The pool guard ends with this statement: relaying marks the entry, which
+    // takes the pool lock again.
+    let added = server
+        .pool()
+        .add(db, &blob, &fee_context, now, do_not_relay);
+    match added {
         Ok(id) => {
+            // Accepted is not the same as sent. It goes out only when the
+            // caller allows it and there is a peer to send it to.
+            // Announced as the C++ announces it: accepted, and allowed out.
+            if let Some(core) = server.core().filter(|_| !do_not_relay) {
+                core.announce_pool_txs(&[id]);
+            }
+            let relayed = !do_not_relay && server.relays();
+            if relayed {
+                if let Some(p) = server.p2p() {
+                    p.relay_transaction(id, blob.clone());
+                }
+            }
             let mut m = relay_flags(None);
             m.insert("status".into(), json!("OK"));
             m.insert("reason".into(), json!(""));
-            m.insert("not_relayed".into(), json!(do_not_relay));
+            m.insert("not_relayed".into(), json!(!relayed));
             m.insert("tx_hash".into(), json!(wow_crypto::hex::encode(&id)));
             Value::Object(m).to_string()
         }
@@ -675,7 +727,7 @@ fn relay_flags(rejection: Option<&crate::mempool::Rejection>) -> serde_json::Map
     }
     // Not implemented, and reported as such rather than silently absent.
     m.insert("sanity_check_failed".into(), json!(false));
-    m.insert("untrusted".into(), json!(UNTRUSTED));
+    m.insert("untrusted".into(), json!(untrusted()));
     m.insert("credits".into(), json!(0));
     m.insert("top_hash".into(), json!(""));
     m
@@ -716,7 +768,7 @@ pub fn get_transactions(server: &super::Server, body: &[u8]) -> RpcResult {
                 "double_spend_seen": entry.double_spend_seen,
                 "block_height": 0,
                 "received_timestamp": entry.receive_time,
-                "relayed": !entry.do_not_relay,
+                "relayed": entry.relayed,
             }));
             continue;
         }
@@ -732,7 +784,7 @@ pub fn get_transactions(server: &super::Server, body: &[u8]) -> RpcResult {
         }
     }
 
-    let mut m = base("OK", UNTRUSTED);
+    let mut m = base("OK", untrusted());
     m.insert("txs".into(), json!(found));
     m.insert("missed_tx".into(), json!(missing));
     Ok(Value::Object(m))
@@ -801,11 +853,11 @@ mod tests {
     /// answer, which a wallet would read as fact.
     #[test]
     fn an_unsupported_method_explains_itself() {
-        let e = RpcError::unsupported("get_transaction_pool");
+        let e = RpcError::unsupported("get_miner_data");
         assert_eq!(e.code, error::UNSUPPORTED_RPC);
-        assert!(e.message.contains("get_transaction_pool"));
+        assert!(e.message.contains("get_miner_data"));
         assert!(
-            e.message.contains("none of which are built yet"),
+            e.message.contains("not implemented") && e.message.contains("restricted"),
             "the message should say why: {}",
             e.message
         );

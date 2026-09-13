@@ -7,5 +7,7 @@ license.workspace = true
 
 [dependencies]
 wow-crypto.workspace = true
+wow-log.workspace = true
 wow-serialize.workspace = true
 wow-types.workspace = true
+socket2.workspace = true

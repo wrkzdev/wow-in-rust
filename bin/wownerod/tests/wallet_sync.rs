@@ -126,6 +126,7 @@ fn start(tag: &str, extra: usize) -> (Daemon, Vec<[u8; 32]>) {
             scratch.0.to_str().unwrap(),
             "--db-readonly",
             "--serve",
+            "--no-zmq",
             "--rpc-bind-port",
             &port.to_string(),
         ])

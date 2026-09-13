@@ -181,7 +181,7 @@ fn read_corpus(sub: &str) -> Vec<(String, Vec<u8>)> {
     let mut paths: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().map_or(true, |e| e != "md"))
+        .filter(|p| p.is_file() && p.extension().is_none_or(|e| e != "md"))
         .collect();
     paths.sort();
     for p in paths {

@@ -146,6 +146,108 @@ impl LocalChain {
         self.chain.trusted_below()
     }
 
+    /// Validate and add a block from outside, returning what it became.
+    ///
+    /// The transactions are checked against the block's `tx_hashes` here, in
+    /// order and by hash, before the chain sees them (`specs/08` §5.5).
+    pub fn submit(&mut self, blob: &[u8], txs: &[Vec<u8>]) -> Result<Submitted, Refusal> {
+        let block = Block::from_blob(blob)
+            .map_err(|e| Refusal::Malformed(format!("the block does not parse: {e}")))?;
+
+        // A peer that sends a different set is a protocol violation, and
+        // checking here rather than trusting it is what stops a peer choosing
+        // which transactions this node validates.
+        if txs.len() != block.tx_hashes.len() {
+            return Err(Refusal::Malformed(format!(
+                "the block names {} transactions and {} came with it",
+                block.tx_hashes.len(),
+                txs.len()
+            )));
+        }
+        let mut parsed = Vec::with_capacity(txs.len());
+        for (i, blob) in txs.iter().enumerate() {
+            let tx = Transaction::from_blob(blob)
+                .map_err(|e| Refusal::Malformed(format!("transaction {i} does not parse: {e}")))?;
+            let id = wow_types::hashes::transaction_hash_from_blob(&tx, blob)
+                .ok_or_else(|| Refusal::Malformed(format!("transaction {i} has no hash")))?;
+            if id != block.tx_hashes[i] {
+                return Err(Refusal::Malformed(format!(
+                    "transaction {i} is {} where the block names {}",
+                    wow_crypto::hex::encode(&id),
+                    wow_crypto::hex::encode(&block.tx_hashes[i])
+                )));
+            }
+            parsed.push((tx, blob.clone()));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let added = self
+            .chain
+            .handle_block(&block, blob, &parsed, now)
+            .map_err(Refusal::Rejected)?;
+
+        match added {
+            wow_core::Added::MainChain { .. } => {
+                if let Some(id) = block.block_id() {
+                    self.hashes.push(id);
+                }
+            }
+            wow_core::Added::Reorg { .. } => {
+                if let Err(e) = self.resync_hashes() {
+                    wow_log::error!(
+                        "blockchain",
+                        "cannot re-read block hashes after a reorganisation: {e}"
+                    );
+                }
+            }
+            wow_core::Added::AltChain { .. } => {}
+        }
+
+        Ok(Submitted {
+            added,
+            block,
+            txs: parsed,
+        })
+    }
+
+    /// Bring the block-hash cache back in line with the database after the
+    /// tip moved backwards: a reorganisation or `pop_blocks`.
+    pub fn resync_hashes(&mut self) -> Result<(), String> {
+        let height = self.db.height();
+        self.hashes.truncate(height as usize);
+        // Walk back over entries a reorganisation replaced; only as deep as it
+        // went, since everything below the split still matches.
+        while let Some(last) = self.hashes.last().copied() {
+            let h = self.hashes.len() as u64 - 1;
+            match self.db.get_block_hash(h) {
+                Ok(real) if real == last => break,
+                _ => {
+                    self.hashes.pop();
+                }
+            }
+        }
+        for h in self.hashes.len() as u64..height {
+            self.hashes.push(
+                self.db
+                    .get_block_hash(h)
+                    .map_err(|e| format!("cannot read the block at height {h}: {e}"))?,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn blockchain(&self) -> &Blockchain<LmdbDb> {
+        &self.chain
+    }
+
+    pub fn blockchain_mut(&mut self) -> &mut Blockchain<LmdbDb> {
+        &mut self.chain
+    }
+
     /// What this node tells a peer about its chain.
     pub fn sync_data(&self, network: Network) -> CoreSyncData {
         let height = self.height();
@@ -194,49 +296,36 @@ impl ChainTip for LocalChain {
     }
 
     fn add_block(&mut self, blob: &[u8], txs: &[Vec<u8>]) -> Result<(), String> {
-        let block = Block::from_blob(blob).map_err(|e| format!("the block does not parse: {e}"))?;
-
-        // `specs/08` §5.5: the transactions must match the block's `tx_hashes`,
-        // in order. A peer that sends a different set is a protocol violation,
-        // and checking here rather than trusting it is what stops a peer
-        // choosing which transactions this node validates.
-        if txs.len() != block.tx_hashes.len() {
-            return Err(format!(
-                "the block names {} transactions and {} came with it",
-                block.tx_hashes.len(),
-                txs.len()
-            ));
-        }
-        let mut parsed = Vec::with_capacity(txs.len());
-        for (i, blob) in txs.iter().enumerate() {
-            let tx = Transaction::from_blob(blob)
-                .map_err(|e| format!("transaction {i} does not parse: {e}"))?;
-            let id = wow_types::hashes::transaction_hash_from_blob(&tx, blob)
-                .ok_or_else(|| format!("transaction {i} has no hash"))?;
-            if id != block.tx_hashes[i] {
-                return Err(format!(
-                    "transaction {i} is {} where the block names {}",
-                    wow_crypto::hex::encode(&id),
-                    wow_crypto::hex::encode(&block.tx_hashes[i])
-                ));
-            }
-            parsed.push((tx, blob.clone()));
-        }
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        self.chain
-            .add_block(&block, blob, &parsed, now)
-            .map_err(|e| format!("{e:?}"))?;
-
-        if let Some(id) = block.block_id() {
-            self.hashes.push(id);
-        }
-        Ok(())
+        self.submit(blob, txs)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
+}
+
+/// Why [`LocalChain::submit`] did not take a block.
+#[derive(Debug)]
+pub enum Refusal {
+    /// The block or a transaction does not parse, or the transactions are not
+    /// the ones the block names: the sender's doing.
+    Malformed(String),
+    /// The chain's rules refused it.
+    Rejected(wow_core::Rejection),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Malformed(r) => f.write_str(r),
+            Refusal::Rejected(r) => write!(f, "{r}"),
+        }
+    }
+}
+
+/// A block the chain took, and what it was made of.
+pub struct Submitted {
+    pub added: wow_core::Added,
+    pub block: Block,
+    pub txs: Vec<(Transaction, Vec<u8>)>,
 }
 
 /// Sync from one peer, printing progress.
@@ -247,7 +336,7 @@ pub fn run(db: LmdbDb, network: Network, address: &str, max_batches: usize) -> R
     // A peer id that is not the same twice, so a node does not look like a
     // self-connection to a peer it reconnects to.
     let peer_id = {
-        let mut rng = wow_wallet_entropy()?;
+        let mut rng = seeded_rng()?;
         let mut b = [0u8; 8];
         rng.fill(&mut b);
         u64::from_le_bytes(b)
@@ -330,13 +419,13 @@ pub fn run(db: LmdbDb, network: Network, address: &str, max_batches: usize) -> R
 /// a predictable source would collide across restarts, and two nodes sharing one
 /// would each read the other as a self-connection and hang up.
 #[cfg(windows)]
-fn wow_wallet_entropy() -> Result<wow_crypto::random::Rng, String> {
+pub fn seeded_rng() -> Result<wow_crypto::random::Rng, String> {
     // Reuse the wallet's, rather than carrying a second copy of the FFI.
     wow_wallet::entropy::seeded_rng()
 }
 
 #[cfg(not(windows))]
-fn wow_wallet_entropy() -> Result<wow_crypto::random::Rng, String> {
+pub fn seeded_rng() -> Result<wow_crypto::random::Rng, String> {
     use std::io::Read;
 
     let mut state = [0u8; wow_crypto::keccak::HASH_STATE_BYTES];
@@ -406,8 +495,8 @@ mod tests {
     /// self-connection to each other.
     #[test]
     fn peer_ids_differ_between_runs() {
-        let mut a = wow_wallet_entropy().expect("entropy");
-        let mut b = wow_wallet_entropy().expect("entropy");
+        let mut a = seeded_rng().expect("entropy");
+        let mut b = seeded_rng().expect("entropy");
         let mut x = [0u8; 8];
         let mut y = [0u8; 8];
         a.fill(&mut x);

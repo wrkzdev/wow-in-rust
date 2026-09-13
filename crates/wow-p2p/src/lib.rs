@@ -1,23 +1,24 @@
-//! Levin codec, peerlist, connection manager, sync, Dandelion++ relay
+//! Levin codec, peer lists, connection manager, sync, Dandelion++ relay
 //! (`specs/08-p2p.md`).
 //!
 //! [`levin`] is the wire framing — the 33-byte header, the command set, the
-//! size limits and fragment reassembly. [`messages`] is what peers exchange
-//! (`specs/08` §3), [`peer`] is one connection and its handshake (§4), and
-//! [`sync`] pulls a chain from one of them (§5).
+//! size limits and fragment reassembly — and [`frame`] reads it off a socket
+//! that times out. [`messages`] is what peers exchange (`specs/08` §3).
 //!
-//! # What is here and what is not
+//! Two ways to use a peer:
 //!
-//! Enough to **sync from** the network: dial a peer, handshake, find where the
-//! chains diverge, pull the blocks after it. Not here, and each absent rather
-//! than half-built:
+//! * [`peer`] and [`sync`]: one outgoing connection, driven synchronously --
+//!   dial, handshake, pull a chain. What `wownerod --sync-from` uses.
+//! * [`node`]: a whole node. It listens and dials, keeps [`addressbook`]'s
+//!   white, gray and anchor lists and its bans, syncs from whichever peer is
+//!   ahead, serves chain data to peers that are behind, and relays blocks and
+//!   transactions -- deciding nothing about validity itself, which it asks a
+//!   [`node::Core`] about.
 //!
-//! * **listening.** Accepting inbound connections needs the ping-back that
-//!   gates the white list (§4.2), peer bans and connection limits.
-//! * **the peer list.** Peers from a handshake are handed to the caller and
-//!   nothing is persisted, so every run starts from its seed nodes.
-//! * **block propagation** (§6) and **Dandelion++ relay** (§7). This node
-//!   receives; it does not announce.
+//! [`queue`] spreads a node's sync across several peers (§5.6).
+//!
+//! Not here: pruning (§9), and the i2p/Tor zones and their noise channels
+//! (§7.4).
 //!
 //! Everything in this crate parses bytes an unauthenticated peer chose, so
 //! `specs/15` §4.4's invariant governs: **never panic**. A parse failure is a
@@ -25,9 +26,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod addressbook;
+pub mod frame;
 pub mod levin;
 pub mod messages;
+pub mod net;
+pub mod node;
 pub mod peer;
+pub mod queue;
 pub mod sync;
 
 pub use levin::{command, flags, Header, Kind, LevinError, Reassembler, Reassembly};

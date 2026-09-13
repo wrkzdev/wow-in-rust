@@ -289,9 +289,11 @@ impl AccountBase {
 
         let multisig_keys = match keys.get("m_multisig_keys").and_then(Value::as_bytes) {
             None => Vec::new(),
-            Some(b) if b.len() % SECRET_KEY_LEN == 0 => b
-                .chunks_exact(SECRET_KEY_LEN)
-                .map(|c| SecretKey(c.try_into().expect("32 bytes")))
+            Some(b) if b.len().is_multiple_of(SECRET_KEY_LEN) => b
+                .as_chunks::<SECRET_KEY_LEN>()
+                .0
+                .iter()
+                .map(|c| SecretKey(*c))
                 .collect(),
             Some(b) => {
                 return Err(AccountError::BadLength {

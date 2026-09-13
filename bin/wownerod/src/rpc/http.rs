@@ -1,9 +1,9 @@
 //! A minimal HTTP/1.1 server.
 //!
 //! `specs/11-daemon-rpc.md` §1. Only what the RPC surface needs: `POST` with a
-//! `Content-Length` body, and a JSON response. No chunked encoding, no
-//! keep-alive pipelining, no TLS — `specs/11` §1.2 allows deferring TLS to a
-//! reverse proxy, and this build does.
+//! `Content-Length` body, and a JSON response. No chunked encoding and no
+//! keep-alive pipelining. TLS is below this layer: it reads and writes
+//! whatever stream it is handed, plain or `super::tls`'s.
 //!
 //! # This faces the network
 //!
@@ -17,7 +17,6 @@
 //! client, and `specs/15` §4.4's rule for such code is "never panic".
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 /// `MAX_RPC_CONTENT_LENGTH` (`specs/11` §1.1).
@@ -27,16 +26,29 @@ pub const MAX_CONTENT_LENGTH: usize = 1_048_576;
 /// constant for. Without one a peer could send headers forever.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 
-/// How long a single request may take to arrive.
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a single request may take to arrive, and its answer to leave. Set
+/// on the socket by the caller, since a TLS stream has no socket of its own.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A parsed request.
 #[derive(Debug)]
 pub struct Request {
     pub method: String,
     pub path: String,
+    /// Names as sent; look them up with [`Request::header`].
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl Request {
+    /// A header's value, by case-insensitive name.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Why a request was not served.
@@ -75,11 +87,8 @@ impl From<std::io::Error> for HttpError {
     }
 }
 
-/// Read one request from a connection.
-pub fn read_request(stream: &TcpStream) -> Result<Request, HttpError> {
-    stream.set_read_timeout(Some(READ_TIMEOUT))?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-
+/// Read one request from a connection whose timeouts are already set.
+pub fn read_request<S: Read>(stream: &mut S) -> Result<Request, HttpError> {
     let mut reader = BufReader::new(stream);
     let mut header_bytes = 0usize;
 
@@ -100,8 +109,10 @@ pub fn read_request(stream: &TcpStream) -> Result<Request, HttpError> {
         .ok_or(HttpError::Malformed("no path"))?
         .to_string();
 
-    // Headers. Only `Content-Length` matters here.
+    // Headers. `Content-Length` is acted on here; the rest are kept for the
+    // router, bounded by the same byte cap.
     let mut content_length = 0usize;
+    let mut headers = Vec::new();
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h)? == 0 {
@@ -128,39 +139,64 @@ pub fn read_request(stream: &TcpStream) -> Result<Request, HttpError> {
                     });
                 }
             }
+            headers.push((name.trim().to_string(), value.trim().to_string()));
         }
     }
 
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;
 
-    Ok(Request { method, path, body })
+    Ok(Request {
+        method,
+        path,
+        headers,
+        body,
+    })
 }
 
 /// Write a JSON response.
-pub fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    write_response(stream, status, "application/json", body.as_bytes())
+pub fn write_json(stream: &mut impl Write, status: u16, body: &str) -> std::io::Result<()> {
+    write_response(stream, status, "application/json", body.as_bytes(), &[])
+}
+
+/// Write a JSON response with extra headers, such as a Digest challenge or a
+/// CORS grant.
+pub fn write_json_with(
+    stream: &mut impl Write,
+    status: u16,
+    body: &str,
+    headers: &[(&str, String)],
+) -> std::io::Result<()> {
+    write_response(stream, status, "application/json", body.as_bytes(), headers)
 }
 
 /// Write an epee portable-storage response, for the binary endpoints
-/// (`specs/11` §5).
+/// (`specs/11` §5), with any extra headers.
 ///
 /// A wallet reads the body by `Content-Length` rather than by sniffing, so the
 /// content type is informational — but sending JSON's type with epee's bytes
 /// would be a lie that costs nothing to avoid.
-pub fn write_binary(stream: &mut TcpStream, status: u16, body: &[u8]) -> std::io::Result<()> {
-    write_response(stream, status, "application/octet-stream", body)
+pub fn write_binary_with(
+    stream: &mut impl Write,
+    status: u16,
+    body: &[u8],
+    headers: &[(&str, String)],
+) -> std::io::Result<()> {
+    write_response(stream, status, "application/octet-stream", body, headers)
 }
 
 fn write_response(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: u16,
     content_type: &str,
     body: &[u8],
+    headers: &[(&str, String)],
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
@@ -169,15 +205,21 @@ fn write_response(
     };
     // The head and the body are written separately: a body that is not UTF-8
     // cannot go through `format!`.
-    let head = format!(
+    //
+    // No `Access-Control-Allow-Origin` unless the caller passes one: the C++
+    // sends it only for the origins `--rpc-access-control-origins` names, and a
+    // wildcard would let any web page read this node's answers.
+    let mut head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         \r\n",
+         Connection: close\r\n",
         body.len()
     );
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
@@ -202,8 +244,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
 
-        let (stream, _) = listener.accept().unwrap();
-        let out = read_request(&stream);
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        let out = read_request(&mut stream);
         let _ = client.join();
         out
     }
@@ -216,6 +259,9 @@ mod tests {
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/json_rpc");
         assert_eq!(req.body, b"hello");
+        assert_eq!(req.header("host"), Some("x"), "headers are kept");
+        assert_eq!(req.header("HOST"), Some("x"), "and found by any case");
+        assert_eq!(req.header("origin"), None);
     }
 
     #[test]
@@ -289,8 +335,9 @@ mod tests {
         std::thread::spawn(move || {
             let _ = TcpStream::connect(addr);
         });
-        let (stream, _) = listener.accept().unwrap();
-        assert!(matches!(read_request(&stream), Err(HttpError::Closed)));
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        assert!(matches!(read_request(&mut stream), Err(HttpError::Closed)));
     }
 
     #[test]
@@ -312,5 +359,9 @@ mod tests {
         assert!(out.contains("Content-Type: application/json"));
         assert!(out.contains("Content-Length: 7"));
         assert!(out.ends_with("{\"a\":1}"));
+        assert!(
+            !out.contains("Access-Control-Allow-Origin"),
+            "no wildcard CORS header: {out}"
+        );
     }
 }

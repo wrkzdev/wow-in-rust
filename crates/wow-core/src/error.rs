@@ -19,10 +19,20 @@ pub enum BlockError {
     // -- §2 step 2 --
     /// `prev_id` is not the tip, so this belongs to `handle_alternative_block`.
     ///
-    /// Not a failure: the caller routes it to the alt-chain path (§8).
+    /// Only [`crate::Blockchain::add_block`] returns this, since it is the
+    /// main-chain step alone. [`crate::Blockchain::handle_block`] routes such a
+    /// block to the alternative-chain path (`specs/06` §8) instead.
     NotOnTip {
         prev: Hash256,
         tip: Hash256,
+    },
+    /// The parent is neither on the main chain nor among the alternative
+    /// blocks, so there is nothing to attach the block to. Not proof the block
+    /// is bad -- its parent may simply not have arrived -- which is why it is
+    /// its own variant: a caller asks the peer for the chain rather than
+    /// blaming it.
+    Orphan {
+        prev: Hash256,
     },
 
     // -- §2 step 3 --
@@ -53,6 +63,11 @@ pub enum BlockError {
         height: u64,
         expected: Hash256,
         found: Hash256,
+    },
+    /// An alternative block at or below the last checkpoint, which no chain
+    /// may replace (`specs/06` §7, §8).
+    AltBelowCheckpoint {
+        height: u64,
     },
 
     // -- §2 step 8 --
@@ -112,6 +127,11 @@ impl std::fmt::Display for BlockError {
         match self {
             AlreadyExists { .. } => write!(f, "block already known"),
             NotOnTip { .. } => write!(f, "block does not extend the tip"),
+            Orphan { .. } => write!(f, "the block's parent is unknown"),
+            AltBelowCheckpoint { height } => write!(
+                f,
+                "an alternative block at height {height} is at or below the last checkpoint"
+            ),
             WrongVersion {
                 height,
                 found,

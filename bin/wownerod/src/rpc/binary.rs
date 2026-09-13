@@ -88,7 +88,7 @@ fn db_error(e: impl std::fmt::Display) -> RpcError {
 /// none — which means "start from genesis", not "start from wherever the
 /// request suggested".
 fn split_height(db: &LmdbDb, block_ids: &[u8]) -> Result<u64, RpcError> {
-    if block_ids.len() % 32 != 0 {
+    if !block_ids.len().is_multiple_of(32) {
         return Err(RpcError::new(
             error::WRONG_PARAM,
             "block_ids is not a whole number of hashes",
@@ -103,9 +103,8 @@ fn split_height(db: &LmdbDb, block_ids: &[u8]) -> Result<u64, RpcError> {
     }
 
     // Newest first, so the first match is the deepest agreement.
-    for chunk in block_ids.chunks_exact(32) {
-        let hash: [u8; 32] = chunk.try_into().expect("32 bytes");
-        if let Ok(h) = db.get_block_height(&hash) {
+    for hash in block_ids.as_chunks::<32>().0 {
+        if let Ok(h) = db.get_block_height(hash) {
             return Ok(h + 1);
         }
     }

@@ -167,9 +167,8 @@ impl Ctx {
             }
             if msg.len() > BLOCK {
                 let n = (msg.len() - 1) / BLOCK;
-                for chunk in msg[..n * BLOCK].chunks_exact(BLOCK) {
-                    let block: [u8; BLOCK] = chunk.try_into().expect("chunks_exact");
-                    self.process_block(&block, BLOCK as u64);
+                for block in msg[..n * BLOCK].as_chunks::<BLOCK>().0 {
+                    self.process_block(block, BLOCK as u64);
                 }
                 msg = &msg[n * BLOCK..];
             }

@@ -11,21 +11,33 @@
 //!   the incoming block's (`specs/07` §3, `specs/06` §9.4);
 //! * the weight limit used to validate a block is the one computed **after the
 //!   previous block**, not one derived from this block (`specs/06` §3.4).
+//!
+//! # Alternative chains
+//!
+//! [`Blockchain::handle_block`] is the entry point a node uses. A block that
+//! extends the tip goes through [`Blockchain::add_block`]; one that does not is
+//! checked as an alternative block and stored (`specs/06` §8), and when its
+//! chain's cumulative difficulty strictly exceeds the main chain's, the node
+//! switches to it (§7). The switch applies the alternative blocks through the
+//! same twelve steps, so a reorganisation can never admit a block the main
+//! path would refuse -- and if one fails partway, the original chain is put
+//! back.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use wow_consensus::checkpoints::Checkpoints;
 use wow_consensus::difficulty::{difficulty_blocks_count, next_difficulty};
-use wow_consensus::emission::{get_block_reward, validate_miner_reward, MinerReward};
+use wow_consensus::emission::{get_block_reward, median, validate_miner_reward, MinerReward};
 use wow_consensus::hardfork::HardFork;
-use wow_consensus::timestamp::{check_block_timestamp, timestamp_check_window};
+use wow_consensus::timestamp::{check_block_timestamp, timestamp_check_window, TimestampError};
 use wow_consensus::weight::{
     next_long_term_block_weight, update_next_cumulative_weight_limit, LongTermWeightWindow,
     WeightLimits,
 };
 use wow_consensus::{constants, tx_rules};
 use wow_crypto::types::Hash256;
-use wow_storage::db::BlockchainDb;
+use wow_storage::db::{AltBlockData, BlockchainDb};
 use wow_types::{check_hash, Block, Difficulty, Network, Transaction};
 
 use crate::error::{Added, BlockError};
@@ -141,6 +153,37 @@ pub struct Blockchain<D: BlockchainDb> {
     /// Zero -- the default -- checks everything. See
     /// [`Blockchain::trust_below`] for why anything else is ever correct.
     trusted_below: u64,
+    /// The transactions of blocks on alternative chains, by block id.
+    ///
+    /// `alt_blocks` stores a block's blob and nothing else; the C++ finds an
+    /// alternative block's transactions in its pool when it switches chains.
+    /// This node keeps them here, in memory, so an alternative chain that
+    /// outlives a restart has lost them -- and switching to it is then refused
+    /// with [`BlockError::MissingTx`] rather than attempted without them.
+    alt_txs: HashMap<Hash256, Vec<(Transaction, Vec<u8>)>>,
+    /// Transactions a reorganisation or [`Blockchain::pop_blocks`] took off the
+    /// main chain, for the caller to return to its pool (`specs/06` §7 step 4).
+    orphaned_txs: Vec<(Transaction, Vec<u8>)>,
+    /// `--fixed-difficulty` (`specs/07` §5): regtest's difficulty for every
+    /// block after genesis, in place of the algorithm.
+    fixed_difficulty: Option<Difficulty>,
+}
+
+/// One block of an alternative chain, as the walk back to the main chain
+/// finds it.
+struct AltLink {
+    id: Hash256,
+    block: Block,
+    blob: Vec<u8>,
+    data: AltBlockData,
+}
+
+/// A main-chain block taken off during a reorganisation, kept whole so it can
+/// be put back if the switch fails.
+struct Popped {
+    info: wow_storage::records::BlockInfo,
+    block: Block,
+    txs: Vec<(Transaction, Vec<u8>)>,
 }
 
 impl<D: BlockchainDb> Blockchain<D> {
@@ -159,9 +202,473 @@ impl<D: BlockchainDb> Blockchain<D> {
             checkpoints: Checkpoints::new(network),
             state: ChainState::default(),
             trusted_below: 0,
+            alt_txs: HashMap::new(),
+            orphaned_txs: Vec::new(),
+            fixed_difficulty: None,
         };
         chain.reload_state()?;
         Ok(chain)
+    }
+
+    /// Whether a block is known, on the main chain or as an alternative.
+    ///
+    /// `have_block` in the C++, which is what a peer's announcement is checked
+    /// against: a block already stored as an alternative is not news.
+    pub fn have_block(&self, id: &Hash256) -> Result<bool, BlockError> {
+        if self.db.block_exists(id)? {
+            return Ok(true);
+        }
+        match self.db.get_alt_block(id) {
+            Ok(_) => Ok(true),
+            Err(wow_storage::DbError::NotFound) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The transactions a reorganisation or [`Blockchain::pop_blocks`] removed
+    /// from the main chain and that the new chain does not contain, handed over
+    /// once.
+    pub fn take_orphaned_txs(&mut self) -> Vec<(Transaction, Vec<u8>)> {
+        std::mem::take(&mut self.orphaned_txs)
+    }
+
+    /// `pop_blocks`: take up to `n` blocks off the tip. The genesis block is
+    /// never removed. Returns how many were.
+    ///
+    /// Their transactions wait in [`Blockchain::take_orphaned_txs`].
+    pub fn pop_blocks(&mut self, n: u64) -> Result<u64, BlockError> {
+        let n = n.min(self.height().saturating_sub(1));
+        for _ in 0..n {
+            let (_, txs) = self.db.pop_block()?;
+            self.orphaned_txs.extend(txs.into_iter().map(with_blob));
+        }
+        self.reload_state()?;
+        Ok(n)
+    }
+
+    /// `add_new_block`: a block joins the main chain if it extends the tip, and
+    /// takes the alternative-chain path (`specs/06` §8) if it does not.
+    ///
+    /// `txs` are the block's non-coinbase transactions, in `tx_hashes` order,
+    /// as for [`Blockchain::add_block`].
+    pub fn handle_block(
+        &mut self,
+        blk: &Block,
+        blob: &[u8],
+        txs: &[(Transaction, Vec<u8>)],
+        now: u64,
+    ) -> Result<Added, Rejection> {
+        let id = blk
+            .block_id()
+            .ok_or_else(|| reject(Step::HaveIt, BlockError::Malformed("no block id")))?;
+        if self.have_block(&id).map_err(|e| reject(Step::HaveIt, e))? {
+            return Err(reject(Step::HaveIt, BlockError::AlreadyExists { id }));
+        }
+        match self.top_hash() {
+            Some(tip) if blk.header.prev_id != tip => {
+                self.handle_alternative_block(blk, blob, txs, now, id)
+            }
+            _ => self.add_block(blk, blob, txs, now),
+        }
+    }
+
+    /// `build_alt_chain`: walk `prev` back through the stored alternative
+    /// blocks to the main chain.
+    ///
+    /// Returns the alternative blocks oldest first and the main-chain height
+    /// they attach to, or `None` when the walk ends at a block this node has
+    /// never seen.
+    fn alt_chain_to(&self, mut prev: Hash256) -> Result<Option<(Vec<AltLink>, u64)>, BlockError> {
+        let mut links: Vec<AltLink> = Vec::new();
+        loop {
+            if self.db.block_exists(&prev)? {
+                let split = self.db.get_block_height(&prev)?;
+                links.reverse();
+                return Ok(Some((links, split)));
+            }
+            let (data, blob) = match self.db.get_alt_block(&prev) {
+                Ok(found) => found,
+                Err(wow_storage::DbError::NotFound) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            // Heights fall strictly along the walk. A store where they do not
+            // is corrupt, and following it could loop.
+            if links.last().is_some_and(|l| data.height >= l.data.height) || data.height == 0 {
+                return Err(BlockError::Malformed(
+                    "the stored alternative blocks do not descend in height",
+                ));
+            }
+            let block = Block::from_blob(&blob)
+                .map_err(|_| BlockError::Malformed("a stored alternative block does not parse"))?;
+            let next = block.header.prev_id;
+            links.push(AltLink {
+                id: prev,
+                block,
+                blob,
+                data,
+            });
+            prev = next;
+        }
+    }
+
+    /// `handle_alternative_block` (`specs/06` §8).
+    ///
+    /// The checks follow the C++, including two places it is looser than the
+    /// main path: the timestamp is compared with the median only, with no
+    /// future-time limit, and the transactions and the coinbase amount are not
+    /// examined until the chain is switched to -- when every block goes through
+    /// [`Blockchain::add_block`] in full.
+    fn handle_alternative_block(
+        &mut self,
+        blk: &Block,
+        blob: &[u8],
+        txs: &[(Transaction, Vec<u8>)],
+        now: u64,
+        id: Hash256,
+    ) -> Result<Added, Rejection> {
+        let chain_height = self.height();
+        let Some((mut links, split)) = self
+            .alt_chain_to(blk.header.prev_id)
+            .map_err(|e| reject(Step::ParentIsTip, e))?
+        else {
+            return Err(reject(
+                Step::ParentIsTip,
+                BlockError::Orphan {
+                    prev: blk.header.prev_id,
+                },
+            ));
+        };
+        let height = split + links.len() as u64 + 1;
+
+        if !self
+            .checkpoints
+            .is_alternative_block_allowed(chain_height, height)
+        {
+            return Err(reject(
+                Step::Checkpoint,
+                BlockError::AltBelowCheckpoint { height },
+            ));
+        }
+
+        // 3. Hard fork, for the height the block would have.
+        let vote = blk.header.hard_fork_vote();
+        if !self.hardfork.check(height, blk.header.major_version, vote) {
+            return Err(reject(
+                Step::HardFork,
+                BlockError::WrongVersion {
+                    height,
+                    found: blk.header.major_version,
+                    required: self.hardfork.required_version(height),
+                    vote,
+                },
+            ));
+        }
+
+        // Both windows below are sized by the main chain's current version,
+        // as `get_current_hard_fork_version()` sizes them in the C++.
+        let version = self.tip_version();
+
+        // 4. Timestamp: at least the median of the alternative chain's own
+        // timestamps, topped up from the main chain below the split.
+        let mut stamps = self
+            .alt_timestamps(&links, split, version)
+            .map_err(|e| reject(Step::Timestamp, e))?;
+        let m = median(&mut stamps);
+        if blk.header.timestamp < m {
+            return Err(reject(
+                Step::Timestamp,
+                BlockError::Timestamp(TimestampError::BelowMedian { median: m }),
+            ));
+        }
+
+        // 5. Difficulty, over the alternative chain's window.
+        let difficulty = self
+            .alt_difficulty(&links, height, version)
+            .map_err(|e| reject(Step::Difficulty, e))?;
+
+        // 6. Proof of work, with the seed hash resolved along this chain
+        // (`specs/03` §3.3): an alternative block's seed height may land on a
+        // block the main chain does not have.
+        if !self.pow.may_skip(height) {
+            let hashing_blob = blk.hashing_blob().ok_or_else(|| {
+                reject(
+                    Step::ProofOfWork,
+                    BlockError::Pow(crate::pow::PowError::NoHashingBlob),
+                )
+            })?;
+            let seed_height = wow_randomwow::seed::rx_seedheight(height);
+            let seed = match seed_height.checked_sub(split + 1) {
+                Some(i) => links.get(i as usize).map(|l| l.id).ok_or_else(|| {
+                    reject(Step::ProofOfWork, BlockError::Malformed("seed height"))
+                })?,
+                None => self
+                    .db
+                    .get_block_hash(seed_height)
+                    .map_err(|e| reject(Step::ProofOfWork, e.into()))?,
+            };
+            let pow = self
+                .pow
+                .pow_hash(height, blk.header.major_version, &hashing_blob, &seed)
+                .map_err(|e| reject(Step::ProofOfWork, BlockError::Pow(e)))?;
+            if !check_hash(&pow, difficulty) {
+                return Err(reject(
+                    Step::ProofOfWork,
+                    BlockError::InsufficientPow { difficulty },
+                ));
+            }
+        }
+
+        // 8. Coinbase prevalidation.
+        let unlock = self
+            .coinbase_unlock_time(height, blk.header.major_version)
+            .map_err(|e| reject(Step::CoinbasePrevalidation, e))?;
+        tx_rules::check_coinbase(&blk.miner_tx, blk.header.major_version, height, unlock)
+            .map_err(|e| reject(Step::CoinbasePrevalidation, BlockError::Coinbase(e)))?;
+
+        if txs.len() != blk.tx_hashes.len() {
+            return Err(reject(
+                Step::Transactions,
+                BlockError::Malformed("transaction count does not match tx_hashes"),
+            ));
+        }
+
+        // Store it, with what `alt_block_data_t` records.
+        let (parent_difficulty, parent_coins) = match links.last() {
+            Some(l) => (l.data.cumulative_difficulty, l.data.already_generated_coins),
+            None => {
+                let info = self
+                    .db
+                    .get_block_info(split)
+                    .map_err(|e| reject(Step::Commit, e.into()))?;
+                (info.cumulative_difficulty, info.coins)
+            }
+        };
+        let reward = blk
+            .miner_tx
+            .prefix
+            .vout
+            .iter()
+            .fold(0u64, |a, o| a.saturating_add(o.amount));
+        let data = AltBlockData {
+            height,
+            cumulative_weight: self.cumulative_block_weight(blk, txs),
+            cumulative_difficulty: parent_difficulty + difficulty,
+            already_generated_coins: parent_coins.saturating_add(reward),
+        };
+        self.db
+            .add_alt_block(&id, &data, blob)
+            .map_err(|e| reject(Step::Commit, e.into()))?;
+        self.alt_txs.insert(id, txs.to_vec());
+
+        // `specs/06` §7 step 1: switch only on strictly more work.
+        if data.cumulative_difficulty <= self.state.cumulative_difficulty {
+            return Ok(Added::AltChain { height });
+        }
+        links.push(AltLink {
+            id,
+            block: blk.clone(),
+            blob: blob.to_vec(),
+            data,
+        });
+        self.switch_to_alternative(links, split, now)
+    }
+
+    /// The timestamps `check_block_timestamp` compares an alternative block
+    /// against: every block of its chain, newest first, then main-chain blocks
+    /// from the split point down until the window is full.
+    ///
+    /// `complete_timestamps_vector` stops *above* height zero, so the genesis
+    /// timestamp is never among them, and when the chain is shorter than the
+    /// window the median is taken over what there is.
+    fn alt_timestamps(
+        &self,
+        links: &[AltLink],
+        split: u64,
+        version: u8,
+    ) -> Result<Vec<u64>, BlockError> {
+        let window = timestamp_check_window(version);
+        let mut stamps: Vec<u64> = links
+            .iter()
+            .rev()
+            .map(|l| l.block.header.timestamp)
+            .collect();
+        if stamps.len() < window {
+            let need = (window - stamps.len()) as u64;
+            let stop = split.saturating_sub(need);
+            let mut h = split;
+            while h != stop {
+                stamps.push(self.db.get_block_timestamp(h)?);
+                h -= 1;
+            }
+        }
+        Ok(stamps)
+    }
+
+    /// `get_next_difficulty_for_alternative_chain`.
+    ///
+    /// The window is the alternative chain's own blocks, and main-chain blocks
+    /// below the split when it is shorter than the window -- with the same
+    /// skip of the genesis block the main path makes.
+    fn alt_difficulty(
+        &self,
+        links: &[AltLink],
+        height: u64,
+        version: u8,
+    ) -> Result<Difficulty, BlockError> {
+        // As in the C++, the fixed difficulty answers from the main chain's
+        // height here too.
+        if let Some(d) = self.fixed_difficulty {
+            return Ok(if self.height() > 0 { d } else { 1 });
+        }
+        let count = difficulty_blocks_count(version) as usize;
+        let mut timestamps = Vec::with_capacity(count);
+        let mut cumulative = Vec::with_capacity(count);
+
+        if links.len() < count {
+            let stop = links.first().map(|l| l.data.height).unwrap_or(height);
+            let from_main = ((count - links.len()) as u64).min(stop);
+            let start = (stop - from_main).max(1);
+            for h in start..stop {
+                let info = self.db.get_block_info(h)?;
+                timestamps.push(info.timestamp);
+                cumulative.push(info.cumulative_difficulty);
+            }
+            for l in links {
+                timestamps.push(l.block.header.timestamp);
+                cumulative.push(l.data.cumulative_difficulty);
+            }
+        } else {
+            for l in &links[links.len() - count..] {
+                timestamps.push(l.block.header.timestamp);
+                cumulative.push(l.data.cumulative_difficulty);
+            }
+        }
+        Ok(next_difficulty(
+            version,
+            timestamps,
+            cumulative,
+            height,
+            self.network,
+        ))
+    }
+
+    /// `switch_to_alternative_blockchain` (`specs/06` §7).
+    ///
+    /// `chain` is the alternative chain oldest first, ending with the block
+    /// that tipped the balance; `split` is the main-chain height it attaches
+    /// to.
+    fn switch_to_alternative(
+        &mut self,
+        chain: Vec<AltLink>,
+        split: u64,
+        now: u64,
+    ) -> Result<Added, Rejection> {
+        let storage = |e: BlockError| reject(Step::Commit, e);
+        let new_tip = split + chain.len() as u64;
+
+        // Every alternative block's transactions have to be at hand before
+        // the main chain is touched; finding one missing halfway would mean
+        // restoring the chain for a reason known up front.
+        let mut bodies = Vec::with_capacity(chain.len());
+        for link in &chain {
+            match self.alt_txs.get(&link.id) {
+                Some(t) => bodies.push(t.clone()),
+                None if link.block.tx_hashes.is_empty() => bodies.push(Vec::new()),
+                None => {
+                    return Err(reject(
+                        Step::Transactions,
+                        BlockError::MissingTx {
+                            hash: link.block.tx_hashes[0],
+                        },
+                    ))
+                }
+            }
+        }
+
+        // 2. Pop the main chain down to the split point.
+        let mut popped: Vec<Popped> = Vec::new();
+        while self.height() > split + 1 {
+            let h = self.height() - 1;
+            let info = self.db.get_block_info(h).map_err(|e| storage(e.into()))?;
+            let (block, txs) = self.db.pop_block().map_err(|e| storage(e.into()))?;
+            popped.push(Popped {
+                info,
+                block,
+                txs: txs.into_iter().map(with_blob).collect(),
+            });
+        }
+        popped.reverse();
+        self.reload_state().map_err(storage)?;
+
+        // 3. Apply the alternative chain through the full main-chain checks.
+        for (i, (link, txs)) in chain.iter().zip(&bodies).enumerate() {
+            let Err(rejected) = self.add_block(&link.block, &link.blob, txs, now) else {
+                continue;
+            };
+
+            // Put the original chain back.
+            for _ in 0..i {
+                self.db.pop_block().map_err(|e| storage(e.into()))?;
+            }
+            self.reload_state().map_err(storage)?;
+            for p in &popped {
+                self.add_block(&p.block, &p.block.to_blob(), &p.txs, now)
+                    .map_err(|r| {
+                        reject(
+                            Step::Commit,
+                            BlockError::Storage(format!(
+                                "a failed reorganisation could not restore block {}: {r}",
+                                p.info.height
+                            )),
+                        )
+                    })?;
+            }
+            // The failing block, and everything built on it, cannot be valid.
+            for bad in &chain[i..] {
+                self.db
+                    .remove_alt_block(&bad.id)
+                    .map_err(|e| storage(e.into()))?;
+                self.alt_txs.remove(&bad.id);
+            }
+            return Err(rejected);
+        }
+
+        // 5. What came off the main chain is an alternative chain now.
+        for p in &popped {
+            let data = AltBlockData {
+                height: p.info.height,
+                cumulative_weight: p.info.weight,
+                cumulative_difficulty: p.info.cumulative_difficulty,
+                already_generated_coins: p.info.coins,
+            };
+            self.db
+                .add_alt_block(&p.info.hash, &data, &p.block.to_blob())
+                .map_err(|e| storage(e.into()))?;
+            self.alt_txs.insert(p.info.hash, p.txs.clone());
+        }
+        for link in &chain {
+            self.db
+                .remove_alt_block(&link.id)
+                .map_err(|e| storage(e.into()))?;
+            self.alt_txs.remove(&link.id);
+        }
+
+        // 4. Transactions the new chain does not contain go back to the pool.
+        for p in popped.iter() {
+            for (tx, blob) in &p.txs {
+                let in_chain = wow_types::hashes::transaction_hash_from_blob(tx, blob)
+                    .map(|h| self.db.tx_exists(&h).unwrap_or(false))
+                    .unwrap_or(false);
+                if !in_chain {
+                    self.orphaned_txs.push((tx.clone(), blob.clone()));
+                }
+            }
+        }
+
+        Ok(Added::Reorg {
+            height: new_tip,
+            popped: popped.len() as u64,
+        })
     }
 
     pub fn db(&self) -> &Arc<D> {
@@ -215,6 +722,14 @@ impl<D: BlockchainDb> Blockchain<D> {
     /// The height below which transaction rules are not re-checked.
     pub fn trusted_below(&self) -> u64 {
         self.trusted_below
+    }
+
+    /// Fix the difficulty of every block after genesis, as `--fixed-difficulty`
+    /// does on regtest (`specs/07` §5). Keeping it off real networks is the
+    /// caller's job: a node doing this on mainnet accepts blocks nobody else
+    /// does.
+    pub fn set_fixed_difficulty(&mut self, difficulty: Option<Difficulty>) {
+        self.fixed_difficulty = difficulty;
     }
 
     pub fn state(&self) -> &ChainState {
@@ -302,6 +817,9 @@ impl<D: BlockchainDb> Blockchain<D> {
         let height = self.height();
         if height == 0 {
             return Ok(1);
+        }
+        if let Some(d) = self.fixed_difficulty {
+            return Ok(d);
         }
         let version = self.tip_version();
         let count = difficulty_blocks_count(version) as u64;
@@ -698,6 +1216,21 @@ impl<D: BlockchainDb> Blockchain<D> {
             // which is what the C++ uses too.
             Ok([0u8; 32])
         }
+    }
+}
+
+/// A transaction the store handed back, with its blob.
+///
+/// Re-parsed from its own serialisation, so the region offsets the store and
+/// the hashes read describe this blob rather than whichever one it was first
+/// parsed from.
+fn with_blob(tx: Transaction) -> (Transaction, Vec<u8>) {
+    let mut w = wow_serialize::binary::Writer::with_capacity(2048);
+    tx.write(&mut w);
+    let blob = w.into_vec();
+    match Transaction::from_blob(&blob) {
+        Ok(parsed) => (parsed, blob),
+        Err(_) => (tx, blob),
     }
 }
 

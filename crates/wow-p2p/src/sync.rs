@@ -5,12 +5,9 @@
 //!
 //! # One peer at a time
 //!
-//! `specs/08` §5.6 describes a span queue: several peers each assigned a height
-//! range, completed spans reordered for in-order application. This is the
-//! simple form the same section calls acceptable — "a simple one-peer-at-a-time
-//! sync is acceptable for M2 but will be slow" — and slow it is. A span queue
-//! is a throughput change, not a correctness one, and it can be added without
-//! moving anything below.
+//! This is the single-connection client behind `wownerod --sync-from`: the
+//! simple form `specs/08` §5.6 calls acceptable. A running node spreads its
+//! sync across peers with the span queue in [`crate::queue`] instead.
 //!
 //! # Batches are aligned to the seed epoch
 //!

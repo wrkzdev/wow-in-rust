@@ -416,12 +416,11 @@ fn f8(s: &mut State, block: &[u8; 64]) {
 pub fn jh256(input: &[u8]) -> [u8; 32] {
     let mut s = state_from_bytes(&H0);
 
-    let mut chunks = input.chunks_exact(64);
-    for c in chunks.by_ref() {
-        f8(&mut s, c.try_into().expect("chunks_exact(64)"));
+    let (chunks, rest) = input.as_chunks::<64>();
+    for c in chunks {
+        f8(&mut s, c);
     }
 
-    let rest = chunks.remainder();
     let bitlen = (input.len() as u64) * 8;
 
     // JH's padding is **not** the usual "append the length if it still fits".

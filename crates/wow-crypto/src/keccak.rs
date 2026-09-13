@@ -97,8 +97,8 @@ pub fn keccakf(st: &mut [u64; 25]) {
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
     let st = sponge(data);
     let mut out = [0u8; 32];
-    for (i, chunk) in out.chunks_exact_mut(8).enumerate() {
-        chunk.copy_from_slice(&st[i].to_le_bytes());
+    for (i, chunk) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        *chunk = st[i].to_le_bytes();
     }
     out
 }
@@ -112,8 +112,8 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
 pub fn keccak1600(data: &[u8]) -> [u8; HASH_STATE_BYTES] {
     let st = sponge(data);
     let mut out = [0u8; HASH_STATE_BYTES];
-    for (i, chunk) in out.chunks_exact_mut(8).enumerate() {
-        chunk.copy_from_slice(&st[i].to_le_bytes());
+    for (i, chunk) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        *chunk = st[i].to_le_bytes();
     }
     out
 }
@@ -124,14 +124,13 @@ pub fn keccak1600(data: &[u8]) -> [u8; HASH_STATE_BYTES] {
 /// the lengths used above.
 fn sponge(data: &[u8]) -> [u64; 25] {
     let mut st = [0u64; 25];
-    let mut chunks = data.chunks_exact(HASH_DATA_AREA);
-    for block in &mut chunks {
+    let (blocks, rem) = data.as_chunks::<HASH_DATA_AREA>();
+    for block in blocks {
         absorb(&mut st, block);
         keccakf(&mut st);
     }
 
     // Final, padded block. `0x01` domain byte, `0x80` at the end of the rate.
-    let rem = chunks.remainder();
     let mut last = [0u8; HASH_DATA_AREA];
     last[..rem.len()].copy_from_slice(rem);
     last[rem.len()] = 0x01;
@@ -144,8 +143,8 @@ fn sponge(data: &[u8]) -> [u64; 25] {
 #[inline]
 fn absorb(st: &mut [u64; 25], block: &[u8]) {
     debug_assert_eq!(block.len(), HASH_DATA_AREA);
-    for (i, word) in block.chunks_exact(8).enumerate() {
-        st[i] ^= u64::from_le_bytes(word.try_into().unwrap());
+    for (i, word) in block.as_chunks::<8>().0.iter().enumerate() {
+        st[i] ^= u64::from_le_bytes(*word);
     }
 }
 

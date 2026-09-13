@@ -104,8 +104,8 @@ pub fn checksum_index(words: &[&str], lang: &'static WordList) -> Result<usize, 
 pub fn key_to_words(key: &SecretKey, lang: &'static WordList) -> String {
     let n = WORDLIST_LEN;
     let mut out: Vec<&str> = Vec::with_capacity(SEED_WORDS);
-    for chunk in key.0.chunks_exact(4) {
-        let x = u32::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in key.0.as_chunks::<4>().0 {
+        let x = u32::from_le_bytes(*chunk);
         let w1 = x % n;
         let w2 = (x / n + w1) % n;
         let w3 = (x / n / n + w2) % n;
@@ -142,7 +142,7 @@ pub fn words_to_key(phrase: &str) -> Result<(SecretKey, &'static WordList), Mnem
 
     let n = WORDLIST_LEN;
     let mut key = [0u8; 32];
-    for (g, group) in seed.chunks_exact(3).enumerate() {
+    for (g, group) in seed.as_chunks::<3>().0.iter().enumerate() {
         let w1 = lang
             .index_of(group[0], has_checksum)
             .ok_or_else(|| MnemonicError::UnknownWord(group[0].to_string()))?

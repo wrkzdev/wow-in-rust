@@ -3,8 +3,8 @@
 //! `specs/10-storage-lmdb.md` §7 lists four requirements for taking over a
 //! database the C++ node wrote, and all four are here:
 //!
-//! * refuse read-write when `lock.mdb` shows a live writer, "as a clear error
-//!   rather than blocking";
+//! * refuse a second writer "as a clear error rather than blocking" -- see
+//!   [`claim_writer`], and what it does *not* detect;
 //! * check `properties["version"] == 5`;
 //! * verify the tip agrees across `blocks` / `block_info` / `block_heights`;
 //! * **infer the network from the genesis hash and refuse a mismatch** — the
@@ -21,6 +21,76 @@ use wow_storage::lmdb::LmdbDb;
 use wow_types::Network;
 
 use crate::cli::Config;
+
+/// The file a read-write `wownerod` holds an exclusive lock on, beside
+/// `data.mdb`.
+///
+/// Not `lock.mdb`: that is LMDB's own, and its writer mutex cannot be probed
+/// without blocking on it.
+pub const WRITER_LOCK_FILENAME: &str = "wownerod-rs.lock";
+
+/// Proof that this process is the database's only writer, held until drop.
+pub struct WriterLock {
+    _file: std::fs::File,
+}
+
+/// Claim the right to write to the database, or say who has it.
+///
+/// `specs/10` §7 asks for a second writer to be "a clear error rather than
+/// blocking". LMDB's own answer is to block: a read-write open starts a write
+/// transaction, which waits on the writer mutex for as long as another process
+/// holds it -- during a sync, most of the time.
+///
+/// The lock is an OS advisory lock on [`WRITER_LOCK_FILENAME`], released by the
+/// kernel if the holder dies, so a crash never leaves a stale lock behind. It
+/// is this implementation's own: **a running C++ node does not take it.** Next
+/// to one, open with `--db-readonly`, which LMDB supports alongside a writer.
+///
+/// With `create`, a missing database directory is made first -- only the
+/// syncing path passes it, for the same reason [`bootstrap`] is only called
+/// there.
+pub fn claim_writer(cfg: &Config, create: bool) -> Result<WriterLock, String> {
+    let dir = db_dir(&cfg.data_dir, cfg.network, cfg.regtest);
+    if !dir.exists() {
+        if !create {
+            return Err(no_database(&dir));
+        }
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+
+    let path = dir.join(WRITER_LOCK_FILENAME);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+
+    match file.try_lock() {
+        Ok(()) => Ok(WriterLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "{} is already open for writing by another wownerod\n\
+             Only one process may write to a database. Stop the other one, or \
+             pass --db-readonly to inspect or serve it alongside.",
+            dir.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("cannot lock {}: {e}", path.display())),
+    }
+}
+
+fn no_database(dir: &std::path::Path) -> String {
+    format!(
+        "no database at {}\n\
+         Point --data-dir at a directory holding `{}/data.mdb`. \
+         `--serve` and `--sync-from` create one there; the inspection \
+         commands do not, so a mistyped path is an error and not an \
+         empty chain.",
+        dir.display(),
+        wow_storage::env::DB_DIR
+    )
+}
 
 /// Create the database and write the genesis block into it.
 ///
@@ -70,15 +140,7 @@ pub fn bootstrap(cfg: &Config) -> Result<(), String> {
 pub fn open(cfg: &Config) -> Result<LmdbDb, String> {
     let dir = db_dir(&cfg.data_dir, cfg.network, cfg.regtest);
     if !dir.exists() {
-        return Err(format!(
-            "no database at {}\n\
-             Point --data-dir at a directory holding `{}/data.mdb`. \
-             `--sync-from` will create one there; the inspection commands \
-             will not, so a mistyped path is an error and not an empty \
-             chain.",
-            dir.display(),
-            wow_storage::env::DB_DIR
-        ));
+        return Err(no_database(&dir));
     }
 
     let mode = OpenMode {
@@ -376,7 +438,7 @@ pub fn verify_difficulty(
         }
         checked += 1;
 
-        if checked % 50_000 == 0 {
+        if checked.is_multiple_of(50_000) {
             println!("  ... {checked} heights, at {h}");
         }
     }

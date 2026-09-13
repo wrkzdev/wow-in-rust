@@ -141,7 +141,7 @@ impl State {
 
         if datalen > 0 {
             let left = self.buflen >> 3;
-            let n = (datalen >> 3) + usize::from(datalen % 8 != 0);
+            let n = (datalen >> 3) + usize::from(!datalen.is_multiple_of(8));
             self.buf[left..left + n].copy_from_slice(&data[offset..offset + n]);
             self.buflen += datalen;
         } else {

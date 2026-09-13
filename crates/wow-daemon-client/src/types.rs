@@ -325,13 +325,10 @@ impl DaemonClient {
             .get("tx_hashes")
             .and_then(Value::as_bytes)
             .unwrap_or(&[]);
-        if blob.len() % 32 != 0 {
+        if !blob.len().is_multiple_of(32) {
             return Err(DaemonError::BadField("tx_hashes"));
         }
-        Ok(blob
-            .chunks_exact(32)
-            .map(|c| c.try_into().expect("32 bytes"))
-            .collect())
+        Ok(blob.as_chunks::<32>().0.to_vec())
     }
 
     /// A `POST` that returns the raw body regardless of the `status` field.
@@ -445,8 +442,10 @@ fn u64_list(v: Option<&Value>) -> Vec<u64> {
     match v {
         Some(Value::Array(a)) => a.items.iter().filter_map(Value::as_u64).collect(),
         Some(Value::String(b)) => b
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect(),
         _ => Vec::new(),
     }

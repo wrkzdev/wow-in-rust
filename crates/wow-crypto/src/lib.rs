@@ -56,6 +56,7 @@ pub mod hash;
 pub mod hex;
 pub mod keccak;
 pub mod keys;
+pub mod md5;
 pub mod mnemonic;
 pub mod ops;
 pub mod random;

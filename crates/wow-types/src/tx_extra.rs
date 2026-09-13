@@ -214,8 +214,10 @@ pub fn parse_tx_extra(extra: &[u8]) -> ParsedExtra {
                 };
                 i += count * 32;
                 let keys = body
-                    .chunks_exact(32)
-                    .map(|c| PublicKey(c.try_into().unwrap()))
+                    .as_chunks::<32>()
+                    .0
+                    .iter()
+                    .map(|c| PublicKey(*c))
                     .collect();
                 out.fields.push(TxExtraField::AdditionalPubkeys(keys));
             }
@@ -277,7 +279,7 @@ fn write_field(out: &mut Vec<u8>, f: &TxExtraField) {
     match f {
         TxExtraField::Padding { len } => {
             // `len` counts the tag byte.
-            out.extend(std::iter::repeat(0u8).take(len.saturating_sub(1)));
+            out.extend(std::iter::repeat_n(0u8, len.saturating_sub(1)));
         }
         TxExtraField::Pubkey(k) => out.extend_from_slice(&k.0),
         TxExtraField::Nonce(n) => {
@@ -391,11 +393,11 @@ mod tests {
     #[test]
     fn nonce_length_is_capped() {
         let mut extra = vec![tag::NONCE, 0xff, 0x01]; // varint 255
-        extra.extend(std::iter::repeat(0u8).take(255));
+        extra.extend(std::iter::repeat_n(0u8, 255));
         assert_eq!(parse_tx_extra(&extra).error, None);
 
         let mut extra = vec![tag::NONCE, 0x80, 0x02]; // varint 256
-        extra.extend(std::iter::repeat(0u8).take(256));
+        extra.extend(std::iter::repeat_n(0u8, 256));
         assert_eq!(
             parse_tx_extra(&extra).error,
             Some(TxExtraError::NonceTooLong)

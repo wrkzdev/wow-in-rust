@@ -108,6 +108,7 @@ fn start(tag: &str, extra: usize) -> Daemon {
             scratch.0.to_str().unwrap(),
             "--db-readonly",
             "--serve",
+            "--no-zmq",
             "--rpc-bind-port",
             &port.to_string(),
         ])
@@ -180,6 +181,17 @@ fn post(port: u16, path: &str, body: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("bad JSON: {e}\n{body}"))
 }
 
+/// One raw HTTP exchange, returning the whole response text.
+fn raw(port: u16, request: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(request.as_bytes()).unwrap();
+    s.flush().unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out
+}
+
 fn rpc(port: u16, method: &str, params: &str) -> Value {
     let body = format!(r#"{{"jsonrpc":"2.0","id":"0","method":"{method}","params":{params}}}"#);
     post(port, "/json_rpc", &body)
@@ -201,6 +213,40 @@ fn get_height_reports_the_tip() {
     assert_eq!(v["untrusted"], true);
     assert_eq!(v["credits"], 0);
     assert_eq!(v["top_hash"], "");
+}
+
+/// A request carrying `Origin` came from a web page, and is refused: the
+/// text/plain POST a page can send without a CORS preflight would otherwise
+/// reach the handler. No response carries a wildcard CORS header either.
+#[test]
+fn browser_requests_are_refused_and_no_cors_header_is_sent() {
+    let d = start("origin", 1);
+    let body = "{}";
+
+    let from_a_page = raw(
+        d.port,
+        &format!(
+            "POST /get_height HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.com\r\n\
+             Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(from_a_page.starts_with("HTTP/1.1 403"), "{from_a_page}");
+    assert!(!from_a_page.contains("\"height\""), "{from_a_page}");
+
+    let from_a_client = raw(
+        d.port,
+        &format!(
+            "POST /get_height HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(from_a_client.starts_with("HTTP/1.1 200"), "{from_a_client}");
+    assert!(
+        !from_a_client.contains("Access-Control-Allow-Origin"),
+        "{from_a_client}"
+    );
 }
 
 /// The C++ serves both spellings, and so must this.

@@ -200,7 +200,7 @@ pub fn required_fee(
             get_dynamic_base_fee(base_reward, ctx.median(), ctx.version)
         };
         let mut kb = tx_weight / 1024;
-        if tx_weight % 1024 != 0 {
+        if !tx_weight.is_multiple_of(1024) {
             kb += 1;
         }
         (kb.saturating_mul(fee_per_kb), fee_per_kb)

@@ -86,12 +86,14 @@ fn version_and_help_work_without_a_database() {
     let text = stdout(&h);
     assert!(text.contains("--check-difficulty-checkpoints"));
     assert!(text.contains("--db-readonly"));
-    // The help says plainly what is missing, so nobody expects a mining node
-    // or an unattended one.
+    // The help says plainly what is built and what is missing, so nobody
+    // expects background mining or i2p/Tor from it.
     assert!(text.contains("NOT YET IMPLEMENTED"));
     assert!(text.contains("--sync-from"));
+    assert!(text.contains("--start-mining") && text.contains("--spendkey"));
+    assert!(text.contains("--rpc-ssl") && text.contains("--zmq-pub"));
     assert!(
-        text.contains("Mining"),
+        text.contains("background mining") && text.contains("i2p/Tor"),
         "the help must still name what is not built"
     );
 }
@@ -268,9 +270,9 @@ fn the_checkpoint_check_says_when_there_are_none() {
 #[test]
 fn unimplemented_options_are_refused_by_the_binary() {
     for (opt, expect) in [
-        ("--p2p-bind-port", "peer-to-peer"),
-        ("--seed-node", "peer-to-peer"),
-        ("--start-mining", "miner"),
+        ("--limit-rate", "rate limiting"),
+        ("--proxy", "proxy"),
+        ("--bg-mining-enable", "background mining"),
     ] {
         let o = wownerod(&[opt]);
         assert!(!o.status.success(), "{opt} should fail");
@@ -278,6 +280,50 @@ fn unimplemented_options_are_refused_by_the_binary() {
         assert!(e.contains(expect), "{opt}: {e}");
         assert!(e.contains("not implemented"), "{opt}: {e}");
     }
+}
+
+/// A second read-write process is refused with a reason, not left waiting on
+/// LMDB's writer mutex -- and `--db-readonly` still works beside the writer.
+#[test]
+fn a_second_writer_is_refused() {
+    let s = Scratch::new("secondwriter");
+    seed_genesis(s.data_dir(), Network::Mainnet);
+
+    // Stand in for a running `wownerod` by holding its lock from here.
+    let lock_path =
+        wow_storage::env::db_dir(s.data_dir(), Network::Mainnet, false).join("wownerod-rs.lock");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open the lock file");
+    held.try_lock().expect("take the lock");
+
+    let data_dir = s.data_dir().to_str().unwrap();
+    let o = wownerod(&["--data-dir", data_dir, "--status"]);
+    assert!(!o.status.success(), "a second writer must not start");
+    let e = stderr(&o);
+    assert!(e.contains("already open for writing"), "{e}");
+    assert!(e.contains("--db-readonly"), "it should say what to do: {e}");
+
+    let o = wownerod(&["--data-dir", data_dir, "--db-readonly", "--status"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+
+    // Released, the same command works.
+    drop(held);
+    let o = wownerod(&["--data-dir", data_dir, "--status"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+}
+
+/// Two commands on one command line are refused rather than the last one
+/// silently winning.
+#[test]
+fn two_commands_are_refused_by_the_binary() {
+    let o = wownerod(&["--serve", "--sync-from", "127.0.0.1:1"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("separate commands"), "{}", stderr(&o));
 }
 
 /// The mutually exclusive network flags are enforced at the binary too.

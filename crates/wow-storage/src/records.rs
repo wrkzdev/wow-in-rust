@@ -378,11 +378,13 @@ impl OutTx {
 /// An empty vector is stored as a zero-length value, which is a legitimate
 /// record rather than a missing one.
 pub fn decode_tx_outputs(s: &[u8]) -> Result<Vec<u64>, RecordError> {
-    if s.len() % 8 != 0 {
+    if !s.len().is_multiple_of(8) {
         return Err(RecordError::RaggedOutputIndices { found: s.len() });
     }
-    Ok(s.chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8)")))
+    Ok(s.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect())
 }
 

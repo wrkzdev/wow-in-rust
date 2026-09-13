@@ -34,9 +34,9 @@ The normative specification is vendored in [`specs/`](specs/). Start with
 |---|---|---|
 | **M1** | Wire parity: crypto primitives, serialization, block/tx types, hashes, RandomWOW | **complete; gate met** |
 | **M2** | Verifying sync on mainnet (PoW, difficulty, LMDB store) | **syncs from live C++ peers**; CryptoNight v2/v4 missing |
-| **M3** | Serving node (daemon RPC, mempool) | **built**; reorg, propagation and inbound P2P to go |
+| **M3** | Serving node (daemon RPC, mempool, P2P) | **built**: inbound and outbound P2P, sync from several peers at once, IPv6, Dandelion++ relay, reorgs, admin RPC and login, RPC over TLS; exercised between local daemons, not yet as a long-running node on mainnet |
 | **M4** | Wallet (CLI + RPC) | **built and working against public nodes**; sending untested for want of funds |
-| M5 | Mining and the long tail | not started |
+| M5 | Mining and the long tail | **mining built** (templates, the HF 18 signing miner, `generateblocks`), exercised on regtest only; of the long tail, only the ZMQ RPC and publisher are built |
 
 ### Verified against the live network
 
@@ -64,10 +64,19 @@ WOW_LIVE_NODE=node2.monerodevs.org:34568   cargo test -p wow-daemon-client --tes
 **Not verified, and it needs coins:** signing and confirming a real payment,
 sweep, and watching a receive land. Everything up to the signature is checked.
 
-**Not built:** mining, inbound P2P connections, block propagation, reorg
-handling, transaction proofs, key-image import/export, multiple accounts. The
-daemon's `--help` names what is missing rather than accepting options it cannot
-honour.
+**Built, but only exercised between local daemons:** `wownerod --serve` as a
+long-running node — inbound peers, syncing from several peers at once, IPv6,
+Dandelion++ relay, fluffy blocks, reorgs, the admin and mining RPC, HTTP Digest
+login, RPC over TLS, the ZMQ RPC and publisher — and the miner, on regtest.
+None of it has yet run for long against live C++ peers.
+
+**Not built:** in the wallets, transaction proofs, key-image import/export and
+multiple accounts; in the daemon, proxies and i2p/Tor, rate limits, pruning,
+bootstrap daemons, background mining, extra messages in mined blocks, and ZMQ
+over `ipc://` or with CURVE/PLAIN security. The daemon's `--help` names what is
+missing rather than accepting options it cannot honour.
+[`docs/daemon-review.md`](docs/daemon-review.md) tracks the daemon review item
+by item, with the known gaps in what is built.
 
 ### What M1 has
 
@@ -196,8 +205,10 @@ crates/
   wow-randomwow/     RandomWOW FFI                                    [M1/M2]
   wow-consensus/     emission, weights, fees, difficulty, hard forks
   wow-storage/       BlockchainDb + LMDB, byte-compatible data.mdb
-  wow-core/          Blockchain, TxPool, miner                        [M2/M3]
-  wow-p2p/           levin, peerlist, sync, Dandelion++               [M2]
+  wow-core/          Blockchain: validation, alternative chains, reorgs
+  wow-p2p/           levin, peer lists, multi-peer sync, the node, Dandelion++
+  wow-zmq/           ZMTP 3.1 without libzmq: REP/PUB servers, REQ/SUB clients
+  wow-log/           C++-style log levels and categories, file rotation
   wow-rpc-types/     shared RPC request/response types                [M3]
   wow-rpc-server/    daemon HTTP server                               [M3]
   wow-wallet/        wallet core                                      [M4]

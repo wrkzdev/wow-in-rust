@@ -15,6 +15,7 @@ use wow_core::chain::{Blockchain, Step};
 use wow_core::error::BlockError;
 use wow_core::pow::{PowError, PowVerifier, RandomWowOnly, TrustingVerifier};
 use wow_crypto::types::Hash256;
+use wow_storage::db::BlockchainDb;
 use wow_storage::env::OpenMode;
 use wow_storage::lmdb::LmdbDb;
 use wow_types::{Block, Network};
@@ -668,6 +669,205 @@ fn the_trusted_boundary_is_observable() {
     let mut c = chain(&s);
     c.trust_below(838_801);
     assert_eq!(c.trusted_below(), 838_801);
+}
+
+// ---------------------------------------------------------------------------
+// alternative chains and reorganisation (specs/06 §7, §8)
+// ---------------------------------------------------------------------------
+
+/// A main chain of `n` blocks, through `handle_block`, returning their ids.
+fn build_main(
+    c: &mut Blockchain<LmdbDb>,
+    blocks: &[(u64, Hash256, Vec<u8>)],
+    n: usize,
+    now: u64,
+) -> Vec<Hash256> {
+    let mut ids = Vec::new();
+    let mut prev = [0u8; 32];
+    for i in 0..n {
+        let blk = rehome(&blocks[i % blocks.len()].2, i as u64, prev);
+        let added = c
+            .handle_block(&blk, &blob_of(&blk), &[], now)
+            .unwrap_or_else(|e| panic!("block {i}: {e}"));
+        assert_eq!(added, wow_core::Added::MainChain { height: i as u64 });
+        prev = blk.block_id().unwrap();
+        ids.push(prev);
+    }
+    ids
+}
+
+/// A block competing for `height` on top of `prev`: the fixture block that
+/// would sit there, with a different nonce so its id differs.
+fn rival(blocks: &[(u64, Hash256, Vec<u8>)], height: u64, prev: Hash256) -> Block {
+    let mut blk = rehome(&blocks[height as usize % blocks.len()].2, height, prev);
+    blk.header.nonce = blk.header.nonce.wrapping_add(0x5151);
+    Block::from_blob(&blob_of(&blk)).unwrap()
+}
+
+/// A block off the tip is stored as an alternative, not refused -- and an
+/// alternative with **equal** work does not take over: `specs/06` §7 switches
+/// only on strictly more.
+#[test]
+fn a_block_off_the_tip_is_kept_as_an_alternative() {
+    let s = Scratch::new("altkeep");
+    let mut c = chain(&s);
+    let blocks = fixture_blocks();
+    let now = now_after(&blocks);
+    let ids = build_main(&mut c, &blocks, 3, now);
+
+    let alt = rival(&blocks, 2, ids[1]);
+    let added = c.handle_block(&alt, &blob_of(&alt), &[], now).expect("alt");
+    assert_eq!(added, wow_core::Added::AltChain { height: 2 });
+
+    assert_eq!(c.height(), 3, "the main chain did not move");
+    assert_eq!(c.top_hash(), Some(ids[2]));
+    assert_eq!(c.db().get_alt_block_count().unwrap(), 1);
+    assert!(c.have_block(&alt.block_id().unwrap()).unwrap());
+
+    // Announced again, it is known.
+    let again = c.handle_block(&alt, &blob_of(&alt), &[], now).unwrap_err();
+    assert!(matches!(again.error, BlockError::AlreadyExists { .. }));
+}
+
+/// **The reorganisation.** An alternative chain with more cumulative
+/// difficulty replaces the main chain from the split point, and the replaced
+/// block becomes the alternative.
+#[test]
+fn a_heavier_alternative_chain_takes_over() {
+    let s = Scratch::new("reorg");
+    let blocks = fixture_blocks();
+    let now = now_after(&blocks);
+
+    let (tip, displaced, state) = {
+        let mut c = chain(&s);
+        let ids = build_main(&mut c, &blocks, 3, now);
+
+        let a2 = rival(&blocks, 2, ids[1]);
+        assert_eq!(
+            c.handle_block(&a2, &blob_of(&a2), &[], now).unwrap(),
+            wow_core::Added::AltChain { height: 2 }
+        );
+        let a3 = rival(&blocks, 3, a2.block_id().unwrap());
+        let added = c.handle_block(&a3, &blob_of(&a3), &[], now).expect("reorg");
+        assert_eq!(
+            added,
+            wow_core::Added::Reorg {
+                height: 3,
+                popped: 1
+            }
+        );
+
+        assert_eq!(c.height(), 4);
+        assert_eq!(c.top_hash(), a3.block_id());
+        assert_eq!(c.db().get_block_hash(2).unwrap(), a2.block_id().unwrap());
+        assert_eq!(c.state().cumulative_difficulty, 4);
+
+        // The block that was displaced is kept as the alternative now, and the
+        // blocks that joined the main chain are no longer alternatives.
+        assert!(!c.db().block_exists(&ids[2]).unwrap());
+        assert!(c.have_block(&ids[2]).unwrap());
+        assert_eq!(c.db().get_alt_block_count().unwrap(), 1);
+
+        (
+            c.top_hash(),
+            ids[2],
+            (
+                c.state().cumulative_difficulty,
+                c.state().difficulty_window.clone(),
+                c.state().already_generated_coins,
+            ),
+        )
+    };
+
+    // The cached state after a switch matches one rebuilt from the store.
+    let c = chain(&s);
+    assert_eq!(c.top_hash(), tip);
+    assert!(c.have_block(&displaced).unwrap());
+    assert_eq!(c.state().cumulative_difficulty, state.0);
+    assert_eq!(c.state().difficulty_window, state.1);
+    assert_eq!(c.state().already_generated_coins, state.2);
+}
+
+/// A block whose parent this node has never seen is an orphan: not stored,
+/// and reported as such so the caller asks for the chain instead of blaming
+/// the peer.
+#[test]
+fn a_block_with_an_unknown_parent_is_an_orphan() {
+    let s = Scratch::new("orphan");
+    let mut c = chain(&s);
+    let blocks = fixture_blocks();
+    let now = now_after(&blocks);
+    build_main(&mut c, &blocks, 2, now);
+
+    let orphan = rival(&blocks, 2, [0x42u8; 32]);
+    let e = c
+        .handle_block(&orphan, &blob_of(&orphan), &[], now)
+        .unwrap_err();
+    assert_eq!(e.step, Step::ParentIsTip);
+    assert_eq!(e.error, BlockError::Orphan { prev: [0x42u8; 32] });
+    assert_eq!(c.db().get_alt_block_count().unwrap(), 0);
+}
+
+/// If a block of the heavier chain fails the full checks during the switch,
+/// the original main chain is put back and the failing block forgotten.
+#[test]
+fn a_failed_reorganisation_restores_the_main_chain() {
+    let s = Scratch::new("reorgfail");
+    let mut c = chain(&s);
+    let blocks = fixture_blocks();
+    let now = now_after(&blocks);
+    let ids = build_main(&mut c, &blocks, 3, now);
+    let before = c.state().cumulative_difficulty;
+
+    let a2 = rival(&blocks, 2, ids[1]);
+    c.handle_block(&a2, &blob_of(&a2), &[], now).unwrap();
+
+    // Overpays its coinbase. The alternative path does not check the amount
+    // -- the C++ does not either -- so it is stored and triggers the switch,
+    // and the full check during the switch is what refuses it.
+    let mut a3 = rival(&blocks, 3, a2.block_id().unwrap());
+    for o in a3.miner_tx.prefix.vout.iter_mut() {
+        o.amount = u64::MAX / 4;
+    }
+    let a3 = Block::from_blob(&blob_of(&a3)).unwrap();
+    let e = c.handle_block(&a3, &blob_of(&a3), &[], now).unwrap_err();
+    assert_eq!(e.step, Step::CoinbaseAmount, "{e}");
+
+    assert_eq!(c.height(), 3);
+    assert_eq!(c.top_hash(), Some(ids[2]), "the original chain is back");
+    assert_eq!(c.state().cumulative_difficulty, before);
+    assert!(
+        !c.have_block(&a3.block_id().unwrap()).unwrap(),
+        "the failing block is forgotten"
+    );
+    assert!(
+        c.have_block(&a2.block_id().unwrap()).unwrap(),
+        "its valid parent stays an alternative"
+    );
+}
+
+/// `pop_blocks` takes blocks off the tip and never the genesis block.
+#[test]
+fn pop_blocks_rewinds_but_keeps_genesis() {
+    let s = Scratch::new("pop");
+    let mut c = chain(&s);
+    let blocks = fixture_blocks();
+    let now = now_after(&blocks);
+    let ids = build_main(&mut c, &blocks, 4, now);
+
+    assert_eq!(c.pop_blocks(2).unwrap(), 2);
+    assert_eq!(c.height(), 2);
+    assert_eq!(c.top_hash(), Some(ids[1]));
+    assert_eq!(c.state().cumulative_difficulty, 2);
+    assert!(c.take_orphaned_txs().is_empty(), "coinbase-only blocks");
+
+    assert_eq!(c.pop_blocks(100).unwrap(), 1, "stops above genesis");
+    assert_eq!(c.height(), 1);
+
+    // The popped blocks can be applied again.
+    let blk = rehome(&blocks[1].2, 1, ids[0]);
+    c.handle_block(&blk, &blob_of(&blk), &[], now).unwrap();
+    assert_eq!(c.height(), 2);
 }
 
 /// The cached difficulty window and a freshly rebuilt one must agree.

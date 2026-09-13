@@ -85,10 +85,15 @@ fn mul(a: &[u8; aes::BLOCK], b: &[u8; aes::BLOCK]) -> [u8; aes::BLOCK] {
 /// one — there is no carry between the halves.
 #[inline]
 fn sum_half_blocks(a: &mut [u8; aes::BLOCK], b: &[u8; aes::BLOCK]) {
-    for (ha, hb) in a.chunks_exact_mut(8).zip(b.chunks_exact(8)) {
-        let x = u64::from_le_bytes(ha.try_into().expect("8 bytes"));
-        let y = u64::from_le_bytes(hb.try_into().expect("8 bytes"));
-        ha.copy_from_slice(&x.wrapping_add(y).to_le_bytes());
+    for (ha, hb) in a
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip(b.as_chunks::<8>().0)
+    {
+        let x = u64::from_le_bytes(*ha);
+        let y = u64::from_le_bytes(*hb);
+        *ha = x.wrapping_add(y).to_le_bytes();
     }
 }
 
@@ -248,12 +253,12 @@ pub fn hash(input: &[u8], variant: Variant) -> Result<[u8; 32], CnError> {
 
     // One more permutation, then the selected final hash over all 200 bytes.
     let mut words = [0u64; 25];
-    for (w, chunk) in words.iter_mut().zip(state.chunks_exact(8)) {
-        *w = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+    for (w, chunk) in words.iter_mut().zip(state.as_chunks::<8>().0) {
+        *w = u64::from_le_bytes(*chunk);
     }
     keccak::keccakf(&mut words);
-    for (w, chunk) in words.iter().zip(state.chunks_exact_mut(8)) {
-        chunk.copy_from_slice(&w.to_le_bytes());
+    for (w, chunk) in words.iter().zip(state.as_chunks_mut::<8>().0.iter_mut()) {
+        *chunk = w.to_le_bytes();
     }
 
     Ok(match state[0] & 3 {

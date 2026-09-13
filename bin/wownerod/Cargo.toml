@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json.workspace = true
+wow-log.workspace = true
 wow-consensus.workspace = true
 wow-core.workspace = true
 wow-crypto.workspace = true
@@ -18,9 +19,18 @@ wow-storage.workspace = true
 wow-serialize.workspace = true
 wow-types.workspace = true
 wow-p2p.workspace = true
+wow-zmq.workspace = true
 wow-randomwow.workspace = true
 wow-wallet.workspace = true
 curve25519-dalek.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+time.workspace = true
+
+# `src/signal.rs`: the SIGINT/SIGTERM handler.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 wow-daemon-client.workspace = true
