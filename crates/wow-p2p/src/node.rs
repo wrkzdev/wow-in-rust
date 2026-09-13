@@ -209,6 +209,13 @@ pub trait Core: Send + Sync {
     fn pool_hashes(&self) -> Vec<Hash256>;
     /// These transactions have gone out to at least one peer.
     fn tx_relayed(&self, ids: &[Hash256]);
+    /// Pool transactions due to go out again: never sent, or sent long enough
+    /// ago (`tx_memory_pool::get_relayable_transactions`). Asked on every
+    /// maintenance tick, so an implementation keeps its own pace; the default
+    /// is a core with nothing to send again.
+    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>)> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +798,16 @@ impl Node {
         lock(&self.shared.conns).len()
     }
 
+    /// Connections in the normal state: synchronised, and so the ones a
+    /// transaction or a block is sent to.
+    pub fn normal_connection_count(&self) -> usize {
+        self.shared
+            .snapshot()
+            .iter()
+            .filter(|c| c.state() == STATE_NORMAL)
+            .count()
+    }
+
     /// The block queue's spans, lowest first, for `sync_info`.
     pub fn spans(&self) -> Vec<SpanInfo> {
         lock(&self.shared.queue).info()
@@ -982,6 +999,17 @@ impl Shared {
             .collect();
         let mut relay = lock(&self.relay);
         relay.embargo.remove(&id);
+        if targets.is_empty() {
+            // Sent to nobody, so not marked relayed: the pool offers it again
+            // ([`Core::due_for_relay`]) until a synchronised peer can take it.
+            // Marking it here left it in the pool for good.
+            wow_log::debug!(
+                LOG,
+                "no synchronised peer to send transaction {} to; it waits in the pool",
+                wow_crypto::hex::encode(&id)
+            );
+            return;
+        }
         for t in targets {
             let flush_at = Instant::now() + self.exp_delay(DANDELION_FLUSH_AVERAGE);
             let entry = relay.queued.entry(t).or_insert((flush_at, Vec::new()));
@@ -1087,6 +1115,14 @@ impl Shared {
                     c.notify(command::NEW_TRANSACTIONS, &body);
                 }
             }
+        }
+
+        // A transaction sent once can still have reached no one: a peer that
+        // dropped it, a connection that closed before its flush. The pool says
+        // what is due to go again, as `relay_txpool_transactions` asks it in
+        // the C++, and it goes as fluff.
+        for (id, blob) in self.core.due_for_relay() {
+            self.fluff(None, id, blob);
         }
     }
 
@@ -2035,7 +2071,16 @@ fn advance(shared: &Shared, conn: &Conn, proto: &mut Proto) {
 
     let ours = shared.core.sync_data();
     if proto.chain.is_empty() {
-        if conn.peer_sync().cumulative_difficulty <= ours.cumulative_difficulty {
+        // Not ahead: no more work than ours, or a tip this node already holds.
+        // The second is the C++ test (`process_payload_sync_data` settles on
+        // `have_block(top_id)`). Without it a peer on the same chain stays
+        // unsettled for as long as the two nodes' stored difficulties disagree,
+        // as they do for a database synced before the hard-fork version fix,
+        // and nothing is relayed to it.
+        let peer = conn.peer_sync();
+        if peer.cumulative_difficulty <= ours.cumulative_difficulty
+            || shared.core.have_block(&peer.top_id)
+        {
             settle(shared, conn, proto);
         } else if Instant::now() >= proto.chain_again_at {
             request_chain(shared, conn, proto);

@@ -49,6 +49,12 @@ const TX_FROM_ALT_BLOCK_LIVETIME: u64 = 7 * 86_400;
 /// so one still in its Dandelion++ stem phase (embargo mean 39 s) is not
 /// handed to a peer that did not get it through the stem.
 const COMPLEMENT_QUIET_SECS: u64 = 120;
+/// `MIN_RELAY_TIME`: a transaction sent to peers is not sent again sooner.
+pub const MIN_RELAY_SECS: u64 = 5 * 60;
+/// `MAX_RELAY_TIME`: nor later than this after the last time.
+pub const MAX_RELAY_SECS: u64 = 4 * 3_600;
+/// `max_relayable_check`: how often the pool is walked for what is due.
+pub const RELAY_CHECK_SECS: u64 = 2 * 60;
 
 /// Why a transaction was not admitted.
 ///
@@ -165,6 +171,10 @@ pub struct TxPool {
     weight: u64,
     /// `--max-txpool-weight`.
     max_weight: u64,
+    /// When each transaction last went out to peers from this process. Not
+    /// saved: a pool loaded at start has everything due to go out again,
+    /// which is what a restart should do.
+    relayed_at: HashMap<Hash256, u64>,
 }
 
 impl Default for TxPool {
@@ -180,6 +190,7 @@ impl TxPool {
             spent: HashMap::new(),
             weight: 0,
             max_weight: MAX_POOL_WEIGHT,
+            relayed_at: HashMap::new(),
         }
     }
 
@@ -231,6 +242,7 @@ impl TxPool {
 
     pub fn remove(&mut self, id: &Hash256) -> Option<PoolEntry> {
         let entry = self.by_id.remove(id)?;
+        self.relayed_at.remove(id);
         self.weight = self.weight.saturating_sub(entry.weight);
         self.spent.retain(|_, owner| owner != id);
         Some(entry)
@@ -502,12 +514,46 @@ impl TxPool {
             .collect()
     }
 
-    pub fn mark_relayed(&mut self, ids: &[Hash256]) {
+    /// These went out to peers at `now`.
+    pub fn mark_relayed(&mut self, ids: &[Hash256], now: u64) {
         for id in ids {
             if let Some(e) = self.by_id.get_mut(id) {
                 e.relayed = true;
+                self.relayed_at.insert(*id, now);
             }
         }
+    }
+
+    /// `get_relayable_transactions`: what is due to go out to peers again.
+    ///
+    /// One never sent from this process goes at once. One sent goes again
+    /// after [`relay_delay`], since a single send can reach no one: a peer
+    /// that drops it, a connection that closes, no peer synchronised at the
+    /// time. One older than half its lifetime is left to expire rather than
+    /// spread again, where a node about to drop it would take it back.
+    pub fn due_for_relay(&self, now: u64) -> Vec<(Hash256, Vec<u8>)> {
+        self.by_id
+            .iter()
+            .filter(|(id, e)| {
+                // A transaction paying no fee is never relayed.
+                if e.do_not_relay || e.fee == 0 {
+                    return false;
+                }
+                let life = if e.kept_by_block {
+                    TX_FROM_ALT_BLOCK_LIVETIME
+                } else {
+                    TX_LIVETIME
+                };
+                if now.saturating_sub(e.receive_time) > life / 2 {
+                    return false;
+                }
+                match self.relayed_at.get(*id) {
+                    None => true,
+                    Some(&last) => now.saturating_sub(last) > relay_delay(last, e.receive_time),
+                }
+            })
+            .map(|(id, e)| (*id, e.blob.clone()))
+            .collect()
     }
 
     /// `flush_txpool`: drop the named transactions, or every one when none are
@@ -517,6 +563,7 @@ impl TxPool {
             let n = self.by_id.len();
             self.by_id.clear();
             self.spent.clear();
+            self.relayed_at.clear();
             self.weight = 0;
             return n;
         }
@@ -618,6 +665,14 @@ impl TxPool {
         pool.expire(now);
         pool
     }
+}
+
+/// `get_relay_delay`: the wait before sending a transaction again, five minutes
+/// more for every five minutes it had been in the pool when last sent, and at
+/// most four hours.
+fn relay_delay(last_relayed: u64, received: u64) -> u64 {
+    let age = last_relayed.saturating_sub(received);
+    ((age + MIN_RELAY_SECS) / MIN_RELAY_SECS * MIN_RELAY_SECS).min(MAX_RELAY_SECS)
 }
 
 fn fee_rate(e: &PoolEntry) -> f64 {
@@ -796,6 +851,45 @@ mod tests {
             double_spend_seen: false,
             kept_by_block: false,
         }
+    }
+
+    /// Never sent goes now; sent goes again on a delay that grows with its
+    /// age; kept private or past half its lifetime, it never goes.
+    #[test]
+    fn a_transaction_goes_out_again_on_a_growing_delay() {
+        let t0 = 10_000_000;
+        let mut pool = TxPool::new();
+        pool.by_id.insert(id(1), entry(100, 10, t0));
+        let mut private = entry(100, 10, t0);
+        private.do_not_relay = true;
+        pool.by_id.insert(id(2), private);
+        pool.by_id
+            .insert(id(3), entry(100, 10, t0 - TX_LIVETIME / 2 - 1));
+
+        let due = |pool: &TxPool, now: u64| -> Vec<u8> {
+            let mut ids: Vec<u8> = pool
+                .due_for_relay(now)
+                .iter()
+                .map(|(id, _)| id[0])
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(due(&pool, t0), vec![1], "never sent: at once");
+
+        pool.mark_relayed(&[id(1)], t0);
+        assert!(due(&pool, t0 + MIN_RELAY_SECS).is_empty(), "just sent");
+        assert_eq!(due(&pool, t0 + MIN_RELAY_SECS + 1), vec![1]);
+
+        // Sent again an hour after it arrived: it waits an hour and five
+        // minutes before the next time.
+        pool.mark_relayed(&[id(1)], t0 + 3_600);
+        assert!(due(&pool, t0 + 7_200).is_empty());
+        assert_eq!(relay_delay(t0 + 3_600, t0), 3_600 + MIN_RELAY_SECS);
+        assert_eq!(relay_delay(t0 + 86_400, t0), MAX_RELAY_SECS, "capped");
+
+        pool.remove(&id(1));
+        assert!(pool.relayed_at.is_empty(), "forgotten with the transaction");
     }
 
     /// A transaction mined in a block leaves the pool, and so does one that

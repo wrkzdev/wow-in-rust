@@ -248,8 +248,13 @@ impl Server {
     /// `send_raw_transaction` reports `not_relayed` from this. Answering
     /// `false` while no peer is connected would tell a wallet its payment is
     /// on the network when it is sitting in this process's memory.
+    ///
+    /// Only synchronised connections count. A transaction is sent to those
+    /// and no others, so a peer still handshaking or syncing takes nothing.
     pub fn relays(&self) -> bool {
-        self.p2p.as_ref().is_some_and(|p| p.connection_count() > 0)
+        self.p2p
+            .as_ref()
+            .is_some_and(|p| p.normal_connection_count() > 0)
     }
 
     /// Where the node stands against its peers. With no peer-to-peer node it

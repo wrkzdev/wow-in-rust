@@ -20,6 +20,7 @@
 //! miner data and blocks as they happen, in the C++'s order.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use wow_consensus::fee::FeeContext;
@@ -110,6 +111,8 @@ pub struct NodeCore {
     /// RPC fee estimate does not wait on a sync holding the chain.
     fee: Mutex<FeeContext>,
     listener: OnceLock<Arc<dyn Listener>>,
+    /// When the pool is next walked for transactions due to go out again.
+    next_relay_check: AtomicU64,
 }
 
 impl NodeCore {
@@ -129,6 +132,7 @@ impl NodeCore {
             pool,
             fee: Mutex::new(fee),
             listener: OnceLock::new(),
+            next_relay_check: AtomicU64::new(0),
         }))
     }
 
@@ -741,7 +745,19 @@ impl Core for NodeCore {
     }
 
     fn tx_relayed(&self, ids: &[Hash256]) {
-        lock(&self.pool).mark_relayed(ids);
+        lock(&self.pool).mark_relayed(ids, unix_now());
+    }
+
+    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Asked every tick; the pool is walked every two minutes.
+        let now = unix_now();
+        if now < self.next_relay_check.load(Relaxed) {
+            return Vec::new();
+        }
+        self.next_relay_check
+            .store(now + crate::mempool::RELAY_CHECK_SECS, Relaxed);
+        lock(&self.pool).due_for_relay(now)
     }
 }
 
