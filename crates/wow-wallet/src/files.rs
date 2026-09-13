@@ -19,8 +19,10 @@
 //! The keys file **is** shared, and is read and written compatibly. That is
 //! where the money is; a cache is a few minutes of rescanning.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::history::{SentDestination, SentState, SentTx};
 use crate::refresh::{Transfer, WalletState};
 use crate::subaddress::SubaddressTable;
 use crate::{AccountBase, KeysFile};
@@ -342,6 +344,26 @@ impl Session {
     pub fn transfers(&self) -> &[Transfer] {
         &self.state.transfers
     }
+
+    /// Ask the daemon's pool about every sent transaction not yet in a block,
+    /// and judge them by it ([`WalletState::update_pending`]). Returns the ones
+    /// that failed just now.
+    ///
+    /// Only once a refresh has caught up; `update_pending` says why.
+    pub fn check_pending(&mut self) -> Result<Vec<wow_crypto::types::Hash256>, String> {
+        if self.state.sent.iter().all(|s| s.height().is_some()) {
+            return Ok(Vec::new());
+        }
+        let daemon = self.daemon.as_ref().ok_or("no daemon set")?;
+        let pool: HashSet<_> = daemon
+            .get_pool_hashes()
+            .map_err(|e| format!("cannot read the daemon's pool: {e}"))?
+            .into_iter()
+            .collect();
+        let failed = self.state.update_pending(&pool, now());
+        self.dirty = true;
+        Ok(failed)
+    }
 }
 
 fn random_iv(rng: &mut wow_crypto::random::Rng) -> [u8; 8] {
@@ -406,6 +428,7 @@ pub mod cache {
                     "spent_height": t.spent_height,
                     "unlock_time": t.unlock_time,
                     "is_coinbase": t.is_coinbase,
+                    "timestamp": t.timestamp,
                 })
             })
             .collect();
@@ -421,6 +444,7 @@ pub mod cache {
             "start_height": state.start_height,
             "hashes": hashes,
             "transfers": transfers,
+            "sent": state.sent.iter().map(sent_to_json).collect::<Vec<_>>(),
         })
         .to_string()
         .into_bytes()
@@ -460,6 +484,14 @@ pub mod cache {
             .map(|a| a.iter().filter_map(transfer_from_json).collect())
             .unwrap_or_default();
 
+        // Added without a version bump: a cache from before simply has no
+        // record of anything sent, and bumping would throw its transfers away.
+        state.sent = v
+            .get("sent")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(sent_from_json).collect())
+            .unwrap_or_default();
+
         state.by_key_image = state
             .transfers
             .iter()
@@ -491,6 +523,88 @@ pub mod cache {
             spent_height: v.get("spent_height")?.as_u64()?,
             unlock_time: v.get("unlock_time")?.as_u64()?,
             is_coinbase: v.get("is_coinbase")?.as_bool()?,
+            timestamp: v.get("timestamp").and_then(Value::as_u64).unwrap_or(0),
+        })
+    }
+
+    fn sent_to_json(s: &SentTx) -> Value {
+        json!({
+            "txid": wow_crypto::hex::encode(&s.txid),
+            "state": match s.state {
+                SentState::Pending => "pending",
+                SentState::Failed => "failed",
+                SentState::Confirmed(_) => "confirmed",
+            },
+            "height": s.height(),
+            "amount_in": s.amount_in,
+            "amount_out": s.amount_out,
+            "change": s.change,
+            "destinations": s
+                .destinations
+                .iter()
+                .map(|d| json!({ "address": d.address, "amount": d.amount }))
+                .collect::<Vec<_>>(),
+            "payment_id": s.payment_id.map(|p| wow_crypto::hex::encode(&p)),
+            "timestamp": s.timestamp,
+            "sent_time": s.sent_time,
+            "unlock_time": s.unlock_time,
+            "account": s.account,
+            "minors": s.minors,
+            "key_images": s
+                .key_images
+                .iter()
+                .map(|k| wow_crypto::hex::encode(&k.0))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn sent_from_json(v: &Value) -> Option<SentTx> {
+        let bytes32 = |s: &Value| <[u8; 32]>::try_from(wow_crypto::hex::decode(s.as_str()?)?).ok();
+        let number = |name: &str| v.get(name).and_then(Value::as_u64);
+        let state = match v.get("state")?.as_str()? {
+            "pending" => SentState::Pending,
+            "failed" => SentState::Failed,
+            "confirmed" => SentState::Confirmed(number("height")?),
+            _ => return None,
+        };
+        Some(SentTx {
+            txid: bytes32(v.get("txid")?)?,
+            state,
+            amount_in: number("amount_in")?,
+            amount_out: number("amount_out")?,
+            change: number("change")?,
+            destinations: v
+                .get("destinations")?
+                .as_array()?
+                .iter()
+                .map(|d| {
+                    Some(SentDestination {
+                        address: d.get("address")?.as_str()?.to_string(),
+                        amount: d.get("amount")?.as_u64()?,
+                    })
+                })
+                .collect::<Option<_>>()?,
+            payment_id: v
+                .get("payment_id")
+                .and_then(Value::as_str)
+                .and_then(wow_crypto::hex::decode)
+                .and_then(|b| b.try_into().ok()),
+            timestamp: number("timestamp")?,
+            sent_time: number("sent_time")?,
+            unlock_time: number("unlock_time")?,
+            account: number("account")? as u32,
+            minors: v
+                .get("minors")?
+                .as_array()?
+                .iter()
+                .map(|m| m.as_u64().map(|m| m as u32))
+                .collect::<Option<_>>()?,
+            key_images: v
+                .get("key_images")?
+                .as_array()?
+                .iter()
+                .map(|k| bytes32(k).map(wow_crypto::types::KeyImage))
+                .collect::<Option<_>>()?,
         })
     }
 }
@@ -573,6 +687,41 @@ mod tests {
             s.state.start_height, 500_000,
             "the wallet was told where to start"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record of what was sent survives the cache. The chain cannot say where
+    /// a transaction went, so a record lost on reopening is lost for good.
+    #[test]
+    fn a_sent_record_survives_the_cache() {
+        let dir = scratch("sent");
+        let mut s = fresh_session(&dir, 0);
+        s.state.sent.push(SentTx {
+            txid: [4u8; 32],
+            state: SentState::Confirmed(12),
+            amount_in: 10_000,
+            amount_out: 9_500,
+            change: 2_500,
+            destinations: vec![SentDestination {
+                address: "Wo1payee".into(),
+                amount: 7_000,
+            }],
+            payment_id: Some([3u8; 8]),
+            timestamp: 1_700_000_100,
+            sent_time: 1_700_000_000,
+            unlock_time: 0,
+            account: 0,
+            minors: vec![0, 2],
+            key_images: vec![wow_crypto::types::KeyImage([9u8; 32])],
+        });
+        let raw = cache::store(&s.state);
+
+        let keys = &s.keys_file.account.keys;
+        let table = SubaddressTable::new(&keys.account_address, &keys.view_secret_key, 1, 1);
+        let mut back = WalletState::new(s.keys_file.account.clone(), table, 0, Network::Mainnet);
+        cache::load(&mut back, &raw).expect("loads");
+        assert_eq!(back.sent, s.state.sent);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

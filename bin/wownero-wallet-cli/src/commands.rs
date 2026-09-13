@@ -7,6 +7,7 @@
 
 use wow_types::address::{Address, AddressKind};
 use wow_wallet::decoys::{self, GammaPicker};
+use wow_wallet::history::{EntryKind, PROPAGATION_TIMEOUT};
 use wow_wallet::spend::{self, SpendOptions};
 use wow_wallet::transfer::{self, Destination, SpendableOutput};
 
@@ -161,7 +162,7 @@ Chain
 
 History
   incoming_transfers [available|unavailable]
-  show_transfers [in|out|all]
+  show_transfers [in|out|pending|failed|coinbase|all] [<min_height> [<max_height>]]
   unspent_outputs
 
 Sending
@@ -367,6 +368,22 @@ fn refresh(session: &mut Session) -> Result<(), String> {
     }
     session.dirty = true;
 
+    // Caught up, so a sent transaction missing from both the chain and the
+    // pool really is missing.
+    match session.check_pending() {
+        Ok(failed) => {
+            for txid in failed {
+                println!(
+                    "Transaction {} is in neither a block nor the daemon's pool \
+                     {PROPAGATION_TIMEOUT} seconds after it was sent. Marked failed; its inputs \
+                     can be spent again.",
+                    wow_crypto::hex::encode(&txid)
+                );
+            }
+        }
+        Err(e) => eprintln!("{e}"),
+    }
+
     let scanned = session.state.scan_height().saturating_sub(start);
     println!("Scanned {scanned} block(s).");
     if received > 0 {
@@ -386,10 +403,7 @@ fn rescan(session: &mut Session) -> Result<(), String> {
         return Ok(());
     }
     let from = session.keys_file.refresh_height();
-    session.state.hashes.clear();
-    session.state.transfers.clear();
-    session.state.by_key_image.clear();
-    session.state.start_height = from;
+    session.state.rescan_from(from);
     session.dirty = true;
     println!("Cleared. Run `refresh` to scan from height {from}.");
     Ok(())
@@ -442,32 +456,101 @@ fn incoming_transfers(session: &mut Session, args: &[&str]) -> Result<(), String
 }
 
 fn show_transfers(session: &mut Session, args: &[&str]) -> Result<(), String> {
-    let filter = args.first().copied().unwrap_or("all");
+    use EntryKind::*;
+    const ALL: &[EntryKind] = &[In, Coinbase, Out, Pending, Failed];
+
+    // `simple_wallet::get_transfers`: a word to narrow what is shown, then a
+    // height range.
+    let (kinds, rest): (&[EntryKind], &[&str]) = match args.first().copied() {
+        Some("in" | "incoming") => (&[In, Coinbase], &args[1..]),
+        Some("out" | "outgoing") => (&[Out, Pending, Failed], &args[1..]),
+        Some("pending") => (&[Pending], &args[1..]),
+        Some("failed") => (&[Failed], &args[1..]),
+        Some("coinbase") => (&[Coinbase], &args[1..]),
+        Some("pool") => {
+            println!("(this build does not track incoming transactions in the pool)");
+            return Ok(());
+        }
+        Some("all" | "both") => (ALL, &args[1..]),
+        _ => (ALL, args),
+    };
+    let height_arg = |i: usize, default: u64| match rest.get(i) {
+        Some(s) => s.parse().map_err(|_| format!("`{s}` is not a height")),
+        None => Ok(default),
+    };
+    let (min, max) = (height_arg(0, 0)?, height_arg(1, u64::MAX)?);
+
+    let chain_height = session.chain_height();
+    let now = now();
     let mut shown = 0usize;
-    for t in session.transfers() {
-        let direction = if t.spent { "out" } else { "in" };
-        if filter != "all" && filter != direction {
+    for e in session.state.history() {
+        if !kinds.contains(&e.kind) {
             continue;
         }
+        // Above the lower height and up to the upper, as the C++ has it.
+        if let Some(h) = e.height {
+            if (min > 0 && h <= min) || h > max {
+                continue;
+            }
+        }
         shown += 1;
+
+        let received = matches!(e.kind, In | Coinbase);
+        let block = match e.height {
+            Some(h) => format!("{h:08}"),
+            None => e.kind.name().to_string(),
+        };
+        let direction = match e.kind {
+            In => "in",
+            Coinbase => "block",
+            _ => "out",
+        };
+        let unlocked = if !received {
+            "-"
+        } else if e.unlocked(chain_height, now) {
+            "unlocked"
+        } else {
+            "locked"
+        };
+        let destinations = if received {
+            // The subaddress it came in on, cut short as the C++ cuts it.
+            let minor = e.minors.first().copied().unwrap_or(0);
+            let address = session.address_at(e.account, minor).unwrap_or_default();
+            format!(
+                "{}:{}",
+                &address[..address.len().min(6)],
+                fmt::amount(e.amount)
+            )
+        } else if e.destinations.is_empty() {
+            "-".to_string()
+        } else {
+            e.destinations
+                .iter()
+                .map(|d| format!("{}:{}", d.address, fmt::amount(d.amount)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let indices = e
+            .minors
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let payment_id = e
+            .payment_id
+            .map_or_else(|| "0".repeat(16), |p| wow_crypto::hex::encode(&p));
         println!(
-            "{:<4} {:<10} {:>20}  {}",
-            direction,
-            t.block_height,
-            fmt::amount(t.amount),
-            wow_crypto::hex::encode(&t.txid)
+            "{block:>8} {direction:>6} {unlocked:>8} {:>25.25} {:>20.20} {} {payment_id} {:>14.14} \
+             {destinations} {indices} -",
+            fmt::timestamp(e.timestamp),
+            fmt::amount(e.amount),
+            wow_crypto::hex::encode(&e.txid),
+            fmt::amount(e.fee),
         );
     }
     if shown == 0 {
         println!("(none)");
     }
-    // An outgoing transfer is inferred from an output being spent, which is
-    // not the same as a record of what was sent. Saying so beats letting a
-    // user believe the history is complete.
-    println!(
-        "(outgoing entries are this wallet's own outputs being spent; a record of destinations \
-         needs store-tx-info, which is not built yet)"
-    );
     Ok(())
 }
 
@@ -740,9 +823,28 @@ fn send(
         .map_err(|e| format!("cannot reach the daemon to relay: {e}"))?;
 
     if result.accepted() {
-        println!("Sent. Transaction {}", wow_crypto::hex::encode(&txid));
-        println!("(it will appear in the balance once it is mined and four blocks have passed)");
+        // That it was sent, and spent its inputs, is written down either way.
+        // Where it went is written down only with `store-tx-info` on.
+        let (payees, recorded_pid) = if session.keys_file.store_tx_info() {
+            (vec![address_text.as_str()], pid)
+        } else {
+            (Vec::new(), None)
+        };
+        session
+            .state
+            .record_sent(txid, &plan, &payees, recorded_pid, now());
         session.dirty = true;
+        // Saved at once: a wallet that forgot this send would offer the same
+        // inputs to the next one, and the daemon would refuse it.
+        match session.save() {
+            Ok(()) => session.dirty = false,
+            Err(e) => eprintln!("Sent, but the wallet could not be saved: {e}"),
+        }
+        println!("Sent. Transaction {}", wow_crypto::hex::encode(&txid));
+        println!(
+            "(the change is in the balance now, and can be spent once the transaction is mined \
+             and four blocks have passed)"
+        );
     } else {
         println!("The daemon rejected the transaction.");
         if !result.reason.is_empty() {
@@ -780,7 +882,9 @@ fn one_time_secret(
 fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let Some(option) = args.first() else {
         println!("usage: set <option> <value>");
-        println!("known: refresh-from-block-height, subaddress-lookahead, seed-language");
+        println!(
+            "known: refresh-from-block-height, subaddress-lookahead, seed-language, store-tx-info"
+        );
         return Ok(());
     };
     let value = args.get(1).ok_or("a value is required")?;
@@ -811,6 +915,17 @@ fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
                 .keys_file
                 .settings
                 .insert("subaddress_lookahead_minor".into(), minor.into());
+        }
+        "store-tx-info" => {
+            if session.is_view_only() {
+                return Err("a view-only wallet sends nothing, so it has nothing to record".into());
+            }
+            let on = match *value {
+                "1" | "true" | "on" => true,
+                "0" | "false" | "off" => false,
+                _ => return Err("store-tx-info is 0 or 1".into()),
+            };
+            session.keys_file.set_store_tx_info(on);
         }
         other => return Err(format!("`{other}` is not a setting this build knows")),
     }

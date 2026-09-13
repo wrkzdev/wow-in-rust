@@ -382,6 +382,7 @@ mod tests {
             spent_height: 0,
             unlock_time: 0,
             is_coinbase: false,
+            timestamp: 0,
         }
     }
 

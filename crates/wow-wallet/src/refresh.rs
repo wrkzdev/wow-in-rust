@@ -32,6 +32,7 @@ use wow_types::block::Block;
 use wow_types::tx::{Transaction, TxIn};
 
 use crate::account::AccountBase;
+use crate::history::{SeenSpend, SentTx};
 use crate::scan::{scan_transaction, ScanKeys};
 use crate::subaddress::SubaddressTable;
 
@@ -72,15 +73,23 @@ pub struct Transfer {
     pub spent_height: u64,
     pub unlock_time: u64,
     pub is_coinbase: bool,
+    /// The timestamp of the block it is in. Zero when read from a cache
+    /// written before it was kept.
+    pub timestamp: u64,
 }
 
 impl Transfer {
-    /// `is_transfer_unlocked` (`specs/12` §4.2): the transaction's own unlock
-    /// time, **and** a minimum age of four blocks.
+    /// See [`unlocked_at`].
     pub fn unlocked(&self, chain_height: u64, now: u64) -> bool {
-        wow_consensus::timestamp::is_tx_spendtime_unlocked(self.unlock_time, chain_height, now)
-            && self.block_height + SPENDABLE_AGE <= chain_height
+        unlocked_at(self.unlock_time, self.block_height, chain_height, now)
     }
+}
+
+/// `is_transfer_unlocked` (`specs/12` §4.2): the transaction's own unlock
+/// time, **and** a minimum age of four blocks.
+pub fn unlocked_at(unlock_time: u64, block_height: u64, chain_height: u64, now: u64) -> bool {
+    wow_consensus::timestamp::is_tx_spendtime_unlocked(unlock_time, chain_height, now)
+        && block_height + SPENDABLE_AGE <= chain_height
 }
 
 /// A block and its transactions, as a source hands them over.
@@ -165,6 +174,9 @@ pub struct WalletState {
     /// Key image → index into `transfers`, for spotting our own outputs being
     /// spent.
     pub by_key_image: HashMap<KeyImage, usize>,
+    /// Transactions that spent this wallet's outputs, sent from here or found
+    /// in a block ([`crate::history`]).
+    pub sent: Vec<SentTx>,
     /// `max_reorg_depth`. Zero means unlimited, as in the reference.
     pub max_reorg_depth: u64,
     /// This chain's genesis hash.
@@ -201,6 +213,7 @@ impl WalletState {
             start_height,
             transfers: Vec::new(),
             by_key_image: HashMap::new(),
+            sent: Vec::new(),
             max_reorg_depth: 0,
         }
     }
@@ -210,13 +223,18 @@ impl WalletState {
         self.start_height + self.hashes.len() as u64
     }
 
-    /// The total of every unspent output.
+    /// The total of every unspent output, and the change still to come back
+    /// from transactions not yet in a block.
+    ///
+    /// `wallet2::balance` counts that change too. Without it, a send looks as
+    /// if it took the whole of its inputs until a block carries it.
     pub fn balance(&self) -> u64 {
         self.transfers
             .iter()
             .filter(|t| !t.spent)
             .map(|t| t.amount)
-            .sum()
+            .sum::<u64>()
+            + self.pending_change()
     }
 
     /// The total of every unspent output that can actually be spent now.
@@ -311,6 +329,20 @@ impl WalletState {
             .enumerate()
             .filter_map(|(i, t)| t.key_image.map(|k| (k, i)))
             .collect();
+        self.detach_sent(height);
+    }
+
+    /// Forget everything scanned and start again at `height`: `rescan_bc`.
+    ///
+    /// What the chain will say again is dropped. Where this wallet's own
+    /// transactions went is not on the chain, so those records are kept and
+    /// matched up again as the scan finds them.
+    pub fn rescan_from(&mut self, height: u64) {
+        self.hashes.clear();
+        self.transfers.clear();
+        self.by_key_image.clear();
+        self.start_height = height;
+        self.detach_sent(height);
     }
 
     /// Fetch one batch and process it.
@@ -423,13 +455,14 @@ impl WalletState {
 
         // The coinbase first, then the transactions, which is the order the
         // global output indices come in (`specs/11` §5.1).
+        let timestamp = block.header.timestamp;
         let coinbase_indices = bundle.output_indices.first().cloned().unwrap_or_default();
         self.process_transaction(
             height,
+            timestamp,
             &block.miner_tx,
             wow_types::hashes::transaction_hash(&block.miner_tx).unwrap_or(wow_crypto::NULL_HASH),
             &coinbase_indices,
-            true,
             summary,
         );
 
@@ -445,7 +478,7 @@ impl WalletState {
                 .get(i + 1)
                 .cloned()
                 .unwrap_or_default();
-            self.process_transaction(height, &tx, txid, &indices, false, summary);
+            self.process_transaction(height, timestamp, &tx, txid, &indices, summary);
         }
 
         if height == self.scan_height() {
@@ -457,21 +490,34 @@ impl WalletState {
     fn process_transaction(
         &mut self,
         height: u64,
+        timestamp: u64,
         tx: &Transaction,
         txid: Hash256,
         global_indices: &[u64],
-        is_coinbase: bool,
         summary: &mut RefreshSummary,
     ) {
-        // Spends first: an output of ours consumed by this transaction.
+        let is_coinbase = matches!(tx.prefix.vin.first(), Some(TxIn::Gen { .. }));
+
+        // Spends first: outputs of ours consumed by this transaction.
+        let mut spent = 0u64;
+        let mut account = None;
+        let mut minors = Vec::new();
+        let mut key_images = Vec::new();
         for input in &tx.prefix.vin {
             if let TxIn::ToKey { k_image, .. } = input {
                 if let Some(&i) = self.by_key_image.get(k_image) {
-                    if !self.transfers[i].spent {
-                        self.transfers[i].spent = true;
-                        self.transfers[i].spent_height = height;
+                    let t = &mut self.transfers[i];
+                    // Spent at height zero is spent by a transaction that was
+                    // not in a block yet. This is its block.
+                    if !t.spent || t.spent_height == 0 {
+                        t.spent = true;
+                        t.spent_height = height;
                         summary.spent += 1;
                     }
+                    spent += t.amount;
+                    account = Some(t.subaddress.major);
+                    minors.push(t.subaddress.minor);
+                    key_images.push(*k_image);
                 }
             }
         }
@@ -479,13 +525,17 @@ impl WalletState {
         // Then receipts. A scan failure is a fact about the transaction, not
         // about the wallet: a malformed transaction on chain must not stop a
         // refresh, and the reference logs and moves on too.
-        let found = match scan_transaction(tx, &self.keys()) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
+        let found = scan_transaction(tx, &self.keys()).unwrap_or_default();
 
+        let mut received = 0u64;
         for r in found {
+            if Some(r.subaddress.major) == account {
+                received += r.amount;
+            }
             let key_image = r.key_image;
+            // Found again by a rescan, and already spent by a transaction
+            // still waiting for a block.
+            let spent_by_pending = key_image.is_some_and(|k| self.is_pending_input(&k));
             self.transfers.push(Transfer {
                 block_height: height,
                 txid,
@@ -500,15 +550,33 @@ impl WalletState {
                 mask: r.mask,
                 amount: r.amount,
                 subaddress: r.subaddress,
-                spent: false,
+                spent: spent_by_pending,
                 spent_height: 0,
                 unlock_time: tx.prefix.unlock_time,
                 is_coinbase,
+                timestamp,
             });
             if let Some(k) = key_image {
                 self.by_key_image.insert(k, self.transfers.len() - 1);
             }
             summary.received += 1;
+        }
+
+        if let Some(account) = account {
+            minors.sort_unstable();
+            minors.dedup();
+            self.spend_seen(SeenSpend {
+                txid,
+                height,
+                timestamp,
+                spent,
+                received,
+                fee: tx.fee().unwrap_or(0),
+                unlock_time: tx.prefix.unlock_time,
+                account,
+                minors,
+                key_images,
+            });
         }
     }
 }
@@ -1169,6 +1237,7 @@ mod tests {
             spent_height: 0,
             unlock_time: 0,
             is_coinbase: false,
+            timestamp: 0,
         };
 
         let now = 1_700_000_000;
@@ -1220,5 +1289,90 @@ mod tests {
         assert!(s.caught_up);
         assert_eq!(s.blocks_scanned, 0);
         assert_eq!(w.scan_height(), before);
+    }
+
+    /// A spend of ours that was not sent from here is recorded from what its
+    /// block shows: what left, the fee, the time. Not where it went. Orphaned,
+    /// it is forgotten, since nothing but that block said it happened.
+    #[test]
+    fn a_spend_found_in_a_block_is_recorded() {
+        use crate::history::SentState;
+
+        let me = state(7, 0);
+        let tx = payment(&me.account.keys.account_address, 4_000, 11);
+
+        let mut w = me;
+        let mut chain = Chain::new();
+        chain.push(&[tx], vec![vec![], vec![3]]);
+        w.refresh(&chain, 10).expect("refresh");
+        let image = w.transfers[0].key_image.expect("an image");
+
+        let spend = spend_of(image, 21);
+        let txid = wow_types::hashes::transaction_hash(&spend).expect("an id");
+        chain.push(&[spend], vec![vec![], vec![]]);
+        w.refresh(&chain, 10).expect("refresh");
+
+        assert_eq!(w.sent.len(), 1);
+        let s = &w.sent[0];
+        assert_eq!(s.txid, txid);
+        assert_eq!(s.state, SentState::Confirmed(1));
+        assert_eq!(s.amount_in, 4_000);
+        assert_eq!(s.fee(), 500, "the fee the transaction carries");
+        assert!(s.destinations.is_empty(), "a block does not say where");
+        assert_eq!(s.timestamp, 1_600_000_002, "its block's timestamp");
+        assert_eq!(w.transfers[0].timestamp, 1_600_000_001);
+
+        chain.reorg_from(1, 2);
+        w.refresh(&chain, 10).expect("refresh");
+        assert!(w.sent.is_empty());
+    }
+
+    /// A send spends its inputs when it is relayed, is confirmed by the block
+    /// that carries it, and goes back to pending, still holding its inputs, if
+    /// that block is orphaned.
+    #[test]
+    fn a_send_waits_for_its_block_and_again_after_a_reorg() {
+        use crate::history::SentState;
+
+        let me = state(7, 0);
+        let tx = payment(&me.account.keys.account_address, 4_000, 11);
+
+        let mut w = me;
+        let mut chain = Chain::new();
+        chain.push(&[tx], vec![vec![], vec![3]]);
+        w.refresh(&chain, 10).expect("refresh");
+        let image = w.transfers[0].key_image.expect("an image");
+
+        let spend = spend_of(image, 21);
+        let txid = wow_types::hashes::transaction_hash(&spend).expect("an id");
+        let plan = crate::spend::SpendPlan {
+            inputs: vec![0],
+            amounts: vec![3_000],
+            change: 500,
+            fee: 500,
+            estimated_weight: 0,
+        };
+        w.record_sent(txid, &plan, &["Wo1payee"], None, 1_700_000_000);
+        assert!(w.transfers[0].spent, "spent from the moment it is relayed");
+        assert_eq!(w.balance(), 500, "only the change on its way back");
+
+        chain.push(&[spend], vec![vec![], vec![]]);
+        w.refresh(&chain, 10).expect("refresh");
+        assert_eq!(w.sent.len(), 1, "matched up, not recorded twice");
+        assert_eq!(w.sent[0].state, SentState::Confirmed(1));
+        assert_eq!(w.sent[0].destinations[0].address, "Wo1payee");
+        assert_eq!(w.transfers[0].spent_height, 1);
+
+        chain.reorg_from(1, 2);
+        w.refresh(&chain, 10).expect("refresh");
+        assert_eq!(w.sent[0].state, SentState::Pending);
+        assert!(w.transfers[0].spent, "its input stays spent while it waits");
+        assert_eq!(w.transfers[0].spent_height, 0);
+
+        // A rescan keeps the record, and the input it spends is found spent.
+        w.rescan_from(0);
+        w.refresh(&chain, 10).expect("refresh");
+        assert_eq!(w.sent[0].destinations[0].address, "Wo1payee");
+        assert!(w.transfers[0].spent);
     }
 }

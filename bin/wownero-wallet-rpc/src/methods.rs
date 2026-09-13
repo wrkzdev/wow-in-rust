@@ -487,12 +487,13 @@ fn incoming_transfers(session: &Session, params: &Value) -> MethodResult {
 }
 
 fn get_transfers(session: &Session, params: &Value) -> MethodResult {
-    let want_in = params.get("in").and_then(Value::as_bool).unwrap_or(false);
-    let want_out = params.get("out").and_then(Value::as_bool).unwrap_or(false);
-    let filter_by_height = params
-        .get("filter_by_height")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    use wow_wallet::history::EntryKind;
+
+    let flag = |name: &str| params.get(name).and_then(Value::as_bool).unwrap_or(false);
+    // A request that names no list gets every list.
+    let asked = ["in", "out", "pending", "failed", "pool"].map(flag);
+    let all = !asked.contains(&true);
+    let filter_by_height = flag("filter_by_height");
     let min = params
         .get("min_height")
         .and_then(Value::as_u64)
@@ -505,50 +506,85 @@ fn get_transfers(session: &Session, params: &Value) -> MethodResult {
     let height = session.chain_height();
     let now = wow_wallet::files::now();
 
-    let mut incoming = Vec::new();
-    let mut outgoing = Vec::new();
-    for t in &session.state.transfers {
-        if filter_by_height && (t.block_height < min || t.block_height > max) {
-            continue;
+    // `in`, `out`, `pending`, `failed`, `pool`. The pool list stays empty:
+    // incoming transactions in the pool are not tracked.
+    let mut lists: [Vec<Value>; 5] = Default::default();
+    for e in session.state.history() {
+        if let (true, Some(h)) = (filter_by_height, e.height) {
+            if h < min || h > max {
+                continue;
+            }
         }
-        let entry = json!({
-            "txid": wow_crypto::hex::encode(&t.txid),
-            "payment_id": "",
-            "height": t.block_height,
-            "timestamp": 0,
-            "amount": t.amount,
-            "amounts": [t.amount],
-            "fee": 0,
-            "note": "",
-            "destinations": [],
-            "type": if t.spent { "out" } else { "in" },
-            "unlock_time": t.unlock_time,
-            "locked": !t.unlocked(height, now),
-            "subaddr_index": { "major": t.subaddress.major, "minor": t.subaddress.minor },
-            "subaddr_indices": [{ "major": t.subaddress.major, "minor": t.subaddress.minor }],
-            "address": session.primary_address(),
-            "double_spend_seen": false,
-            "confirmations": height.saturating_sub(t.block_height),
-            "suggested_confirmations_threshold": suggested_confirmations(t.amount),
-        });
-        if t.spent {
-            outgoing.push(entry);
-        } else {
-            incoming.push(entry);
-        }
+        let list = match e.kind {
+            EntryKind::In | EntryKind::Coinbase => 0,
+            EntryKind::Out => 1,
+            EntryKind::Pending => 2,
+            EntryKind::Failed => 3,
+        };
+        lists[list].push(transfer_entry(session, &e, height, now));
     }
 
     let mut out = Map::new();
-    if want_in || (!want_in && !want_out) {
-        out.insert("in".into(), json!(incoming));
+    for ((name, wanted), list) in ["in", "out", "pending", "failed", "pool"]
+        .into_iter()
+        .zip(asked)
+        .zip(lists)
+    {
+        if wanted || all {
+            out.insert(name.into(), json!(list));
+        }
     }
-    if want_out || (!want_in && !want_out) {
-        out.insert("out".into(), json!(outgoing));
-    }
-    out.insert("pending".into(), json!([]));
-    out.insert("failed".into(), json!([]));
-    out.insert("pool".into(), json!([]));
     Ok(Value::Object(out))
+}
+
+/// One `transfer_entry`: `wallet_rpc_server::fill_transfer_entry`.
+fn transfer_entry(
+    session: &Session,
+    e: &wow_wallet::history::HistoryEntry,
+    chain_height: u64,
+    now: u64,
+) -> Value {
+    use wow_wallet::history::EntryKind;
+
+    let received = matches!(e.kind, EntryKind::In | EntryKind::Coinbase);
+    // A payment is to one subaddress. A send is reported against the account.
+    let minor = if received {
+        e.minors.first().copied().unwrap_or(0)
+    } else {
+        0
+    };
+    let confirmations = match e.height {
+        Some(h) if h < chain_height => chain_height - h,
+        _ => 0,
+    };
+    json!({
+        "txid": wow_crypto::hex::encode(&e.txid),
+        "payment_id": e.payment_id.map_or_else(|| "0".repeat(16), |p| wow_crypto::hex::encode(&p)),
+        "height": e.height.unwrap_or(0),
+        "timestamp": e.timestamp,
+        "amount": e.amount,
+        "amounts": e.amounts,
+        "fee": e.fee,
+        "note": "",
+        "destinations": e
+            .destinations
+            .iter()
+            .map(|d| json!({ "amount": d.amount, "address": d.address }))
+            .collect::<Vec<_>>(),
+        "type": e.kind.name(),
+        "unlock_time": e.unlock_time,
+        "locked": !e.unlocked(chain_height, now),
+        "subaddr_index": { "major": e.account, "minor": minor },
+        "subaddr_indices": e
+            .minors
+            .iter()
+            .map(|m| json!({ "major": e.account, "minor": m }))
+            .collect::<Vec<_>>(),
+        "address": session.address_at(e.account, minor).unwrap_or_default(),
+        "double_spend_seen": false,
+        "confirmations": confirmations,
+        "suggested_confirmations_threshold": suggested_confirmations(e.amount),
+    })
 }
 
 /// `suggested_confirmations_threshold`, computed from the block target rather
@@ -579,33 +615,16 @@ fn get_transfer_by_txid(session: &Session, params: &Value) -> MethodResult {
     let now = wow_wallet::files::now();
     let found: Vec<Value> = session
         .state
-        .transfers
+        .history()
         .iter()
-        .filter(|t| t.txid == id)
-        .map(|t| {
-            json!({
-                "txid": text,
-                "amount": t.amount,
-                "height": t.block_height,
-                "type": if t.spent { "out" } else { "in" },
-                "locked": !t.unlocked(height, now),
-                "unlock_time": t.unlock_time,
-                "confirmations": height.saturating_sub(t.block_height),
-                "subaddr_index": { "major": t.subaddress.major, "minor": t.subaddress.minor },
-                "address": session.primary_address(),
-                "fee": 0,
-                "payment_id": "",
-                "note": "",
-                "destinations": [],
-                "double_spend_seen": false,
-            })
-        })
+        .filter(|e| e.txid == id)
+        .map(|e| transfer_entry(session, e, height, now))
         .collect();
 
     if found.is_empty() {
         return Err(Error::new(
             errors::WRONG_TXID,
-            "this wallet has no output from that transaction",
+            "this wallet has no record of that transaction",
         ));
     }
     Ok(json!({ "transfer": found[0], "transfers": found }))
@@ -713,6 +732,9 @@ fn refresh(session: &mut Session, params: &Value) -> MethodResult {
         session.daemon_height = info.height;
     }
     session.dirty = true;
+    // Caught up, so pending sends can be judged. A pool that cannot be read
+    // leaves them as they were, which is no reason to fail a refresh.
+    let _ = session.check_pending();
 
     // How many blocks *this call* fetched, not how tall the chain is. A wallet
     // created at the tip fetches one block and must not report 873,000.
@@ -724,10 +746,7 @@ fn refresh(session: &mut Session, params: &Value) -> MethodResult {
 
 fn rescan(session: &mut Session) -> MethodResult {
     let from = session.keys_file.refresh_height();
-    session.state.hashes.clear();
-    session.state.transfers.clear();
-    session.state.by_key_image.clear();
-    session.state.start_height = from;
+    session.state.rescan_from(from);
     session.dirty = true;
 
     if session.daemon.is_some() {
@@ -976,6 +995,19 @@ fn build_and_send(
             format!("the daemon rejected the transaction: {}", result.reason),
         ));
     }
+    // `wallet2::commit_tx`, which `do_not_relay` skips: recorded, and its
+    // inputs spent, whether or not `store-tx-info` keeps where it went.
+    if !do_not_relay {
+        let store = session.keys_file.store_tx_info();
+        let payees = if store { vec![address] } else { Vec::new() };
+        session.state.record_sent(
+            txid,
+            &plan,
+            &payees,
+            decoded.payment_id.filter(|_| store),
+            wow_wallet::files::now(),
+        );
+    }
     session.dirty = true;
 
     let mut out = json!({
@@ -1090,6 +1122,7 @@ mod tests {
             spent_height: 0,
             unlock_time: 0,
             is_coinbase: false,
+            timestamp: 0,
         };
 
         // Four-block age only.

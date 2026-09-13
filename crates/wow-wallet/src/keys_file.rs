@@ -214,6 +214,20 @@ impl KeysFile {
         self.settings.get("seed_language")?.as_str()
     }
 
+    /// `store_tx_info`: whether a sent transaction's destinations and payment
+    /// id are written down. On unless turned off; keys files from before it
+    /// had that name say `store_tx_keys`.
+    pub fn store_tx_info(&self) -> bool {
+        bool_member(&self.settings, "store_tx_info")
+            .or_else(|| bool_member(&self.settings, "store_tx_keys"))
+            .unwrap_or(true)
+    }
+
+    pub fn set_store_tx_info(&mut self, on: bool) {
+        self.settings
+            .insert("store_tx_info".into(), Json::from(u64::from(on)));
+    }
+
     /// `(major, minor)` lookahead — how many unused subaddresses to precompute.
     pub fn subaddress_lookahead(&self) -> (u32, u32) {
         (

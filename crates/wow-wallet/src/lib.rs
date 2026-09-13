@@ -9,6 +9,7 @@
 //! | [`keys_file`] | the `<name>.keys` file, read and written compatibly |
 //! | [`subaddress`] | the spend-key → `(major, minor)` table |
 //! | [`scan`] | deciding whether a transaction paid this wallet |
+//! | [`history`] | what this wallet sent, and its transfer history |
 //!
 //! # What is here and what is not
 //!
@@ -33,6 +34,7 @@ pub mod chacha;
 pub mod decoys;
 pub mod entropy;
 pub mod files;
+pub mod history;
 pub mod keys_file;
 pub mod refresh;
 pub mod scan;
@@ -42,6 +44,7 @@ pub mod transfer;
 
 pub use account::{AccountBase, AccountError, AccountKeys};
 pub use decoys::{select_ring, GammaPicker, RandomSource, Ring};
+pub use history::{EntryKind, HistoryEntry, SentDestination, SentState, SentTx};
 pub use keys_file::{AskPassword, KeysFile, KeysFileError};
 pub use refresh::{BlockSource, RefreshError, Transfer, WalletState};
 pub use scan::{scan_transaction, Received, ScanError, ScanKeys};
