@@ -1,29 +1,40 @@
-//! RandomWOW — Wownero's proof of work.
+//! RandomWOW — Wownero's proof of work, in Rust.
 //!
-//! `specs/03-pow.md`. RandomWOW is RandomX compiled with a Wownero-specific
-//! `configuration.h`: the algorithm structure is unmodified, only the
-//! parameters differ. The three that matter most are a **1 MiB** scratchpad
-//! (RandomX: 2 MiB), **1024** program iterations (2048), **16** programs (8),
-//! and the Argon2d salt `"RandomWOW\x01"` (`"RandomX\x03"`).
+//! `specs/03-pow.md`. RandomWOW is RandomX with Wownero's parameters: the
+//! algorithm structure is unmodified. The parameters that matter most are a
+//! **1 MiB** scratchpad (RandomX: 2 MiB), **1024** program iterations (2048),
+//! **16** programs (8), and the Argon2d salt `"RandomWOW\x01"`
+//! (`"RandomX\x03"`). Outside `configuration.h` the fork changes one thing
+//! more, `AesGenerator4R`'s keys ([`params::Config::aes_4r_keys`]).
 //!
 //! > **Using upstream RandomX defaults produces valid-looking hashes that fail
 //! > every difficulty check on the real chain.**
 //!
-//! That failure mode is silent and confusing, so it is guarded three times:
-//! `build.rs` refuses to build against the wrong `configuration.h`,
-//! [`config::verify_linked_configuration`] re-checks the **linked** library at
-//! runtime, and the tests in [`config`] assert the salt and the frequency sum
-//! that `specs/15` §2.4 names. `tests/hashing.rs` closes the loop by checking
-//! that the canonical RandomX test vector does *not* come out to upstream
-//! RandomX's published answer.
+//! This crate used to link the pinned C++ library (RandomWOW `27b099b6`). It
+//! now implements the algorithm itself, with the parameters as data
+//! ([`params`]), which lets that failure mode be checked from both sides:
+//!
+//! * `tests/randomx_vectors.rs` runs upstream's parameters against upstream
+//!   RandomX's published hashes, which checks the algorithm on its own;
+//! * `tests/wownero_vectors.rs` holds hashes the C++ library computed with
+//!   Wownero's parameters, taken before it was removed;
+//! * `tests/mainnet_pow.rs` checks real mainnet blocks against their own
+//!   difficulty.
+//!
+//! `docs/spec-deltas.md` §25 records the change of route from `specs/03` §3.5.
 //!
 //! # What is here
 //!
-//! * [`config`] — the linked library's parameters, read back through FFI.
+//! * [`params`] — the parameter sets.
 //! * [`seed`] — seed-hash epochs (`rx_seedheight`), pure arithmetic.
-//! * [`vm`] — safe `Cache` / `Dataset` / `Vm` wrappers and a two-slot
-//!   [`vm::SeedCache`].
-//! * [`ffi`] — the raw bindings.
+//! * [`vm`] — `Cache` / `Dataset` / `Vm` and a two-slot [`vm::SeedCache`].
+//!
+//! Underneath: Argon2d and BLAKE2b fill the Cache; SuperscalarHash computes
+//! Dataset items, compiled to machine code on x86-64 and interpreted
+//! elsewhere; and the VM is an interpreter over decoded programs, with
+//! RandomX's rounding modes emulated in software so the result does not depend
+//! on the host's floating-point state. `unsafe` is confined to the AES-NI
+//! rounds and to the compiled SuperscalarHash's executable memory.
 //!
 //! # What is not
 //!
@@ -34,12 +45,18 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-pub mod config;
-pub mod ffi;
+mod aes;
+mod argon2;
+mod blake2b;
+mod cache;
+mod float;
+mod jit;
+mod machine;
+pub mod params;
 pub mod seed;
+mod superscalar;
 pub mod vm;
 
-pub use config::{verify_linked_configuration, Configuration};
 pub use seed::{rx_seedheight, rx_seedheights, SEEDHASH_EPOCH_BLOCKS, SEEDHASH_EPOCH_LAG};
 pub use vm::{Cache, Dataset, RandomWowError, SeedCache, Vm};
 

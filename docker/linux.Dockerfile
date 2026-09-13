@@ -2,13 +2,13 @@
 #
 # Linux x86_64 and aarch64, glibc. Built by docker/build-dist.sh.
 #
-# Debian bookworm, so the binaries need glibc >= 2.36 and libstdc++ (RandomWOW
-# is C++) at runtime.
+# Debian bookworm, so the binaries need glibc >= 2.36 at runtime. The only C
+# compiled is LMDB, hence a C cross-compiler and nothing more.
 
 FROM --platform=linux/amd64 rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS build
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends cmake ninja-build g++-aarch64-linux-gnu \
+ && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
  && rm -rf /var/lib/apt/lists/*
 
 # The image's own toolchain, not whatever "stable" means on the day
@@ -17,7 +17,6 @@ ENV RUSTUP_TOOLCHAIN=1.98.1
 RUN rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
 ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
     AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CARGO_PROFILE_RELEASE_STRIP=symbols \

@@ -1,4 +1,0 @@
-[submodule "third_party/randomwow"]
-	path = third_party/randomwow
-	url = https://codeberg.org/wownero/RandomWOW
-	branch = 1.2.1-wow

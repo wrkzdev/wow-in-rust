@@ -11,9 +11,6 @@ Cargo.lock.bak
 /tests/corpus/weights/
 /tests/corpus/unlock/
 
-# CMake output for the RandomWOW submodule
-/third_party/randomwow/build
-
 # --- from the repository's own template ---
 
 # MSVC Windows builds of rustc generate these, which store debugging information

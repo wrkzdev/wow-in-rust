@@ -26,12 +26,6 @@ for p in "$@"; do
   esac
 done
 
-if [ ! -f third_party/randomwow/src/configuration.h ]; then
-  echo "third_party/randomwow is empty. Run:" >&2
-  echo "  git submodule update --init third_party/randomwow" >&2
-  exit 1
-fi
-
 # Provenance for BUILDINFO. A tree with uncommitted changes says so, rather
 # than claiming a commit it was not built from.
 rev=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)

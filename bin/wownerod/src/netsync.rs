@@ -6,7 +6,9 @@
 //! and a layer that conflated them would blame the peer for our own bug or
 //! the other way round.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use wow_core::chain::Blockchain;
 use wow_crypto::types::Hash256;
@@ -31,11 +33,14 @@ use wow_types::Network;
 /// That is a statement about today's checkpoint list, not about the variants
 /// being unnecessary -- a chain replayed with checkpoints disabled still needs
 /// them, and so does anyone who wants to know the chain is what it claims.
-struct ChainPow {
+pub(crate) struct ChainPow {
     seeds: wow_randomwow::vm::SeedCache,
     /// Below this height the proof is not computed, matching the reference's
     /// `fast_check`. See [`LocalChain::new`].
     trusted_below: u64,
+    /// RandomWOW hashes computed before the chain asked for them, by seed and
+    /// hashing blob. See [`ChainPow::prehash`].
+    ready: Mutex<HashMap<(Hash256, Vec<u8>), Hash256>>,
 }
 
 impl ChainPow {
@@ -43,6 +48,77 @@ impl ChainPow {
         ChainPow {
             seeds: wow_randomwow::vm::SeedCache::new(wow_randomwow::vm::verify_flags()),
             trusted_below,
+            ready: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn trusted_below(&self) -> u64 {
+        self.trusted_below
+    }
+
+    /// Compute the RandomWOW hash of each `(seed, hashing blob)` on every core,
+    /// for `pow_hash` to find ready.
+    ///
+    /// The chain verifies one block at a time under its lock, and a light-mode
+    /// hash takes a good fraction of a second, so a sync batch hashed one after
+    /// another would hold the lock for most of a minute. Hashing the batch
+    /// first, side by side and without the lock, leaves the chain only the
+    /// comparison with the difficulty.
+    ///
+    /// Nothing here decides validity. A hash is a pure function of its seed and
+    /// blob, so a stored one is exactly what `pow_hash` would compute. A pair
+    /// the chain never asks for -- a refused block, a seed guessed from the
+    /// wrong branch -- costs only its time, and [`ChainPow::forget`] drops it.
+    pub(crate) fn prehash(&self, work: &[(Hash256, Vec<u8>)]) {
+        let todo: Vec<&(Hash256, Vec<u8>)> = {
+            let ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+            work.iter().filter(|w| !ready.contains_key(*w)).collect()
+        };
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(todo.len());
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    let mut vm: Option<wow_randomwow::vm::Vm> = None;
+                    while let Some((seed, blob)) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        if vm.as_ref().map(|v| v.seed()) != Some(seed) {
+                            // A failure is left for `pow_hash` to report.
+                            let Ok(cache) = self.seeds.get(seed) else {
+                                return;
+                            };
+                            if let Some(v) = vm.as_mut() {
+                                v.set_cache(cache);
+                            } else if let Ok(v) = wow_randomwow::vm::Vm::light(
+                                wow_randomwow::vm::verify_flags(),
+                                cache,
+                            ) {
+                                vm = Some(v);
+                            } else {
+                                return;
+                            }
+                        }
+                        let Some(v) = vm.as_mut() else {
+                            return;
+                        };
+                        let hash = v.hash(blob);
+                        self.ready
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert((*seed, blob.clone()), hash);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Drop whatever [`ChainPow::prehash`] computed for `work` that the chain
+    /// did not use.
+    pub(crate) fn forget(&self, work: &[(Hash256, Vec<u8>)]) {
+        let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+        for w in work {
+            ready.remove(w);
         }
     }
 }
@@ -65,6 +141,14 @@ impl wow_core::pow::PowVerifier for ChainPow {
     ) -> Result<Hash256, wow_core::pow::PowError> {
         // `RX_BLOCK_VERSION` is 13 (`specs/03` §3).
         if major_version >= 13 {
+            let ready = self
+                .ready
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(*seed_hash, hashing_blob.to_vec()));
+            if let Some(hash) = ready {
+                return Ok(hash);
+            }
             let cache = self
                 .seeds
                 .get(seed_hash)
@@ -98,6 +182,9 @@ pub struct LocalChain {
     /// on every request — which happens once per batch, so it is not the cost
     /// that matters; not having to ask the database mid-sync is.
     hashes: Vec<Hash256>,
+    /// The chain's verifier, shared so a batch's proofs can be computed before
+    /// the chain lock is taken.
+    pow: Arc<ChainPow>,
 }
 
 impl LocalChain {
@@ -123,9 +210,9 @@ impl LocalChain {
         // it. A chain with no checkpoints verifies everything.
         let trusted_below = checkpoints.last_height().map(|h| h + 1).unwrap_or(0);
 
-        let mut chain =
-            Blockchain::new(db.clone(), Arc::new(ChainPow::new(trusted_below)), network)
-                .map_err(|e| format!("cannot open the chain: {e:?}"))?;
+        let pow = Arc::new(ChainPow::new(trusted_below));
+        let mut chain = Blockchain::new(db.clone(), pow.clone(), network)
+            .map_err(|e| format!("cannot open the chain: {e:?}"))?;
         chain.trust_below(trusted_below);
 
         let height = db.height();
@@ -137,13 +224,23 @@ impl LocalChain {
             );
         }
 
-        Ok(LocalChain { chain, db, hashes })
+        Ok(LocalChain {
+            chain,
+            db,
+            hashes,
+            pow,
+        })
     }
 
     /// The height below which this node is trusting checkpoints rather than
     /// verifying. See [`LocalChain::new`].
     pub fn trusted_below(&self) -> u64 {
         self.chain.trusted_below()
+    }
+
+    /// The chain's proof-of-work verifier, for hashing ahead of it.
+    pub(crate) fn pow(&self) -> Arc<ChainPow> {
+        self.pow.clone()
     }
 
     /// Validate and add a block from outside, returning what it became.
@@ -489,6 +586,30 @@ mod tests {
             matches!(e, wow_core::pow::PowError::CryptoNightNotImplemented { .. }),
             "a block whose proof cannot be checked is refused, never waved through: {e}"
         );
+    }
+
+    /// A proof hashed ahead of the chain is the hash the chain would compute,
+    /// and the chain takes it rather than a copy.
+    #[test]
+    fn a_prehashed_proof_is_the_computed_one_and_is_used_once() {
+        use wow_core::pow::PowVerifier;
+
+        let pow = ChainPow::new(0);
+        let seed = [0x11u8; 32];
+        let work = vec![(seed, b"first".to_vec()), (seed, b"second".to_vec())];
+        pow.prehash(&work);
+        assert_eq!(pow.ready.lock().unwrap().len(), 2);
+
+        let cache = pow.seeds.get(&seed).expect("cache");
+        let flags = wow_randomwow::vm::verify_flags();
+        let want = wow_randomwow::vm::Vm::light(flags, cache)
+            .expect("vm")
+            .hash(b"first");
+        assert_eq!(pow.pow_hash(1, 13, b"first", &seed).expect("hash"), want);
+        assert_eq!(pow.ready.lock().unwrap().len(), 1, "taken, not copied");
+
+        pow.forget(&work);
+        assert!(pow.ready.lock().unwrap().is_empty());
     }
 
     /// A peer id is drawn fresh, so two runs do not look like a

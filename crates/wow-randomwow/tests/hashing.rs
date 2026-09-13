@@ -6,14 +6,14 @@
 //! serve it; generating those triples needs a local daemon or an instrumented
 //! build.
 //!
-//! What can be checked without one is stronger than it first looks: the
-//! canonical RandomX test vector, computed with this library, must **not**
-//! match upstream RandomX's published answer. Together with the header-level
-//! assertions in `config`, that confirms the linked library is RandomWOW
-//! end-to-end rather than only at the header.
+//! `wownero_vectors.rs` holds hashes the C++ library computed instead, and
+//! `mainnet_pow.rs` checks real blocks. What is here is the behaviour around
+//! the hash: that it is not upstream's, determinism, re-keying, the seed cache,
+//! and light and full mode agreeing.
 
 use std::sync::Arc;
 
+use wow_randomwow::params::WOWNERO;
 use wow_randomwow::vm::{verify_flags, Cache, SeedCache, Vm};
 
 fn hex(b: &[u8]) -> String {
@@ -29,29 +29,21 @@ fn hash_with(seed: &[u8; 32], input: &[u8]) -> [u8; 32] {
 /// The canonical RandomX test vector: key `"test key 000"`, input
 /// `"This is a test"`. Upstream RandomX publishes
 /// `639183aae1bf4c9a35884cb46b09cad9175f04efd7684e7262a0ac1c2f0b4e3f` for it,
-/// and the RandomWOW fork left that expectation in `src/tests/tests.cpp`
+/// and `randomx_vectors.rs` gets exactly that from this code under upstream's
+/// parameters. The RandomWOW fork left the expectation in its `tests.cpp`
 /// unchanged even though its parameters differ.
 ///
-/// So computing it here MUST give something else. If it ever matches, the
-/// build is linked against upstream RandomX and every PoW check on mainnet
+/// Under Wownero's parameters it MUST come out different. If it ever matches,
+/// the node is hashing with upstream RandomX's and every PoW check on mainnet
 /// will fail.
 #[test]
 fn is_not_upstream_randomx() {
     const UPSTREAM: &str = "639183aae1bf4c9a35884cb46b09cad9175f04efd7684e7262a0ac1c2f0b4e3f";
 
-    // `initCache("test key 000")` keys on the ASCII string, not a 32-byte hash,
-    // so this goes through the raw cache API rather than `hash_with`.
-    let key = b"test key 000";
-    let cache = Arc::new(
-        {
-            // Cache::new takes a 32-byte seed; pad the ASCII key the way the
-            // RandomX test does (it passes the bare string and its length).
-            let mut seed = [0u8; 32];
-            seed[..key.len()].copy_from_slice(key);
-            Cache::new(verify_flags(), &seed)
-        }
-        .expect("cache"),
-    );
+    // `initCache("test key 000")` keys on the bare ASCII string, which only the
+    // parameterised constructor takes.
+    let cache =
+        Arc::new(Cache::with_config(&WOWNERO, verify_flags(), b"test key 000").expect("cache"));
     let mut vm = Vm::light(verify_flags(), cache).expect("vm");
     let out = vm.hash(b"This is a test");
 
@@ -62,12 +54,8 @@ fn is_not_upstream_randomx() {
     );
 }
 
-/// A regression vector for this build.
-///
-/// Not a consensus vector — it is this implementation's own output, pinned so a
-/// change in the submodule, the configuration or the build flags shows up as a
-/// test failure rather than as a silently different chain. Replace it with real
-/// `calc_pow` triples once a daemon is available (`specs/15` §2.4).
+/// The same seed and input always give the same hash, and changing either
+/// changes it. The hashes themselves are pinned in `wownero_vectors.rs`.
 #[test]
 fn hashing_is_deterministic() {
     let seed = [0x11u8; 32];

@@ -11,15 +11,22 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use sha2::{Digest, Sha256};
 use wow_storage::db::BlockchainDb;
 use wow_storage::env::OpenMode;
 use wow_storage::lmdb::LmdbDb;
 use wow_types::{Block, Network};
+
+/// The daemon's own provider, so the client here is as pure Rust as it is.
+#[path = "../src/rpc/tls/provider.rs"]
+#[allow(dead_code)]
+mod provider;
 
 struct Scratch(PathBuf);
 
@@ -158,7 +165,7 @@ type ClientAuth = (CertificateDer<'static>, PrivateKeyDer<'static>);
 
 /// A request over TLS: the response and the certificate the server showed.
 fn over_tls(port: u16, client: Option<ClientAuth>) -> Result<(String, Vec<u8>), String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(provider::provider());
     let seen = Arc::new(Mutex::new(Vec::new()));
     let keep = Arc::new(Keep {
         seen: seen.clone(),
@@ -195,27 +202,26 @@ fn certificate_in(path: &Path) -> Vec<u8> {
     CertificateDer::from_pem_file(path).unwrap().to_vec()
 }
 
-/// A self-signed pair, as PEM files in `dir`.
+/// A self-signed ECDSA P-256 pair for `localhost`, as PEM files in `dir`.
 fn make_pair(dir: &Path, name: &str) -> (PathBuf, PathBuf, ClientAuth) {
-    let key = rcgen::KeyPair::generate().unwrap();
-    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .unwrap()
-        .self_signed(&key)
+    let (key, key_pem) = provider::generate_p256().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    // rcgen without a crypto backend of its own draws no serial number.
+    params.serial_number = Some(rcgen::SerialNumber::from(rand_core::RngCore::next_u64(
+        &mut rand_core::OsRng,
+    )));
+    let cert = params
+        .self_signed(&provider::CertSigner::new(&key).unwrap())
         .unwrap();
     let crt = dir.join(format!("{name}.crt"));
     let pem = dir.join(format!("{name}.key"));
     std::fs::write(&crt, cert.pem()).unwrap();
-    std::fs::write(&pem, key.serialize_pem()).unwrap();
-    let auth = (
-        cert.der().clone(),
-        PrivateKeyDer::from_pem_slice(key.serialize_pem().as_bytes()).unwrap(),
-    );
-    (crt, pem, auth)
+    std::fs::write(&pem, &key_pem).unwrap();
+    (crt, pem, (cert.der().clone(), key))
 }
 
 fn fingerprint_hex(der: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, der)
-        .as_ref()
+    Sha256::digest(der)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
@@ -287,6 +293,35 @@ fn a_given_certificate_is_served() {
     let (_, cert) = over_tls(port, None).unwrap();
     assert_eq!(cert, certificate_in(&crt));
     assert!(!s.0.join("rpc_ssl.crt").exists(), "nothing generated");
+}
+
+/// **A pair the C++ left in the data directory**: an RSA key as PKCS#8 PEM
+/// and a serial-1, empty-subject certificate. It is served as it is -- the
+/// same certificate, so the same fingerprint -- and not replaced.
+#[test]
+fn an_rsa_pair_left_by_the_cpp_is_served_as_it_is() {
+    let s = Scratch::new("cpp-rsa");
+    let rsa = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let key_pem = rsa.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.serial_number = Some(rcgen::SerialNumber::from(1u64));
+    let cert = params
+        .self_signed(&provider::CertSigner::new(&key).unwrap())
+        .unwrap();
+    std::fs::write(s.0.join("rpc_ssl.crt"), cert.pem()).unwrap();
+    std::fs::write(s.0.join("rpc_ssl.key"), key_pem.as_bytes()).unwrap();
+
+    let port = free_port();
+    let _d = start(&s.0, port, &[]);
+    let (body, served) = over_tls(port, None).expect("a TLS request");
+    assert!(body.contains("\"height\":1"), "{body}");
+    assert_eq!(served, cert.der().to_vec());
+    assert_eq!(
+        fingerprint_hex(&served),
+        fingerprint_hex(&certificate_in(&s.0.join("rpc_ssl.crt")))
+    );
 }
 
 /// **Client certificates.** With a fingerprint listed, TLS is mandatory and

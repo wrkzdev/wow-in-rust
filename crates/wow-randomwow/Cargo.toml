@@ -4,16 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "RandomWOW proof of work: FFI to the pinned RandomWOW library, seed epochs, VM lifecycle"
-build = "build.rs"
-links = "randomx"
+description = "RandomWOW proof of work in Rust: Cache, Dataset, VM and seed epochs"
 
 [dependencies]
+
+# `src/jit.rs`: executable memory for compiled SuperscalarHash.
+[target.'cfg(all(target_arch = "x86_64", unix))'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 wow-crypto.workspace = true
 wow-types.workspace = true
-
-[build-dependencies]
-cmake = "0.1"
-cc = "1.0"

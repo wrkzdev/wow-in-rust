@@ -51,6 +51,7 @@ Statuses:
 | Keep the pool in step with the chain | Done | Mined transactions leave the pool. After a reorg or `pop_blocks`, transactions from the replaced blocks go back in |
 | Real `synchronized`, `target_height` and connection counts in `get_info`; `sync_info` | Done | `untrusted` also follows the sync state |
 | `--no-sync`, `--offline`, clean Ctrl-C/SIGTERM | Done | Shutdown order: miner, peers, pool saved, database synced last |
+| *(found along the way)* proof of work for a sync batch on every core | Done | Before taking the chain lock, `apply_blocks` computes the RandomWOW hash of each block in the batch in parallel; the chain then takes each hash instead of computing it. A hash depends only on its seed and hashing blob, so a stored one is exactly what the chain would compute, and unused ones are dropped after the batch (`ChainPow::prehash` in [`netsync.rs`](../bin/wownerod/src/netsync.rs)) |
 | *(found along the way)* syncing from several peers at once | Done | Spans of block ids are reserved per connection and filled by different peers, as in the C++ `block_queue` ([`queue.rs`](../crates/wow-p2p/src/queue.rs), [`node.rs`](../crates/wow-p2p/src/node.rs)). One `p2p-apply` thread applies filled spans in height order. The C++ thresholds hold: at most 10 filled spans and 100 MB queued, with download forced within 1000 blocks of the tip. A stale next span is re-requested from another peer after 30 s (5 s in standby). A peer that disconnects has its unfilled spans flushed; a peer whose blocks are rejected loses its spans and is banned, or has its connection closed when the rejection does not warrant a ban. `sync_info` now reports `spans` and `overview` ([`tests/node.rs`](../crates/wow-p2p/tests/node.rs)) |
 
 ## B. P2P listener
@@ -83,7 +84,7 @@ Statuses:
 | `--log-level` and `--log-file` using `tracing` | Different | Uses a small [`wow-log`](../crates/wow-log) crate instead, with the C++'s `0`–`4` and `category:LEVEL` syntax plus file rotation (`--max-log-file-size`, `--max-log-files`). **Open:** `WOW_P2P_TRACE` remains in the single-peer `--sync-from` code ([`peer.rs`](../crates/wow-p2p/src/peer.rs)) |
 | `--rpc-restricted-bind-port`, a second restricted listener | Done | `--rpc-restricted-bind-ip` too |
 | IPv6 on the RPC port: `--rpc-use-ipv6`, `--rpc-bind-ipv6-address`, `--rpc-restricted-bind-ipv6-address`, `--rpc-ignore-ipv4` | Done | Both bind addresses default to `::1` ([`tests/ipv6.rs`](../bin/wownerod/tests/ipv6.rs)) |
-| TLS on the RPC port | Done | rustls with the ring provider ([`tls.rs`](../bin/wownerod/src/rpc/tls.rs)). `--rpc-ssl enabled\|disabled\|autodetect`; the default, autodetect, takes plain and TLS connections on the same port. A self-signed certificate is generated once and kept as `rpc_ssl.crt` and `rpc_ssl.key` in the data directory, unless `--rpc-ssl-certificate` and `--rpc-ssl-private-key` supply one. Client certificates are checked against `--rpc-ssl-allowed-fingerprints` (SHA-256) or `--rpc-ssl-ca-certificates`, with `--rpc-ssl-allow-chained`; `--rpc-ssl-allow-any-cert` turns the check off ([`tests/tls.rs`](../bin/wownerod/tests/tls.rs)) |
+| TLS on the RPC port | Done | rustls, on a provider of pure-Rust RustCrypto crates ([`tls.rs`](../bin/wownerod/src/rpc/tls.rs), [`provider.rs`](../bin/wownerod/src/rpc/tls/provider.rs)) that replaced ring. It negotiates what the C++ does: TLS 1.3, and TLS 1.2 with ECDHE, ECDSA or RSA certificates, AES-GCM or ChaCha20-Poly1305, and X25519, P-256 or P-384. `--rpc-ssl enabled\|disabled\|autodetect`; the default, autodetect, takes plain and TLS connections on the same port. A self-signed ECDSA P-256 certificate is generated once and kept as `rpc_ssl.crt` and `rpc_ssl.key` in the data directory, unless `--rpc-ssl-certificate` and `--rpc-ssl-private-key` supply one. RSA pairs, which the C++ generates (RSA-4096) and `wownero-gen-ssl-cert` makes, are served as they are, with the same fingerprint. They are signed with `rsa` 0.9, blinded but not constant-time (RUSTSEC-2023-0071), and the node warns at startup when it serves one. Client certificates are checked against `--rpc-ssl-allowed-fingerprints` (SHA-256) or `--rpc-ssl-ca-certificates`, with `--rpc-ssl-allow-chained`; `--rpc-ssl-allow-any-cert` turns the check off ([`tests/tls.rs`](../bin/wownerod/tests/tls.rs)) |
 | `--rpc-login` (HTTP Digest) and `--rpc-access-control-origins` | Done | RFC 2617, MD5, `qop=auth`. A password left out is generated and printed. An address is blocked for 24 h after 3 failed logins unless `--disable-rpc-ban`; loopback is exempt |
 | Per-IP connection caps: 3 public, 25 private | Done | Plus 100 in total; all three are options |
 | `--public-node` | Done | Advertises the restricted port, and is refused without one |
@@ -114,6 +115,14 @@ Statuses:
 | `ipc://` pub endpoints; CURVE and PLAIN security | Open | Not supported |
 | `get_output_distribution` for amounts other than 0 | Open | Only amount 0 (RingCT) is served |
 
+## G. Code that is not Rust
+
+| Item | Status | Notes |
+|---|---|---|
+| RandomWOW, from the pinned C++ library | Done | Rewritten in Rust ([`wow-randomwow`](../crates/wow-randomwow)). The submodule, `build.rs`, and CMake, Ninja and the C++ runtime are gone from the builds, CI and Docker images. The fork changes `AesGenerator4R`'s keys as well as `configuration.h` ([spec-deltas §25](spec-deltas.md)). Checked against upstream RandomX's published hashes, hashes from the C++ library, and 26 mainnet blocks. SuperscalarHash is compiled to machine code on x86-64; the VM is interpreted. A light-mode hash takes about 75 ms on a 16-thread desktop; the C++ took 19 ms with its JIT and 389 ms without |
+| ring, under the RPC TLS | Done | Replaced by the RustCrypto provider (see D). Tested with every suite, group and key type, with record vectors computed by OpenSSL, and against OpenSSL's `s_client` with an RSA-4096 pair laid out as the C++ leaves it. `cargo tree` finds no ring, aws-lc-rs or OpenSSL |
+| LMDB | Kept | The one C dependency, by design: `data.mdb` must stay byte-compatible with the C++ node |
+
 ## Still open, in one place
 
 **Daemon**
@@ -139,6 +148,14 @@ Statuses:
   them, because checkpoints cover those heights. A chain replayed without
   checkpoints still stops at the version 9 fork, and the miner cannot mine
   those versions.
+* RandomWOW's VM is interpreted, and SuperscalarHash is compiled only on
+  x86-64. A JIT for the VM, and for aarch64, would bring verification and
+  mining closer to the C++ speed.
+* The Docker release builds have not been run since the C++ toolchain was
+  removed from their images.
+* An RSA key on the RPC TLS port is signed by `rsa` 0.9, which is not
+  constant-time (RUSTSEC-2023-0071, no fixed release). Until one exists, an
+  ECDSA key avoids it, at the cost of a new fingerprint.
 
 **Wallets**
 

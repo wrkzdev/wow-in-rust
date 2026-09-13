@@ -607,7 +607,8 @@ out to be easier for a specific table"). It is the crate `heed` itself builds
 on, so this removes a dependency rather than adding one.
 
 The cost is real and worth stating: `crates/wow-storage/src/raw.rs` is the only
-`unsafe` code in the workspace outside the RandomWOW FFI. It is confined to one
+`unsafe` code in the workspace outside the RandomWOW FFI (since replaced by Rust;
+see §25). It is confined to one
 module, every block carries a `SAFETY` note, and the borrow checker enforces
 what §1.1 asks for in prose — a transaction borrows the environment, a cursor
 borrows the transaction, and every returned `&[u8]` borrows the transaction, so
@@ -1019,3 +1020,79 @@ way, with the same wording, so the test suite can tell.
 `wallet_sync::the_client_gets_a_distribution_from_this_daemon`, plus
 `wow-daemon-client`'s `tests/live_node.rs`, which runs against a real node on
 demand.
+
+---
+
+## 25. RandomWOW changes more than `configuration.h` — and is now Rust
+
+A RandomX whose `configuration.h` values are all parameterised, and set to
+Wownero's, still gives a wrong hash for every block.
+
+**Spec:** [`03-pow.md`](../specs/03-pow.md) §3 — "RandomWOW is RandomX compiled
+with a Wownero-specific `configuration.h`. The algorithm structure (…) is
+unmodified RandomX; only the parameters differ." §3.5 recommends FFI to the
+pinned C++ library and accepts a pure-Rust RandomX "only if it is parameterised
+… and passes the RandomWOW test vectors", as a later optimisation;
+[`00-overview.md`](../specs/00-overview.md) §8 requires the submodule.
+
+**Reference:** the fork (`codeberg.org/wownero/RandomWOW`, branch `1.2.1-wow`)
+is upstream RandomX 1.2.1 plus one commit, `27b099b6` "RandomWOW parameters".
+Besides `configuration.h`, its assembler copy, and `common.hpp`'s frequency sum
+(which drops `IROL_R`, now 0), that commit changes `aes_hash.cpp`:
+
+```cpp
+-#define AES_GEN_4R_KEY0 0x99e5d23f, 0x2f546d2b, 0xd1833ddb, 0x6421aadd
++#define AES_GEN_4R_KEY0 0xcf359e95, 0x141f82b7, 0x7ffbe4a6, 0xf890465d
+ ...                                     /* KEY1..3 likewise; KEY4..7 kept */
+ 	while (outptr < outputEnd) {
+ 		state0 = aesdec<softAes>(state0, key0);
+ 		state1 = aesenc<softAes>(state1, key0);
+-		state2 = aesdec<softAes>(state2, key4);
+-		state3 = aesenc<softAes>(state3, key4);
++		state2 = aesdec<softAes>(state2, key0);
++		state3 = aesenc<softAes>(state3, key0);
+ 		...                              /* rounds 2-4 likewise */
+```
+
+`AesGenerator4R` turns each program's seed into the program, so this changes
+every program. RandomWOW uses its own keys 0-3, on all four lanes, where
+upstream gives lanes 2 and 3 keys 4-7. The comment above the keys still derives
+them as BLAKE2b-512 of `"RandomX AesGenerator4R keys 0-3"`; that is true of
+upstream's values, not these, and the fork does not say where they come from.
+The fork's `tests.cpp` also still expects upstream's hashes.
+
+**Resolution:** `wow-randomwow` implements RandomX in Rust with every parameter
+as data, the 4R keys included (`params::Config::aes_4r_keys`), and no longer
+links the C++. The parameters and the algorithm are checked separately:
+
+* under upstream's parameters it reproduces upstream RandomX's published hashes
+  (`tests.cpp`, tests 1a-1e), which checks the algorithm;
+* under Wownero's it reproduces nine hashes the C++ library computed before it
+  was removed, which checks the parameters;
+* real mainnet blocks satisfy their own difficulty, as before;
+* the pieces are held to `tests.cpp`'s own vectors: the Argon2d Cache, the
+  SuperscalarHash generator, Dataset items, `AesGenerator1R`,
+  `randomx_reciprocal`, instruction decoding, and rounding in every mode.
+
+Two things the C++ does cannot be copied directly:
+
+* **Rounding modes.** `CFROUND` sets the CPU's rounding mode. Rust code assumes
+  round-to-nearest throughout, so each operation is computed that way and then
+  moved one step where the mode needs it. Which side the exact result lies on
+  is found exactly: TwoSum for addition, a 128-bit mantissa comparison for
+  multiplication, division and square root.
+* **The JIT.** SuperscalarHash is compiled to x86-64 machine code, as the C++
+  does. The VM is interpreted. A light-mode hash measured about 75 ms on a
+  16-thread desktop, where the C++ took 19 ms with its JIT and 389 ms without
+  it. To make up the difference, sync hashes each batch of blocks on every core
+  before verifying them.
+
+With the C++ gone, the builds, CI and release images need no CMake, Ninja or
+C++ runtime.
+
+**Pinned by:** `tests/randomx_vectors.rs`, `tests/wownero_vectors.rs` and
+`tests/mainnet_pow.rs` in `wow-randomwow`;
+`aes::tests::upstream_4r_keys_come_from_blake2b`; and
+`jit::tests::running::*`, which holds the compiled SuperscalarHash to the
+interpreter over generated programs and over every instruction with every
+register pair.

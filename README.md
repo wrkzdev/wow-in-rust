@@ -95,15 +95,20 @@ by item, with the known gaps in what is built.
   computed `sig_data` and the Schnorr verifier, which is the Wownero-specific
   rule ([`specs/06`](specs/06-consensus-rules.md) §4) and checks most of the
   stack at once.
-* **`wow-randomwow`** — FFI to the pinned RandomWOW library, seed-hash epochs,
-  and cache/dataset/VM lifecycle. **Hashes 26 real mainnet blocks and every one
-  satisfies its own recorded chain difficulty** (1.0e8 – 9.2e9), which validates
-  the seed arithmetic, the hashing blob and the linked configuration together.
-  The configuration is separately checked three ways
-  ([`specs/15`](specs/15-testing-and-conformance.md) §2.4): the build refuses a
-  wrong `configuration.h`, the linked library's parameters are read back through
-  FFI, and the canonical RandomX test vector is asserted *not* to match
-  upstream's published answer.
+* **`wow-randomwow`** — RandomWOW in Rust, replacing an FFI binding to the
+  pinned C++ library: the Argon2d Cache, SuperscalarHash (compiled to machine
+  code on x86-64), the VM with RandomX's rounding modes emulated in software,
+  seed-hash epochs, and the cache/dataset/VM lifecycle. **Under upstream's
+  parameters it reproduces upstream RandomX's published hashes, and under
+  Wownero's the hashes the C++ library computed**, which checks the algorithm
+  and the parameters separately. The one change the fork makes outside
+  `configuration.h`, its `AesGenerator4R` keys, is
+  [`docs/spec-deltas.md`](docs/spec-deltas.md) §25. **Hashes 26 real mainnet
+  blocks and every one satisfies its own recorded chain difficulty** (1.0e8 –
+  9.2e9), which validates the seed arithmetic, the hashing blob and the
+  parameters together. A light-mode hash takes about 75 ms on a 16-thread
+  desktop, where the C++ took 19 ms with its JIT; sync makes up for it by
+  hashing each batch on every core.
 
 ### What M1 still needs
 
@@ -202,7 +207,7 @@ crates/
   wow-crypto/        hashing, ed25519, key derivation, view tags, base58, mnemonics, H/commitments
   wow-serialize/     binary archive (consensus) + epee portable storage + varints
   wow-types/         Block, Transaction, RctSig, addresses, difficulty
-  wow-randomwow/     RandomWOW FFI                                    [M1/M2]
+  wow-randomwow/     RandomWOW in Rust; SuperscalarHash JIT on x86-64 [M1/M2]
   wow-consensus/     emission, weights, fees, difficulty, hard forks
   wow-storage/       BlockchainDb + LMDB, byte-compatible data.mdb
   wow-core/          Blockchain: validation, alternative chains, reorgs
@@ -222,7 +227,6 @@ scripts/             corpus generation (blocks, difficulty windows, weights, unl
 ## Building and testing
 
 ```sh
-git submodule update --init third_party/randomwow
 cargo build --workspace
 cargo test  --workspace          # ~30 s, dominated by the 5,545 crypto vectors
 cargo clippy --workspace --all-targets -- -D warnings
@@ -232,16 +236,16 @@ cargo fmt --all --check
 cargo test -p wow-randomwow --release -- --ignored   # ~2.3 GiB dataset build
 ```
 
-Building `wow-randomwow` needs CMake and a C++ toolchain. On Windows it also
-needs **Ninja**: CMake's "MinGW Makefiles" generator cannot handle a build path
-containing a space, which is easy to end up with. `build.rs` detects Ninja
-and says so clearly if it is missing; `WOW_CMAKE_GENERATOR` overrides the
-choice.
+A Rust toolchain and a C compiler are all it needs. LMDB, built by
+`lmdb-master-sys`, is the only code that is not Rust; RandomWOW, which used to
+need CMake and a C++ toolchain, is Rust now.
 
 The workspace pins `opt-level = 3` for dependencies even in the test profile:
 an unoptimised `curve25519-dalek` makes the vector suite take minutes rather
 than seconds, and [`specs/15`](specs/15-testing-and-conformance.md) §6 budgets
-under five minutes for it.
+under five minutes for it. `wow-crypto` and `wow-randomwow` get the same in the
+dev profile too, since unoptimised proof-of-work makes a debug node unable to
+follow the chain.
 
 ## Working on this
 
@@ -251,7 +255,7 @@ Three rules, in order of importance.
 documents cite `src/...` paths in the reference tree, not this repository. Keep
 a checkout to hand. Seventeen places where the spec's summary turned out to be
 imprecise are collected in [`docs/spec-deltas.md`](docs/spec-deltas.md) —
-twenty-four of them so far — each
+twenty-five of them so far — each
 with the C++ that settles it; they are also flagged at the code that depends on
 them.
 
@@ -267,9 +271,10 @@ chain split. Each one this milestone touches has a test naming it.
 network before any authentication; a panic there is a remote crash
 ([`specs/15`](specs/15-testing-and-conformance.md) §4.4). Every parser here has
 a `never_panics` test. `wow-crypto`, `wow-serialize` and `wow-types` set
-`#![forbid(unsafe_code)]`; `wow-randomwow` cannot, since it is an FFI binding,
-so it sets `#![deny(unsafe_op_in_unsafe_fn)]` and every `unsafe` block carries a
-`SAFETY` comment.
+`#![forbid(unsafe_code)]`; `wow-randomwow` cannot, since it uses AES-NI and
+runs SuperscalarHash as machine code, so it sets
+`#![deny(unsafe_op_in_unsafe_fn)]` and every `unsafe` block carries a `SAFETY`
+comment.
 
 ## Reference tree
 

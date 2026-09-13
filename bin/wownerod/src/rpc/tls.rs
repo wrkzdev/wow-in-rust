@@ -16,9 +16,9 @@
 //! first start and kept as `rpc_ssl.crt` and `rpc_ssl.key` in the data
 //! directory -- the files the C++ writes and reads -- so its fingerprint stays
 //! the same across restarts and a client can pin it. The C++ makes RSA-4096;
-//! this build makes ECDSA P-256, since `ring` cannot generate RSA keys. Every
-//! TLS client accepts either, and a pair the C++ left in the directory is
-//! served as it is.
+//! this build makes ECDSA P-256, whose signing is constant-time where RSA
+//! signing here is not ([`provider`]). Every TLS client accepts either, and a
+//! pair the C++ left in the directory is served as it is, with a warning.
 //!
 //! # Client certificates
 //!
@@ -28,10 +28,18 @@
 //! SHA-256 fingerprint is listed or it is itself in the CA file; with
 //! `--rpc-ssl-allow-chained`, also when it chains to a certificate in that
 //! file. `--rpc-ssl-allow-any-cert` turns the check off.
+//!
+//! # The cryptography
+//!
+//! All of it is [`provider`]'s: pure Rust, no ring, aws-lc-rs or OpenSSL.
+
+mod provider;
+#[cfg(test)]
+mod provider_tests;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,10 +51,12 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
+use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::{
     DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig, ServerConnection,
-    SignatureScheme, StreamOwned,
+    SignatureAlgorithm, SignatureScheme, StreamOwned,
 };
+use sha2::{Digest, Sha256};
 
 use super::http;
 use crate::cli::{Config, RpcSsl};
@@ -78,10 +88,7 @@ pub fn is_client_hello(data: &[u8]) -> bool {
 
 /// A certificate's SHA-256 fingerprint.
 pub fn fingerprint(der: &[u8]) -> [u8; 32] {
-    ring::digest::digest(&ring::digest::SHA256, der)
-        .as_ref()
-        .try_into()
-        .unwrap_or([0; 32])
+    Sha256::digest(der).into()
 }
 
 /// `aa:bb:...`, as fingerprints are usually shown.
@@ -123,9 +130,12 @@ pub fn load_pair(cert: &Path, key: &Path) -> Result<Pair, String> {
 }
 
 /// A self-signed certificate and its key, as PEM: serial 1, an empty subject,
-/// valid from now for half a year, as the C++ makes them.
+/// valid from now for half a year, as the C++ makes them; the key ECDSA P-256.
 fn generate() -> Result<(String, String), String> {
-    let key = rcgen::KeyPair::generate().map_err(|e| format!("cannot generate a TLS key: {e}"))?;
+    let (key, key_pem) =
+        provider::generate_p256().map_err(|e| format!("cannot generate a TLS key: {e}"))?;
+    let signer = provider::CertSigner::new(&key)
+        .map_err(|e| format!("cannot use the generated TLS key: {e}"))?;
     let mut params = rcgen::CertificateParams::default();
     params.distinguished_name = rcgen::DistinguishedName::new();
     params.serial_number = Some(rcgen::SerialNumber::from(1u64));
@@ -133,9 +143,9 @@ fn generate() -> Result<(String, String), String> {
     params.not_before = now;
     params.not_after = now + GENERATED_VALIDITY;
     let cert = params
-        .self_signed(&key)
+        .self_signed(&signer)
         .map_err(|e| format!("cannot make a TLS certificate: {e}"))?;
-    Ok((cert.pem(), key.serialize_pem()))
+    Ok((cert.pem(), key_pem))
 }
 
 /// The pair kept in `dir`, made and written there first when there is none.
@@ -179,6 +189,43 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         options.mode(0o400);
     }
     options.open(path)?.write_all(bytes)
+}
+
+/// Where the served pair came from.
+enum Origin {
+    /// `--rpc-ssl-certificate` and `--rpc-ssl-private-key`.
+    Given { key: PathBuf },
+    /// `rpc_ssl.crt` and `rpc_ssl.key` in the data directory.
+    Stored { crt: PathBuf, key: PathBuf },
+}
+
+/// An RSA key is served as it is, since the C++ makes them and users bring
+/// them, but RSA signing in this build is blinded rather than constant-time
+/// (RUSTSEC-2023-0071, see [`provider`]). So say so, once, with the way out
+/// and what it costs.
+fn warn_rsa(origin: &Origin) {
+    const WHY: &str = "RSA signing in this build is not constant-time (RUSTSEC-2023-0071): it \
+                       is blinded, but a client timing many handshakes could still learn \
+                       something of the key";
+    match origin {
+        Origin::Stored { crt, key } => wow_log::warn!(
+            LOG,
+            "the RPC TLS key {} is RSA. {}. Moving {} and {} aside makes the node generate an \
+             ECDSA P-256 pair in their place, but that changes the certificate fingerprint \
+             clients pinned",
+            key.display(),
+            WHY,
+            crt.display(),
+            key.display()
+        ),
+        Origin::Given { key } => wow_log::warn!(
+            LOG,
+            "the RPC TLS key {} is RSA. {}. An ECDSA P-256 or P-384 or Ed25519 key avoids \
+             that, but changes the certificate fingerprint clients pinned",
+            key.display(),
+            WHY
+        ),
+    }
 }
 
 /// The client-certificate check, when there is one to make.
@@ -339,10 +386,16 @@ impl Tls {
             return Ok(None);
         }
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let (certs, key) = match (&cfg.rpc_ssl_certificate, &cfg.rpc_ssl_private_key) {
-            (Some(cert), Some(key)) => load_pair(cert, key)?,
-            _ => stored_or_generated(data_dir)?,
+        let provider = Arc::new(provider::provider());
+        let ((certs, key), origin) = match (&cfg.rpc_ssl_certificate, &cfg.rpc_ssl_private_key) {
+            (Some(cert), Some(key)) => (load_pair(cert, key)?, Origin::Given { key: key.clone() }),
+            _ => (
+                stored_or_generated(data_dir)?,
+                Origin::Stored {
+                    crt: data_dir.join(format!("{CERT_BASENAME}.crt")),
+                    key: data_dir.join(format!("{CERT_BASENAME}.key")),
+                },
+            ),
         };
         let fingerprint = fingerprint(&certs[0]);
 
@@ -356,9 +409,22 @@ impl Tls {
         } else {
             builder.with_no_client_auth()
         };
-        let mut config = builder
-            .with_single_cert(certs, key)
+        // What `with_single_cert` does, but with the key at hand to look at.
+        let (Origin::Given { key: key_path } | Origin::Stored { key: key_path, .. }) = &origin;
+        let key = provider.key_provider.load_private_key(key).map_err(|e| {
+            format!(
+                "TLS: cannot use the private key {}: {e}",
+                key_path.display()
+            )
+        })?;
+        let certified = CertifiedKey::new(certs, key);
+        certified
+            .keys_match()
             .map_err(|e| format!("TLS: the certificate and the private key do not match: {e}"))?;
+        if certified.key.algorithm() == SignatureAlgorithm::RSA {
+            warn_rsa(&origin);
+        }
+        let mut config = builder.with_cert_resolver(Arc::new(SingleCertAndKey::from(certified)));
         // `SSL_SESS_CACHE_OFF`: no session resumption.
         config.session_storage = Arc::new(NoServerSessionStorage {});
 
@@ -425,7 +491,7 @@ mod tests {
     /// A real ClientHello is recognised, and an HTTP request is not.
     #[test]
     fn a_client_hello_is_told_from_a_plain_request() {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(provider::provider());
         let config = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(rustls::DEFAULT_VERSIONS)
             .unwrap()
@@ -456,6 +522,17 @@ mod tests {
         assert_eq!(parse_fingerprint(&"AB ".repeat(32)).unwrap(), fp);
         assert!(parse_fingerprint("abcd").unwrap_err().contains("32 bytes"));
         assert!(parse_fingerprint("zz").unwrap_err().contains("not hex"));
+    }
+
+    /// SHA-256 of the DER, the C++'s `X509_digest(cert, EVP_sha256())`:
+    /// FIPS 180-2's "abc" vector stands in for a certificate.
+    #[test]
+    fn a_fingerprint_is_sha256() {
+        assert_eq!(
+            fingerprint_hex(&fingerprint(b"abc")),
+            "ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:\
+             b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad"
+        );
     }
 
     /// **The kept certificate.** Made once and served again after a restart,

@@ -3,8 +3,8 @@
 # macOS arm64 and x86_64, cross-linked with zig through cargo-zigbuild. Built by
 # docker/build-dist.sh.
 #
-# No Apple SDK is involved: zig carries the macOS libc headers and libc++, and
-# the binaries load nothing but system libraries (libSystem, plus libiconv for
+# No Apple SDK is involved: zig carries the macOS libc headers, and the
+# binaries load nothing but system libraries (libSystem, plus libiconv for
 # wownerod and the CLI wallet). They require macOS 13 or later.
 #
 # zig's linker gives the arm64 binaries the ad-hoc code signature arm64 macOS
@@ -17,7 +17,7 @@
 FROM --platform=linux/amd64 rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS build
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends cmake ninja-build xz-utils \
+ && apt-get install -y --no-install-recommends xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
 # 0.16.0 is the release cargo-zigbuild's own CI tests against. Checksum from

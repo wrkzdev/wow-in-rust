@@ -1,10 +1,9 @@
 # Build context for docker/*.Dockerfile. The build needs the workspace sources
-# and third_party/randomwow's files -- not git metadata, build output, or data.
+# -- not git metadata, build output, or data.
 .git
 **/.git
 target/
 dist/
-third_party/randomwow/build/
 
 # Test data and documentation: not read by a release build.
 tests/corpus/

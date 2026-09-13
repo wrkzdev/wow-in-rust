@@ -37,7 +37,7 @@ use wow_types::tx::{Transaction, TxIn};
 use wow_types::Network;
 
 use crate::mempool::{Rejection as PoolRejection, TxPool};
-use crate::netsync::{LocalChain, Refusal, Submitted};
+use crate::netsync::{ChainPow, LocalChain, Refusal, Submitted};
 use crate::template::{ExtraNonce, NextBlock, Template, TemplateError};
 
 const LOG: &str = "blockchain";
@@ -103,6 +103,8 @@ pub struct NodeCore {
     db: Arc<LmdbDb>,
     hardfork: HardFork,
     chain: Mutex<LocalChain>,
+    /// The chain's proof-of-work verifier, reachable without the chain lock.
+    pow: Arc<ChainPow>,
     pool: Arc<Mutex<TxPool>>,
     /// A snapshot of what fee checks read, refreshed after every block, so an
     /// RPC fee estimate does not wait on a sync holding the chain.
@@ -118,10 +120,12 @@ impl NodeCore {
     ) -> Result<Arc<NodeCore>, String> {
         let chain = LocalChain::new(db.clone(), network)?;
         let fee = fee_context_of(&chain);
+        let pow = chain.pow();
         Ok(Arc::new(NodeCore {
             db,
             hardfork: HardFork::new(network),
             chain: Mutex::new(chain),
+            pow,
             pool,
             fee: Mutex::new(fee),
             listener: OnceLock::new(),
@@ -652,14 +656,24 @@ impl Core for NodeCore {
     }
 
     fn apply_blocks(&self, blocks: &[BlockEntry]) -> (usize, Option<BlockVerdict>) {
-        let mut chain = lock(&self.chain);
-        for (i, b) in blocks.iter().enumerate() {
-            match self.apply(&mut chain, &b.block, &b.txs) {
-                BlockVerdict::Added | BlockVerdict::AlreadyHave | BlockVerdict::Alternative => {}
-                other => return (i, Some(other)),
-            }
-        }
-        (blocks.len(), None)
+        // The proofs first, on every core and without the chain lock.
+        let work = self.pow_work(blocks);
+        self.pow.prehash(&work);
+        let taken = {
+            let mut chain = lock(&self.chain);
+            blocks
+                .iter()
+                .enumerate()
+                .find_map(|(i, b)| match self.apply(&mut chain, &b.block, &b.txs) {
+                    BlockVerdict::Added | BlockVerdict::AlreadyHave | BlockVerdict::Alternative => {
+                        None
+                    }
+                    other => Some((i, Some(other))),
+                })
+                .unwrap_or((blocks.len(), None))
+        };
+        self.pow.forget(&work);
+        taken
     }
 
     fn new_block(&self, entry: &BlockEntry) -> BlockVerdict {
@@ -721,6 +735,46 @@ impl Core for NodeCore {
 }
 
 impl NodeCore {
+    /// The `(seed, hashing blob)` of each block in a sync batch whose proof the
+    /// chain is going to compute: RandomWOW blocks at or above both the tip and
+    /// the trusted range. A seed at or above the tip is an earlier block of the
+    /// same batch.
+    ///
+    /// A guess rather than a ruling. A block that does not parse ends the list,
+    /// since the chain stops there too; one that turns out to be on another
+    /// branch only wastes its hash.
+    fn pow_work(&self, blocks: &[BlockEntry]) -> Vec<(Hash256, Vec<u8>)> {
+        let tip = self.db.height();
+        let from = tip.max(self.pow.trusted_below());
+        let mut ids = HashMap::new();
+        let mut work = Vec::new();
+        for entry in blocks {
+            let Ok(block) = Block::from_blob(&entry.block) else {
+                break;
+            };
+            let height = match block.miner_tx.prefix.vin.as_slice() {
+                [TxIn::Gen { height }] => *height,
+                _ => break,
+            };
+            if let Some(id) = block.block_id() {
+                ids.insert(height, id);
+            }
+            if height < from || block.major_version < wow_randomwow::RX_BLOCK_VERSION {
+                continue;
+            }
+            let seed_height = wow_randomwow::rx_seedheight(height);
+            let seed = if seed_height < tip {
+                self.db.get_block_hash(seed_height).ok()
+            } else {
+                ids.get(&seed_height).copied()
+            };
+            if let (Some(seed), Some(blob)) = (seed, block.hashing_blob()) {
+                work.push((seed, blob));
+            }
+        }
+        work
+    }
+
     /// Transactions from a peer, into the pool.
     fn admit_txs(&self, txs: &[Vec<u8>]) -> Vec<TxVerdict> {
         let ctx = self.fee_context();

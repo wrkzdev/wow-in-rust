@@ -25,7 +25,16 @@ wow-wallet.workspace = true
 curve25519-dalek.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
-ring.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+p256.workspace = true
+p384.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+rsa.workspace = true
+rand_core.workspace = true
 time.workspace = true
 
 # `src/signal.rs`: the SIGINT/SIGTERM handler.
