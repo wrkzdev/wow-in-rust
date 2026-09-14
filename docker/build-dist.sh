@@ -3,26 +3,41 @@
 #
 #   docker/build-dist.sh                  # linux windows macos android
 #   docker/build-dist.sh linux android    # a subset
+#   docker/build-dist.sh extras           # web gui-linux gui-windows gui-macos
+#   docker/build-dist.sh web gui-windows  # any of those, by name
 #
 # Output:
 #   dist/<platform>/wownero-rs-<version>-<rust-target>.{tar.gz,zip}
+#   dist/web/wownero-rs-wallet-web-<version>.tar.gz
+#   dist/gui-<os>/wownero-rs-wallet-gui-<version>-<rust-target>.{tar.gz,zip}
 #   dist/SHA256SUMS                       # every archive under dist/
 #
 # Needs Docker with BuildKit (Docker Desktop, or Engine 23+). Every build runs
 # in a linux/amd64 container, so the host OS does not matter; on an arm64 host
 # that means emulation, which is slow but gives the same result.
+#
+# The exception is gui-macos. The GUI needs Apple's SDK, which no container
+# has, so on a macOS host it builds natively (extras/macos/build.sh), and on
+# any other host it is skipped with a note.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 all=(linux windows macos android)
+extras=(web gui-linux gui-windows gui-macos)
 if [ $# -eq 0 ]; then
   set -- "${all[@]}"
 fi
+platforms=()
 for p in "$@"; do
-  case " ${all[*]} " in
-    *" $p "*) ;;
-    *) echo "unknown platform '$p' (expected: ${all[*]})" >&2; exit 2 ;;
+  case $p in
+    extras) platforms+=("${extras[@]}") ;;
+    *)
+      case " ${all[*]} ${extras[*]} " in
+        *" $p "*) platforms+=("$p") ;;
+        *) echo "unknown platform '$p' (expected: ${all[*]} ${extras[*]}, or extras)" >&2; exit 2 ;;
+      esac
+      ;;
   esac
 done
 
@@ -37,17 +52,33 @@ epoch=$(git log -1 --format=%ct 2>/dev/null || echo 315532800)
 mkdir -p dist
 printf '*\n' > dist/.gitignore   # build output never belongs in the repo
 
-for p in "$@"; do
-  echo "==> $p"
-  rm -rf "dist/$p"
+in_docker() {
+  local dockerfile=$1 platform=$2
+  rm -rf "dist/$platform"
   docker buildx build \
     --platform linux/amd64 \
-    --file "docker/$p.Dockerfile" \
+    --file "$dockerfile" \
     --build-arg "GIT_REV=$rev" \
     --build-arg "SOURCE_DATE_EPOCH=$epoch" \
     --target dist \
-    --output "type=local,dest=dist/$p" \
+    --output "type=local,dest=dist/$platform" \
     .
+}
+
+for p in "${platforms[@]}"; do
+  echo "==> $p"
+  case $p in
+    gui-macos)
+      if [ "$(uname -s)" != Darwin ]; then
+        echo "skipped: the macOS GUI wallet builds on a macOS host only"
+        continue
+      fi
+      rm -rf "dist/$p"
+      GIT_REV=$rev bash extras/macos/build.sh "dist/$p"
+      ;;
+    web | gui-*) in_docker "extras/docker/$p.Dockerfile" "$p" ;;
+    *) in_docker "docker/$p.Dockerfile" "$p" ;;
+  esac
 done
 
 sha256() {

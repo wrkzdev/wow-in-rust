@@ -4,6 +4,8 @@
 **/.git
 target/
 dist/
+extras/target/
+extras/wallet-web/dist/
 
 # Test data and documentation: not read by a release build.
 tests/corpus/

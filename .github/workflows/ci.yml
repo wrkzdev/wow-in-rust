@@ -56,6 +56,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --target wasm32-unknown-unknown -p wow-wallet -p wow-daemon-client
 
+  # The GUI and web wallets, a workspace of their own under extras/. The desktop
+  # build is checked and its unit tests run (none needs a display); the web
+  # wallet is checked for wasm32.
+  extras:
+    name: GUI and web wallet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: extras
+      - run: cargo check --manifest-path extras/Cargo.toml -p wownero-wallet-gui
+      - run: cargo test --manifest-path extras/Cargo.toml -p wownero-wallet-gui --lib
+      - run: cargo check --manifest-path extras/Cargo.toml --target wasm32-unknown-unknown -p wownero-wallet-web
+
   # Guards against a silently truncated or swapped corpus: the M1 gate is only
   # meaningful if the vectors are the ones the reference tree ships.
   corpus-integrity:
