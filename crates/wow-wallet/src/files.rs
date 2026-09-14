@@ -18,11 +18,18 @@
 //!
 //! The keys file **is** shared, and is read and written compatibly. That is
 //! where the money is; a cache is a few minutes of rescanning.
+//!
+//! # One program at a time
+//!
+//! An open wallet holds a lock on its keys file ([`crate::lock`]), as the C++
+//! does. A second open, here or in the C++ wallet, is refused rather than left
+//! to spend the same outputs and write over this one's files.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::history::{PooledTx, SentDestination, SentState, SentTx};
+use crate::lock::KeysLock;
 use crate::refresh::{Transfer, WalletState};
 use crate::subaddress::SubaddressTable;
 use crate::{AccountBase, KeysFile};
@@ -78,6 +85,9 @@ pub struct Session {
     pub daemon_height: u64,
     /// Set when anything has changed since the last save.
     pub dirty: bool,
+    /// The keys file, held while the wallet is open. `None` only while a save
+    /// replaces the file.
+    keys_lock: Option<KeysLock>,
 }
 
 impl Session {
@@ -115,7 +125,7 @@ impl Session {
             network,
         );
 
-        let s = Session {
+        let mut s = Session {
             paths,
             keys_file,
             state,
@@ -125,7 +135,9 @@ impl Session {
             daemon: None,
             daemon_height: 0,
             dirty: true,
+            keys_lock: None,
         };
+        // The save takes the lock, on the file it has just written.
         s.save()?;
         s.write_address_file()?;
         Ok(s)
@@ -138,8 +150,14 @@ impl Session {
         kdf_rounds: u64,
         network: Option<Network>,
     ) -> Result<Session, String> {
-        let blob = std::fs::read(paths.keys())
-            .map_err(|e| format!("cannot read {}: {e}", paths.keys().display()))?;
+        // Held from here on, as the C++ locks before it loads, so a wallet open
+        // elsewhere is refused before its keys are read. A Windows lock refuses
+        // reads through any other handle, so the keys are read through it.
+        let keys_path = paths.keys();
+        let keys_lock = KeysLock::acquire(&keys_path).map_err(|e| e.to_string())?;
+        let blob = keys_lock
+            .read()
+            .map_err(|e| format!("cannot read {}: {e}", keys_path.display()))?;
         let keys_file = KeysFile::open(&blob, password.as_bytes(), kdf_rounds)
             .map_err(|e| format!("cannot open the wallet: {e}"))?;
 
@@ -199,11 +217,17 @@ impl Session {
             daemon: None,
             daemon_height: 0,
             dirty: false,
+            keys_lock: Some(keys_lock),
         })
     }
 
     /// Write the keys file and the cache.
-    pub fn save(&self) -> Result<(), String> {
+    ///
+    /// The keys file is replaced by a rename, and a lock left on the file it
+    /// replaced would hold nothing. So the lock is let go for the write and
+    /// taken again on what was written, or on the old file if the write
+    /// failed.
+    pub fn save(&mut self) -> Result<(), String> {
         let mut rng = crate::entropy::seeded_rng()?;
         let iv = random_iv(&mut rng);
         let key_iv = random_iv(&mut rng);
@@ -212,7 +236,11 @@ impl Session {
             .keys_file
             .to_blob(self.password.as_bytes(), self.kdf_rounds, iv, key_iv)
             .map_err(|e| format!("cannot serialize the wallet: {e}"))?;
-        write_atomically(&self.paths.keys(), &blob)?;
+        let keys_path = self.paths.keys();
+        self.keys_lock = None;
+        let written = write_atomically(&keys_path, &blob);
+        self.keys_lock = Some(KeysLock::acquire(&keys_path).map_err(|e| e.to_string())?);
+        written?;
         write_atomically(&self.paths.cache(), &cache::store(&self.state))?;
         Ok(())
     }
@@ -782,6 +810,29 @@ mod tests {
         s.state.hashes.push([7u8; 32]);
         s.start_at_tip(873_427);
         assert_eq!(s.state.start_height, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An open wallet holds its keys file: a second open is refused while the
+    /// first is open, a save keeps it held, and closing lets it go.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn an_open_wallet_is_held() {
+        let dir = scratch("held");
+        let mut s = fresh_session(&dir, 0);
+        let reopen = || Session::open(Paths::new(dir.join("w")), String::new(), 1, None);
+
+        match reopen() {
+            Ok(_) => panic!("opened a wallet that is already open"),
+            Err(e) => assert!(e.contains("another wallet program"), "{e}"),
+        }
+
+        s.save().expect("save");
+        assert!(reopen().is_err(), "still held after a save");
+
+        drop(s);
+        reopen().expect("free once the first is closed");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
