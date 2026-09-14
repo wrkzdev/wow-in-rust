@@ -73,6 +73,9 @@ pub struct Info {
     pub nettype: String,
     pub synchronized: bool,
     pub top_block_hash: String,
+    /// Twice the median the fee tiers come from; half of it is the full
+    /// reward zone. 0 when the daemon does not say.
+    pub block_weight_limit: u64,
 }
 
 /// The outcome of a relay attempt.
@@ -156,6 +159,13 @@ impl DaemonClient {
                 .and_then(Json::as_str)
                 .unwrap_or("")
                 .to_string(),
+            // `NodeRPCProxy::get_block_weight_limit` falls back to the name
+            // from before weights replaced sizes.
+            block_weight_limit: v
+                .get("block_weight_limit")
+                .or_else(|| v.get("block_size_limit"))
+                .and_then(Json::as_u64)
+                .unwrap_or(0),
         })
     }
 
@@ -199,6 +209,21 @@ impl DaemonClient {
             }
         }
         Ok(vec![u64_of(&v, "fee")?])
+    }
+
+    /// `getblockheadersrange`, down to the one field a wallet reads from it:
+    /// the weight of each block from `start_height` to `end_height` inclusive.
+    pub fn get_block_weights(&self, start_height: u64, end_height: u64) -> Result<Vec<u64>> {
+        let v = self.json_rpc(
+            "getblockheadersrange",
+            json!({ "start_height": start_height, "end_height": end_height }),
+        )?;
+        v.get("headers")
+            .and_then(Json::as_array)
+            .ok_or(DaemonError::Missing("headers"))?
+            .iter()
+            .map(|h| u64_of(h, "block_weight"))
+            .collect()
     }
 
     // -- binary -------------------------------------------------------------

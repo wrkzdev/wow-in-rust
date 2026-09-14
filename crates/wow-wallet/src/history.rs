@@ -577,6 +577,7 @@ mod tests {
             change: 2_500,
             fee: 500,
             estimated_weight: 0,
+            sweep: false,
         };
         let txid = [2u8; 32];
         w.record_sent(txid, &plan, &["Wo1payee"], Some([3u8; 8]), SENT);

@@ -118,6 +118,23 @@ pub fn fee_from_weight(base_fee_per_byte: u64, weight: u64) -> u64 {
     quantize_up(weight.saturating_mul(base_fee_per_byte))
 }
 
+/// Bytes of `tx_extra` in a transaction [`crate::transfer::construct`] builds.
+///
+/// The public key is 33. A payment id, real or the dummy that a two-output
+/// transaction carries in its place, is 11: the nonce tag, its length, the
+/// encrypted-id tag and eight bytes. Paying a subaddress adds a tag, a count
+/// and a key per output, and no dummy.
+pub fn extra_size(n_outputs: usize, payment_id: bool, any_subaddress: bool) -> usize {
+    let mut size = 1 + 32;
+    if payment_id || (n_outputs == MIN_OUTPUTS && !any_subaddress) {
+        size += 2 + 1 + 8;
+    }
+    if any_subaddress {
+        size += 2 + 32 * n_outputs;
+    }
+    size
+}
+
 /// What a caller is willing to spend and how.
 #[derive(Clone, Debug)]
 pub struct SpendOptions {
@@ -142,7 +159,7 @@ impl Default for SpendOptions {
         SpendOptions {
             ring_size: crate::decoys::RING_SIZE,
             fee_per_byte: 0,
-            extra_size: 44, // one tx pubkey field
+            extra_size: 44, // the tx public key and an encrypted payment id
             from_account: None,
             ignore_above: u64::MAX,
             ignore_below: 0,
@@ -163,14 +180,52 @@ pub struct SpendPlan {
     /// output is still needed to reach two.
     pub change: u64,
     pub fee: u64,
-    /// The weight the fee was computed from.
+    /// The weight the fee was computed from: the estimate while planning, the
+    /// built transaction's own once [`crate::transfer::construct_settled`] has
+    /// run.
     pub estimated_weight: u64,
+    /// A sweep pays its fee out of the amount sent rather than out of change.
+    pub sweep: bool,
 }
 
 impl SpendPlan {
     /// Total outputs, including change or the dummy that stands in for it.
     pub fn output_count(&self) -> usize {
         (self.amounts.len() + 1).max(MIN_OUTPUTS)
+    }
+
+    /// The same inputs and destinations at another fee.
+    ///
+    /// The difference comes out of the change or, for a sweep, out of the
+    /// amount sent. A fee the inputs cannot cover is [`SpendError::NotEnough`];
+    /// the C++ would go back for another input, which this does not, because
+    /// the fee only moves by the few bytes the estimate was off by.
+    pub fn with_fee(&self, fee: u64) -> Result<SpendPlan, SpendError> {
+        let sending: u64 = self.amounts.iter().sum();
+        let in_total = sending + self.change + self.fee;
+        let mut next = self.clone();
+        next.fee = fee;
+        if self.sweep {
+            if fee >= in_total {
+                return Err(SpendError::NotEnough {
+                    available: in_total,
+                    needed: fee,
+                    fee,
+                });
+            }
+            next.amounts = vec![in_total - fee];
+        } else {
+            let needed = sending.saturating_add(fee);
+            if needed > in_total {
+                return Err(SpendError::NotEnough {
+                    available: in_total,
+                    needed,
+                    fee,
+                });
+            }
+            next.change = in_total - needed;
+        }
+        Ok(next)
     }
 }
 
@@ -283,6 +338,7 @@ pub fn plan(
                 change,
                 fee,
                 estimated_weight: weight,
+                sweep: false,
             });
         }
         fee = next_fee;
@@ -343,6 +399,7 @@ pub fn plan_sweep(transfers: &[Transfer], options: &SpendOptions) -> Result<Spen
         change: 0,
         fee,
         estimated_weight: weight,
+        sweep: true,
     })
 }
 
@@ -666,5 +723,59 @@ mod tests {
         o.from_account = Some(2);
         let p = plan(&transfers, &[1_000_000], &o).expect("a plan");
         assert_eq!(change_index(&p, &transfers), SubaddressIndex::new(2, 0));
+    }
+
+    /// A new fee moves the change and leaves what the payee gets alone.
+    #[test]
+    fn a_new_fee_moves_the_change() {
+        let transfers = vec![transfer(10_000_000_000, 100, 1)];
+        let p = plan(&transfers, &[4_000_000_000], &options(3)).expect("a plan");
+        assert!(!p.sweep);
+
+        let lower = p.with_fee(p.fee - 1_000).expect("a lower fee");
+        assert_eq!(lower.amounts, p.amounts, "the payee is untouched");
+        assert_eq!(lower.change, p.change + 1_000);
+        assert_eq!(lower.inputs, p.inputs);
+
+        let higher = p.with_fee(p.fee + 5_000).expect("a higher fee");
+        assert_eq!(higher.change, p.change - 5_000);
+
+        assert!(matches!(
+            p.with_fee(p.fee + p.change + 1),
+            Err(SpendError::NotEnough { .. })
+        ));
+    }
+
+    /// A sweep's new fee comes out of the amount, and there is still no change.
+    #[test]
+    fn a_new_fee_on_a_sweep_moves_the_amount() {
+        let transfers = vec![transfer(7_000_000_000, 100, 1)];
+        let p = plan_sweep(&transfers, &options(3)).expect("a sweep");
+        assert!(p.sweep);
+
+        let lower = p.with_fee(p.fee - 1_000).expect("a lower fee");
+        assert_eq!(lower.change, 0);
+        assert_eq!(lower.amounts[0], p.amounts[0] + 1_000);
+        assert_eq!(lower.amounts[0] + lower.fee, 7_000_000_000);
+
+        assert!(matches!(
+            p.with_fee(7_000_000_000),
+            Err(SpendError::NotEnough { .. })
+        ));
+    }
+
+    /// The usual transaction's `tx_extra` is 44 bytes with or without a
+    /// payment id, because a dummy stands in for a missing one.
+    #[test]
+    fn the_extra_size_counts_the_dummy_payment_id() {
+        assert_eq!(extra_size(2, false, false), 44, "a dummy");
+        assert_eq!(extra_size(2, true, false), 44, "a real one, the same size");
+        assert_eq!(extra_size(3, false, false), 33, "no dummy past two outputs");
+        assert_eq!(extra_size(3, true, false), 44);
+        assert_eq!(extra_size(2, false, true), 33 + 2 + 64, "keys, no dummy");
+        assert_eq!(
+            SpendOptions::default().extra_size,
+            extra_size(2, false, false)
+        );
     }
 }

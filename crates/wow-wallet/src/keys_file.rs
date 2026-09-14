@@ -228,6 +228,31 @@ impl KeysFile {
             .insert("store_tx_info".into(), Json::from(u64::from(on)));
     }
 
+    /// `default_priority`, 0 to 4, where 0 lets the wallet choose. A keys file
+    /// from before the field existed may carry `default_fee_multiplier`, which
+    /// the reference reads in its place.
+    pub fn default_priority(&self) -> u32 {
+        u64_member(&self.settings, "default_priority")
+            .or_else(|| u64_member(&self.settings, "default_fee_multiplier"))
+            .unwrap_or(0) as u32
+    }
+
+    pub fn set_default_priority(&mut self, priority: u32) {
+        self.settings
+            .insert("default_priority".into(), Json::from(priority));
+    }
+
+    /// `auto_low_priority`: whether a transfer with no priority may pay the
+    /// lowest tier when the network is quiet. On unless turned off.
+    pub fn auto_low_priority(&self) -> bool {
+        bool_member(&self.settings, "auto_low_priority").unwrap_or(true)
+    }
+
+    pub fn set_auto_low_priority(&mut self, on: bool) {
+        self.settings
+            .insert("auto_low_priority".into(), Json::from(u64::from(on)));
+    }
+
     /// `(major, minor)` lookahead — how many unused subaddresses to precompute.
     pub fn subaddress_lookahead(&self) -> (u32, u32) {
         (

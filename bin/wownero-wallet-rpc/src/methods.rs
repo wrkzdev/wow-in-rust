@@ -13,6 +13,7 @@ use serde_json::{json, Map, Value};
 use wow_types::address::{Address, AddressKind};
 use wow_wallet::decoys::{self, GammaPicker};
 use wow_wallet::files::Session;
+use wow_wallet::priority::{self, PrioritySettings};
 use wow_wallet::spend::{self, SpendOptions};
 use wow_wallet::transfer::{self, Destination, SpendableOutput};
 
@@ -158,6 +159,7 @@ pub fn dispatch(state: &State, method: &str, params: &Value) -> MethodResult {
         "transfer_split" => transfer_method(session, params, true),
         "sweep_all" => sweep_all(session, params),
         "relay_tx" => relay_tx(session, params),
+        "get_default_fee_priority" => get_default_fee_priority(session),
         "stop_wallet" => {
             session.save().map_err(internal)?;
             state.request_stop();
@@ -876,14 +878,18 @@ fn build_and_send(
         .map_err(|e| Error::new(errors::WRONG_ADDRESS, e.to_string()))?;
 
     let tiers = client
-        .get_fee_estimate(0)
+        .get_fee_estimate(priority::FEE_ESTIMATE_GRACE_BLOCKS)
         .map_err(|e| Error::new(errors::NO_DAEMON_CONNECTION, e.to_string()))?;
-    let priority = u32_param(params, "priority", 2).clamp(1, 4);
-    let fee_per_byte = tiers
-        .get(priority as usize - 1)
-        .or(tiers.first())
-        .copied()
-        .unwrap_or(0);
+    // `on_transfer`: `adjust_priority(req.priority)`, where a priority left out
+    // is 0 -- the low tier on a quiet chain, not normal.
+    let priority = priority::adjust_priority(
+        &client,
+        u32_param(params, "priority", 0),
+        PrioritySettings::from_keys_file(&session.keys_file),
+        session.state.scan_height(),
+        &tiers,
+    );
+    let fee_per_byte = priority::fee_per_byte(&tiers, priority);
 
     // Another copy of this wallet may have spent some of these outputs since
     // the last refresh; an unreadable pool is no reason to refuse the send.
@@ -892,7 +898,11 @@ fn build_and_send(
     let options = SpendOptions {
         ring_size,
         fee_per_byte,
-        extra_size: if decoded.payment_id.is_some() { 55 } else { 44 },
+        extra_size: spend::extra_size(
+            2,
+            decoded.payment_id.is_some(),
+            decoded.kind == AddressKind::Subaddress,
+        ),
         chain_height: session.chain_height(),
         now: wow_wallet::files::now(),
         ..Default::default()
@@ -963,33 +973,49 @@ fn build_and_send(
         });
     }
 
-    let dests = vec![
-        Destination {
-            address: decoded.keys,
-            is_subaddress: decoded.kind == AddressKind::Subaddress,
-            amount: plan.amounts[0],
-        },
-        Destination {
-            address: session.keys_file.account.keys.account_address,
-            is_subaddress: false,
-            amount: plan.change,
-        },
-    ];
+    let payee = decoded.keys;
+    let payee_is_subaddress = decoded.kind == AddressKind::Subaddress;
+    let change_to = session.keys_file.account.keys.account_address;
+    let destinations = |p: &spend::SpendPlan| {
+        vec![
+            Destination {
+                address: payee,
+                is_subaddress: payee_is_subaddress,
+                amount: p.amounts[0],
+            },
+            Destination {
+                address: change_to,
+                is_subaddress: false,
+                amount: p.change,
+            },
+        ]
+    };
 
-    let built = transfer::construct(&inputs, &dests, plan.fee, decoded.payment_id, &mut || {
-        use wow_wallet::decoys::RandomSource;
-        let mut b = [0u8; 32];
-        for chunk in b.chunks_mut(8) {
-            chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
+    // At the fee the built transaction's weight needs, not the estimate's.
+    let settled = transfer::construct_settled(
+        &inputs,
+        &plan,
+        fee_per_byte,
+        decoded.payment_id,
+        &destinations,
+        &mut || {
+            use wow_wallet::decoys::RandomSource;
+            let mut b = [0u8; 32];
+            for chunk in b.chunks_mut(8) {
+                chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
+            }
+            curve25519_dalek::scalar::Scalar::from_bytes_mod_order(b)
+        },
+    )
+    .map_err(|e| match e {
+        transfer::SettleError::Plan(e) => spend_error(e),
+        transfer::SettleError::Build(e) => {
+            Error::new(errors::GENERIC_TRANSFER_ERROR, e.to_string())
         }
-        curve25519_dalek::scalar::Scalar::from_bytes_mod_order(b)
-    })
-    .map_err(|e| Error::new(errors::GENERIC_TRANSFER_ERROR, e.to_string()))?;
-
-    let mut w = wow_serialize::binary::Writer::with_capacity(8192);
-    built.tx.write(&mut w);
-    let blob = w.into_vec();
-    let txid = transfer::transaction_hash(&built.tx);
+    })?;
+    let plan = settled.plan;
+    let blob = settled.blob;
+    let txid = transfer::transaction_hash(&settled.built.tx);
 
     let do_not_relay = params
         .get("do_not_relay")
@@ -1059,6 +1085,34 @@ fn spend_error(e: spend::SpendError) -> Error {
         }
         spend::SpendError::FeeDidNotSettle(_) => Error::new(errors::TX_NOT_POSSIBLE, e.to_string()),
     }
+}
+
+/// `get_default_fee_priority`: the priority a transfer given none would pay
+/// now.
+fn get_default_fee_priority(session: &Session) -> MethodResult {
+    let client = session
+        .daemon
+        .as_ref()
+        .ok_or_else(|| Error::new(errors::NO_DAEMON_CONNECTION, "no daemon is set"))?;
+    let tiers = client
+        .get_fee_estimate(priority::FEE_ESTIMATE_GRACE_BLOCKS)
+        .map_err(|e| Error::new(errors::NO_DAEMON_CONNECTION, e.to_string()))?;
+    let priority = priority::adjust_priority(
+        client,
+        0,
+        PrioritySettings::from_keys_file(&session.keys_file),
+        session.state.scan_height(),
+        &tiers,
+    );
+    // The reference refuses a 0 rather than report it, including the 0 that a
+    // default priority set in the wallet leaves behind.
+    if priority == 0 {
+        return Err(Error::new(
+            errors::UNKNOWN_ERROR,
+            "Failed to get adjusted fee priority",
+        ));
+    }
+    Ok(json!({ "priority": priority }))
 }
 
 fn relay_tx(session: &mut Session, params: &Value) -> MethodResult {

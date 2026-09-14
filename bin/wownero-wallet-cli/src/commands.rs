@@ -11,6 +11,7 @@ use wow_daemon_client::KeyImageStatus;
 use wow_types::address::{Address, AddressKind};
 use wow_wallet::decoys::{self, GammaPicker};
 use wow_wallet::history::{EntryKind, PROPAGATION_TIMEOUT};
+use wow_wallet::priority::{self, PrioritySettings};
 use wow_wallet::spend::{self, SpendOptions};
 use wow_wallet::transfer::{self, Destination, SpendableOutput};
 use wow_wallet::{PoolCheck, RefreshEvent};
@@ -681,38 +682,45 @@ fn fee(session: &mut Session) -> Result<(), String> {
         .as_ref()
         .ok_or("no daemon set; use `set_daemon <host:port>`")?;
     let tiers = client
-        .get_fee_estimate(0)
+        .get_fee_estimate(priority::FEE_ESTIMATE_GRACE_BLOCKS)
         .map_err(|e| format!("cannot get a fee estimate: {e}"))?;
 
     println!("Fee per byte, by priority:");
     for (i, t) in tiers.iter().enumerate() {
-        println!("  {}: {}", priority_name(i as u32 + 1), fmt::amount(*t));
+        println!("  {}: {}", tier_name(i as u32 + 1), fmt::amount(*t));
     }
-    // What that means for an ordinary transaction.
-    let weight = spend::estimate_tx_weight(1, decoys::RING_SIZE, 2, 44);
+
+    // What a transfer given no priority pays now, for an ordinary one.
+    let settings = PrioritySettings::from_keys_file(&session.keys_file);
+    let chosen = priority::adjust_priority(
+        client,
+        settings.default_priority,
+        settings,
+        session.state.scan_height(),
+        &tiers,
+    );
+    let weight =
+        spend::estimate_tx_weight(1, decoys::RING_SIZE, 2, spend::extra_size(2, false, false));
     println!(
-        "A one-input, two-output transaction weighs about {weight} bytes, so at normal priority \
-         it would cost {}.",
+        "A transfer given no priority pays the {} rate now. A one-input, two-output transaction \
+         weighs about {weight} bytes, so it would cost {}.",
+        tier_name(chosen),
         fmt::amount(spend::fee_from_weight(
-            tiers.get(1).copied().unwrap_or(tiers[0]),
+            priority::fee_per_byte(&tiers, chosen),
             weight
         ))
     );
     Ok(())
 }
 
-fn priority_name(p: u32) -> &'static str {
-    match p {
-        1 => "unimportant",
-        2 => "normal",
-        3 => "elevated",
-        _ => "priority",
-    }
+/// The name of the tier a priority pays. A 0 left unadjusted pays the lowest.
+fn tier_name(p: u32) -> &'static str {
+    priority::PRIORITY_NAMES[p.clamp(1, 4) as usize]
 }
 
 fn transfer_cmd(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let mut rest: Vec<&str> = args.to_vec();
-    let priority = take_priority(&mut rest);
+    let priority = take_priority(&mut rest, session.keys_file.default_priority());
     let ring_size = take_ring_size(&mut rest)?;
 
     let address = rest
@@ -734,7 +742,8 @@ fn transfer_cmd(session: &mut Session, args: &[&str]) -> Result<(), String> {
 
 fn sweep_all(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let mut rest: Vec<&str> = args.to_vec();
-    let priority = take_priority(&mut rest);
+    // `simple_wallet::sweep_main` starts from 0, not the default priority.
+    let priority = take_priority(&mut rest, 0);
     let ring_size = take_ring_size(&mut rest)?;
     let address = rest
         .first()
@@ -796,15 +805,18 @@ fn send(
         (None, other) => other,
     };
 
-    // Fees, from the daemon.
+    // Fees, from the daemon, at the tier `adjust_priority` settles on.
     let tiers = client
-        .get_fee_estimate(0)
+        .get_fee_estimate(priority::FEE_ESTIMATE_GRACE_BLOCKS)
         .map_err(|e| format!("cannot get a fee estimate: {e}"))?;
-    let fee_per_byte = tiers
-        .get(priority.saturating_sub(1) as usize)
-        .or(tiers.first())
-        .copied()
-        .unwrap_or(0);
+    let priority = priority::adjust_priority(
+        &client,
+        priority,
+        PrioritySettings::from_keys_file(&session.keys_file),
+        session.state.scan_height(),
+        &tiers,
+    );
+    let fee_per_byte = priority::fee_per_byte(&tiers, priority);
 
     // Another copy of this wallet may have spent some of these outputs since
     // the last refresh. Better found in the pool now than as a refusal.
@@ -822,7 +834,7 @@ fn send(
     let options = SpendOptions {
         ring_size,
         fee_per_byte,
-        extra_size: if pid.is_some() { 44 + 11 } else { 44 },
+        extra_size: spend::extra_size(2, pid.is_some(), decoded.kind == AddressKind::Subaddress),
         chain_height: session.chain_height(),
         now: now(),
         ..Default::default()
@@ -881,27 +893,58 @@ fn send(
     }
 
     // Destinations: the payee, then change back to ourselves.
+    let payee = decoded.keys;
+    let payee_is_subaddress = decoded.kind == AddressKind::Subaddress;
     let change_to = session.keys_file.account.keys.account_address;
-    let mut dests = vec![Destination {
-        address: decoded.keys,
-        is_subaddress: decoded.kind == AddressKind::Subaddress,
-        amount: plan.amounts[0],
-    }];
-    dests.push(Destination {
-        address: change_to,
-        is_subaddress: false,
-        amount: plan.change,
-    });
+    let destinations = |p: &spend::SpendPlan| {
+        vec![
+            Destination {
+                address: payee,
+                is_subaddress: payee_is_subaddress,
+                amount: p.amounts[0],
+            },
+            Destination {
+                address: change_to,
+                is_subaddress: false,
+                amount: p.change,
+            },
+        ]
+    };
+
+    // Built before asking, as the C++ does: the fee is the built transaction's
+    // weight's, and weighing it takes the transaction.
+    let settled = transfer::construct_settled(
+        &inputs,
+        &plan,
+        fee_per_byte,
+        pid,
+        &destinations,
+        &mut || {
+            use wow_wallet::decoys::RandomSource;
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
+            b[8..16].copy_from_slice(&rng.next_u64().to_le_bytes());
+            b[16..24].copy_from_slice(&rng.next_u64().to_le_bytes());
+            b[24..].copy_from_slice(&rng.next_u64().to_le_bytes());
+            curve25519_dalek::scalar::Scalar::from_bytes_mod_order(b)
+        },
+    )
+    .map_err(|e| format!("cannot build the transaction: {e}"))?;
+    let plan = settled.plan;
 
     println!();
     println!("Sending  {}", fmt::amount(plan.amounts[0]));
     println!("     to  {address_text}");
-    println!("    fee  {}", fmt::amount(plan.fee));
+    println!(
+        "    fee  {} ({})",
+        fmt::amount(plan.fee),
+        tier_name(priority)
+    );
     if plan.change > 0 {
         println!(" change  {}", fmt::amount(plan.change));
     }
     println!(
-        " inputs  {}, ring size {ring_size}, about {} bytes",
+        " inputs  {}, ring size {ring_size}, {} bytes",
         plan.inputs.len(),
         plan.estimated_weight
     );
@@ -913,21 +956,8 @@ fn send(
         return Ok(());
     }
 
-    let built = transfer::construct(&inputs, &dests, plan.fee, pid, &mut || {
-        use wow_wallet::decoys::RandomSource;
-        let mut b = [0u8; 32];
-        b[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
-        b[8..16].copy_from_slice(&rng.next_u64().to_le_bytes());
-        b[16..24].copy_from_slice(&rng.next_u64().to_le_bytes());
-        b[24..].copy_from_slice(&rng.next_u64().to_le_bytes());
-        curve25519_dalek::scalar::Scalar::from_bytes_mod_order(b)
-    })
-    .map_err(|e| format!("cannot build the transaction: {e}"))?;
-
-    let mut w = wow_serialize::binary::Writer::with_capacity(8192);
-    built.tx.write(&mut w);
-    let blob = w.into_vec();
-    let txid = transfer::transaction_hash(&built.tx);
+    let blob = settled.blob;
+    let txid = transfer::transaction_hash(&settled.built.tx);
 
     let result = client
         .send_raw_transaction(&blob, false)
@@ -1053,7 +1083,8 @@ fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let Some(option) = args.first() else {
         println!("usage: set <option> <value>");
         println!(
-            "known: refresh-from-block-height, subaddress-lookahead, seed-language, store-tx-info"
+            "known: refresh-from-block-height, subaddress-lookahead, seed-language, store-tx-info, \
+             priority, auto-low-priority"
         );
         return Ok(());
     };
@@ -1097,6 +1128,21 @@ fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
             };
             session.keys_file.set_store_tx_info(on);
         }
+        "priority" => {
+            let p = priority::parse_priority(value).ok_or(
+                "priority is 0, 1, 2, 3 or 4, or one of: default, unimportant, normal, elevated, \
+                 priority",
+            )?;
+            session.keys_file.set_default_priority(p);
+        }
+        "auto-low-priority" => {
+            let on = match *value {
+                "1" | "true" | "on" => true,
+                "0" | "false" | "off" => false,
+                _ => return Err("auto-low-priority is 0 or 1".into()),
+            };
+            session.keys_file.set_auto_low_priority(on);
+        }
         other => return Err(format!("`{other}` is not a setting this build knows")),
     }
 
@@ -1114,25 +1160,17 @@ fn parse_index(arg: Option<&&str>, default: u32) -> Result<u32, String> {
     }
 }
 
-/// A leading priority word or digit, if present.
-fn take_priority(args: &mut Vec<&str>) -> u32 {
-    let Some(first) = args.first().copied() else {
-        return 2;
-    };
-    let p = match first {
-        "default" | "0" => Some(2),
-        "unimportant" | "1" => Some(1),
-        "normal" | "2" => Some(2),
-        "elevated" | "3" => Some(3),
-        "priority" | "4" => Some(4),
-        _ => None,
-    };
-    match p {
+/// A leading priority word or digit, if present; `default` otherwise.
+///
+/// `default` and `0` are 0, which `adjust_priority` turns into a tier later.
+/// They are not "normal".
+fn take_priority(args: &mut Vec<&str>, default: u32) -> u32 {
+    match args.first().and_then(|a| priority::parse_priority(a)) {
         Some(p) => {
             args.remove(0);
             p
         }
-        None => 2,
+        None => default,
     }
 }
 
@@ -1168,15 +1206,22 @@ mod tests {
     #[test]
     fn priorities_parse_both_ways() {
         let mut a = vec!["elevated", "rest"];
-        assert_eq!(take_priority(&mut a), 3);
+        assert_eq!(take_priority(&mut a, 0), 3);
         assert_eq!(a, vec!["rest"]);
 
         let mut a = vec!["4", "rest"];
-        assert_eq!(take_priority(&mut a), 4);
+        assert_eq!(take_priority(&mut a, 0), 4);
 
-        // Not a priority: left alone, default returned.
+        // `default` is 0, for `adjust_priority` to settle, whatever the
+        // wallet's default priority.
+        let mut a = vec!["default", "rest"];
+        assert_eq!(take_priority(&mut a, 3), 0);
+        assert_eq!(a, vec!["rest"]);
+
+        // Not a priority: left alone, the default returned.
         let mut a = vec!["Wo1abc", "5"];
-        assert_eq!(take_priority(&mut a), 2);
+        assert_eq!(take_priority(&mut a, 0), 0);
+        assert_eq!(take_priority(&mut a, 3), 3);
         assert_eq!(a.len(), 2);
     }
 

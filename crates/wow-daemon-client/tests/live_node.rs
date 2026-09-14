@@ -97,6 +97,44 @@ fn the_decoy_endpoints_answer() {
     eprintln!("fetched {} ring members, all well formed", outs.len());
 }
 
+/// What `adjust_priority` asks before it picks a fee tier. If any of these
+/// fails, a transfer given no priority still pays the low tier, but by the
+/// fallback rather than by looking -- so a broken call would go unnoticed.
+#[test]
+#[ignore = "needs a live node; set WOW_LIVE_NODE"]
+fn the_fee_priority_inputs_answer() {
+    let Some(c) = client() else {
+        eprintln!("set WOW_LIVE_NODE to run this");
+        return;
+    };
+    let tiers = c.get_fee_estimate(10).expect("get_fee_estimate");
+    assert_eq!(
+        tiers.len(),
+        4,
+        "four tiers from the 2021 scaling: {tiers:?}"
+    );
+    assert!(tiers.windows(2).all(|w| w[0] <= w[1]), "ordered: {tiers:?}");
+
+    let info = c.get_info().expect("get_info");
+    assert!(
+        info.block_weight_limit >= 600_000,
+        "twice a median floored at 300,000: {}",
+        info.block_weight_limit
+    );
+
+    let weights = c
+        .get_block_weights(info.height - 10, info.height - 1)
+        .expect("getblockheadersrange");
+    assert_eq!(weights.len(), 10, "one weight per block asked for");
+    assert!(weights.iter().all(|w| *w > 0), "every block has a coinbase");
+
+    c.get_transaction_pool().expect("get_transaction_pool");
+    eprintln!(
+        "tiers {tiers:?}, limit {}, recent weights {weights:?}",
+        info.block_weight_limit
+    );
+}
+
 /// A wallet's refresh call, against the real thing.
 #[test]
 #[ignore = "needs a live node; set WOW_LIVE_NODE"]

@@ -36,6 +36,7 @@ pub mod entropy;
 pub mod files;
 pub mod history;
 pub mod keys_file;
+pub mod priority;
 pub mod refresh;
 pub mod scan;
 pub mod spend;
