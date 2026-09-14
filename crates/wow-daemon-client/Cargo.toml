@@ -8,6 +8,7 @@ description = "A client for a Wownero daemon's RPC (specs/11)"
 
 [dependencies]
 wow-crypto.workspace = true
+wow-log.workspace = true
 wow-serialize.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

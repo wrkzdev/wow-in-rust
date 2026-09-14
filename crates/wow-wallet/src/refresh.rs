@@ -50,6 +50,9 @@ use crate::subaddress::SubaddressTable;
 /// `COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT`.
 pub const MAX_BLOCKS_PER_CALL: u64 = 1_000;
 
+/// `wallet2`'s log category, so one `--log-level` means the same to both.
+const LOG: &str = "wallet.wallet2";
+
 /// `CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE`.
 const SPENDABLE_AGE: u64 = 4;
 
@@ -440,6 +443,12 @@ impl WalletState {
         } else {
             0
         };
+        wow_log::debug!(
+            LOG,
+            "asking for blocks: scanned to {}, {} history hash(es), start_height {start_height}",
+            self.scan_height(),
+            history.len()
+        );
         let batch = source
             .get_blocks(&history, start_height)
             .map_err(|e| RefreshError::Source(e.to_string()))?;
@@ -449,6 +458,13 @@ impl WalletState {
             ..Default::default()
         };
 
+        wow_log::debug!(
+            LOG,
+            "{} block(s) from height {}, the daemon at {}",
+            batch.blocks.len(),
+            batch.start_height,
+            batch.current_height
+        );
         if batch.blocks.is_empty() {
             summary.caught_up = true;
             return Ok(summary);
@@ -469,6 +485,11 @@ impl WalletState {
             // chains split before the wallet's first block. Drop them all, and
             // the next request names the wallet's start height again.
             self.check_reorg_depth(tip - self.start_height)?;
+            wow_log::info!(
+                LOG,
+                "the daemon has none of this wallet's blocks; detaching from {}",
+                self.start_height
+            );
             self.detach(self.start_height);
             summary.reorg_to = Some(self.start_height);
             return Ok(summary);
@@ -489,6 +510,11 @@ impl WalletState {
                     continue;
                 }
                 self.check_reorg_depth(self.scan_height() - height)?;
+                wow_log::info!(
+                    LOG,
+                    "the chain changed at height {height}; detaching {} block(s)",
+                    self.scan_height() - height
+                );
                 self.detach(height);
                 summary.reorg_to = Some(height);
             }
@@ -497,6 +523,12 @@ impl WalletState {
         }
 
         summary.caught_up = self.scan_height() >= batch.current_height;
+        wow_log::debug!(
+            LOG,
+            "{} block(s) added, scanned to {}",
+            summary.blocks_scanned,
+            self.scan_height()
+        );
         if summary.blocks_scanned == 0 && !summary.caught_up {
             // Asking again would get the same answer, forever.
             return Err(RefreshError::NoProgress {

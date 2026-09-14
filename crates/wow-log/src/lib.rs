@@ -5,8 +5,9 @@
 //! asks a Rust node to accept that syntax "for operator familiarity", so this
 //! does: [`set_level`] takes the five presets and [`set_categories`] the list.
 //!
-//! It is a crate of its own, with no dependencies, because both `wow-p2p` and
-//! the binaries log and neither should depend on the other for it.
+//! It is a crate of its own, with no dependencies, because the node's crates,
+//! the wallet's and the binaries all log, and none should depend on another for
+//! it.
 //!
 //! ```
 //! wow_log::info!("global", "listening on {}", 34567);
@@ -203,6 +204,24 @@ pub fn set_file(path: PathBuf, max_size: u64, max_files: usize, quiet: bool) -> 
     Ok(())
 }
 
+/// Stop or start writing lines to stderr. A program whose terminal is its
+/// interface, like the wallet's prompt, keeps its log off it.
+pub fn set_stderr(on: bool) {
+    config()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .also_stderr = on;
+}
+
+/// `mlog_get_default_log_path`: a log file named `name` in the program's own
+/// directory, or in the current one when that cannot be found.
+pub fn beside_program(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
 /// Whether a line at `level` in `category` would be written. The macros check
 /// this first so a disabled line costs no formatting.
 pub fn enabled(category: &str, level: Level) -> bool {
@@ -221,7 +240,7 @@ pub fn enabled(category: &str, level: Level) -> bool {
 pub fn log(category: &str, level: Level, args: fmt::Arguments<'_>) {
     let line = format!(
         "{}\t{}\t{}\t{}\n",
-        timestamp(std::time::SystemTime::now()),
+        timestamp(now()),
         level.tag(),
         category,
         args
@@ -245,7 +264,7 @@ pub fn log(category: &str, level: Level, args: fmt::Arguments<'_>) {
 /// Rename the current file aside with a timestamp, start a new one, and drop
 /// the oldest rotated files past the limit.
 fn rotate(s: &mut FileSink) {
-    let stamp = timestamp(std::time::SystemTime::now())
+    let stamp = timestamp(now())
         .replace([' ', ':'], "-")
         .replace('.', "-");
     let mut aside = s.path.clone().into_os_string();
@@ -286,6 +305,21 @@ fn rotate(s: &mut FileSink) {
     while old.len() > s.max_files {
         let _ = std::fs::remove_file(old.remove(0));
     }
+}
+
+/// The time a line is stamped with.
+///
+/// A bare wasm target has no clock std can read -- `SystemTime::now` panics
+/// there -- and a wallet built for a browser links this crate, so its lines
+/// carry the epoch rather than bring the wallet down.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn now() -> std::time::SystemTime {
+    std::time::SystemTime::now()
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn now() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH
 }
 
 /// `YYYY-MM-DD hh:mm:ss.mmm`, UTC.
@@ -388,6 +422,18 @@ mod tests {
         assert!(set_categories("net.p2p").is_err());
         assert!(set_categories("net.p2p:LOUD").is_err());
         configure("0").unwrap();
+    }
+
+    #[test]
+    fn a_default_log_file_sits_beside_the_program() {
+        let p = beside_program("wownero-wallet-cli.log");
+        assert_eq!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some("wownero-wallet-cli.log")
+        );
+        if let Ok(exe) = std::env::current_exe() {
+            assert_eq!(p.parent(), exe.parent());
+        }
     }
 
     #[test]

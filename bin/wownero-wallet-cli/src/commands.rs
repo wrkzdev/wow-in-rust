@@ -98,6 +98,8 @@ pub fn run_one(session: &mut Session, line: &str) -> Result<Outcome, String> {
         return Ok(Outcome::Continue);
     };
     let args: Vec<&str> = parts.collect();
+    // The name only: an argument can be a password, a seed or a key.
+    wow_log::debug!("wallet.simplewallet", "command `{name}`");
 
     if let Some((_, why)) = NOT_IMPLEMENTED.iter().find(|(n, _)| *n == name) {
         println!("`{name}` is not available in this build: {why}.");

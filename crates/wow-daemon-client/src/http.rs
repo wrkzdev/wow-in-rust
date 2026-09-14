@@ -39,6 +39,10 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The C++ HTTP client's log category, so one `--log-level` means the same to
+/// both.
+const LOG: &str = "net.http";
+
 #[derive(Debug)]
 pub enum HttpError {
     Io(std::io::Error),
@@ -58,6 +62,12 @@ pub enum HttpError {
     },
     /// A malformed status line or headers.
     Malformed(&'static str),
+    /// The connection closed before the body `Content-Length` promised had
+    /// all arrived.
+    Truncated {
+        got: usize,
+        expected: usize,
+    },
     /// A non-2xx status.
     Status {
         code: u16,
@@ -92,6 +102,10 @@ impl std::fmt::Display for HttpError {
                 write!(f, "response of {len} bytes exceeds {MAX_RESPONSE_BYTES}")
             }
             HttpError::Malformed(w) => write!(f, "malformed response: {w}"),
+            HttpError::Truncated { got, expected } => write!(
+                f,
+                "the connection closed after {got} of {expected} body bytes"
+            ),
             HttpError::Status { code } => write!(f, "daemon returned HTTP {code}"),
             HttpError::Transport(what) => write!(f, "{what}"),
         }
@@ -193,6 +207,21 @@ impl Endpoint {
     /// and cost a pool and its failure modes; a refresh makes one call per
     /// thousand blocks, so it is not where the time goes.
     pub fn post(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
+        let started = std::time::Instant::now();
+        wow_log::debug!(LOG, "POST {}{path}, {} byte(s)", self.address, body.len());
+        let result = self.exchange(path, content_type, body);
+        let ms = started.elapsed().as_millis();
+        match &result {
+            Ok(response) => {
+                wow_log::debug!(LOG, "{path}: {} byte(s) in {ms} ms", response.len())
+            }
+            Err(e) => wow_log::info!(LOG, "{path}: {e}, after {ms} ms"),
+        }
+        result
+    }
+
+    /// One request and its response, on a connection of its own.
+    fn exchange(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
         let mut stream = self.connect()?;
 
         let head = format!(
@@ -210,11 +239,11 @@ impl Endpoint {
         stream.write_all(body)?;
         stream.flush()?;
 
-        read_response(stream)
+        read_response(stream, path)
     }
 }
 
-fn read_response(stream: TcpStream) -> Result<Vec<u8>, HttpError> {
+fn read_response(stream: TcpStream, path: &str) -> Result<Vec<u8>, HttpError> {
     let mut reader = BufReader::new(stream);
 
     // Status line.
@@ -234,6 +263,7 @@ fn read_response(stream: TcpStream) -> Result<Vec<u8>, HttpError> {
         if trimmed.is_empty() {
             break;
         }
+        wow_log::trace!(LOG, "{path}: {trimmed}");
         let Some((name, value)) = trimmed.split_once(':') else {
             return Err(HttpError::Malformed("header without a colon"));
         };
@@ -252,6 +282,12 @@ fn read_response(stream: TcpStream) -> Result<Vec<u8>, HttpError> {
         }
     }
 
+    wow_log::debug!(
+        LOG,
+        "{path}: HTTP {code}, Content-Length {}",
+        content_length.map_or_else(|| "absent".to_string(), |l| l.to_string())
+    );
+
     if chunked {
         // The reference daemon never sends chunked for these endpoints. Say so
         // rather than half-implementing it.
@@ -261,7 +297,19 @@ fn read_response(stream: TcpStream) -> Result<Vec<u8>, HttpError> {
     let body = match content_length {
         Some(len) => {
             let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf)?;
+            let mut got = 0;
+            while got < len {
+                match reader.read(&mut buf[got..]) {
+                    // Closed with the body short. `read_exact` would say only
+                    // "failed to fill whole buffer", which does not tell a
+                    // daemon that cut a response off from one that sent the
+                    // wrong length.
+                    Ok(0) => return Err(HttpError::Truncated { got, expected: len }),
+                    Ok(n) => got += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
             buf
         }
         None => {
@@ -362,6 +410,39 @@ mod tests {
         let e = Endpoint::new("http://node2.monerodevs.org:34568");
         let text = e.connect().expect_err("still a scheme").to_string();
         assert!(text.contains("host:port"), "{text}");
+    }
+
+    /// A body cut short says how much of it arrived.
+    #[test]
+    fn a_body_cut_short_says_how_much_arrived() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("an address").to_string();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            // Read the whole request first: closing with some of it unread
+            // would reset the connection instead of ending it.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut chunk).expect("read");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
+                .expect("write");
+        });
+
+        let e = Endpoint::new(address)
+            .post("/get_blocks.bin", "application/octet-stream", b"")
+            .expect_err("cut short");
+        server.join().expect("the server");
+        assert!(
+            matches!(e, HttpError::Truncated { got: 3, expected: 10 }),
+            "{e}"
+        );
+        assert!(e.to_string().contains("3 of 10"), "{e}");
     }
 
     /// The response cap clears a realistic full batch by a wide margin.

@@ -198,7 +198,7 @@ pub fn is_retryable(e: &DaemonError) -> bool {
     match e {
         DaemonError::Status(s) => s == "BUSY",
         DaemonError::Rpc { code, .. } => *code == -9,
-        DaemonError::Http(HttpError::Io(_)) => true,
+        DaemonError::Http(HttpError::Io(_) | HttpError::Truncated { .. }) => true,
         _ => false,
     }
 }
@@ -214,6 +214,11 @@ mod tests {
             code: -9,
             message: "Core is busy".into()
         }));
+
+        assert!(is_retryable(&DaemonError::Http(HttpError::Truncated {
+            got: 3,
+            expected: 10
+        })));
 
         assert!(!is_retryable(&DaemonError::Status("Failed".into())));
         assert!(!is_retryable(&DaemonError::Missing("result")));

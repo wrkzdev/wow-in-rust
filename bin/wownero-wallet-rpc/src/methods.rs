@@ -63,6 +63,8 @@ const DISABLED: &[(&str, &str)] = &[
 
 /// Dispatch one method.
 pub fn dispatch(state: &State, method: &str, params: &Value) -> MethodResult {
+    // The name only: parameters can be a password, a seed or a key.
+    wow_log::debug!("wallet.rpc", "{method}");
     if let Some((_, why)) = DISABLED.iter().find(|(n, _)| *n == method) {
         return Err(Error::new(
             errors::DISABLED,

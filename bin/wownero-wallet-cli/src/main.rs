@@ -69,6 +69,11 @@ struct Options {
     language: Option<String>,
     commands: Vec<String>,
     no_initial_sync: bool,
+    /// `--log-level`, as given.
+    log_level: Option<String>,
+    log_file: Option<PathBuf>,
+    max_log_file_size: u64,
+    max_log_files: usize,
 }
 
 /// Written by hand rather than derived, so a password, seed or secret key
@@ -91,6 +96,10 @@ impl std::fmt::Debug for Options {
             .field("language", &self.language)
             .field("commands", &self.commands)
             .field("no_initial_sync", &self.no_initial_sync)
+            .field("log_level", &self.log_level)
+            .field("log_file", &self.log_file)
+            .field("max_log_file_size", &self.max_log_file_size)
+            .field("max_log_files", &self.max_log_files)
             .finish()
     }
 }
@@ -112,6 +121,10 @@ impl Default for Options {
             language: None,
             commands: Vec::new(),
             no_initial_sync: false,
+            log_level: None,
+            log_file: None,
+            max_log_file_size: 104_850_000,
+            max_log_files: 50,
         }
     }
 }
@@ -144,6 +157,12 @@ Whatever the options below leave out is asked for.
   --mnemonic-language <lang>
   --kdf-rounds <n>                  default 1
   --no-initial-sync
+  --log-file <path>                 log here; never to the terminal
+  --log-level <0-4 | category:LEVEL,...>
+                                    default 0; given alone, logs to
+                                    wownero-wallet-cli.log beside the program
+  --max-log-file-size <bytes>       default 104850000
+  --max-log-files <n>               rotated files to keep, default 50
   --command <cmd ...>               run one command and exit
   --help
 
@@ -230,6 +249,18 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
                 }
             }
             "--no-initial-sync" => o.no_initial_sync = true,
+            "--log-level" => o.log_level = Some(next("--log-level")?),
+            "--log-file" => o.log_file = Some(PathBuf::from(next("--log-file")?)),
+            "--max-log-file-size" => {
+                o.max_log_file_size = next("--max-log-file-size")?
+                    .parse()
+                    .map_err(|_| "--max-log-file-size needs a number".to_string())?;
+            }
+            "--max-log-files" => {
+                o.max_log_files = next("--max-log-files")?
+                    .parse()
+                    .map_err(|_| "--max-log-files needs a number".to_string())?;
+            }
             // Everything after `--command` is one command line.
             "--command" => {
                 let rest: Vec<String> = it.by_ref().collect();
@@ -308,7 +339,35 @@ fn main() {
     }
 }
 
+/// Where the log goes (`wallet_args::main`).
+///
+/// Never to the terminal, which is the wallet's prompt: to `--log-file`, or,
+/// when only `--log-level` is given, to `wownero-wallet-cli.log` beside the
+/// program, where the C++ writes it. With neither, nothing is logged. The C++
+/// opens that file on every run, and without `--log-level` enables no category
+/// to write to it.
+fn start_logging(o: &Options) -> Result<(), String> {
+    wow_log::set_stderr(false);
+    if o.log_level.is_none() && o.log_file.is_none() {
+        return Ok(());
+    }
+    if let Some(spec) = &o.log_level {
+        wow_log::configure(spec).map_err(|e| format!("--log-level: {e}"))?;
+    }
+    let path = o
+        .log_file
+        .clone()
+        .unwrap_or_else(|| wow_log::beside_program("wownero-wallet-cli.log"));
+    wow_log::set_file(path.clone(), o.max_log_file_size, o.max_log_files, true)?;
+    eprintln!("Logging to {}", path.display());
+    wow_log::info!("global", "wownero-wallet-cli {}", env!("CARGO_PKG_VERSION"));
+    // Safe to log only because `Options`' `Debug` redacts every secret.
+    wow_log::debug!("global", "{o:?}");
+    Ok(())
+}
+
 fn run(mut options: Options) -> Result<(), String> {
+    start_logging(&options)?;
     let mut session = startup::start(&mut options)?;
 
     // Connect, and sync unless told not to.
@@ -456,6 +515,34 @@ mod tests {
     fn an_unknown_option_is_an_error() {
         let e = opts(&["--wallet-file", "w", "--mine-please"]).expect_err("rejected");
         assert!(e.contains("--mine-please"), "{e}");
+    }
+
+    /// The log options, with the C++'s rotation defaults.
+    #[test]
+    fn the_log_options_parse() {
+        let o = opts(&["--wallet-file", "w"]).expect("parses");
+        assert!(o.log_level.is_none() && o.log_file.is_none());
+        assert_eq!((o.max_log_file_size, o.max_log_files), (104_850_000, 50));
+
+        let o = opts(&[
+            "--wallet-file",
+            "w",
+            "--log-level",
+            "net.http:DEBUG,wallet.*:INFO",
+            "--log-file",
+            "wallet.log",
+            "--max-log-file-size",
+            "1000",
+            "--max-log-files",
+            "3",
+        ])
+        .expect("parses");
+        assert_eq!(o.log_level.as_deref(), Some("net.http:DEBUG,wallet.*:INFO"));
+        assert_eq!(o.log_file, Some(PathBuf::from("wallet.log")));
+        assert_eq!((o.max_log_file_size, o.max_log_files), (1000, 3));
+
+        assert!(opts(&["--wallet-file", "w", "--log-level"]).is_err());
+        assert!(opts(&["--wallet-file", "w", "--max-log-files", "many"]).is_err());
     }
 
     /// A restore needs nothing up front: the name, seed and keys it is not

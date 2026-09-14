@@ -28,6 +28,7 @@ wownero-wallet-rpc --rpc-bind-port <port>
                    [--testnet|--stagenet]
                    [--prompt-for-password]
                    [--no-initial-sync]
+                   [--log-file <path>] [--log-level <0-4|categories>]
 ```
 
 `--wallet-dir` mode starts with **no wallet open**; the client then calls
