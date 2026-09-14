@@ -916,13 +916,18 @@ fn build_and_send(
     let mut spent_images = Vec::with_capacity(plan.inputs.len());
     for &i in &plan.inputs {
         let t = session.state.transfers[i].clone();
-        let ring = decoys::select_ring(&picker, &mut rng, t.global_output_index, ring_size)
-            .map_err(|e| Error::new(errors::NOT_ENOUGH_OUTS_TO_MIX, e.to_string()))?;
-        let wanted: Vec<(u64, u64)> = ring.indices.iter().map(|i| (0u64, *i)).collect();
-        let outs = client
-            .get_outs(&wanted, false)
-            .map_err(|e| Error::new(errors::NO_DAEMON_CONNECTION, e.to_string()))?;
-        let keys: Vec<([u8; 32], [u8; 32])> = outs.iter().map(|o| (o.key, o.mask)).collect();
+        // Every member one the chain has unlocked, or no node will take it.
+        let (ring, keys) = decoys::select_unlocked_ring(
+            &picker,
+            &mut rng,
+            t.global_output_index,
+            ring_size,
+            |indices| decoys::fetch_members(&client, indices),
+        )
+        .map_err(|e| match e {
+            decoys::DecoyError::Fetch(_) => Error::new(errors::NO_DAEMON_CONNECTION, e.to_string()),
+            _ => Error::new(errors::NOT_ENOUGH_OUTS_TO_MIX, e.to_string()),
+        })?;
 
         let mask = wow_crypto::ops::decode_scalar(&t.mask)
             .ok_or_else(|| Error::new(errors::UNKNOWN_ERROR, "a stored mask is not a scalar"))?;

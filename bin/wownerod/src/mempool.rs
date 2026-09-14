@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use wow_crypto::types::{Hash256, KeyImage};
-use wow_storage::db::BlockchainDb;
+use wow_storage::db::{BlockchainDb, OutputData};
 use wow_storage::lmdb::LmdbDb;
 use wow_types::tx::{Transaction, TxIn};
 
@@ -415,7 +415,7 @@ impl TxPool {
         }
 
         // 7. Full verification. Not policy: skipping it relays forgeries.
-        verify(db, &tx)?;
+        verify(db, &tx, fee_context.version, now)?;
 
         // The pool has no clock of its own, so a stale entry goes when something
         // else arrives. That is enough: a pool nobody is adding to is a pool
@@ -451,6 +451,7 @@ impl TxPool {
         db: &LmdbDb,
         tx: &Transaction,
         blob: &[u8],
+        hf_version: u8,
         now: u64,
     ) -> Result<Hash256, Rejection> {
         let id = wow_types::hashes::transaction_hash_from_blob(tx, blob)
@@ -463,7 +464,7 @@ impl TxPool {
                 self.check_unspent(db, k_image)?;
             }
         }
-        verify(db, tx)?;
+        verify(db, tx, hf_version, now)?;
         self.insert(
             id,
             tx,
@@ -725,7 +726,7 @@ fn fee_rate(e: &PoolEntry) -> f64 {
 /// This is what makes a pool worth having. A node that admits without verifying
 /// is a node that relays forgeries, and the wallet on the other end cannot tell
 /// the difference until the transaction fails to confirm.
-fn verify(db: &LmdbDb, tx: &Transaction) -> Result<(), Rejection> {
+fn verify(db: &LmdbDb, tx: &Transaction, hf_version: u8, now: u64) -> Result<(), Rejection> {
     use wow_crypto::bulletproofs_plus as bpp;
     use wow_crypto::clsag;
 
@@ -812,6 +813,7 @@ fn verify(db: &LmdbDb, tx: &Transaction) -> Result<(), Rejection> {
                 "a ring member is unknown to this node".into(),
             ));
         }
+        check_ring_members(&keys, slot, db.height(), hf_version, now)?;
 
         let ring: Vec<clsag::RingMember> = keys
             .iter()
@@ -833,6 +835,37 @@ fn verify(db: &LmdbDb, tx: &Transaction) -> Result<(), Rejection> {
     }
 
     Ok(())
+}
+
+/// The outputs one input's ring names, against the chain as it stands: each
+/// one unlocked (`outputs_visitor::handle_output`), and from HF 15 none younger
+/// than `CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE` blocks (`check_tx_inputs`).
+///
+/// A signature over a locked output verifies perfectly, which is why this is a
+/// check of its own -- and why a node that checked only the signature admitted,
+/// and relayed, transactions every C++ node refuses.
+fn check_ring_members(
+    members: &[OutputData],
+    slot: usize,
+    chain_height: u64,
+    hf_version: u8,
+    now: u64,
+) -> Result<(), Rejection> {
+    for m in members {
+        if !wow_consensus::is_tx_spendtime_unlocked(m.unlock_time, chain_height, now) {
+            return Err(Rejection::InvalidInput(format!(
+                "input {slot}: a ring member from block {} is locked (unlock time {})",
+                m.height, m.unlock_time
+            )));
+        }
+    }
+    let newest = members.iter().map(|m| m.height).max().unwrap_or(0);
+    wow_consensus::tx_rules::check_min_output_age(hf_version, newest, chain_height).map_err(|_| {
+        Rejection::InvalidInput(format!(
+            "input {slot}: a ring member from block {newest} is younger than {} blocks",
+            wow_consensus::constants::CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE
+        ))
+    })
 }
 
 /// `sum(pseudoOuts) == sum(outPk) + fee*H`.
@@ -1009,6 +1042,39 @@ mod tests {
     }
 
     /// Relative offsets accumulate; the first is absolute.
+    /// A ring member still locked, or too young, is refused however good the
+    /// signature over it, as `handle_output` and `check_tx_inputs` refuse it.
+    /// Checking only the signature let this node admit and relay transactions
+    /// every C++ node turned away.
+    #[test]
+    fn locked_or_young_ring_members_are_refused() {
+        const HEIGHT: u64 = 1_000;
+        const NOW: u64 = 1_700_000_000;
+        let member = |height, unlock_time| OutputData {
+            pubkey: [0; 32],
+            unlock_time,
+            height,
+            commitment: None,
+        };
+
+        // Unlocked, including a coinbase whose unlock height has passed.
+        let fine = [member(900, 0), member(10, 0), member(700, 988)];
+        assert!(check_ring_members(&fine, 0, HEIGHT, 20, NOW).is_ok());
+
+        // A coinbase still inside its 288 blocks.
+        let locked = [member(900, 0), member(950, 950 + 288)];
+        let e = check_ring_members(&locked, 1, HEIGHT, 20, NOW).expect_err("locked");
+        assert!(
+            matches!(&e, Rejection::InvalidInput(why) if why.contains("input 1") && why.contains("locked")),
+            "{e:?}"
+        );
+
+        // Four blocks old is old enough and three is not, from HF 15.
+        assert!(check_ring_members(&[member(HEIGHT - 4, 0)], 0, HEIGHT, 20, NOW).is_ok());
+        assert!(check_ring_members(&[member(HEIGHT - 3, 0)], 0, HEIGHT, 20, NOW).is_err());
+        assert!(check_ring_members(&[member(HEIGHT - 3, 0)], 0, HEIGHT, 14, NOW).is_ok());
+    }
+
     #[test]
     fn key_offsets_are_relative() {
         assert_eq!(to_absolute(&[5]), Some(vec![5]));

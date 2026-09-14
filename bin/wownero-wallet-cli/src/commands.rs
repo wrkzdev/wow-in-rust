@@ -845,14 +845,15 @@ fn send(
     let mut inputs = Vec::with_capacity(plan.inputs.len());
     for &i in &plan.inputs {
         let t = &session.state.transfers[i];
-        let ring = decoys::select_ring(&picker, &mut rng, t.global_output_index, ring_size)
-            .map_err(|e| format!("cannot build a ring: {e}"))?;
-
-        let wanted: Vec<(u64, u64)> = ring.indices.iter().map(|i| (0u64, *i)).collect();
-        let outs = client
-            .get_outs(&wanted, false)
-            .map_err(|e| format!("cannot fetch ring members: {e}"))?;
-        let keys: Vec<([u8; 32], [u8; 32])> = outs.iter().map(|o| (o.key, o.mask)).collect();
+        // Every member one the chain has unlocked, or no node will take it.
+        let (ring, keys) = decoys::select_unlocked_ring(
+            &picker,
+            &mut rng,
+            t.global_output_index,
+            ring_size,
+            |indices| decoys::fetch_members(&client, indices),
+        )
+        .map_err(|e| format!("cannot build a ring: {e}"))?;
 
         let mask = wow_crypto::ops::decode_scalar(&t.mask)
             .ok_or("this output's stored mask is not a valid scalar")?;

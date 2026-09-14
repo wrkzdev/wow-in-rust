@@ -433,12 +433,16 @@ impl NodeCore {
     /// and refresh the fee snapshot.
     fn settle(&self, chain: &mut LocalChain) {
         let orphaned = chain.blockchain_mut().take_orphaned_txs();
+        let fee = fee_context_of(chain);
         if !orphaned.is_empty() {
             let now = unix_now();
             let mut pool = lock(&self.pool);
             let back = orphaned
                 .iter()
-                .filter(|(tx, blob)| pool.add_kept_by_block(&self.db, tx, blob, now).is_ok())
+                .filter(|(tx, blob)| {
+                    pool.add_kept_by_block(&self.db, tx, blob, fee.version, now)
+                        .is_ok()
+                })
                 .count();
             wow_log::info!(
                 "txpool",
@@ -446,7 +450,7 @@ impl NodeCore {
                 orphaned.len()
             );
         }
-        *lock(&self.fee) = fee_context_of(chain);
+        *lock(&self.fee) = fee;
     }
 
     /// A block's transactions, from the message by hash and then from the

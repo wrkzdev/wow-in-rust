@@ -2,13 +2,19 @@
 //!
 //! `specs/12` §4.3, `gamma_picker` in `wallet2.cpp`.
 //!
-//! # This is a privacy mechanism, not a consensus rule
+//! # A privacy mechanism, with one consensus rule in it
 //!
-//! A node accepts any ring of the right size. Nothing here can make a
-//! transaction invalid, and that is exactly what makes it dangerous: a wallet
-//! that picks decoys from the wrong distribution produces transactions that
-//! work perfectly and are distinguishable from every other wallet's, which
-//! deanonymises its user and everyone who happens to be in a ring with them.
+//! A node accepts any ring of the right size whose members are all unlocked.
+//! Which unlocked outputs are chosen cannot make a transaction invalid, and
+//! that is exactly what makes it dangerous: a wallet that picks decoys from the
+//! wrong distribution produces transactions that work perfectly and are
+//! distinguishable from every other wallet's, which deanonymises its user and
+//! everyone who happens to be in a ring with them.
+//!
+//! The one rule is the lock, and the picker cannot see it: a lock belongs to
+//! the output, not to where it sits in the distribution.
+//! [`select_unlocked_ring`] asks a daemon about each member and replaces the
+//! locked ones.
 //!
 //! # The constants are not Monero's
 //!
@@ -31,6 +37,8 @@
 //! binaries seed [`wow_crypto::random::Rng`] from the OS. Passing something
 //! predictable here does not produce an invalid transaction — it produces a
 //! valid one whose real spend can be picked out.
+
+use std::collections::{HashMap, HashSet};
 
 /// `GAMMA_SHAPE`.
 pub const GAMMA_SHAPE: f64 = 19.28;
@@ -156,6 +164,12 @@ pub enum DecoyError {
     NotEnoughDecoys { wanted: usize, tries: usize },
     #[error("the real output at index {0} is not in the distribution")]
     RealOutputNotFound(u64),
+    #[error("the daemon could not say what the ring members are: {0}")]
+    Fetch(String),
+    #[error("the output being spent, at index {0}, is still locked")]
+    RealOutputLocked(u64),
+    #[error("found only {found} unlocked decoys of the {wanted} a ring needs")]
+    TooFewUnlocked { wanted: usize, found: usize },
 }
 
 impl<'a> GammaPicker<'a> {
@@ -389,6 +403,162 @@ pub fn assemble_ring(
         indices: ring.indices.clone(),
         real_index: ring.real_index,
     })
+}
+
+/// A ring member as a daemon describes it in `get_outs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Member {
+    pub key: [u8; 32],
+    pub mask: [u8; 32],
+    /// Whether the chain lets it be spent yet: `is_tx_spendtime_unlocked`.
+    pub unlocked: bool,
+}
+
+/// A ring's members as `(key, mask)`, in ring order: what [`assemble_ring`]
+/// takes.
+pub type MemberKeys = Vec<([u8; 32], [u8; 32])>;
+
+/// How many times a daemon is asked before a ring is given up on.
+const MAX_FETCH_ROUNDS: usize = 10;
+
+/// [`select_ring`] with every member one the chain has unlocked, and the
+/// members' `(key, mask)` in ring order, ready for [`assemble_ring`].
+///
+/// A ring member still locked makes the whole transaction invalid:
+/// `outputs_visitor::handle_output` refuses it with "One of outputs for one of
+/// inputs has wrong tx.unlock_time". So `wallet2::get_outs` reads `unlocked`
+/// in the daemon's answer and puts another pick in place of each locked one,
+/// and so does this. It matters more here than it looks: most recent Wownero
+/// outputs are coinbase, locked for 288 blocks, and a ring of 22 picked without
+/// asking held several of them every time.
+///
+/// `fetch` is given global indices, ascending, and answers one [`Member`] for
+/// each in that order. The real output is asked about in the first round, among
+/// the first candidates, and must be unlocked too.
+pub fn select_unlocked_ring(
+    picker: &GammaPicker<'_>,
+    rng: &mut dyn RandomSource,
+    real: u64,
+    ring_size: usize,
+    mut fetch: impl FnMut(&[u64]) -> Result<Vec<Member>, String>,
+) -> Result<(Ring, MemberKeys), DecoyError> {
+    if real >= picker.num_rct_outputs() {
+        return Err(DecoyError::RealOutputNotFound(real));
+    }
+    let wanted = ring_size.saturating_sub(1);
+    let max_tries = ring_size * 200;
+    let mut members: HashMap<u64, Member> = HashMap::new();
+    let mut decoys: Vec<u64> = Vec::with_capacity(wanted);
+    let mut refused: HashSet<u64> = HashSet::new();
+
+    for round in 0..MAX_FETCH_ROUNDS {
+        let missing = wanted - decoys.len();
+        if round > 0 && missing == 0 {
+            break;
+        }
+
+        // Twice what is missing, so a round with a few locked still fills.
+        // Kept in the order picked, so the ones used are the picker's choice
+        // and not the oldest of them.
+        let mut candidates: Vec<u64> = Vec::with_capacity(missing * 2);
+        let mut tries = 0;
+        while candidates.len() < missing * 2 && tries < max_tries {
+            tries += 1;
+            let Some(i) = picker.pick(rng) else {
+                continue;
+            };
+            if i != real
+                && !refused.contains(&i)
+                && !members.contains_key(&i)
+                && !candidates.contains(&i)
+            {
+                candidates.push(i);
+            }
+        }
+        if candidates.len() < missing {
+            return Err(DecoyError::NotEnoughDecoys {
+                wanted,
+                tries: max_tries,
+            });
+        }
+
+        // Ascending, so where the real output sits in the request says
+        // nothing about which it is.
+        let mut ask = candidates.clone();
+        if round == 0 {
+            ask.push(real);
+        }
+        ask.sort_unstable();
+        let answer = fetch(&ask).map_err(DecoyError::Fetch)?;
+        if answer.len() != ask.len() {
+            return Err(DecoyError::Fetch(format!(
+                "asked about {} outputs and was told about {}",
+                ask.len(),
+                answer.len()
+            )));
+        }
+        let answer: HashMap<u64, Member> = ask.into_iter().zip(answer).collect();
+
+        if round == 0 {
+            let m = answer[&real];
+            if !m.unlocked {
+                return Err(DecoyError::RealOutputLocked(real));
+            }
+            members.insert(real, m);
+        }
+        for i in candidates {
+            let m = answer[&i];
+            if !m.unlocked {
+                refused.insert(i);
+            } else if decoys.len() < wanted {
+                decoys.push(i);
+                members.insert(i, m);
+            }
+        }
+    }
+    if decoys.len() < wanted {
+        return Err(DecoyError::TooFewUnlocked {
+            wanted,
+            found: decoys.len(),
+        });
+    }
+
+    let mut indices = decoys;
+    indices.push(real);
+    indices.sort_unstable();
+    let real_index = indices
+        .iter()
+        .position(|&i| i == real)
+        .ok_or(DecoyError::RealOutputNotFound(real))?;
+    let keys = indices
+        .iter()
+        .map(|i| (members[i].key, members[i].mask))
+        .collect();
+    Ok((
+        Ring {
+            indices,
+            real_index,
+        },
+        keys,
+    ))
+}
+
+/// [`Member`]s from a daemon's `/get_outs.bin`, for
+/// [`select_unlocked_ring`].
+pub fn fetch_members(
+    client: &wow_daemon_client::DaemonClient,
+    indices: &[u64],
+) -> Result<Vec<Member>, String> {
+    let wanted: Vec<(u64, u64)> = indices.iter().map(|i| (0u64, *i)).collect();
+    let outs = client.get_outs(&wanted, false).map_err(|e| e.to_string())?;
+    Ok(outs
+        .iter()
+        .map(|o| Member {
+            key: o.key,
+            mask: o.mask,
+            unlocked: o.unlocked,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -685,5 +855,103 @@ mod tests {
 
         // And so is a wrong count.
         assert!(assemble_ring(&ring, &keys[..3], &real_key, &real_mask).is_err());
+    }
+
+    fn key_of(i: u64) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k[..8].copy_from_slice(&i.to_le_bytes());
+        k
+    }
+
+    /// A daemon's answer where `locked` says which outputs are still locked.
+    fn daemon(locked: impl Fn(u64) -> bool) -> impl Fn(&[u64]) -> Result<Vec<Member>, String> {
+        move |indices| {
+            Ok(indices
+                .iter()
+                .map(|&i| Member {
+                    key: key_of(i),
+                    mask: [1u8; 32],
+                    unlocked: !locked(i),
+                })
+                .collect())
+        }
+    }
+
+    /// An output the daemon says is locked is offered by the picker and
+    /// turned down, and the ring is filled with unlocked ones. On mainnet the
+    /// newest outputs are mostly coinbase, locked for 288 blocks, and a ring
+    /// picked without asking held several every time -- which every C++ node
+    /// refuses.
+    #[test]
+    fn locked_members_are_replaced() {
+        let o = offsets(10_000, 4);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let newest = p.num_rct_outputs() - p.num_rct_outputs() / 50;
+        let locked = move |i: u64| i >= newest;
+        let answer = daemon(locked);
+        let mut asked = Vec::new();
+        let real = 20_000;
+
+        let (ring, keys) = select_unlocked_ring(&p, &mut Lcg(77), real, RING_SIZE, |indices| {
+            asked.extend_from_slice(indices);
+            answer(indices)
+        })
+        .expect("a ring");
+
+        assert!(
+            asked.iter().any(|&i| locked(i)),
+            "the picker offered locked outputs"
+        );
+        assert!(
+            ring.indices.iter().all(|&i| !locked(i)),
+            "and none is in the ring: {:?}",
+            ring.indices
+        );
+        assert_eq!(ring.indices.len(), RING_SIZE);
+        assert_eq!(ring.indices[ring.real_index], real);
+        let mut sorted = ring.indices.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, ring.indices, "ascending and distinct");
+        for (i, (key, _)) in ring.indices.iter().zip(&keys) {
+            assert_eq!(*key, key_of(*i), "each key belongs to its index");
+        }
+    }
+
+    /// The output being spent must be unlocked too; a ring around a locked one
+    /// is refused rather than built.
+    #[test]
+    fn a_locked_real_output_is_refused() {
+        let o = offsets(10_000, 4);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let real = 20_000;
+        assert_eq!(
+            select_unlocked_ring(&p, &mut Lcg(3), real, RING_SIZE, daemon(|i| i == real)),
+            Err(DecoyError::RealOutputLocked(real))
+        );
+    }
+
+    /// With nothing unlocked to pick, it gives up after a bounded number of
+    /// rounds instead of asking the daemon forever.
+    #[test]
+    fn a_chain_with_nothing_unlocked_gives_up() {
+        let o = offsets(10_000, 4);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let real = 20_000;
+        let mut rounds = 0;
+        let everything_else = daemon(|i| i != real);
+        let e = select_unlocked_ring(&p, &mut Lcg(4), real, RING_SIZE, |indices| {
+            rounds += 1;
+            everything_else(indices)
+        })
+        .expect_err("nothing to fill it with");
+        assert_eq!(
+            e,
+            DecoyError::TooFewUnlocked {
+                wanted: RING_SIZE - 1,
+                found: 0
+            }
+        );
+        assert_eq!(rounds, MAX_FETCH_ROUNDS);
     }
 }
