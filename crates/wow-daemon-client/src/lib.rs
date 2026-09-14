@@ -14,6 +14,13 @@
 //!
 //! The binary ones are the wallet's sync path and are where all the volume is.
 //!
+//! # How a request reaches the daemon
+//!
+//! Through a [`Transport`]. [`Endpoint`] opens a socket and speaks HTTP/1.1; a
+//! program where there are no sockets to open, such as a wallet in a browser,
+//! supplies its own ([`DaemonClient::with_transport`]). The framing above and
+//! the typed endpoints are the same either way.
+//!
 //! # A daemon is not trusted
 //!
 //! A wallet sends its short chain history to a node and is told what comes
@@ -27,16 +34,18 @@
 pub mod http;
 pub mod types;
 
+use std::sync::Arc;
+
 use serde_json::{json, Value as Json};
 use wow_serialize::epee::{self, Section};
 
-pub use http::{Endpoint, HttpError};
+pub use http::{Endpoint, HttpError, Transport};
 pub use types::*;
 
-/// A connection to one daemon.
+/// A connection to one daemon. Clones share one transport.
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
-    endpoint: Endpoint,
+    transport: Arc<dyn Transport>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -62,19 +71,23 @@ pub enum DaemonError {
 type Result<T> = std::result::Result<T, DaemonError>;
 
 impl DaemonClient {
-    /// `address` is `host:port`, as typed on a command line.
+    /// `address` is `host:port`, as typed on a command line, reached over TCP.
     pub fn new(address: impl Into<String>) -> DaemonClient {
-        DaemonClient {
-            endpoint: Endpoint::new(address),
-        }
+        DaemonClient::with_endpoint(Endpoint::new(address))
     }
 
     pub fn with_endpoint(endpoint: Endpoint) -> DaemonClient {
-        DaemonClient { endpoint }
+        DaemonClient::with_transport(Arc::new(endpoint))
+    }
+
+    /// A daemon reached some other way than over this crate's sockets: through
+    /// a browser's `fetch`, say, where there are none to open.
+    pub fn with_transport(transport: Arc<dyn Transport>) -> DaemonClient {
+        DaemonClient { transport }
     }
 
     pub fn address(&self) -> &str {
-        &self.endpoint.address
+        self.transport.address()
     }
 
     // -- transports ---------------------------------------------------------
@@ -90,7 +103,7 @@ impl DaemonClient {
         .to_string();
 
         let raw = self
-            .endpoint
+            .transport
             .post("/json_rpc", "application/json", body.as_bytes())?;
         let mut v: Json = serde_json::from_slice(&raw)?;
 
@@ -115,7 +128,7 @@ impl DaemonClient {
     pub fn direct(&self, path: &str, params: Json) -> Result<Json> {
         let body = params.to_string();
         let raw = self
-            .endpoint
+            .transport
             .post(path, "application/json", body.as_bytes())?;
         let v: Json = serde_json::from_slice(&raw)?;
         check_status(&v)?;
@@ -132,7 +145,7 @@ impl DaemonClient {
         content_type: &str,
         body: &[u8],
     ) -> std::result::Result<Vec<u8>, HttpError> {
-        self.endpoint.post(path, content_type, body)
+        self.transport.post(path, content_type, body)
     }
 
     /// `POST` a JSON body and return the raw response, without checking
@@ -151,7 +164,7 @@ impl DaemonClient {
     pub fn binary(&self, path: &str, request: &Section) -> Result<Section> {
         let body = epee::to_bytes(request)?;
         let raw = self
-            .endpoint
+            .transport
             .post(path, "application/octet-stream", &body)?;
         let section = epee::from_bytes(&raw)?;
         check_binary_status(&section)?;
@@ -233,5 +246,39 @@ mod tests {
             check_binary_status(&s),
             Err(DaemonError::Status(x)) if x == "BUSY"
         ));
+    }
+
+    /// A transport the program supplies carries every call, and says where it
+    /// goes.
+    #[test]
+    fn a_supplied_transport_carries_the_calls() {
+        #[derive(Debug)]
+        struct Canned;
+
+        impl Transport for Canned {
+            fn post(
+                &self,
+                path: &str,
+                _content_type: &str,
+                _body: &[u8],
+            ) -> std::result::Result<Vec<u8>, HttpError> {
+                match path {
+                    "/get_height" => Ok(br#"{"height": 873836, "status": "OK"}"#.to_vec()),
+                    _ => Err(HttpError::Transport(format!("no route to {path}"))),
+                }
+            }
+
+            fn address(&self) -> &str {
+                "in-memory"
+            }
+        }
+
+        let client = DaemonClient::with_transport(Arc::new(Canned));
+        assert_eq!(client.address(), "in-memory");
+        assert_eq!(client.get_height().expect("height"), 873_836);
+
+        let e = client.get_info().expect_err("no route");
+        assert!(e.to_string().contains("no route to /get_info"), "{e}");
+        assert!(!is_retryable(&e), "a transport's own failure is not BUSY");
     }
 }

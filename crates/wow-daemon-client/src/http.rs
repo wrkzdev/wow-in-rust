@@ -62,6 +62,9 @@ pub enum HttpError {
     Status {
         code: u16,
     },
+    /// A [`Transport`] other than [`Endpoint`] failed, in its own words: a
+    /// browser refusing a cross-origin request, say.
+    Transport(String),
 }
 
 impl std::fmt::Display for HttpError {
@@ -90,6 +93,7 @@ impl std::fmt::Display for HttpError {
             }
             HttpError::Malformed(w) => write!(f, "malformed response: {w}"),
             HttpError::Status { code } => write!(f, "daemon returned HTTP {code}"),
+            HttpError::Transport(what) => write!(f, "{what}"),
         }
     }
 }
@@ -99,6 +103,33 @@ impl std::error::Error for HttpError {}
 impl From<std::io::Error> for HttpError {
     fn from(e: std::io::Error) -> Self {
         HttpError::Io(e)
+    }
+}
+
+/// How a request reaches a daemon.
+///
+/// [`Endpoint`] is this crate's: a socket, and HTTP/1.1 over it. A program with
+/// no sockets to open, such as a wallet in a browser, supplies one over `fetch`
+/// instead ([`crate::DaemonClient::with_transport`]).
+///
+/// An implementation holds to the limits [`Endpoint`] does: a body over
+/// [`MAX_RESPONSE_BYTES`] is an error rather than an allocation, and a non-2xx
+/// status is [`HttpError::Status`].
+pub trait Transport: std::fmt::Debug + Send + Sync {
+    /// `POST path` with `body`, returning the response body.
+    fn post(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>, HttpError>;
+
+    /// Where the daemon is, as it was given.
+    fn address(&self) -> &str;
+}
+
+impl Transport for Endpoint {
+    fn post(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
+        Endpoint::post(self, path, content_type, body)
+    }
+
+    fn address(&self) -> &str {
+        &self.address
     }
 }
 
