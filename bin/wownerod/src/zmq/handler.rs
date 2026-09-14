@@ -33,6 +33,7 @@ use wow_types::Network;
 
 use super::json::{self, field, JsonError};
 use crate::mempool::Rejection;
+use crate::rpc::binary::supplement_start;
 use crate::rpc::Server;
 
 /// `DAEMON_RPC_VERSION_ZMQ`: 2.0.
@@ -935,19 +936,6 @@ fn rejection_details(r: &Rejection) -> String {
     } else {
         parts.join(" and ")
     }
-}
-
-/// `Blockchain::find_blockchain_supplement`'s split: the height of the first
-/// hash this chain has, from a history that must end at its genesis.
-///
-/// Inclusive, as the C++ has it. The HTTP `get_blocks.bin` here starts one
-/// past it.
-fn supplement_start(db: &LmdbDb, ids: &[Hash256]) -> Option<u64> {
-    let genesis = db.get_block_hash(0).ok()?;
-    if ids.last() != Some(&genesis) {
-        return None;
-    }
-    ids.iter().find_map(|id| db.get_block_height(id).ok())
 }
 
 /// `get_tx_outputs_gindexs`: a transaction's output indices.

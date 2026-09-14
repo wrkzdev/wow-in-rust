@@ -301,9 +301,10 @@ fn get_transactions_separates_found_from_missing() {
     let d = start("gettx", 4);
     let c = client(d.port);
 
-    // A coinbase that is definitely on the chain.
-    let blocks = c.get_blocks(&[], 0, false, false).expect("blocks");
-    let block = Block::from_blob(&blocks.blocks[2].block).expect("parses");
+    // A coinbase that is definitely on the chain. From a height, since the
+    // reference refuses an empty history at zero.
+    let blocks = c.get_blocks(&[], 2, false, false).expect("blocks");
+    let block = Block::from_blob(&blocks.blocks[0].block).expect("parses");
     let txid = wow_types::hashes::transaction_hash(&block.miner_tx).expect("a hash");
 
     let body = serde_json::json!({

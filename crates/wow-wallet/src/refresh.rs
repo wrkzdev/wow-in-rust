@@ -7,10 +7,21 @@
 //!
 //! A wallet does not say "give me height N". It sends a **short chain
 //! history** — its last ten block hashes, then exponentially spaced ones, then
-//! genesis — and the daemon answers from the first hash it recognises. That is
-//! how a reorg is detected without the wallet having to ask: if the chain the
-//! wallet is on no longer exists, the daemon simply starts further back, and
-//! `start_height` in the reply says where.
+//! genesis — and the daemon answers from the newest of those hashes it has.
+//! That is how a reorg is detected without the wallet having to ask: if the
+//! chain the wallet is on no longer exists, the daemon simply starts further
+//! back, and `start_height` in the reply says where.
+//!
+//! The reply starts **at** that block, not after it, so its first block is
+//! normally one the wallet already holds (`find_blockchain_supplement`:
+//! "INCLUDING last known id"). A block the wallet holds is compared, not
+//! scanned: the same hash is passed over, and a different one is where the
+//! chains split. Reading every reply that started below the tip as a reorg
+//! made each batch from a C++ node detach a block and scan it again.
+//!
+//! Only a wallet with no history names a height. The reference answers a start
+//! height above zero from that height whatever the history says, so a wallet
+//! that kept naming one was answered from the same place every time.
 //!
 //! # What is checked, and what is taken on trust
 //!
@@ -146,6 +157,10 @@ pub enum RefreshError {
     },
     #[error("a reorg {depth} blocks deep exceeds max_reorg_depth of {limit}")]
     ReorgTooDeep { depth: u64, limit: u64 },
+    #[error(
+        "the daemon answered from height {from} with no block this wallet could add, though its chain reaches {current}"
+    )]
+    NoProgress { from: u64, current: u64 },
 }
 
 type Result<T> = std::result::Result<T, RefreshError>;
@@ -153,6 +168,8 @@ type Result<T> = std::result::Result<T, RefreshError>;
 /// What one refresh did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RefreshSummary {
+    /// Blocks added to the wallet's chain. One it already held, sent again
+    /// for it to compare, is not counted.
     pub blocks_scanned: u64,
     pub received: usize,
     pub spent: usize,
@@ -249,9 +266,7 @@ impl WalletState {
             // A wallet starting at zero already knows the block at height
             // zero, so it holds genesis from the outset --
             // `wallet2::generate` does `m_blockchain.push_back(genesis_hash)`
-            // for the same reason. Without it the wallet's scan height is 0
-            // while the daemon answers from 1, and the wallet reads the
-            // one-block difference as a gap in the chain.
+            // for the same reason.
             hashes: if start_height == 0 {
                 vec![genesis]
             } else {
@@ -336,10 +351,14 @@ impl WalletState {
             }
             i += step;
         }
-        // Genesis last, if the gaps skipped it.
-        let genesis = self.hashes[0];
-        if out.last() != Some(&genesis) {
-            out.push(genesis);
+        // The first block the wallet holds, if the gaps skipped it, and then
+        // genesis. For a wallet that starts above zero those are different
+        // blocks, and the reference refuses a history that does not end at
+        // genesis ("genesis block mismatch").
+        for anchor in [self.hashes[0], self.genesis] {
+            if out.last() != Some(&anchor) {
+                out.push(anchor);
+            }
         }
         out
     }
@@ -412,8 +431,17 @@ impl WalletState {
     /// [`caught_up`](RefreshSummary::caught_up).
     pub fn refresh_once<S: BlockSource>(&mut self, source: &S) -> Result<RefreshSummary> {
         let history = self.short_chain_history();
+        // A start height above zero makes the reference answer from there and
+        // ignore the history, so it is only named while there is no history to
+        // go by. After that it is zero and the hashes decide, as
+        // `wallet2::refresh` resets it.
+        let start_height = if self.hashes.is_empty() {
+            self.start_height
+        } else {
+            0
+        };
         let batch = source
-            .get_blocks(&history, self.start_height)
+            .get_blocks(&history, start_height)
             .map_err(|e| RefreshError::Source(e.to_string()))?;
 
         let mut summary = RefreshSummary {
@@ -426,8 +454,6 @@ impl WalletState {
             return Ok(summary);
         }
 
-        // Where the daemon chose to answer from tells us whether we are on the
-        // chain it is on.
         let tip = self.scan_height();
         if batch.start_height > tip {
             // A gap: the daemon skipped blocks we have never seen. Accepting it
@@ -437,31 +463,59 @@ impl WalletState {
                 tip,
             });
         }
-        if batch.start_height < tip && !self.hashes.is_empty() {
-            let depth = tip - batch.start_height;
-            if self.max_reorg_depth != 0 && depth > self.max_reorg_depth {
-                return Err(RefreshError::ReorgTooDeep {
-                    depth,
-                    limit: self.max_reorg_depth,
-                });
-            }
-            self.detach(batch.start_height);
-            summary.reorg_to = Some(batch.start_height);
+        if batch.start_height < self.start_height && !self.hashes.is_empty() {
+            // Every block the wallet holds is at or above where it starts, so a
+            // reply from below that means the daemon has none of them: the
+            // chains split before the wallet's first block. Drop them all, and
+            // the next request names the wallet's start height again.
+            self.check_reorg_depth(tip - self.start_height)?;
+            self.detach(self.start_height);
+            summary.reorg_to = Some(self.start_height);
+            return Ok(summary);
         }
 
         for (n, bundle) in batch.blocks.iter().enumerate() {
             let height = batch.start_height + n as u64;
-            // The daemon may resend blocks we already have, which is normal
-            // right after a reorg check.
-            if height < self.scan_height() {
+            // Below where this wallet starts, from a daemon that did not answer
+            // from the height it was given. Nothing there is the wallet's.
+            if height < self.start_height {
                 continue;
             }
-            self.process_block(height, bundle, &mut summary)?;
+            let (block, block_hash) = parse_block(height, bundle)?;
+            if height < self.scan_height() {
+                // A block the wallet holds already, sent again to be compared
+                // (`wallet2::process_parsed_blocks`).
+                if block_hash == self.hashes[(height - self.start_height) as usize] {
+                    continue;
+                }
+                self.check_reorg_depth(self.scan_height() - height)?;
+                self.detach(height);
+                summary.reorg_to = Some(height);
+            }
+            self.process_block(height, &block, block_hash, bundle, &mut summary)?;
+            summary.blocks_scanned += 1;
         }
 
-        summary.blocks_scanned = batch.blocks.len() as u64;
         summary.caught_up = self.scan_height() >= batch.current_height;
+        if summary.blocks_scanned == 0 && !summary.caught_up {
+            // Asking again would get the same answer, forever.
+            return Err(RefreshError::NoProgress {
+                from: batch.start_height,
+                current: batch.current_height,
+            });
+        }
         Ok(summary)
+    }
+
+    /// `max_reorg_depth`, checked before anything is detached.
+    fn check_reorg_depth(&self, depth: u64) -> Result<()> {
+        if self.max_reorg_depth != 0 && depth > self.max_reorg_depth {
+            return Err(RefreshError::ReorgTooDeep {
+                depth,
+                limit: self.max_reorg_depth,
+            });
+        }
+        Ok(())
     }
 
     /// Refresh until caught up, or until `max_batches` have been fetched.
@@ -493,14 +547,11 @@ impl WalletState {
     fn process_block(
         &mut self,
         height: u64,
+        block: &Block,
+        block_hash: Hash256,
         bundle: &BlockBundle,
         summary: &mut RefreshSummary,
     ) -> Result<()> {
-        let block = Block::from_blob(&bundle.block).map_err(|e| RefreshError::BadBlock {
-            height,
-            reason: e.to_string(),
-        })?;
-
         // The chain must be continuous. A daemon that serves a block whose
         // parent we do not have at the height below is serving a different
         // chain, and the loop refuses rather than stitching them together.
@@ -513,11 +564,6 @@ impl WalletState {
                 });
             }
         }
-
-        let block_hash = block.block_id().ok_or_else(|| RefreshError::BadBlock {
-            height,
-            reason: "the block has no id".into(),
-        })?;
 
         // The coinbase first, then the transactions, which is the order the
         // global output indices come in (`specs/11` §5.1).
@@ -702,6 +748,19 @@ impl WalletState {
         self.transfers.push(t);
         Receipt::New
     }
+}
+
+/// Parse a block a source sent, and hash it.
+fn parse_block(height: u64, bundle: &BlockBundle) -> Result<(Block, Hash256)> {
+    let block = Block::from_blob(&bundle.block).map_err(|e| RefreshError::BadBlock {
+        height,
+        reason: e.to_string(),
+    })?;
+    let id = block.block_id().ok_or_else(|| RefreshError::BadBlock {
+        height,
+        reason: "the block has no id".into(),
+    })?;
+    Ok((block, id))
 }
 
 /// The one-time secret key for an output this wallet owns.
@@ -984,8 +1043,8 @@ mod tests {
         (blob, tx_blobs)
     }
 
-    /// A source that serves a fixed chain, answering from the first hash in the
-    /// history it recognises — exactly as a daemon does.
+    /// A source that serves a fixed chain, answering from the newest hash in the
+    /// history it has, that block included, as the C++ daemon does.
     /// `(block blob, transaction blobs, global output indices)`.
     type StoredBlock = (Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u64>>);
 
@@ -1051,15 +1110,31 @@ mod tests {
             block_ids: &[Hash256],
             start_height: u64,
         ) -> std::result::Result<Batch, Never> {
-            // The daemon answers from the first history hash it recognises,
-            // plus one.
-            let mut from = start_height as usize;
-            for h in block_ids {
-                if let Some(pos) = self.hashes.iter().position(|x| x == h) {
-                    from = pos + 1;
-                    break;
-                }
+            // `on_get_blocks`: a history whose newest hash is the top block has
+            // nothing new.
+            if block_ids.first().is_some() && block_ids.first() == self.hashes.last() {
+                return Ok(Batch {
+                    blocks: Vec::new(),
+                    start_height: 0,
+                    current_height: self.blocks.len() as u64,
+                });
             }
+            // `find_blockchain_supplement`: a start height above zero is taken
+            // as given. Otherwise the answer starts **at** the newest hash in
+            // the history this chain has, a block the wallet already holds.
+            //
+            // Unlike the reference, a history this chain has none of is
+            // answered from zero rather than refused. These chains start at a
+            // block zero of their own, not at the network's genesis that a
+            // wallet's history ends with.
+            let from = if start_height > 0 {
+                start_height as usize
+            } else {
+                block_ids
+                    .iter()
+                    .find_map(|h| self.hashes.iter().position(|x| x == h))
+                    .unwrap_or(0)
+            };
             let end = self.blocks.len().min(from + MAX_BLOCKS_PER_CALL as usize);
             let blocks = self.blocks[from.min(end)..end]
                 .iter()
@@ -1286,6 +1361,8 @@ mod tests {
                 h
             })
             .collect();
+        // Height zero is genesis.
+        w.hashes[0] = w.genesis;
 
         let history = w.short_chain_history();
         // Newest first.
@@ -1618,5 +1695,160 @@ mod tests {
         w.refresh(&chain, 10).expect("refresh");
         assert_eq!(w.sent[0].destinations[0].address, "Wo1payee");
         assert!(w.transfers[0].spent);
+    }
+
+    /// A wallet on `chain`, whose block zero stands in for the network's
+    /// genesis. A wallet from [`state`] holds the real genesis, which no
+    /// fixture chain starts with, so its first refresh replaces it.
+    fn state_on(seed: u8, chain: &Chain) -> WalletState {
+        let mut w = state(seed, 0);
+        w.genesis = chain.hashes[0];
+        w.hashes = vec![chain.hashes[0]];
+        w
+    }
+
+    /// A reply starts at the newest block the daemon and the wallet share,
+    /// which the wallet already holds (`find_blockchain_supplement`:
+    /// "INCLUDING last known id"). That block is compared and passed over.
+    ///
+    /// Reading it as a split made every batch from a C++ node a reorg: the
+    /// wallet detached a block it had, scanned it again, and said so.
+    #[test]
+    fn the_block_a_daemon_repeats_is_not_a_reorg() {
+        let mut chain = Chain::new();
+        for _ in 0..4 {
+            chain.push(&[], Vec::new());
+        }
+        let mut w = state_on(7, &chain);
+        let tx = payment(&w.account.keys.account_address, 2_500, 17);
+        chain.push(&[tx], vec![vec![], vec![6]]);
+
+        let s = w.refresh(&chain, 10).expect("refresh");
+        assert_eq!(s.reorg_to, None);
+        assert_eq!(s.blocks_scanned, 4, "block zero was held already");
+        assert_eq!(s.received, 1);
+        assert_eq!(w.hashes, chain.hashes);
+
+        chain.push(&[], Vec::new());
+        let s = w.refresh_once(&chain).expect("refresh");
+        assert_eq!(s.reorg_to, None, "the tip sent again is not a split");
+        assert_eq!(s.blocks_scanned, 1, "only the new block is scanned");
+        assert!(s.events.is_empty(), "nothing is found twice: {:?}", s.events);
+        assert_eq!(w.transfers.len(), 1);
+        assert_eq!(w.hashes, chain.hashes);
+    }
+
+    /// A wallet restored above zero names its height only while it holds no
+    /// hashes. The reference answers a start height above zero from that
+    /// height whatever the history says, so a wallet that went on naming it
+    /// was sent the same blocks on every call.
+    #[test]
+    fn a_restored_wallet_names_its_height_only_until_it_has_a_history() {
+        use std::cell::RefCell;
+
+        struct Asked<'a>(&'a Chain, RefCell<Vec<u64>>);
+        impl BlockSource for Asked<'_> {
+            type Error = Never;
+            fn get_blocks(
+                &self,
+                ids: &[Hash256],
+                start: u64,
+            ) -> std::result::Result<Batch, Never> {
+                self.1.borrow_mut().push(start);
+                self.0.get_blocks(ids, start)
+            }
+        }
+
+        let mut chain = Chain::new();
+        for _ in 0..8 {
+            chain.push(&[], Vec::new());
+        }
+        let mut w = state(7, 5);
+        {
+            let asked = Asked(&chain, RefCell::new(Vec::new()));
+            let s = w.refresh(&asked, 10).expect("refresh");
+            assert!(s.caught_up);
+            assert_eq!(asked.1.into_inner(), vec![5], "no history yet, so the height");
+        }
+        assert_eq!(w.hashes, chain.hashes[5..]);
+
+        chain.push(&[], Vec::new());
+        chain.push(&[], Vec::new());
+        let asked = Asked(&chain, RefCell::new(Vec::new()));
+        let s = w.refresh(&asked, 10).expect("refresh");
+        assert!(s.caught_up);
+        assert_eq!(s.reorg_to, None);
+        assert_eq!(s.blocks_scanned, 2);
+        assert_eq!(asked.1.into_inner(), vec![0], "a history now, so no height");
+        assert_eq!(w.hashes, chain.hashes[5..]);
+    }
+
+    /// The history ends at the network's genesis even for a wallet that starts
+    /// above zero, after the first block it holds: the reference refuses a
+    /// history that does not end at its genesis ("genesis block mismatch").
+    #[test]
+    fn a_history_always_ends_at_genesis() {
+        let mut w = state(7, 500);
+        w.hashes = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+        assert_eq!(
+            w.short_chain_history(),
+            vec![[3u8; 32], [2u8; 32], [1u8; 32], w.genesis]
+        );
+    }
+
+    /// A split below the first block a restored wallet holds leaves the daemon
+    /// with none of its blocks, so it answers from further down than the
+    /// wallet starts. The wallet drops what it holds and asks from its own
+    /// start again, rather than scanning blocks below it.
+    #[test]
+    fn a_split_below_where_a_wallet_starts_rescans_from_its_start() {
+        let mut chain = Chain::new();
+        for _ in 0..8 {
+            chain.push(&[], Vec::new());
+        }
+        let mut w = state(7, 5);
+        w.refresh(&chain, 10).expect("refresh");
+        assert_eq!(w.hashes, chain.hashes[5..]);
+
+        chain.reorg_from(3, 6);
+        let s = w.refresh(&chain, 10).expect("refresh");
+        assert_eq!(s.reorg_to, Some(5), "back to where the wallet starts");
+        assert!(s.caught_up);
+        assert_eq!(w.hashes, chain.hashes[5..]);
+    }
+
+    /// A reply of only blocks the wallet holds, from a daemon whose chain is
+    /// taller, would have the loop ask again forever. It is refused instead.
+    #[test]
+    fn a_reply_with_nothing_new_from_a_taller_chain_is_refused() {
+        let mut chain = Chain::new();
+        for _ in 0..4 {
+            chain.push(&[], Vec::new());
+        }
+        let mut w = state_on(7, &chain);
+        w.refresh(&chain, 10).expect("refresh");
+
+        struct Stale<'a>(&'a Chain);
+        impl BlockSource for Stale<'_> {
+            type Error = Never;
+            fn get_blocks(
+                &self,
+                _ids: &[Hash256],
+                _start: u64,
+            ) -> std::result::Result<Batch, Never> {
+                let mut batch = self.0.get_blocks(&[self.0.hashes[0]], 0)?;
+                batch.current_height += 10;
+                Ok(batch)
+            }
+        }
+
+        let e = w
+            .refresh_once(&Stale(&chain))
+            .expect_err("no progress is refused");
+        assert!(
+            matches!(e, RefreshError::NoProgress { from: 0, current: 14 }),
+            "{e}"
+        );
+        assert_eq!(w.hashes, chain.hashes, "and nothing was dropped");
     }
 }
