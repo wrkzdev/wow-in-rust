@@ -19,6 +19,9 @@ members = [
     "bin/wownero-wallet-cli",
     "bin/wownero-wallet-rpc",
 ]
+# The GUI and web wallets are a workspace of their own (extras/Cargo.toml), so
+# nothing here builds egui or wasm-bindgen.
+exclude = ["extras"]
 
 [workspace.package]
 version = "0.11.4"

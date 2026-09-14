@@ -1,4 +1,6 @@
 /target
+/extras/target
+/extras/wallet-web/dist
 **/*.rs.bk
 Cargo.lock.bak
 
