@@ -8,12 +8,12 @@
 use std::time::Instant;
 
 use wow_daemon_client::KeyImageStatus;
-use wow_types::address::{Address, AddressKind};
-use wow_wallet::decoys::{self, GammaPicker};
+use wow_types::address::Address;
+use wow_wallet::decoys;
 use wow_wallet::history::{EntryKind, PROPAGATION_TIMEOUT};
 use wow_wallet::priority::{self, PrioritySettings};
-use wow_wallet::spend::{self, SpendOptions};
-use wow_wallet::transfer::{self, Destination, SpendableOutput};
+use wow_wallet::send::SendRequest;
+use wow_wallet::spend;
 use wow_wallet::{PoolCheck, RefreshEvent};
 
 use crate::fmt;
@@ -772,20 +772,11 @@ fn send(
     if session.is_view_only() {
         return Err("a view-only wallet cannot spend: it has no spend key".into());
     }
-    let client = session
-        .daemon
-        .clone()
-        .ok_or("no daemon set; use `set_daemon <host:port>`")?;
+    if session.daemon.is_none() {
+        return Err("no daemon set; use `set_daemon <host:port>`".into());
+    }
 
-    // The destination, decoded against this wallet's network.
     let (address_text, amount) = &destinations[0];
-    let decoded = Address::decode_for(address_text, session.network).map_err(|e| {
-        format!(
-            "that address is not valid for {}: {e}",
-            session.network.name()
-        )
-    })?;
-
     let explicit_pid: Option<[u8; 8]> = match payment_id {
         Some(hex) => Some(
             wow_crypto::hex::decode(hex)
@@ -795,150 +786,37 @@ fn send(
         ),
         None => None,
     };
-    // An integrated address carries its own payment id, and giving a second one
-    // is ambiguous rather than additive.
-    let pid = match (decoded.payment_id, explicit_pid) {
-        (Some(_), Some(_)) => {
-            return Err("that is an integrated address; it already carries a payment id".into())
-        }
-        (Some(p), None) => Some(p),
-        (None, other) => other,
-    };
 
-    // Fees, from the daemon, at the tier `adjust_priority` settles on.
-    let tiers = client
-        .get_fee_estimate(priority::FEE_ESTIMATE_GRACE_BLOCKS)
-        .map_err(|e| format!("cannot get a fee estimate: {e}"))?;
-    let priority = priority::adjust_priority(
-        &client,
+    let request = SendRequest {
+        address: address_text,
+        amount: (!sweep).then_some(*amount),
         priority,
-        PrioritySettings::from_keys_file(&session.keys_file),
-        session.state.scan_height(),
-        &tiers,
-    );
-    let fee_per_byte = priority::fee_per_byte(&tiers, priority);
-
-    // Another copy of this wallet may have spent some of these outputs since
-    // the last refresh. Better found in the pool now than as a refusal.
-    match session.note_pool_spends() {
-        Ok(noted) => report_pool(
-            session,
-            &PoolCheck {
-                noted,
-                failed: Vec::new(),
-            },
-        ),
-        Err(e) => eprintln!("{e}"),
-    }
-
-    let options = SpendOptions {
         ring_size,
-        fee_per_byte,
-        extra_size: spend::extra_size(2, pid.is_some(), decoded.kind == AddressKind::Subaddress),
-        chain_height: session.chain_height(),
-        now: now(),
-        ..Default::default()
+        payment_id: explicit_pid,
     };
+    let prepared = session.prepare_send(&request).map_err(|e| e.to_string())?;
 
-    let plan = if sweep {
-        spend::plan_sweep(session.transfers(), &options)
-    } else {
-        spend::plan(session.transfers(), &[*amount], &options)
+    // Spends of this wallet's outputs that preparing found in the pool.
+    if let Some(e) = &prepared.pool_unread {
+        eprintln!("{e}");
     }
-    .map_err(|e| e.to_string())?;
-
-    // Rings, one per input.
-    let distribution = client
-        .get_output_distribution(0, 0, session.chain_height().saturating_sub(1))
-        .map_err(|e| format!("cannot get the output distribution: {e}"))?;
-    let picker = GammaPicker::new(&distribution).map_err(|e| e.to_string())?;
-    let mut rng = term::seeded_rng()?;
-
-    let mut inputs = Vec::with_capacity(plan.inputs.len());
-    for &i in &plan.inputs {
-        let t = &session.state.transfers[i];
-        // Every member one the chain has unlocked, or no node will take it.
-        let (ring, keys) = decoys::select_unlocked_ring(
-            &picker,
-            &mut rng,
-            t.global_output_index,
-            ring_size,
-            |indices| decoys::fetch_members(&client, indices),
-        )
-        .map_err(|e| format!("cannot build a ring: {e}"))?;
-
-        let mask = wow_crypto::ops::decode_scalar(&t.mask)
-            .ok_or("this output's stored mask is not a valid scalar")?;
-        let assembled = decoys::assemble_ring(
-            &ring,
-            &keys,
-            &t.public_key,
-            &wow_crypto::rct::commit(t.amount, &mask),
-        )
-        .map_err(|e| format!("the daemon's ring members do not match ours: {e}"))?;
-
-        // The one-time secret key for this output.
-        let secret = one_time_secret(session, t)?;
-
-        inputs.push(SpendableOutput {
-            public_key: t.public_key,
-            secret_key: secret,
-            mask,
-            amount: t.amount,
-            key_image: t.key_image.ok_or("this output has no key image")?,
-            ring: assembled.members,
-            global_indices: assembled.indices,
-            real_index: assembled.real_index,
-        });
-    }
-
-    // Destinations: the payee, then change back to ourselves.
-    let payee = decoded.keys;
-    let payee_is_subaddress = decoded.kind == AddressKind::Subaddress;
-    let change_to = session.keys_file.account.keys.account_address;
-    let destinations = |p: &spend::SpendPlan| {
-        vec![
-            Destination {
-                address: payee,
-                is_subaddress: payee_is_subaddress,
-                amount: p.amounts[0],
-            },
-            Destination {
-                address: change_to,
-                is_subaddress: false,
-                amount: p.change,
-            },
-        ]
-    };
-
-    // Built before asking, as the C++ does: the fee is the built transaction's
-    // weight's, and weighing it takes the transaction.
-    let settled = transfer::construct_settled(
-        &inputs,
-        &plan,
-        fee_per_byte,
-        pid,
-        &destinations,
-        &mut || {
-            use wow_wallet::decoys::RandomSource;
-            let mut b = [0u8; 32];
-            b[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
-            b[8..16].copy_from_slice(&rng.next_u64().to_le_bytes());
-            b[16..24].copy_from_slice(&rng.next_u64().to_le_bytes());
-            b[24..].copy_from_slice(&rng.next_u64().to_le_bytes());
-            curve25519_dalek::scalar::Scalar::from_bytes_mod_order(b)
+    report_pool(
+        session,
+        &PoolCheck {
+            noted: prepared.noted_in_pool.clone(),
+            failed: Vec::new(),
         },
-    )
-    .map_err(|e| format!("cannot build the transaction: {e}"))?;
-    let plan = settled.plan;
+    );
 
+    let plan = &prepared.plan;
+    let txid = prepared.txid;
     println!();
     println!("Sending  {}", fmt::amount(plan.amounts[0]));
     println!("     to  {address_text}");
     println!(
         "    fee  {} ({})",
         fmt::amount(plan.fee),
-        tier_name(priority)
+        tier_name(prepared.priority)
     );
     if plan.change > 0 {
         println!(" change  {}", fmt::amount(plan.change));
@@ -948,7 +826,7 @@ fn send(
         plan.inputs.len(),
         plan.estimated_weight
     );
-    if let Some(p) = pid {
+    if let Some(p) = prepared.payment_id {
         println!("payment id  {}", wow_crypto::hex::encode(&p));
     }
     if !term::confirm("Send?") {
@@ -956,25 +834,12 @@ fn send(
         return Ok(());
     }
 
-    let blob = settled.blob;
-    let txid = transfer::transaction_hash(&settled.built.tx);
-
-    let result = client
-        .send_raw_transaction(&blob, false)
-        .map_err(|e| format!("cannot reach the daemon to relay: {e}"))?;
+    let relayed = session
+        .commit_send(&prepared, false)
+        .map_err(|e| e.to_string())?;
+    let result = relayed.result;
 
     if result.accepted() {
-        // That it was sent, and spent its inputs, is written down either way.
-        // Where it went is written down only with `store-tx-info` on.
-        let (payees, recorded_pid) = if session.keys_file.store_tx_info() {
-            (vec![address_text.as_str()], pid)
-        } else {
-            (Vec::new(), None)
-        };
-        session
-            .state
-            .record_sent(txid, &plan, &payees, recorded_pid, now());
-        session.dirty = true;
         // Saved at once: a wallet that forgot this send would offer the same
         // inputs to the next one, and the daemon would refuse it.
         match session.save() {
@@ -1006,29 +871,29 @@ fn send(
         }
         println!("  status: {}", result.status);
         if result.double_spend {
-            explain_double_spend(session, &client, &plan);
+            explain_double_spend(session, &relayed.noted_in_pool, plan);
         }
     }
     Ok(())
 }
 
-/// After a refusal as a double spend: say which input was spent, and where,
-/// and keep it out of the next transaction if the pool has the spend.
+/// After a refusal as a double spend: say which input was spent, and where.
+/// Spends found in the pool are already held back by the time this runs.
 fn explain_double_spend(
-    session: &mut Session,
-    client: &wow_daemon_client::DaemonClient,
+    session: &Session,
+    noted: &[wow_crypto::types::Hash256],
     plan: &spend::SpendPlan,
 ) {
-    match session.note_pool_spends() {
-        Ok(noted) => report_pool(
-            session,
-            &PoolCheck {
-                noted,
-                failed: Vec::new(),
-            },
-        ),
-        Err(e) => eprintln!("  {e}"),
-    }
+    report_pool(
+        session,
+        &PoolCheck {
+            noted: noted.to_vec(),
+            failed: Vec::new(),
+        },
+    );
+    let Some(client) = session.daemon.clone() else {
+        return;
+    };
 
     let inputs: Vec<(usize, [u8; 32])> = plan
         .inputs
@@ -1066,15 +931,6 @@ fn explain_double_spend(
             KeyImageStatus::Unspent => {}
         }
     }
-}
-
-/// The one-time secret key for an output, recomputed rather than stored.
-fn one_time_secret(
-    session: &Session,
-    t: &wow_wallet::refresh::Transfer,
-) -> Result<wow_crypto::types::SecretKey, String> {
-    wow_wallet::refresh::one_time_secret_key(&session.keys_file.account, t)
-        .ok_or_else(|| "a view-only wallet has no spend key".to_string())
 }
 
 // -- settings --------------------------------------------------------------

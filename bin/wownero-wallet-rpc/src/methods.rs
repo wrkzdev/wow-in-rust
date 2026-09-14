@@ -11,11 +11,11 @@
 use serde_json::{json, Map, Value};
 
 use wow_types::address::{Address, AddressKind};
-use wow_wallet::decoys::{self, GammaPicker};
+use wow_wallet::decoys::{self, DecoyError};
 use wow_wallet::files::Session;
 use wow_wallet::priority::{self, PrioritySettings};
-use wow_wallet::spend::{self, SpendOptions};
-use wow_wallet::transfer::{self, Destination, SpendableOutput};
+use wow_wallet::send::{SendError, SendRequest};
+use wow_wallet::spend;
 
 use crate::errors::{self, Error};
 use crate::server::State;
@@ -827,7 +827,8 @@ fn sweep_all(session: &mut Session, params: &Value) -> MethodResult {
     }))
 }
 
-/// The shared path: plan, ring, build, relay.
+/// The shared path: refuse what cannot be sent as asked, then prepare, relay
+/// and record.
 fn build_and_send(
     session: &mut Session,
     address: &str,
@@ -869,190 +870,44 @@ fn build_and_send(
         ));
     }
 
-    let client = session
-        .daemon
-        .clone()
-        .ok_or_else(|| Error::new(errors::NO_DAEMON_CONNECTION, "no daemon is set"))?;
-
-    let decoded = Address::decode_for(address, session.network)
-        .map_err(|e| Error::new(errors::WRONG_ADDRESS, e.to_string()))?;
-
-    let tiers = client
-        .get_fee_estimate(priority::FEE_ESTIMATE_GRACE_BLOCKS)
-        .map_err(|e| Error::new(errors::NO_DAEMON_CONNECTION, e.to_string()))?;
-    // `on_transfer`: `adjust_priority(req.priority)`, where a priority left out
-    // is 0 -- the low tier on a quiet chain, not normal.
-    let priority = priority::adjust_priority(
-        &client,
-        u32_param(params, "priority", 0),
-        PrioritySettings::from_keys_file(&session.keys_file),
-        session.state.scan_height(),
-        &tiers,
-    );
-    let fee_per_byte = priority::fee_per_byte(&tiers, priority);
-
-    // Another copy of this wallet may have spent some of these outputs since
-    // the last refresh; an unreadable pool is no reason to refuse the send.
-    let _ = session.note_pool_spends();
-
-    let options = SpendOptions {
+    let request = SendRequest {
+        address,
+        amount,
+        // `on_transfer`: `adjust_priority(req.priority)`, where a priority left
+        // out is 0 -- the low tier on a quiet chain, not normal.
+        priority: u32_param(params, "priority", 0),
         ring_size,
-        fee_per_byte,
-        extra_size: spend::extra_size(
-            2,
-            decoded.payment_id.is_some(),
-            decoded.kind == AddressKind::Subaddress,
-        ),
-        chain_height: session.chain_height(),
-        now: wow_wallet::files::now(),
-        ..Default::default()
+        payment_id: None,
     };
-
-    let plan = match amount {
-        Some(a) => spend::plan(&session.state.transfers, &[a], &options),
-        None => spend::plan_sweep(&session.state.transfers, &options),
-    }
-    .map_err(spend_error)?;
-
-    // Rings.
-    let distribution = client
-        .get_output_distribution(0, 0, session.chain_height().saturating_sub(1))
-        .map_err(|e| Error::new(errors::NO_DAEMON_CONNECTION, e.to_string()))?;
-    let picker = GammaPicker::new(&distribution)
-        .map_err(|e| Error::new(errors::NOT_ENOUGH_OUTS_TO_MIX, e.to_string()))?;
-    let mut rng = wow_wallet::entropy::seeded_rng().map_err(internal)?;
-
-    let mut inputs = Vec::with_capacity(plan.inputs.len());
-    let mut spent_images = Vec::with_capacity(plan.inputs.len());
-    for &i in &plan.inputs {
-        let t = session.state.transfers[i].clone();
-        // Every member one the chain has unlocked, or no node will take it.
-        let (ring, keys) = decoys::select_unlocked_ring(
-            &picker,
-            &mut rng,
-            t.global_output_index,
-            ring_size,
-            |indices| decoys::fetch_members(&client, indices),
-        )
-        .map_err(|e| match e {
-            decoys::DecoyError::Fetch(_) => Error::new(errors::NO_DAEMON_CONNECTION, e.to_string()),
-            _ => Error::new(errors::NOT_ENOUGH_OUTS_TO_MIX, e.to_string()),
-        })?;
-
-        let mask = wow_crypto::ops::decode_scalar(&t.mask)
-            .ok_or_else(|| Error::new(errors::UNKNOWN_ERROR, "a stored mask is not a scalar"))?;
-        let assembled = decoys::assemble_ring(
-            &ring,
-            &keys,
-            &t.public_key,
-            &wow_crypto::rct::commit(t.amount, &mask),
-        )
-        .map_err(|e| {
-            Error::new(
-                errors::UNKNOWN_ERROR,
-                format!("the daemon's ring members do not match ours: {e}"),
-            )
-        })?;
-
-        let secret = wow_wallet::refresh::one_time_secret_key(&session.keys_file.account, &t)
-            .ok_or_else(|| Error::new(errors::WATCH_ONLY, "no spend key"))?;
-        let image = t
-            .key_image
-            .ok_or_else(|| Error::new(errors::WRONG_KEY_IMAGE, "no key image"))?;
-        spent_images.push(wow_crypto::hex::encode(&image.0));
-
-        inputs.push(SpendableOutput {
-            public_key: t.public_key,
-            secret_key: secret,
-            mask,
-            amount: t.amount,
-            key_image: image,
-            ring: assembled.members,
-            global_indices: assembled.indices,
-            real_index: assembled.real_index,
-        });
-    }
-
-    let payee = decoded.keys;
-    let payee_is_subaddress = decoded.kind == AddressKind::Subaddress;
-    let change_to = session.keys_file.account.keys.account_address;
-    let destinations = |p: &spend::SpendPlan| {
-        vec![
-            Destination {
-                address: payee,
-                is_subaddress: payee_is_subaddress,
-                amount: p.amounts[0],
-            },
-            Destination {
-                address: change_to,
-                is_subaddress: false,
-                amount: p.change,
-            },
-        ]
-    };
-
-    // At the fee the built transaction's weight needs, not the estimate's.
-    let settled = transfer::construct_settled(
-        &inputs,
-        &plan,
-        fee_per_byte,
-        decoded.payment_id,
-        &destinations,
-        &mut || {
-            use wow_wallet::decoys::RandomSource;
-            let mut b = [0u8; 32];
-            for chunk in b.chunks_mut(8) {
-                chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
-            }
-            curve25519_dalek::scalar::Scalar::from_bytes_mod_order(b)
-        },
-    )
-    .map_err(|e| match e {
-        transfer::SettleError::Plan(e) => spend_error(e),
-        transfer::SettleError::Build(e) => {
-            Error::new(errors::GENERIC_TRANSFER_ERROR, e.to_string())
-        }
-    })?;
-    let plan = settled.plan;
-    let blob = settled.blob;
-    let txid = transfer::transaction_hash(&settled.built.tx);
+    let prepared = session.prepare_send(&request).map_err(send_error)?;
 
     let do_not_relay = params
         .get("do_not_relay")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let result = client
-        .send_raw_transaction(&blob, do_not_relay)
-        .map_err(|e| Error::new(errors::NO_DAEMON_CONNECTION, e.to_string()))?;
-    if !result.accepted() {
-        if result.double_spend {
-            // If the first spend is in the pool, hold its outputs back, so the
-            // next attempt does not pick them again.
-            let _ = session.note_pool_spends();
-            session.dirty = true;
-        }
+    // `wallet2::commit_tx`, which `do_not_relay` skips, records it: its inputs
+    // spent, whether or not `store-tx-info` keeps where it went.
+    let relayed = session
+        .commit_send(&prepared, do_not_relay)
+        .map_err(send_error)?;
+    if !relayed.result.accepted() {
         return Err(Error::new(
             errors::GENERIC_TRANSFER_ERROR,
-            format!("the daemon rejected the transaction: {}", result.reason),
+            format!(
+                "the daemon rejected the transaction: {}",
+                relayed.result.reason
+            ),
         ));
     }
-    // `wallet2::commit_tx`, which `do_not_relay` skips: recorded, and its
-    // inputs spent, whether or not `store-tx-info` keeps where it went.
-    if !do_not_relay {
-        let store = session.keys_file.store_tx_info();
-        let payees = if store { vec![address] } else { Vec::new() };
-        session.state.record_sent(
-            txid,
-            &plan,
-            &payees,
-            decoded.payment_id.filter(|_| store),
-            wow_wallet::files::now(),
-        );
-    }
-    session.dirty = true;
 
+    let plan = &prepared.plan;
+    let spent_images: Vec<String> = prepared
+        .key_images
+        .iter()
+        .map(|k| wow_crypto::hex::encode(&k.0))
+        .collect();
     let mut out = json!({
-        "tx_hash": wow_crypto::hex::encode(&txid),
+        "tx_hash": wow_crypto::hex::encode(&prepared.txid),
         "tx_key": "",
         "amount": plan.amounts[0],
         "fee": plan.fee,
@@ -1062,11 +917,33 @@ fn build_and_send(
         "spent_key_images": { "key_images": spent_images },
     });
     if params.get("get_tx_hex").and_then(Value::as_bool) == Some(true) {
-        out["tx_blob"] = json!(wow_crypto::hex::encode(&blob));
+        out["tx_blob"] = json!(wow_crypto::hex::encode(&prepared.blob));
     } else {
         out["tx_blob"] = json!("");
     }
     Ok(out)
+}
+
+/// Map a send's failure to the code a client branches on.
+fn send_error(e: SendError) -> Error {
+    let message = e.to_string();
+    let code = match e {
+        SendError::Plan(e) => return spend_error(e),
+        SendError::ViewOnly => errors::WATCH_ONLY,
+        SendError::NoDaemon
+        | SendError::FeeEstimate(_)
+        | SendError::Distribution(_)
+        | SendError::Relay(_)
+        | SendError::Ring(DecoyError::Fetch(_)) => errors::NO_DAEMON_CONNECTION,
+        SendError::Address { .. } => errors::WRONG_ADDRESS,
+        SendError::TwoPaymentIds => errors::WRONG_PAYMENT_ID,
+        SendError::Ring(_) => errors::NOT_ENOUGH_OUTS_TO_MIX,
+        SendError::Build(_) => errors::GENERIC_TRANSFER_ERROR,
+        SendError::RingMismatch(_) | SendError::Damaged(_) | SendError::Entropy(_) => {
+            errors::UNKNOWN_ERROR
+        }
+    };
+    Error::new(code, message)
 }
 
 /// Map a planning failure to the code a client branches on.
