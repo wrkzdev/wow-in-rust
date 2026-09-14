@@ -452,11 +452,9 @@ fn random_iv(rng: &mut wow_crypto::random::Rng) -> [u8; 8] {
     iv
 }
 
+/// The time now, in seconds since 1970 ([`crate::clock`]).
 pub fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::clock::now()
 }
 
 /// Write to a temporary file and rename over the target.

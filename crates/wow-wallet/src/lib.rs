@@ -31,6 +31,7 @@
 
 pub mod account;
 pub mod chacha;
+pub mod clock;
 pub mod decoys;
 pub mod entropy;
 pub mod files;

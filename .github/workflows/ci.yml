@@ -42,6 +42,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  # The wallet library also builds for a browser, where there are no sockets,
+  # no OS entropy and no clock std can read. Checked, not tested: nothing here
+  # runs under wasm.
+  wasm:
+    name: wallet library for wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target wasm32-unknown-unknown -p wow-wallet -p wow-daemon-client
+
   # Guards against a silently truncated or swapped corpus: the M1 gate is only
   # meaningful if the vectors are the ones the reference tree ships.
   corpus-integrity:
