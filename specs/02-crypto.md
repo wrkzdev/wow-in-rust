@@ -456,9 +456,22 @@ selected by `state[0] & 3`. Port `src/crypto/slow-hash.c`.
 
 ```
 derivation = 8 * r * A                      # tx secret key * recipient view pubkey
-key = hash_to_scalar( derivation || 0x8d )  # HASH_KEY_ENCRYPTED_PAYMENT_ID
+key = cn_fast_hash( derivation || 0x8d )    # HASH_KEY_ENCRYPTED_PAYMENT_ID
 encrypted_pid[i] = pid[i] XOR key[i]        # for i in 0..8
 ```
+
+The key is the hash itself (`device_default::encrypt_payment_id`), **not**
+`hash_to_scalar`. Reducing it mod ℓ changes its first eight bytes for about 15
+hashes in 16, so a wallet that reduces it reads a different id from the one
+sent.
+
+The payee decrypts under `8 * a * R`, `R` the transaction's first
+`TX_EXTRA_TAG_PUBKEY`, and reads only the first `TX_EXTRA_NONCE`. An id that
+decrypts to zeros is the dummy a one-destination transaction without an id
+carries, and means none.
+
+Vector: derivation `5a` × 32 and id `0102030405060708` give `ceabd1d99028a12b`;
+the zero id gives `cfa9d2dd952ea623`.
 
 ## 9. Conformance checklist
 

@@ -61,7 +61,6 @@ const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ),
     ("address_book", "the address book is not built yet"),
     ("account", "multiple accounts are not built yet"),
-    ("payments", "payment-id history is not built yet"),
     ("donate", "the donation address is not wired up"),
     ("show_qr_code", "QR rendering is not built yet"),
     (
@@ -135,6 +134,7 @@ pub fn run_one(session: &mut Session, line: &str) -> Result<Outcome, String> {
         }
         "incoming_transfers" => incoming_transfers(session, &args),
         "show_transfers" => show_transfers(session, &args),
+        "payments" => payments(session, &args),
         "unspent_outputs" => unspent_outputs(session),
         "fee" => fee(session),
         "transfer" => transfer_cmd(session, &args),
@@ -169,6 +169,7 @@ Chain
 History
   incoming_transfers [available|unavailable]
   show_transfers [in|out|pending|failed|coinbase|all] [<min_height> [<max_height>]]
+  payments <payment_id> [<payment_id> ...]
   unspent_outputs
 
 Sending
@@ -648,6 +649,44 @@ fn show_transfers(session: &mut Session, args: &[&str]) -> Result<(), String> {
     }
     if shown == 0 {
         println!("(none)");
+    }
+    Ok(())
+}
+
+/// `simple_wallet::show_payments`: the payments received with each id given.
+fn payments(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("usage: payments <payment_id> [<payment_id> ...]".into());
+    }
+    let received = session.state.payments(0);
+    println!(
+        "{:<16}  {:<64}  {:>8}  {:>20}  {:>11}  {:>10}",
+        "payment", "transaction", "height", "amount", "unlock time", "addr index"
+    );
+    for arg in args {
+        let Some(key) = wow_wallet::history::parse_payment_key(arg) else {
+            println!("`{arg}` is not a payment id: 16 or 64 hex characters");
+            continue;
+        };
+        let mut found = false;
+        for e in received
+            .iter()
+            .filter(|e| wow_wallet::history::payment_key(e.payment_id) == key)
+        {
+            found = true;
+            println!(
+                "{:<16}  {}  {:>8}  {:>20}  {:>11}  {:>10}",
+                arg,
+                wow_crypto::hex::encode(&e.txid),
+                e.height.unwrap_or(0),
+                fmt::amount(e.amount),
+                e.unlock_time,
+                e.minors.first().copied().unwrap_or(0),
+            );
+        }
+        if !found {
+            println!("No payments with id {arg}");
+        }
     }
     Ok(())
 }

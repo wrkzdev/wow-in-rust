@@ -529,6 +529,7 @@ pub mod cache {
                     "unlock_time": t.unlock_time,
                     "is_coinbase": t.is_coinbase,
                     "timestamp": t.timestamp,
+                    "payment_id": t.payment_id.map(|p| wow_crypto::hex::encode(&p)),
                 })
             })
             .collect();
@@ -664,6 +665,12 @@ pub mod cache {
             unlock_time: v.get("unlock_time")?.as_u64()?,
             is_coinbase: v.get("is_coinbase")?.as_bool()?,
             timestamp: v.get("timestamp").and_then(Value::as_u64).unwrap_or(0),
+            // Absent from a cache written before it was kept; a rescan reads it.
+            payment_id: v
+                .get("payment_id")
+                .and_then(Value::as_str)
+                .and_then(wow_crypto::hex::decode)
+                .and_then(|b| b.try_into().ok()),
         })
     }
 
@@ -863,6 +870,55 @@ mod tests {
         let mut back = WalletState::new(s.keys_file.account.clone(), table, 0, Network::Mainnet);
         cache::load(&mut back, &raw).expect("loads");
         assert_eq!(back.sent, s.state.sent);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An output's payment id survives the cache, and an output from a cache
+    /// written before it was kept reads back with none.
+    #[test]
+    fn a_payment_id_survives_the_cache() {
+        let dir = scratch("payment-id");
+        let mut s = fresh_session(&dir, 0);
+        s.state.transfers.push(Transfer {
+            block_height: 12,
+            txid: [4u8; 32],
+            internal_output_index: 0,
+            global_output_index: 30,
+            public_key: wow_crypto::types::PublicKey([5u8; 32]),
+            derivation: wow_crypto::types::KeyDerivation([6u8; 32]),
+            key_image: Some(wow_crypto::types::KeyImage([7u8; 32])),
+            mask: [8u8; 32],
+            amount: 5_000,
+            subaddress: wow_crypto::types::SubaddressIndex::MAIN,
+            spent: false,
+            spent_height: 0,
+            unlock_time: 0,
+            is_coinbase: false,
+            timestamp: 1_700_000_000,
+            payment_id: Some([0xf9, 0x33, 0x77, 0x88, 0xdd, 0x75, 0x25, 0x55]),
+        });
+        let raw = cache::store(&s.state);
+
+        let fresh = || {
+            let keys = &s.keys_file.account.keys;
+            let table = SubaddressTable::new(&keys.account_address, &keys.view_secret_key, 1, 1);
+            WalletState::new(s.keys_file.account.clone(), table, 0, Network::Mainnet)
+        };
+
+        let mut back = fresh();
+        cache::load(&mut back, &raw).expect("loads");
+        assert_eq!(back.transfers, s.state.transfers);
+
+        let mut older: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        older["transfers"][0]
+            .as_object_mut()
+            .expect("an object")
+            .remove("payment_id");
+        let mut old = fresh();
+        cache::load(&mut old, older.to_string().as_bytes()).expect("loads");
+        assert_eq!(old.transfers.len(), 1, "the output is kept");
+        assert_eq!(old.transfers[0].payment_id, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

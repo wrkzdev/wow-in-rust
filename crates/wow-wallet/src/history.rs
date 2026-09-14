@@ -153,6 +153,31 @@ impl HistoryEntry {
     }
 }
 
+/// The key `wallet2` files a payment under, a `crypto::hash`: an encrypted
+/// id's eight bytes and 24 zeros, or all zeros for none.
+pub fn payment_key(payment_id: Option<[u8; 8]>) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    if let Some(id) = payment_id {
+        key[..8].copy_from_slice(&id);
+    }
+    key
+}
+
+/// A payment id as `wallet2::parse_payment_id` reads one: 64 hex characters,
+/// or 16 that stand for the first eight bytes of 64.
+///
+/// A long id with anything past its first eight bytes names no payment this
+/// wallet keeps: it reads only encrypted ids, and the C++ ignores plain ones
+/// from block version 12.
+pub fn parse_payment_key(text: &str) -> Option<[u8; 32]> {
+    let bytes = wow_crypto::hex::decode(text)?;
+    match bytes.len() {
+        32 => bytes.try_into().ok(),
+        8 => Some(payment_key(bytes.try_into().ok())),
+        _ => None,
+    }
+}
+
 /// A transaction waiting in the daemon's pool.
 #[derive(Clone, Debug)]
 pub struct PooledTx {
@@ -403,7 +428,7 @@ impl WalletState {
                 amounts: vec![t.amount],
                 fee: 0,
                 destinations: Vec::new(),
-                payment_id: None,
+                payment_id: t.payment_id,
                 account: t.subaddress.major,
                 minors: vec![t.subaddress.minor],
                 unlock_time: t.unlock_time,
@@ -433,6 +458,17 @@ impl WalletState {
 
         entries.sort_by_key(|e| (e.height.is_none(), e.height.unwrap_or(0), e.timestamp));
         entries
+    }
+
+    /// Payments received in blocks above `min_height`: `wallet2::get_payments`.
+    /// One per transaction and subaddress, as [`Self::history`] has them, change
+    /// left out. [`payment_key`] says which id each was filed under.
+    pub fn payments(&self, min_height: u64) -> Vec<HistoryEntry> {
+        self.history()
+            .into_iter()
+            .filter(|e| matches!(e.kind, EntryKind::In | EntryKind::Coinbase))
+            .filter(|e| e.height.is_some_and(|h| h > min_height))
+            .collect()
     }
 
     /// A block spent outputs of ours: `process_unconfirmed` and
@@ -564,6 +600,7 @@ mod tests {
             unlock_time: 0,
             is_coinbase: false,
             timestamp: 1_600_000_000,
+            payment_id: None,
         });
         w.by_key_image.insert(KeyImage([9u8; 32]), 0);
         w
@@ -721,6 +758,41 @@ mod tests {
         );
         assert_eq!(h[1].destinations[0].address, "Wo1payee");
         assert_eq!(h[1].payment_id, Some([3u8; 8]));
+    }
+
+    /// `get_payments`: the payments in, change left out, above a height, filed
+    /// under the key `wallet2` files them under.
+    #[test]
+    fn payments_are_found_by_payment_id() {
+        let mut w = wallet();
+        w.transfers[0].payment_id = Some([4u8; 8]);
+        let txid = send(&mut w);
+        let change = Transfer {
+            txid,
+            block_height: 9,
+            amount: 2_500,
+            key_image: Some(KeyImage([8u8; 32])),
+            payment_id: None,
+            ..w.transfers[0].clone()
+        };
+        w.transfers.push(change);
+        w.sent[0].state = SentState::Confirmed(9);
+
+        let payments = w.payments(0);
+        assert_eq!(payments.len(), 1, "the change is not a payment");
+        assert_eq!(payments[0].payment_id, Some([4u8; 8]));
+        let short = parse_payment_key("0404040404040404").expect("a short id");
+        assert_eq!(payment_key(payments[0].payment_id), short);
+        assert_eq!(
+            parse_payment_key(&format!("{}{}", "04".repeat(8), "0".repeat(48))),
+            Some(short),
+            "a short id is the long id it begins"
+        );
+        assert_eq!(payment_key(None), [0u8; 32], "none is the null hash");
+        assert!(w.payments(5).is_empty(), "above the height, not at it");
+
+        assert_eq!(parse_payment_key("0404"), None);
+        assert_eq!(parse_payment_key("not hex"), None);
     }
 
     /// Sent to itself, a transaction shows as nothing sent: only the fee left.

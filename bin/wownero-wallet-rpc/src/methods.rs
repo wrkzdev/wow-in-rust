@@ -135,10 +135,8 @@ pub fn dispatch(state: &State, method: &str, params: &Value) -> MethodResult {
         "incoming_transfers" => incoming_transfers(session, params),
         "get_transfers" => get_transfers(session, params),
         "get_transfer_by_txid" => get_transfer_by_txid(session, params),
-        "get_payments" | "get_bulk_payments" => Err(Error::new(
-            errors::DISABLED,
-            "payment-id history needs store-tx-info, which is not built yet",
-        )),
+        "get_payments" => get_payments(session, params),
+        "get_bulk_payments" => get_bulk_payments(session, params),
         "query_key" => query_key(session, params),
         "get_tx_key" => Err(Error::new(
             errors::NO_TXKEY,
@@ -632,6 +630,94 @@ fn get_transfer_by_txid(session: &Session, params: &Value) -> MethodResult {
     Ok(json!({ "transfer": found[0], "transfers": found }))
 }
 
+/// `on_get_payments`: the payments received with one payment id.
+fn get_payments(session: &Session, params: &Value) -> MethodResult {
+    let text = params
+        .get("payment_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let key = payment_key_param(text)?;
+
+    let height = session.chain_height();
+    let now = wow_wallet::files::now();
+    let payments: Vec<Value> = session
+        .state
+        .payments(0)
+        .iter()
+        .filter(|e| wow_wallet::history::payment_key(e.payment_id) == key)
+        .map(|e| payment_details(session, e, text, height, now))
+        .collect();
+    Ok(json!({ "payments": payments }))
+}
+
+/// `on_get_bulk_payments`: the payments received with any of `payment_ids`,
+/// or every payment when it is empty, in blocks above `min_block_height`.
+fn get_bulk_payments(session: &Session, params: &Value) -> MethodResult {
+    let min_height = params
+        .get("min_block_height")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let ids: Vec<&str> = params
+        .get("payment_ids")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    let height = session.chain_height();
+    let now = wow_wallet::files::now();
+    let received = session.state.payments(min_height);
+
+    let mut payments = Vec::new();
+    if ids.is_empty() {
+        // Each under its whole key, 64 characters, as the C++ prints it here.
+        for e in &received {
+            let key = wow_crypto::hex::encode(&wow_wallet::history::payment_key(e.payment_id));
+            payments.push(payment_details(session, e, &key, height, now));
+        }
+    }
+    for text in ids {
+        let key = payment_key_param(text)?;
+        for e in received
+            .iter()
+            .filter(|e| wow_wallet::history::payment_key(e.payment_id) == key)
+        {
+            payments.push(payment_details(session, e, text, height, now));
+        }
+    }
+    Ok(json!({ "payments": payments }))
+}
+
+/// A payment id a request names, as the key payments are filed under.
+fn payment_key_param(text: &str) -> Result<[u8; 32], Error> {
+    wow_wallet::history::parse_payment_key(text).ok_or_else(|| {
+        Error::new(
+            errors::WRONG_PAYMENT_ID,
+            format!("`{text}` is not a payment id: 16 or 64 hex characters"),
+        )
+    })
+}
+
+/// One `payment_details`, reported under `payment_id`.
+fn payment_details(
+    session: &Session,
+    e: &wow_wallet::history::HistoryEntry,
+    payment_id: &str,
+    chain_height: u64,
+    now: u64,
+) -> Value {
+    let minor = e.minors.first().copied().unwrap_or(0);
+    json!({
+        "payment_id": payment_id,
+        "tx_hash": wow_crypto::hex::encode(&e.txid),
+        "amount": e.amount,
+        "block_height": e.height.unwrap_or(0),
+        "unlock_time": e.unlock_time,
+        "locked": !e.unlocked(chain_height, now),
+        "subaddr_index": { "major": e.account, "minor": minor },
+        "address": session.address_at(e.account, minor).unwrap_or_default(),
+    })
+}
+
 fn query_key(session: &Session, params: &Value) -> MethodResult {
     let kind = params
         .get("key_type")
@@ -936,7 +1022,7 @@ fn send_error(e: SendError) -> Error {
         | SendError::Relay(_)
         | SendError::Ring(DecoyError::Fetch(_)) => errors::NO_DAEMON_CONNECTION,
         SendError::Address { .. } => errors::WRONG_ADDRESS,
-        SendError::TwoPaymentIds => errors::WRONG_PAYMENT_ID,
+        SendError::TwoPaymentIds | SendError::PaymentIdToSubaddress => errors::WRONG_PAYMENT_ID,
         SendError::Ring(_) => errors::NOT_ENOUGH_OUTS_TO_MIX,
         SendError::Build(_) => errors::GENERIC_TRANSFER_ERROR,
         SendError::RingMismatch(_) | SendError::Damaged(_) | SendError::Entropy(_) => {
@@ -1069,6 +1155,7 @@ mod tests {
             unlock_time: 0,
             is_coinbase: false,
             timestamp: 0,
+            payment_id: None,
         };
 
         // Four-block age only.

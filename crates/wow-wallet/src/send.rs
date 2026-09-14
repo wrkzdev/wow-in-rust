@@ -83,6 +83,8 @@ pub enum SendError {
     },
     #[error("that is an integrated address; it already carries a payment id")]
     TwoPaymentIds,
+    #[error("a payment id cannot go to a subaddress: its payee could not read it")]
+    PaymentIdToSubaddress,
     #[error("cannot get a fee estimate: {0}")]
     FeeEstimate(DaemonError),
     #[error("cannot get the output distribution: {0}")]
@@ -125,6 +127,13 @@ impl Session {
             (Some(p), None) => Some(p),
             (None, other) => other,
         };
+        // A transaction paying a subaddress gives each output a key of its own,
+        // and the id is encrypted under the payee's; the payee decrypts under
+        // the transaction's main key. The C++ takes an id only in an integrated
+        // address, which is never a subaddress.
+        if payment_id.is_some() && decoded.kind == AddressKind::Subaddress {
+            return Err(SendError::PaymentIdToSubaddress);
+        }
 
         // Fees, at the tier `adjust_priority` settles on.
         let tiers = client
@@ -380,6 +389,14 @@ mod tests {
         assert!(matches!(
             s.prepare_send(&both),
             Err(SendError::TwoPaymentIds)
+        ));
+
+        let subaddress = Address::subaddress(Network::Mainnet, keys).encode();
+        let mut to_subaddress = request(&subaddress);
+        to_subaddress.payment_id = Some([2; 8]);
+        assert!(matches!(
+            s.prepare_send(&to_subaddress),
+            Err(SendError::PaymentIdToSubaddress)
         ));
 
         s.keys_file.account.forget_spend_key();

@@ -183,19 +183,23 @@ pub fn get_subaddress(
 
 /// Encrypt or decrypt an 8-byte payment id (the operation is its own inverse).
 ///
-/// `specs/02-crypto.md` §8:
+/// `specs/02-crypto.md` §8, `device_default::encrypt_payment_id`:
 /// ```text
-/// key = hash_to_scalar(derivation || 0x8d)
+/// key = cn_fast_hash(derivation || 0x8d)
 /// out[i] = pid[i] XOR key[i]     for i in 0..8
 /// ```
+///
+/// The key is the hash, not reduced to a scalar. Reduced, its first eight
+/// bytes differ for fifteen hashes in sixteen, and a C++ wallet reads another
+/// id than the one sent.
 pub fn encrypt_payment_id(pid: &[u8; 8], derivation: &KeyDerivation) -> [u8; 8] {
     let mut buf = [0u8; 33];
     buf[..32].copy_from_slice(&derivation.0);
     buf[32] = HASH_KEY_ENCRYPTED_PAYMENT_ID;
-    let key = hash_to_scalar(&buf);
+    let key = cn_fast_hash(&buf);
     let mut out = [0u8; 8];
     for i in 0..8 {
-        out[i] = pid[i] ^ key.0[i];
+        out[i] = pid[i] ^ key[i];
     }
     out
 }
@@ -343,6 +347,23 @@ mod tests {
         let enc = encrypt_payment_id(&pid, &d);
         assert_ne!(enc, pid);
         assert_eq!(encrypt_payment_id(&enc, &d), pid);
+    }
+
+    /// A known answer, computed outside this crate with Keccak-256 over
+    /// `derivation || 0x8d`. The reduced key `hash_to_scalar` gives would
+    /// encrypt these to `40b00cb4f2dd301b` and `41b20fb0f7db3713`.
+    #[test]
+    fn payment_id_encryption_matches_the_reference() {
+        let d = KeyDerivation([0x5au8; 32]);
+        assert_eq!(
+            encrypt_payment_id(&[1, 2, 3, 4, 5, 6, 7, 8], &d),
+            [0xce, 0xab, 0xd1, 0xd9, 0x90, 0x28, 0xa1, 0x2b]
+        );
+        // The dummy a transaction without an id carries.
+        assert_eq!(
+            encrypt_payment_id(&[0; 8], &d),
+            [0xcf, 0xa9, 0xd2, 0xdd, 0x95, 0x2e, 0xa6, 0x23]
+        );
     }
 
     #[test]

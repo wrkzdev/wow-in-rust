@@ -960,6 +960,11 @@ mod tests {
         let enc: wow_crypto::types::Hash8 = nonce[1..].try_into().expect("8 bytes");
         let dec = wow_crypto::keys::encrypt_payment_id(&enc, &got[0].derivation);
         assert_eq!(dec, pid, "the recipient recovers the payment id");
+        assert_eq!(
+            crate::scan::payment_id(&built.tx, &them.view),
+            Some(pid),
+            "and a refresh reads it"
+        );
     }
 
     /// The balance check is not advisory. An unbalanced request is refused
@@ -1146,6 +1151,7 @@ mod tests {
             [0u8; 8],
             "the payee reads it as no payment id"
         );
+        assert_eq!(crate::scan::payment_id(&built.tx, &them.view), None);
         assert_eq!(
             built.tx.prefix.extra.len(),
             crate::spend::extra_size(2, false, false),

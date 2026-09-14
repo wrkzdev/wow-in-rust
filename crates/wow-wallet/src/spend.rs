@@ -440,6 +440,7 @@ mod tests {
             unlock_time: 0,
             is_coinbase: false,
             timestamp: 0,
+            payment_id: None,
         }
     }
 

@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use wow_crypto::types::{Hash256, KeyDerivation, KeyImage, PublicKey, SubaddressIndex};
+use wow_crypto::types::{Hash256, Hash8, KeyDerivation, KeyImage, PublicKey, SubaddressIndex};
 use wow_types::block::Block;
 use wow_types::tx::{Transaction, TxIn};
 
@@ -76,6 +76,10 @@ pub struct Transfer {
     /// The timestamp of the block it is in. Zero when read from a cache
     /// written before it was kept.
     pub timestamp: u64,
+    /// The payment id its transaction carried, decrypted: the key the C++
+    /// files its `payment_details` under. `None` for none, and when read from
+    /// a cache written before it was kept.
+    pub payment_id: Option<Hash8>,
 }
 
 impl Transfer {
@@ -594,6 +598,13 @@ impl WalletState {
         // about the wallet: a malformed transaction on chain must not stop a
         // refresh, and the reference logs and moves on too.
         let found = scan_transaction(tx, &self.keys()).unwrap_or_default();
+        // Decrypting the payment id costs a scalar multiplication, so only a
+        // transaction that paid this wallet is asked for one.
+        let payment_id = if found.is_empty() {
+            None
+        } else {
+            crate::scan::payment_id(tx, &self.account.keys.view_secret_key)
+        };
 
         let mut received = 0u64;
         for r in found {
@@ -620,6 +631,7 @@ impl WalletState {
                 unlock_time: tx.prefix.unlock_time,
                 is_coinbase,
                 timestamp,
+                payment_id,
             });
             let burnt = match receipt {
                 Receipt::Ignored => continue,
@@ -788,6 +800,16 @@ mod tests {
     /// both. Building it properly makes the fixture a transaction a node would
     /// accept, which is what a refresh is supposed to be reading.
     fn payment(to: &AccountPublicAddress, amount: u64, seed: u8) -> Transaction {
+        payment_with_id(to, amount, seed, None)
+    }
+
+    /// [`payment`], carrying a payment id as an integrated address would.
+    fn payment_with_id(
+        to: &AccountPublicAddress,
+        amount: u64,
+        seed: u8,
+        payment_id: Option<Hash8>,
+    ) -> Transaction {
         let sender = account(seed ^ 0xa5);
         let fee = 1_000u64;
         let input = spendable_input(amount + fee + 500, seed);
@@ -821,7 +843,7 @@ mod tests {
             std::slice::from_ref(&input),
             &destinations,
             fee,
-            None,
+            payment_id,
             &mut rand,
         )
         .expect("construct")
@@ -1375,6 +1397,7 @@ mod tests {
             unlock_time: 0,
             is_coinbase: false,
             timestamp: 0,
+            payment_id: None,
         };
 
         let now = 1_700_000_000;
@@ -1412,6 +1435,33 @@ mod tests {
         assert!(w.by_key_image.is_empty());
     }
 
+    /// A payment's id is read as its payee reads it and kept with the output.
+    /// A transaction carrying only the dummy has none.
+    #[test]
+    fn a_payment_id_is_kept_with_its_output() {
+        let mut w = state(7, 0);
+        let to = w.account.keys.account_address;
+        let id = [0xf9, 0x33, 0x77, 0x88, 0xdd, 0x75, 0x25, 0x55];
+
+        let mut chain = Chain::new();
+        chain.push(
+            &[
+                payment_with_id(&to, 5_000, 21, Some(id)),
+                payment(&to, 6_000, 22),
+            ],
+            vec![vec![], vec![8, 9], vec![10, 11]],
+        );
+        w.refresh(&chain, 10).expect("refresh");
+
+        let mut got: Vec<(u64, Option<Hash8>)> = w
+            .transfers
+            .iter()
+            .map(|t| (t.amount, t.payment_id))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(5_000, Some(id)), (6_000, None)]);
+    }
+
     /// Two outputs with the same one-time key share a key image, so only one
     /// can ever be spent. The larger is held and the other ignored, as
     /// `wallet2` does; holding both would leave one looking spendable after
@@ -1435,6 +1485,7 @@ mod tests {
             unlock_time: 0,
             is_coinbase: false,
             timestamp: 0,
+            payment_id: None,
         };
         assert_eq!(w.add_transfer(first.clone()), Receipt::New);
 
