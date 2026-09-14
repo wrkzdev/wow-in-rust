@@ -188,9 +188,9 @@ pub fn run(db: LmdbDb, cfg: &Config) -> Result<(), String> {
     let zmq = zmq_bound
         .map(|b| crate::zmq::start(b, server.clone(), core.as_deref(), cfg.restricted_zmq_rpc))
         .transpose()?;
-    if !cfg.non_interactive && std::io::stdin().is_terminal() {
-        crate::console::spawn(server.clone());
-    }
+    // Dropped as `run` returns, which puts the terminal back.
+    let _terminal = (!cfg.non_interactive && std::io::stdin().is_terminal())
+        .then(|| crate::console::spawn(server.clone()));
 
     // A miner that cannot start stops the node, the way a bad option would --
     // but through the shutdown below, so peers and the pool are still saved.

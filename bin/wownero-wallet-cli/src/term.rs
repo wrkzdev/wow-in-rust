@@ -3,8 +3,16 @@
 //! Reading a password without echoing it needs a platform call, so this is the
 //! binary's only `unsafe`. Entropy lives in `wow_wallet::entropy`, because the
 //! RPC server needs it too and it is not a terminal concern.
+//!
+//! What is typed at a terminal goes through a line editor: left and right move
+//! along the line, up and down through the commands typed before. The history
+//! is kept in memory only, so no command is written to disk. Input from a pipe
+//! or a file is read as it always was.
 
 use std::io::{BufRead, IsTerminal, Write};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use rustyline::DefaultEditor;
 
 pub use wow_wallet::entropy::seeded_rng;
 
@@ -14,8 +22,42 @@ pub fn interactive() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// The line editor, when standard input is a terminal it can drive.
+fn editor() -> MutexGuard<'static, Option<DefaultEditor>> {
+    static EDITOR: OnceLock<Mutex<Option<DefaultEditor>>> = OnceLock::new();
+    EDITOR
+        .get_or_init(|| {
+            Mutex::new(if interactive() {
+                DefaultEditor::new().ok()
+            } else {
+                None
+            })
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Read a line from standard input, or `None` at end of file.
+///
+/// At a terminal Ctrl-C ends input as end of file does: the editor holds the
+/// terminal in raw mode, so it arrives as a key rather than a signal.
 pub fn read_line(prompt: &str) -> Option<String> {
+    read(prompt, false)
+}
+
+/// Read a command: a line that up and down bring back at later prompts.
+pub fn read_command(prompt: &str) -> Option<String> {
+    read(prompt, true)
+}
+
+fn read(prompt: &str, remember: bool) -> Option<String> {
+    if let Some(editor) = editor().as_mut() {
+        let line = editor.readline(prompt).ok()?;
+        if remember && !line.trim().is_empty() {
+            let _ = editor.add_history_entry(line.as_str());
+        }
+        return Some(line);
+    }
     print!("{prompt}");
     let _ = std::io::stdout().flush();
     let mut line = String::new();

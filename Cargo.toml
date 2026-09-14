@@ -71,6 +71,11 @@ time = "0.3"
 serde_json = "1.0"
 thiserror = "1.0"
 hex = "0.4"
+# The node's console and the wallet's prompt: line editing, and up and down
+# through the commands typed before. Without its default features: no history
+# file (nothing typed at a wallet is written to disk), no custom key bindings,
+# no home-directory lookup.
+rustyline = { version = "18.0", default-features = false }
 
 [profile.release]
 opt-level = 3

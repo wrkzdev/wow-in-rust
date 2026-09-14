@@ -36,8 +36,9 @@ x25519-dalek.workspace = true
 rsa.workspace = true
 rand_core.workspace = true
 time.workspace = true
+rustyline.workspace = true
 
-# `src/signal.rs`: the SIGINT/SIGTERM handler.
+# `src/signal.rs`: the SIGINT/SIGTERM handler, and the terminal's mode.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

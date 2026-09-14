@@ -7,11 +7,18 @@
 //!
 //! It runs only when standard input is a terminal and `--non-interactive` was
 //! not given, so a node under a service manager never waits on a prompt.
+//!
+//! A line can be edited as it is typed, and up and down step through the
+//! commands typed before. The history is kept in memory only.
 
 use std::io::BufRead;
 use std::sync::Arc;
 
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use serde_json::{json, Value};
+use wow_consensus::constants::DIFFICULTY_TARGET_V2;
+use wow_consensus::hardfork::HardFork;
 use wow_storage::db::BlockchainDb;
 
 use crate::rpc::{admin, methods, mining, Server};
@@ -45,7 +52,7 @@ pub enum Cmd {
 
 const HELP: &str = "\
 Commands (a subset of the C++ daemon's; see specs/09 §4):
-  status                  height, sync state, connections
+  status                  heights, sync, connections, forks, pool, database
   print_height            the chain height
   sync_info               connections and what each peer reports
   print_pl                the white and gray peer lists
@@ -133,23 +140,56 @@ pub fn parse(line: &str) -> Result<Option<Cmd>, String> {
 }
 
 /// Read commands from standard input on a thread of their own.
-pub fn spawn(server: Arc<Server>) {
+///
+/// Returns the terminal's mode as the console found it, to be put back when
+/// the node stops.
+pub fn spawn(server: Arc<Server>) -> crate::signal::TerminalMode {
+    let mode = crate::signal::TerminalMode::save();
     let _ = std::thread::Builder::new()
         .name("console".into())
-        .spawn(move || {
-            let stdin = std::io::stdin();
-            for line in stdin.lock().lines() {
-                let Ok(line) = line else { break };
-                match parse(&line).and_then(|c| match c {
-                    Some(cmd) => run(&server, cmd),
-                    None => Ok(String::new()),
-                }) {
-                    Ok(out) if out.is_empty() => {}
-                    Ok(out) => println!("{out}"),
-                    Err(e) => eprintln!("{e}"),
+        .spawn(move || match DefaultEditor::new() {
+            Ok(editor) => edit(&server, editor),
+            Err(e) => {
+                wow_log::warn!("global", "the console cannot edit lines: {e}");
+                for line in std::io::stdin().lock().lines() {
+                    let Ok(line) = line else { break };
+                    execute(&server, &line);
                 }
             }
         });
+    mode
+}
+
+/// Commands from the line editor, until input ends.
+fn edit(server: &Server, mut editor: DefaultEditor) {
+    loop {
+        match editor.readline("") {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    let _ = editor.add_history_entry(line.as_str());
+                }
+                execute(server, &line);
+            }
+            // The editor holds the terminal in raw mode, so Ctrl-C arrives
+            // here rather than as the signal that would stop the node.
+            Err(ReadlineError::Interrupted) => {
+                server.request_stop();
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn execute(server: &Server, line: &str) {
+    match parse(line).and_then(|c| match c {
+        Some(cmd) => run(server, cmd),
+        None => Ok(String::new()),
+    }) {
+        Ok(out) if out.is_empty() => {}
+        Ok(out) => println!("{out}"),
+        Err(e) => eprintln!("{e}"),
+    }
 }
 
 fn err(e: crate::rpc::methods::RpcError) -> String {
@@ -168,39 +208,7 @@ fn s(v: &Value, key: &str) -> String {
 pub fn run(server: &Server, cmd: Cmd) -> Result<String, String> {
     Ok(match cmd {
         Cmd::Help => HELP.to_string(),
-        Cmd::Status => {
-            let i = methods::get_info(server).map_err(err)?;
-            let height = i["height"].as_u64().unwrap_or(0);
-            let target = i["target_height"].as_u64().unwrap_or(0).max(height);
-            let percent = if target == 0 {
-                100.0
-            } else {
-                height as f64 * 100.0 / target as f64
-            };
-            let difficulty = i["difficulty"].as_u64().unwrap_or(0);
-            let uptime = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-                .saturating_sub(server.start_time());
-            format!(
-                "Height: {height}/{target} ({percent:.1}%) on {}, {}, net hash {:.2} H/s, \
-                 {}(out)+{}(in) connections, uptime {}d {}h {}m {}s",
-                s(&i, "nettype"),
-                if i["synchronized"] == true {
-                    "synchronised"
-                } else {
-                    "not synchronised"
-                },
-                difficulty as f64 / wow_consensus::constants::DIFFICULTY_TARGET_V2 as f64,
-                i["outgoing_connections_count"],
-                i["incoming_connections_count"],
-                uptime / 86_400,
-                uptime / 3_600 % 24,
-                uptime / 60 % 60,
-                uptime % 60,
-            )
-        }
+        Cmd::Status => status(server)?,
         Cmd::PrintHeight => server.db().height().to_string(),
         Cmd::SyncInfo => {
             let v = admin::sync_info(server).map_err(err)?;
@@ -400,9 +408,218 @@ pub fn run(server: &Server, cmd: Cmd) -> Result<String, String> {
     })
 }
 
+/// `status`: what `get_info` says, and what the node knows beside it, as a
+/// table.
+fn status(server: &Server) -> Result<String, String> {
+    let i = methods::get_info(server).map_err(err)?;
+    let height = i["height"].as_u64().unwrap_or(0);
+    let target = i["target_height"].as_u64().unwrap_or(0).max(height);
+    let difficulty = i["difficulty"].as_u64().unwrap_or(0);
+    let (outgoing, incoming) = (
+        i["outgoing_connections_count"].as_u64().unwrap_or(0),
+        i["incoming_connections_count"].as_u64().unwrap_or(0),
+    );
+    let hf = HardFork::new(server.config().network);
+    let uptime = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .saturating_sub(server.start_time());
+    let mining = match server.miner().as_ref().map(crate::miner::Miner::status) {
+        Some(m) if m.active => format!("{} on {} thread(s)", hashrate(m.speed as f64), m.threads),
+        _ => "No".into(),
+    };
+
+    Ok(table(&[
+        ("Local Height", height.to_string()),
+        ("Network Height", target.to_string()),
+        ("Percentage Synced", percent_synced(height, target)),
+        (
+            "Sync Status",
+            if i["offline"] == true {
+                "Offline"
+            } else if i["synchronized"] == true {
+                "Synchronised"
+            } else if outgoing + incoming == 0 {
+                "Waiting for peers"
+            } else {
+                "Syncing"
+            }
+            .into(),
+        ),
+        ("Network", s(&i, "nettype")),
+        (
+            "Network Hashrate",
+            hashrate(difficulty as f64 / DIFFICULTY_TARGET_V2 as f64),
+        ),
+        ("Difficulty", difficulty.to_string()),
+        (
+            "Block Version",
+            format!("v{}", hf.required_version(height.saturating_sub(1))),
+        ),
+        ("Next Fork", next_fork(&hf, height)),
+        ("Incoming Connections", incoming.to_string()),
+        ("Outgoing Connections", outgoing.to_string()),
+        (
+            "Peer List (White/Grey)",
+            format!(
+                "{} / {}",
+                s(&i, "white_peerlist_size"),
+                s(&i, "grey_peerlist_size")
+            ),
+        ),
+        ("RPC Connections", s(&i, "rpc_connections_count")),
+        ("Uptime", uptime_text(uptime)),
+        ("Transaction Pool Size", s(&i, "tx_pool_size")),
+        ("Alternative Block Count", s(&i, "alt_blocks_count")),
+        ("DB Engine", "LMDB".into()),
+        (
+            "Database Size",
+            bytes(i["database_size"].as_u64().unwrap_or(0)),
+        ),
+        // `--prune-blockchain` is refused at start (`cli.rs`).
+        ("Pruned Node", "No".into()),
+        ("Mining", mining),
+        ("wownero-rs Version", env!("CARGO_PKG_VERSION").into()),
+    ]))
+}
+
+/// Rows as a two-column table, each column as wide as its widest cell.
+fn table(rows: &[(&str, String)]) -> String {
+    let key = rows
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    let value = rows
+        .iter()
+        .map(|(_, v)| v.chars().count())
+        .max()
+        .unwrap_or(0);
+    let rule = "-".repeat(key + value + 7);
+    let mut out = rule.clone();
+    for (k, v) in rows {
+        out.push_str(&format!("\n| {k:<key$} | {v:<value$} |"));
+    }
+    out.push('\n');
+    out.push_str(&rule);
+    out
+}
+
+/// Truncated, not rounded, so a node a block behind never reads `100.00%`.
+fn percent_synced(height: u64, target: u64) -> String {
+    if target == 0 || height >= target {
+        return "100.00%".into();
+    }
+    let hundredths = height as u128 * 10_000 / target as u128;
+    format!("{}.{:02}%", hundredths / 100, hundredths % 100)
+}
+
+fn hashrate(per_second: f64) -> String {
+    const UNITS: [&str; 5] = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s"];
+    let (mut v, mut unit) = (per_second, 0);
+    while v >= 1000.0 && unit + 1 < UNITS.len() {
+        v /= 1000.0;
+        unit += 1;
+    }
+    format!("{v:.2} {}", UNITS[unit])
+}
+
+fn bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let (mut v, mut unit) = (n as f64, 0);
+    while v >= 1024.0 && unit + 1 < UNITS.len() {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.2} {}", UNITS[unit])
+    }
+}
+
+fn uptime_text(secs: u64) -> String {
+    format!(
+        "{}d {}h {}m {}s",
+        secs / 86_400,
+        secs / 3_600 % 24,
+        secs / 60 % 60,
+        secs % 60
+    )
+}
+
+/// The first fork in the node's table that the chain, `height` blocks long,
+/// has not reached yet.
+fn next_fork(hf: &HardFork, height: u64) -> String {
+    let current = hf.required_version(height.saturating_sub(1));
+    match hf
+        .forks()
+        .iter()
+        .find(|f| f.version > current && f.height >= height)
+    {
+        None => "None scheduled".into(),
+        Some(f) if f.height == height => format!("v{} with the next block", f.version),
+        Some(f) => format!(
+            "v{} at {} ({:.2} Days)",
+            f.version,
+            f.height,
+            ((f.height - height) * DIFFICULTY_TARGET_V2) as f64 / 86_400.0
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_rows_line_up_in_a_table() {
+        let t = table(&[
+            ("Local Height", "4221105".into()),
+            ("Uptime", "1d 11h 41m 42s".into()),
+        ]);
+        assert_eq!(
+            t,
+            "\
+---------------------------------
+| Local Height | 4221105        |
+| Uptime       | 1d 11h 41m 42s |
+---------------------------------"
+        );
+        assert!(t.lines().all(|l| l.len() == 33), "{t}");
+    }
+
+    #[test]
+    fn status_values_read_in_sensible_units() {
+        assert_eq!(percent_synced(0, 0), "100.00%");
+        assert_eq!(percent_synced(10, 5), "100.00%");
+        assert_eq!(percent_synced(999_999, 1_000_000), "99.99%");
+        assert_eq!(percent_synced(63_300, 873_597), "7.24%");
+
+        assert_eq!(hashrate(0.0), "0.00 H/s");
+        assert_eq!(hashrate(990_700.0), "990.70 KH/s");
+        assert_eq!(hashrate(2_500_000.0), "2.50 MH/s");
+
+        assert_eq!(bytes(512), "512 B");
+        assert_eq!(bytes(5 * 1024 * 1024 * 1024), "5.00 GiB");
+
+        assert_eq!(uptime_text(128_502), "1d 11h 41m 42s");
+    }
+
+    #[test]
+    fn the_next_fork_is_the_first_the_chain_has_not_reached() {
+        let testnet = HardFork::new(wow_types::Network::Testnet);
+        // 41 blocks: the tip is on v15, v16 activates at 45.
+        assert_eq!(next_fork(&testnet, 41), "v16 at 45 (0.01 Days)");
+        // 45 blocks: block 45, the next one, is v16's first.
+        assert_eq!(next_fork(&testnet, 45), "v16 with the next block");
+        assert_eq!(next_fork(&testnet, 71), "None scheduled");
+        assert_eq!(
+            next_fork(&HardFork::new(wow_types::Network::Mainnet), 800_000),
+            "None scheduled"
+        );
+    }
 
     #[test]
     fn commands_parse_with_their_arguments() {

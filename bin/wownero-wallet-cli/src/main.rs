@@ -374,7 +374,7 @@ fn run(mut options: Options) -> Result<(), String> {
 
     // Otherwise, a prompt.
     println!("Type `help` for commands.");
-    while let Some(line) = term::read_line("[wallet]: ") {
+    while let Some(line) = term::read_command("[wallet]: ") {
         if matches!(
             commands::run(&mut session, line.trim()).0,
             commands::Outcome::Quit
