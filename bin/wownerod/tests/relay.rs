@@ -303,7 +303,7 @@ fn get_transactions_separates_found_from_missing() {
 
     // A coinbase that is definitely on the chain. From a height, since the
     // reference refuses an empty history at zero.
-    let blocks = c.get_blocks(&[], 2, false, false).expect("blocks");
+    let blocks = c.get_blocks(&[], 2, false, false, 0).expect("blocks");
     let block = Block::from_blob(&blocks.blocks[0].block).expect("parses");
     let txid = wow_types::hashes::transaction_hash(&block.miner_tx).expect("a hash");
 

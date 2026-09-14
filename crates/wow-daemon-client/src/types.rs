@@ -231,14 +231,19 @@ impl DaemonClient {
     /// `/get_blocks.bin` — the refresh workhorse (`specs/11` §5.1).
     ///
     /// `block_ids` is the wallet's short chain history, newest first, genesis
-    /// last. The daemon answers from the first hash it recognises, which is how
-    /// a reorg is detected without the wallet asking.
+    /// last. The daemon answers from the newest block in it that it has, that
+    /// block included, which is how a reorg is detected without the wallet
+    /// asking.
+    ///
+    /// `max_block_count` caps the reply below the daemon's own limit of 1000,
+    /// and 0 leaves it there. A daemon that predates the field ignores it.
     pub fn get_blocks(
         &self,
         block_ids: &[Hash256],
         start_height: u64,
         prune: bool,
         no_miner_tx: bool,
+        max_block_count: u64,
     ) -> Result<GetBlocks> {
         let mut req = Section::new();
         // CONTAINER_POD_AS_BLOB: one string, not an array.
@@ -249,6 +254,9 @@ impl DaemonClient {
         req.insert("start_height".into(), Value::U64(start_height));
         req.insert("prune".into(), Value::Bool(prune));
         req.insert("no_miner_tx".into(), Value::Bool(no_miner_tx));
+        if max_block_count > 0 {
+            req.insert("max_block_count".into(), Value::U64(max_block_count));
+        }
 
         let res = self.binary("/get_blocks.bin", &req)?;
         parse_get_blocks(&res)

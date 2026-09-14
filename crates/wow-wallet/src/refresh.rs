@@ -50,6 +50,10 @@ use crate::subaddress::SubaddressTable;
 /// `COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT`.
 pub const MAX_BLOCKS_PER_CALL: u64 = 1_000;
 
+/// The fewest blocks a batch is cut down to. A reply starts with a block the
+/// wallet already holds, so one block alone would never bring anything new.
+const MIN_BLOCKS_PER_CALL: u64 = 2;
+
 /// `wallet2`'s log category, so one `--log-level` means the same to both.
 const LOG: &str = "wallet.wallet2";
 
@@ -117,6 +121,9 @@ pub struct BlockBundle {
     pub txs: Vec<Vec<u8>>,
     /// Global output indices, coinbase first then `tx_hashes` order.
     pub output_indices: Vec<Vec<u64>>,
+    /// The transactions are pruned: prefix and RingCT base only, which is all
+    /// a scan reads.
+    pub pruned: bool,
 }
 
 /// One batch of blocks.
@@ -135,11 +142,20 @@ pub struct Batch {
 pub trait BlockSource {
     type Error: std::fmt::Display;
 
+    /// At most `max_blocks` blocks, from where `block_ids` meets the source's
+    /// chain, or from `start_height` when that is above zero.
     fn get_blocks(
         &self,
         block_ids: &[Hash256],
         start_height: u64,
+        max_blocks: u64,
     ) -> std::result::Result<Batch, Self::Error>;
+
+    /// Whether `error` is a reply cut off before its end, which a batch of
+    /// fewer blocks might get past.
+    fn cut_short(_error: &Self::Error) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -251,6 +267,10 @@ pub struct WalletState {
     /// Needed because the short chain history must never be *empty*: see
     /// [`WalletState::short_chain_history`].
     pub genesis: Hash256,
+    /// How many blocks to ask for at once: halved when a reply is cut short,
+    /// doubled back after one that arrives whole. Not saved; each run starts
+    /// at the most a daemon sends.
+    batch_size: u64,
 }
 
 impl WalletState {
@@ -281,6 +301,7 @@ impl WalletState {
             by_public_key: HashMap::new(),
             sent: Vec::new(),
             max_reorg_depth: 0,
+            batch_size: MAX_BLOCKS_PER_CALL,
         }
     }
 
@@ -420,7 +441,12 @@ impl WalletState {
     /// transactions went is not on the chain, so those records are kept and
     /// matched up again as the scan finds them.
     pub fn rescan_from(&mut self, height: u64) {
-        self.hashes.clear();
+        // From zero, holding genesis again, as a new wallet does.
+        self.hashes = if height == 0 {
+            vec![self.genesis]
+        } else {
+            Vec::new()
+        };
         self.transfers.clear();
         self.by_key_image.clear();
         self.by_public_key.clear();
@@ -445,13 +471,30 @@ impl WalletState {
         };
         wow_log::debug!(
             LOG,
-            "asking for blocks: scanned to {}, {} history hash(es), start_height {start_height}",
+            "asking for blocks: scanned to {}, {} history hash(es), start_height {start_height}, at most {}",
             self.scan_height(),
-            history.len()
+            history.len(),
+            self.batch_size
         );
-        let batch = source
-            .get_blocks(&history, start_height)
-            .map_err(|e| RefreshError::Source(e.to_string()))?;
+        let batch = loop {
+            match source.get_blocks(&history, start_height, self.batch_size) {
+                Ok(batch) => break batch,
+                // A reply cut off before its end: ask for fewer blocks. A node
+                // or a link that cannot carry a thousand blocks in one reply may
+                // still carry a few hundred.
+                Err(e) if S::cut_short(&e) && self.batch_size > MIN_BLOCKS_PER_CALL => {
+                    self.batch_size = (self.batch_size / 2).max(MIN_BLOCKS_PER_CALL);
+                    wow_log::info!(
+                        LOG,
+                        "{e}; asking for {} block(s) at a time",
+                        self.batch_size
+                    );
+                }
+                Err(e) => return Err(RefreshError::Source(e.to_string())),
+            }
+        };
+        // Back toward the most, after a reply that arrived whole.
+        self.batch_size = (self.batch_size * 2).min(MAX_BLOCKS_PER_CALL);
 
         let mut summary = RefreshSummary {
             current_height: batch.current_height,
@@ -597,6 +640,21 @@ impl WalletState {
             }
         }
 
+        // Each transaction's id is the block's, as `wallet2` takes it: a pruned
+        // transaction has lost part of what its id is a hash of. Checked before
+        // anything is recorded, so a short list cannot pair a transaction with
+        // another's id.
+        if bundle.txs.len() != block.tx_hashes.len() {
+            return Err(RefreshError::BadBlock {
+                height,
+                reason: format!(
+                    "{} transaction(s) for {} hash(es)",
+                    bundle.txs.len(),
+                    block.tx_hashes.len()
+                ),
+            });
+        }
+
         // The coinbase first, then the transactions, which is the order the
         // global output indices come in (`specs/11` §5.1).
         let timestamp = block.header.timestamp;
@@ -610,13 +668,16 @@ impl WalletState {
             summary,
         );
 
-        for (i, blob) in bundle.txs.iter().enumerate() {
-            let tx = Transaction::from_blob(blob).map_err(|e| RefreshError::BadTransaction {
+        for (i, (blob, &txid)) in bundle.txs.iter().zip(&block.tx_hashes).enumerate() {
+            let parsed = if bundle.pruned {
+                Transaction::from_blob_base_only(blob)
+            } else {
+                Transaction::from_blob(blob)
+            };
+            let tx = parsed.map_err(|e| RefreshError::BadTransaction {
                 height,
                 reason: e.to_string(),
             })?;
-            let txid = wow_types::hashes::transaction_hash_from_blob(&tx, blob)
-                .unwrap_or(wow_crypto::NULL_HASH);
             let indices = bundle
                 .output_indices
                 .get(i + 1)
@@ -827,9 +888,14 @@ pub fn one_time_secret_key(
 /// A live daemon as a [`BlockSource`].
 ///
 /// The only thing this adds over the trait is the shape change: the client
-/// speaks `specs/11` and the loop speaks blocks. `prune` is false and
-/// `no_miner_tx` is false because a wallet must see coinbase outputs — mining
-/// is how most wallets on this chain get paid.
+/// speaks `specs/11` and the loop speaks blocks.
+///
+/// `prune` is true, as `wallet2::pull_blocks` asks: a scan reads prefixes and
+/// RingCT bases, and the signatures and proofs pruning leaves out are nearly
+/// all of a block. A thousand early blocks are 42 MB whole and 1.8 MB pruned,
+/// and a daemon that ignores the flag sends them whole, which reads just as
+/// well. `no_miner_tx` is false because a wallet must see coinbase outputs —
+/// mining is how most wallets on this chain get paid.
 impl BlockSource for wow_daemon_client::DaemonClient {
     type Error = wow_daemon_client::DaemonError;
 
@@ -837,13 +903,15 @@ impl BlockSource for wow_daemon_client::DaemonClient {
         &self,
         block_ids: &[Hash256],
         start_height: u64,
+        max_blocks: u64,
     ) -> std::result::Result<Batch, Self::Error> {
         let res = wow_daemon_client::DaemonClient::get_blocks(
             self,
             block_ids,
             start_height,
+            true,
             false,
-            false,
+            max_blocks,
         )?;
         Ok(Batch {
             blocks: res
@@ -853,11 +921,19 @@ impl BlockSource for wow_daemon_client::DaemonClient {
                     block: b.block,
                     txs: b.txs,
                     output_indices: b.output_indices,
+                    pruned: b.pruned,
                 })
                 .collect(),
             start_height: res.start_height,
             current_height: res.current_height,
         })
+    }
+
+    fn cut_short(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            wow_daemon_client::DaemonError::Http(wow_daemon_client::HttpError::Truncated { .. })
+        )
     }
 }
 
@@ -1141,6 +1217,7 @@ mod tests {
             &self,
             block_ids: &[Hash256],
             start_height: u64,
+            max_blocks: u64,
         ) -> std::result::Result<Batch, Never> {
             // `on_get_blocks`: a history whose newest hash is the top block has
             // nothing new.
@@ -1167,13 +1244,15 @@ mod tests {
                     .find_map(|h| self.hashes.iter().position(|x| x == h))
                     .unwrap_or(0)
             };
-            let end = self.blocks.len().min(from + MAX_BLOCKS_PER_CALL as usize);
+            let most = max_blocks.min(MAX_BLOCKS_PER_CALL) as usize;
+            let end = self.blocks.len().min(from + most);
             let blocks = self.blocks[from.min(end)..end]
                 .iter()
                 .map(|(b, t, o)| BlockBundle {
                     block: b.clone(),
                     txs: t.clone(),
                     output_indices: o.clone(),
+                    pruned: false,
                 })
                 .collect();
             Ok(Batch {
@@ -1430,12 +1509,14 @@ mod tests {
                 &self,
                 _ids: &[Hash256],
                 _start: u64,
+                _max: u64,
             ) -> std::result::Result<Batch, Never> {
                 Ok(Batch {
                     blocks: vec![BlockBundle {
                         block: self.0.clone(),
                         txs: self.1.clone(),
                         output_indices: Vec::new(),
+                        pruned: false,
                     }],
                     start_height: self.2,
                     current_height: self.2 + 1,
@@ -1462,6 +1543,7 @@ mod tests {
                 &self,
                 _ids: &[Hash256],
                 _start: u64,
+                _max: u64,
             ) -> std::result::Result<Batch, Never> {
                 let (blob, txs) = block_with([0u8; 32], 1, &[]);
                 Ok(Batch {
@@ -1469,6 +1551,7 @@ mod tests {
                         block: blob,
                         txs,
                         output_indices: Vec::new(),
+                        pruned: false,
                     }],
                     start_height: 500,
                     current_height: 501,
@@ -1785,9 +1868,10 @@ mod tests {
                 &self,
                 ids: &[Hash256],
                 start: u64,
+                max: u64,
             ) -> std::result::Result<Batch, Never> {
                 self.1.borrow_mut().push(start);
-                self.0.get_blocks(ids, start)
+                self.0.get_blocks(ids, start, max)
             }
         }
 
@@ -1867,8 +1951,9 @@ mod tests {
                 &self,
                 _ids: &[Hash256],
                 _start: u64,
+                _max: u64,
             ) -> std::result::Result<Batch, Never> {
-                let mut batch = self.0.get_blocks(&[self.0.hashes[0]], 0)?;
+                let mut batch = self.0.get_blocks(&[self.0.hashes[0]], 0, MAX_BLOCKS_PER_CALL)?;
                 batch.current_height += 10;
                 Ok(batch)
             }
@@ -1882,5 +1967,123 @@ mod tests {
             "{e}"
         );
         assert_eq!(w.hashes, chain.hashes, "and nothing was dropped");
+    }
+
+    /// A pruned transaction keeps its prefix and RingCT base, which is all a
+    /// scan reads, and takes its id from its block.
+    #[test]
+    fn a_pruned_block_is_scanned_like_a_whole_one() {
+        struct Pruned<'a>(&'a Chain);
+        impl BlockSource for Pruned<'_> {
+            type Error = Never;
+            fn get_blocks(
+                &self,
+                ids: &[Hash256],
+                start: u64,
+                max: u64,
+            ) -> std::result::Result<Batch, Never> {
+                let mut batch = self.0.get_blocks(ids, start, max)?;
+                for bundle in &mut batch.blocks {
+                    for blob in &mut bundle.txs {
+                        let whole = Transaction::from_blob(blob).expect("a whole transaction");
+                        blob.truncate(whole.unprunable_size);
+                    }
+                    bundle.pruned = true;
+                }
+                Ok(batch)
+            }
+        }
+
+        let mut chain = Chain::new();
+        chain.push(&[], Vec::new());
+        let mut w = state_on(7, &chain);
+        let tx = payment(&w.account.keys.account_address, 3_300, 23);
+        let txid = wow_types::hashes::transaction_hash(&tx).expect("an id");
+        chain.push(&[tx], vec![vec![], vec![9, 10]]);
+
+        let batch = Pruned(&chain)
+            .get_blocks(&[chain.hashes[0]], 0, MAX_BLOCKS_PER_CALL)
+            .expect("blocks");
+        assert!(
+            Transaction::from_blob(&batch.blocks[1].txs[0]).is_err(),
+            "pruned, it is not a whole transaction any more"
+        );
+
+        let s = w.refresh(&Pruned(&chain), 10).expect("refresh");
+        assert_eq!(s.received, 1);
+        assert_eq!(w.transfers[0].amount, 3_300);
+        assert_eq!(w.transfers[0].txid, txid, "the id its block gives");
+        assert_eq!(w.hashes, chain.hashes);
+    }
+
+    /// A reply cut short is asked for again with half as many blocks, and the
+    /// batch grows back after replies that arrive whole. One that cannot get
+    /// even two blocks through gives up with the reason.
+    #[test]
+    fn a_reply_cut_short_is_asked_for_again_with_fewer_blocks() {
+        use std::cell::RefCell;
+
+        /// Cuts off any reply of more than `.1` blocks.
+        struct Narrow<'a>(&'a Chain, u64, RefCell<Vec<u64>>);
+        impl BlockSource for Narrow<'_> {
+            type Error = &'static str;
+            fn get_blocks(
+                &self,
+                ids: &[Hash256],
+                start: u64,
+                max: u64,
+            ) -> std::result::Result<Batch, &'static str> {
+                self.2.borrow_mut().push(max);
+                if max > self.1 {
+                    return Err("the connection closed early");
+                }
+                self.0.get_blocks(ids, start, max).map_err(|_| "unreachable")
+            }
+
+            fn cut_short(_error: &&'static str) -> bool {
+                true
+            }
+        }
+
+        let mut chain = Chain::new();
+        for _ in 0..8 {
+            chain.push(&[], Vec::new());
+        }
+
+        let mut w = state_on(7, &chain);
+        let narrow = Narrow(&chain, 3, RefCell::new(Vec::new()));
+        let s = w.refresh(&narrow, 20).expect("refresh");
+        assert!(s.caught_up);
+        assert_eq!(w.hashes, chain.hashes);
+        let asked = narrow.2.into_inner();
+        assert_eq!(
+            asked[..11],
+            [1000, 500, 250, 125, 62, 31, 15, 7, 3, 6, 3],
+            "halved until one got through, then tried double: {asked:?}"
+        );
+
+        let mut w = state_on(7, &chain);
+        let e = w
+            .refresh_once(&Narrow(&chain, 1, RefCell::new(Vec::new())))
+            .expect_err("nothing gets through");
+        assert!(
+            matches!(&e, RefreshError::Source(m) if m.contains("closed early")),
+            "{e}"
+        );
+    }
+
+    /// A rescan from zero holds genesis again, as a new wallet does, so the
+    /// first reply is compared with it whether it starts at genesis or after.
+    #[test]
+    fn a_rescan_from_zero_holds_genesis() {
+        let mut w = state(7, 0);
+        w.hashes.push([1u8; 32]);
+        w.rescan_from(0);
+        assert_eq!(w.hashes, vec![w.genesis]);
+        assert_eq!(w.scan_height(), 1);
+
+        w.rescan_from(40);
+        assert!(w.hashes.is_empty());
+        assert_eq!(w.scan_height(), 40);
     }
 }

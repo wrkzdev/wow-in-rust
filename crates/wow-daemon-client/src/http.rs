@@ -224,13 +224,17 @@ impl Endpoint {
     fn exchange(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
         let mut stream = self.connect()?;
 
+        // No `Connection: close`, though this connection carries one request
+        // and is closed once the body is read. Wownero 0.11.3 stops a
+        // connection as soon as it has answered a request that asks for that,
+        // cancelling the reply it is still writing, so a large one arrives cut
+        // short. `wallet2` never sends it, and neither does this.
         let head = format!(
             "POST {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
              Content-Type: {content_type}\r\n\
              Content-Length: {len}\r\n\
              Accept: */*\r\n\
-             Connection: close\r\n\
              \r\n",
             host = self.address,
             len = body.len(),
@@ -252,8 +256,9 @@ fn read_response(stream: TcpStream, path: &str) -> Result<Vec<u8>, HttpError> {
     read_line(&mut reader, &mut line, &mut header_bytes)?;
     let code = parse_status(&line)?;
 
-    // Headers. `Connection: close` means the body may be delimited by EOF, so
-    // a missing `Content-Length` is not an error.
+    // Headers. A body without a `Content-Length` runs to the end of the
+    // connection, which only a server that closes it can send; the daemons
+    // this talks to always give a length.
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
     loop {

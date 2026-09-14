@@ -151,7 +151,7 @@ fn a_refresh_from_the_tip_returns_blocks() {
     // a history holding only genesis.
     let genesis = wow_consensus::genesis::genesis_id(wow_types::Network::Mainnet);
     let got = c
-        .get_blocks(&[genesis], from, false, false)
+        .get_blocks(&[genesis], from, false, false, 0)
         .expect("get_blocks");
     assert!(!got.blocks.is_empty(), "the tip block comes back");
     assert_eq!(got.start_height, from);
@@ -178,7 +178,7 @@ fn a_second_batch_starts_at_the_last_block_of_the_first() {
     let genesis = wow_consensus::genesis::genesis_id(wow_types::Network::Mainnet);
 
     let first = c
-        .get_blocks(&[genesis], 0, false, false)
+        .get_blocks(&[genesis], 0, false, false, 0)
         .expect("first batch");
     assert_eq!(first.start_height, 0, "a history of genesis alone starts at it");
     let last = first.blocks.last().expect("blocks");
@@ -189,7 +189,7 @@ fn a_second_batch_starts_at_the_last_block_of_the_first() {
     let last_height = first.start_height + first.blocks.len() as u64 - 1;
 
     let second = c
-        .get_blocks(&[last_id, genesis], 0, false, false)
+        .get_blocks(&[last_id, genesis], 0, false, false, 0)
         .expect("second batch");
     assert_eq!(second.start_height, last_height, "the block both have, again");
     assert_eq!(

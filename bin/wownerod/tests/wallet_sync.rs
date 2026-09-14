@@ -257,7 +257,12 @@ fn the_daemon_answers_from_the_short_chain_history() {
     let mut w = wallet(0);
     w.hashes = hashes[..4].to_vec();
 
-    let batch = wow_wallet::refresh::BlockSource::get_blocks(&c, &w.short_chain_history(), 0)
+    let batch = wow_wallet::refresh::BlockSource::get_blocks(
+        &c,
+        &w.short_chain_history(),
+        0,
+        wow_wallet::refresh::MAX_BLOCKS_PER_CALL,
+    )
         .expect("get_blocks");
     assert_eq!(batch.start_height, 3, "from the newest block both have");
     assert_eq!(batch.blocks.len(), hashes.len() - 3);
@@ -274,7 +279,13 @@ fn a_start_height_above_zero_is_taken_as_given() {
     let c = client(d.port);
 
     let nonsense = vec![[0xabu8; 32], [0xcdu8; 32]];
-    let batch = wow_wallet::refresh::BlockSource::get_blocks(&c, &nonsense, 5).expect("get_blocks");
+    let batch = wow_wallet::refresh::BlockSource::get_blocks(
+        &c,
+        &nonsense,
+        5,
+        wow_wallet::refresh::MAX_BLOCKS_PER_CALL,
+    )
+    .expect("get_blocks");
     assert_eq!(batch.start_height, 5, "the height, whatever the history");
     assert_eq!(batch.blocks.len(), hashes.len() - 5);
 }
@@ -288,7 +299,7 @@ fn a_history_not_ending_at_genesis_is_refused() {
 
     let nonsense = vec![[0xabu8; 32], [0xcdu8; 32]];
     let e = c
-        .get_blocks(&nonsense, 0, false, false)
+        .get_blocks(&nonsense, 0, false, false, 0)
         .expect_err("refused");
     assert!(e.to_string().contains("Failed"), "{e}");
 }
@@ -301,7 +312,7 @@ fn output_indices_line_up_with_the_blocks() {
     let c = client(d.port);
 
     // A history of genesis alone. The reference refuses an empty one.
-    let res = c.get_blocks(&hashes[..1], 0, false, false).expect("get_blocks");
+    let res = c.get_blocks(&hashes[..1], 0, false, false, 0).expect("get_blocks");
     assert_eq!(res.blocks.len(), 6, "genesis plus five");
 
     for (h, b) in res.blocks.iter().enumerate() {
@@ -332,7 +343,7 @@ fn get_o_indexes_matches_get_blocks() {
     let (d, hashes) = start("oindexes", 4);
     let c = client(d.port);
 
-    let res = c.get_blocks(&hashes[..1], 0, false, false).expect("get_blocks");
+    let res = c.get_blocks(&hashes[..1], 0, false, false, 0).expect("get_blocks");
     let block = Block::from_blob(&res.blocks[2].block).expect("parses");
     let txid = wow_types::hashes::transaction_hash(&block.miner_tx).expect("a hash");
 
@@ -349,7 +360,7 @@ fn get_outs_returns_ring_members() {
     let (d, hashes) = start("outs", 6);
     let c = client(d.port);
 
-    let res = c.get_blocks(&hashes[..1], 0, false, false).expect("get_blocks");
+    let res = c.get_blocks(&hashes[..1], 0, false, false, 0).expect("get_blocks");
     // A RingCT output is filed under amount zero (`specs/10` §5.1).
     let indices: Vec<u64> = res
         .blocks
@@ -413,7 +424,7 @@ fn a_start_height_past_the_tip_is_refused() {
     let c = client(d.port);
 
     let e = c
-        .get_blocks(&[], hashes.len() as u64 + 100, false, false)
+        .get_blocks(&[], hashes.len() as u64 + 100, false, false, 0)
         .expect_err("past the tip");
     assert!(e.to_string().contains("past the tip"), "{e}");
 }
