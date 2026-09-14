@@ -22,10 +22,11 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::history::{SentDestination, SentState, SentTx};
+use crate::history::{PooledTx, SentDestination, SentState, SentTx};
 use crate::refresh::{Transfer, WalletState};
 use crate::subaddress::SubaddressTable;
 use crate::{AccountBase, KeysFile};
+use wow_crypto::types::Hash256;
 use wow_daemon_client::DaemonClient;
 use wow_types::Network;
 
@@ -345,25 +346,76 @@ impl Session {
         &self.state.transfers
     }
 
-    /// Ask the daemon's pool about every sent transaction not yet in a block,
-    /// and judge them by it ([`WalletState::update_pending`]). Returns the ones
-    /// that failed just now.
+    /// Read the daemon's pool: take note of spends of this wallet's outputs
+    /// that were not sent from here ([`WalletState::note_pool_spends`]), then
+    /// judge every transaction not yet in a block by it
+    /// ([`WalletState::update_pending`]).
     ///
     /// Only once a refresh has caught up; `update_pending` says why.
-    pub fn check_pending(&mut self) -> Result<Vec<wow_crypto::types::Hash256>, String> {
-        if self.state.sent.iter().all(|s| s.height().is_some()) {
+    pub fn check_pending(&mut self) -> Result<PoolCheck, String> {
+        // A view-only wallet has no key images to find, and nothing pending.
+        if self.state.by_key_image.is_empty()
+            && self.state.sent.iter().all(|s| s.height().is_some())
+        {
+            return Ok(PoolCheck::default());
+        }
+        let pool = self.read_pool()?;
+        let ids: HashSet<Hash256> = pool.iter().map(|p| p.txid).collect();
+        let noted = self.state.note_pool_spends(&pool, now());
+        let failed = self.state.update_pending(&ids, now());
+        self.dirty = true;
+        Ok(PoolCheck { noted, failed })
+    }
+
+    /// The first half of [`check_pending`](Self::check_pending), which needs
+    /// no refresh first because it can only spend outputs, never give them
+    /// back. For just before sending, and just after a send is refused as a
+    /// double spend.
+    pub fn note_pool_spends(&mut self) -> Result<Vec<Hash256>, String> {
+        if self.state.by_key_image.is_empty() {
             return Ok(Vec::new());
         }
-        let daemon = self.daemon.as_ref().ok_or("no daemon set")?;
-        let pool: HashSet<_> = daemon
-            .get_pool_hashes()
-            .map_err(|e| format!("cannot read the daemon's pool: {e}"))?
-            .into_iter()
-            .collect();
-        let failed = self.state.update_pending(&pool, now());
-        self.dirty = true;
-        Ok(failed)
+        let pool = self.read_pool()?;
+        let noted = self.state.note_pool_spends(&pool, now());
+        if !noted.is_empty() {
+            self.dirty = true;
+        }
+        Ok(noted)
     }
+
+    /// The daemon's pool, parsed. A transaction whose blob does not parse is
+    /// left out rather than failing the rest.
+    fn read_pool(&self) -> Result<Vec<PooledTx>, String> {
+        let daemon = self.daemon.as_ref().ok_or("no daemon set")?;
+        let listed = daemon
+            .get_transaction_pool()
+            .map_err(|e| format!("cannot read the daemon's pool: {e}"))?;
+        Ok(listed
+            .into_iter()
+            .filter_map(|p| {
+                let tx = wow_types::tx::Transaction::from_blob(&p.blob).ok()?;
+                // The id from the blob, not the daemon's word for it: it has to
+                // match what a block or a send from here would call it.
+                let txid = wow_types::hashes::transaction_hash_from_blob(&tx, &p.blob)?;
+                Some(PooledTx {
+                    txid,
+                    tx,
+                    receive_time: p.receive_time,
+                })
+            })
+            .collect())
+    }
+}
+
+/// What [`Session::check_pending`] found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PoolCheck {
+    /// Transactions in the pool spending this wallet's outputs, not sent from
+    /// here, recorded just now.
+    pub noted: Vec<Hash256>,
+    /// Sent transactions in neither a block nor the pool past the timeout,
+    /// judged failed just now.
+    pub failed: Vec<Hash256>,
 }
 
 fn random_iv(rng: &mut wow_crypto::random::Rng) -> [u8; 8] {
@@ -492,12 +544,7 @@ pub mod cache {
             .map(|a| a.iter().filter_map(sent_from_json).collect())
             .unwrap_or_default();
 
-        state.by_key_image = state
-            .transfers
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| t.key_image.map(|k| (k, i)))
-            .collect();
+        state.reindex();
         Ok(())
     }
 

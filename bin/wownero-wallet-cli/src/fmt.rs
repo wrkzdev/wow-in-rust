@@ -50,6 +50,15 @@ pub fn timestamp(ts: u64) -> String {
     )
 }
 
+/// A span of seconds: `45s`, `4m 52s`, `2h 05m`.
+pub fn duration(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3_600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3_600, secs / 60 % 60),
+    }
+}
+
 /// Parse an amount as a user types it.
 ///
 /// Accepts a bare integer (`5`), a decimal (`5.25`), and a leading point
@@ -209,5 +218,14 @@ mod tests {
             "a leap day"
         );
         assert_eq!(timestamp(0), "<unknown>");
+    }
+
+    #[test]
+    fn durations_read_at_a_glance() {
+        assert_eq!(duration(0), "0s");
+        assert_eq!(duration(59), "59s");
+        assert_eq!(duration(292), "4m 52s");
+        assert_eq!(duration(3_600), "1h 00m");
+        assert_eq!(duration(7_500), "2h 05m");
     }
 }

@@ -96,6 +96,27 @@ impl SendResult {
     }
 }
 
+/// One transaction in the daemon's pool, as `/get_transaction_pool` lists it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PoolTx {
+    pub id: Hash256,
+    pub blob: Vec<u8>,
+    /// When the daemon received it.
+    pub receive_time: u64,
+    pub relayed: bool,
+    pub double_spend_seen: bool,
+}
+
+/// `COMMAND_RPC_IS_KEY_IMAGE_SPENT::STATUS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyImageStatus {
+    Unspent,
+    /// In a block.
+    SpentInChain,
+    /// By a transaction in the pool.
+    SpentInPool,
+}
+
 impl DaemonClient {
     // -- direct JSON --------------------------------------------------------
 
@@ -331,6 +352,41 @@ impl DaemonClient {
         Ok(blob.as_chunks::<32>().0.to_vec())
     }
 
+    /// `/get_transaction_pool`: every transaction in the pool, with its blob.
+    ///
+    /// A restricted C++ node leaves out what was submitted with
+    /// `do_not_relay`, which is nothing a wallet on another machine could
+    /// have sent.
+    pub fn get_transaction_pool(&self) -> Result<Vec<PoolTx>> {
+        let v = self.direct("/get_transaction_pool", json!({}))?;
+        parse_transaction_pool(&v)
+    }
+
+    /// `/is_key_image_spent`, one status per key image, in order.
+    pub fn is_key_image_spent(&self, key_images: &[[u8; 32]]) -> Result<Vec<KeyImageStatus>> {
+        let hex: Vec<String> = key_images
+            .iter()
+            .map(|k| wow_crypto::hex::encode(k))
+            .collect();
+        let v = self.direct("/is_key_image_spent", json!({ "key_images": hex }))?;
+        let status = v
+            .get("spent_status")
+            .and_then(Json::as_array)
+            .ok_or(DaemonError::Missing("spent_status"))?;
+        if status.len() != key_images.len() {
+            return Err(DaemonError::BadField("spent_status"));
+        }
+        status
+            .iter()
+            .map(|s| match s.as_u64() {
+                Some(0) => Ok(KeyImageStatus::Unspent),
+                Some(1) => Ok(KeyImageStatus::SpentInChain),
+                Some(2) => Ok(KeyImageStatus::SpentInPool),
+                _ => Err(DaemonError::BadField("spent_status")),
+            })
+            .collect()
+    }
+
     /// A `POST` that returns the raw body regardless of the `status` field.
     fn endpoint_post(&self, path: &str, body: &[u8]) -> Result<Vec<u8>> {
         Ok(self.raw_post(path, "application/json", body)?)
@@ -449,6 +505,36 @@ fn u64_list(v: Option<&Value>) -> Vec<u64> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Pull a `/get_transaction_pool` response apart.
+///
+/// An empty pool comes back with no `transactions` field at all: epee omits an
+/// empty container, in JSON as in binary.
+fn parse_transaction_pool(v: &Json) -> Result<Vec<PoolTx>> {
+    let Some(txs) = v.get("transactions") else {
+        return Ok(Vec::new());
+    };
+    let txs = txs
+        .as_array()
+        .ok_or(DaemonError::BadField("transactions"))?;
+    txs.iter()
+        .map(|t| {
+            let id = wow_crypto::hex::decode(&str_of(t, "id_hash"))
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .ok_or(DaemonError::BadField("id_hash"))?;
+            let blob = wow_crypto::hex::decode(&str_of(t, "tx_blob"))
+                .filter(|b| !b.is_empty())
+                .ok_or(DaemonError::BadField("tx_blob"))?;
+            Ok(PoolTx {
+                id,
+                blob,
+                receive_time: t.get("receive_time").and_then(Json::as_u64).unwrap_or(0),
+                relayed: bool_of(t, "relayed"),
+                double_spend_seen: bool_of(t, "double_spend_seen"),
+            })
+        })
+        .collect()
 }
 
 fn fixed32(s: &Section, field: &'static str) -> Result<[u8; 32]> {
@@ -682,5 +768,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(info.target_height, 500_000);
+    }
+
+    /// A pool listing is read with its blobs, and an empty pool -- which epee
+    /// sends with no `transactions` field -- is an empty list, not an error.
+    #[test]
+    fn a_pool_listing_parses_and_an_empty_one_is_empty() {
+        let id = "3a".repeat(32);
+        let v = json!({
+            "status": "OK",
+            "transactions": [{
+                "id_hash": id,
+                "tx_blob": "0201ff",
+                "receive_time": 1_700_000_000u64,
+                "relayed": true,
+                "double_spend_seen": false,
+            }],
+        });
+        let pool = parse_transaction_pool(&v).expect("parses");
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].id, [0x3a; 32]);
+        assert_eq!(pool[0].blob, vec![0x02, 0x01, 0xff]);
+        assert_eq!(pool[0].receive_time, 1_700_000_000);
+        assert!(pool[0].relayed);
+
+        assert!(parse_transaction_pool(&json!({"status": "OK"}))
+            .expect("parses")
+            .is_empty());
+        assert!(matches!(
+            parse_transaction_pool(&json!({"transactions": [{"id_hash": "zz", "tx_blob": "00"}]})),
+            Err(DaemonError::BadField("id_hash"))
+        ));
     }
 }

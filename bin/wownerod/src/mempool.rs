@@ -63,16 +63,32 @@ pub const RELAY_CHECK_SECS: u64 = 2 * 60;
 /// rather than only that something was wrong.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rejection {
-    TooBig { weight: u64 },
-    FeeTooLow { got: u64, needed: u64 },
-    TxExtraTooBig { len: usize },
-    NonZeroUnlockTime { unlock_time: u64 },
-    DoubleSpend { key_image: KeyImage },
+    TooBig {
+        weight: u64,
+    },
+    FeeTooLow {
+        got: u64,
+        needed: u64,
+    },
+    TxExtraTooBig {
+        len: usize,
+    },
+    NonZeroUnlockTime {
+        unlock_time: u64,
+    },
+    /// `in_pool` is the pooled transaction spending it; `None` means a block
+    /// did.
+    DoubleSpend {
+        key_image: KeyImage,
+        in_pool: Option<Hash256>,
+    },
     AlreadyInPool,
     InvalidInput(String),
     InvalidOutput(String),
     Overspend,
-    TooFewOutputs { count: usize },
+    TooFewOutputs {
+        count: usize,
+    },
     NotParseable(String),
 }
 
@@ -93,9 +109,20 @@ impl Rejection {
                 "the unlock time is {unlock_time}; Wownero does not relay a transaction with a \
                  non-zero unlock time, though one is valid inside a block"
             ),
-            Rejection::DoubleSpend { key_image } => format!(
-                "the output with key image {} has already been spent",
+            Rejection::DoubleSpend {
+                key_image,
+                in_pool: None,
+            } => format!(
+                "the output with key image {} has already been spent in a block",
                 wow_crypto::hex::encode(&key_image.0)
+            ),
+            Rejection::DoubleSpend {
+                key_image,
+                in_pool: Some(tx),
+            } => format!(
+                "the output with key image {} is already being spent by transaction {} in the pool",
+                wow_crypto::hex::encode(&key_image.0),
+                wow_crypto::hex::encode(tx)
             ),
             Rejection::AlreadyInPool => "the transaction is already in the pool".into(),
             Rejection::InvalidInput(w) => format!("an input is not valid: {w}"),
@@ -296,6 +323,24 @@ impl TxPool {
         dropped
     }
 
+    /// Refuse a key image a block or a pooled transaction has spent, saying
+    /// which.
+    fn check_unspent(&self, db: &LmdbDb, k_image: &KeyImage) -> Result<(), Rejection> {
+        if db.has_key_image(k_image).unwrap_or(false) {
+            return Err(Rejection::DoubleSpend {
+                key_image: *k_image,
+                in_pool: None,
+            });
+        }
+        match self.spent.get(k_image) {
+            Some(owner) => Err(Rejection::DoubleSpend {
+                key_image: *k_image,
+                in_pool: Some(*owner),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Add a transaction that has already been checked.
     fn insert(&mut self, id: Hash256, tx: &Transaction, entry: PoolEntry) {
         for input in &tx.prefix.vin {
@@ -360,11 +405,7 @@ impl TxPool {
         // 5. Key images unspent, on chain and in the pool.
         for input in &tx.prefix.vin {
             if let TxIn::ToKey { k_image, .. } = input {
-                if db.has_key_image(k_image).unwrap_or(false) || self.spent.contains_key(k_image) {
-                    return Err(Rejection::DoubleSpend {
-                        key_image: *k_image,
-                    });
-                }
+                self.check_unspent(db, k_image)?;
             }
         }
 
@@ -419,11 +460,7 @@ impl TxPool {
         }
         for input in &tx.prefix.vin {
             if let TxIn::ToKey { k_image, .. } = input {
-                if db.has_key_image(k_image).unwrap_or(false) || self.spent.contains_key(k_image) {
-                    return Err(Rejection::DoubleSpend {
-                        key_image: *k_image,
-                    });
-                }
+                self.check_unspent(db, k_image)?;
             }
         }
         verify(db, tx)?;
@@ -1051,6 +1088,7 @@ mod tests {
             Rejection::NonZeroUnlockTime { unlock_time: 5 },
             Rejection::DoubleSpend {
                 key_image: KeyImage([1u8; 32]),
+                in_pool: None,
             },
             Rejection::AlreadyInPool,
             Rejection::Overspend,
@@ -1064,6 +1102,7 @@ mod tests {
         // Each one sets its own flag and no other.
         let d = Rejection::DoubleSpend {
             key_image: KeyImage([1u8; 32]),
+            in_pool: None,
         };
         let set: Vec<&str> = d
             .flags()
@@ -1072,6 +1111,21 @@ mod tests {
             .map(|(n, _)| *n)
             .collect();
         assert_eq!(set, vec!["double_spend"]);
+
+        // A double spend says where the first spend is, so a wallet that did
+        // not send it can be told which transaction to look for.
+        assert!(d.reason().contains("in a block"), "{}", d.reason());
+        let pooled = Rejection::DoubleSpend {
+            key_image: KeyImage([1u8; 32]),
+            in_pool: Some([0x3a; 32]),
+        };
+        assert!(
+            pooled
+                .reason()
+                .contains(&format!("by transaction {} in the pool", "3a".repeat(32))),
+            "{}",
+            pooled.reason()
+        );
 
         // `tx_extra_too_big` is separate because it is not in the flag array.
         assert!(Rejection::TxExtraTooBig { len: 2_000 }.tx_extra_too_big());

@@ -44,9 +44,10 @@ pub mod transfer;
 
 pub use account::{AccountBase, AccountError, AccountKeys};
 pub use decoys::{select_ring, GammaPicker, RandomSource, Ring};
-pub use history::{EntryKind, HistoryEntry, SentDestination, SentState, SentTx};
+pub use files::PoolCheck;
+pub use history::{EntryKind, HistoryEntry, PooledTx, SentDestination, SentState, SentTx};
 pub use keys_file::{AskPassword, KeysFile, KeysFileError};
-pub use refresh::{BlockSource, RefreshError, Transfer, WalletState};
+pub use refresh::{BlockSource, RefreshError, RefreshEvent, RefreshSummary, Transfer, WalletState};
 pub use scan::{scan_transaction, Received, ScanError, ScanKeys};
 pub use spend::{plan, plan_sweep, SpendError, SpendOptions, SpendPlan};
 pub use subaddress::SubaddressTable;

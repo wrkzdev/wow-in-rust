@@ -156,6 +156,46 @@ pub struct RefreshSummary {
     pub reorg_to: Option<u64>,
     /// True when the wallet has caught up with the daemon.
     pub caught_up: bool,
+    /// The daemon's height as of the last batch, which moves during a long
+    /// refresh.
+    pub current_height: u64,
+    /// What was found, in chain order.
+    pub events: Vec<RefreshEvent>,
+}
+
+/// Something a refresh found about this wallet's money: what
+/// `on_money_received` and `on_money_spent` report in the C++.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefreshEvent {
+    /// An output paid to this wallet. `burnt` is the smaller output with the
+    /// same public key that it replaced, which can no longer be spent.
+    Received {
+        height: u64,
+        txid: Hash256,
+        amount: u64,
+        burnt: u64,
+        subaddress: SubaddressIndex,
+    },
+    /// An output of this wallet's spent by the transaction `txid`.
+    Spent {
+        height: u64,
+        txid: Hash256,
+        amount: u64,
+        subaddress: SubaddressIndex,
+    },
+}
+
+/// What recording an output did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Receipt {
+    New,
+    /// It replaced a smaller output with the same public key.
+    Replaced {
+        burnt: u64,
+    },
+    /// An output with the same public key is already held, spent or at least
+    /// as large.
+    Ignored,
 }
 
 /// The wallet's view of the chain and of its own money.
@@ -174,6 +214,9 @@ pub struct WalletState {
     /// Key image → index into `transfers`, for spotting our own outputs being
     /// spent.
     pub by_key_image: HashMap<KeyImage, usize>,
+    /// One-time public key → index into `transfers`, so an output key seen
+    /// twice is held once (`m_pub_keys`).
+    pub by_public_key: HashMap<PublicKey, usize>,
     /// Transactions that spent this wallet's outputs, sent from here or found
     /// in a block ([`crate::history`]).
     pub sent: Vec<SentTx>,
@@ -213,6 +256,7 @@ impl WalletState {
             start_height,
             transfers: Vec::new(),
             by_key_image: HashMap::new(),
+            by_public_key: HashMap::new(),
             sent: Vec::new(),
             max_reorg_depth: 0,
         }
@@ -296,7 +340,7 @@ impl WalletState {
         out
     }
 
-    fn keys(&self) -> ScanKeys<'_> {
+    pub(crate) fn keys(&self) -> ScanKeys<'_> {
         ScanKeys {
             address: &self.account.keys.account_address,
             view_secret_key: &self.account.keys.view_secret_key,
@@ -323,13 +367,25 @@ impl WalletState {
                 t.spent_height = 0;
             }
         }
+        self.reindex();
+        self.detach_sent(height);
+    }
+
+    /// Rebuild the lookups over `transfers`, after it was cut short or read
+    /// back from a cache.
+    pub(crate) fn reindex(&mut self) {
         self.by_key_image = self
             .transfers
             .iter()
             .enumerate()
             .filter_map(|(i, t)| t.key_image.map(|k| (k, i)))
             .collect();
-        self.detach_sent(height);
+        self.by_public_key = self
+            .transfers
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.public_key, i))
+            .collect();
     }
 
     /// Forget everything scanned and start again at `height`: `rescan_bc`.
@@ -341,6 +397,7 @@ impl WalletState {
         self.hashes.clear();
         self.transfers.clear();
         self.by_key_image.clear();
+        self.by_public_key.clear();
         self.start_height = height;
         self.detach_sent(height);
     }
@@ -355,7 +412,10 @@ impl WalletState {
             .get_blocks(&history, self.start_height)
             .map_err(|e| RefreshError::Source(e.to_string()))?;
 
-        let mut summary = RefreshSummary::default();
+        let mut summary = RefreshSummary {
+            current_height: batch.current_height,
+            ..Default::default()
+        };
 
         if batch.blocks.is_empty() {
             summary.caught_up = true;
@@ -417,6 +477,8 @@ impl WalletState {
             total.spent += s.spent;
             total.reorg_to = s.reorg_to.or(total.reorg_to);
             total.caught_up = s.caught_up;
+            total.current_height = s.current_height;
+            total.events.extend(s.events);
             if s.caught_up {
                 break;
             }
@@ -513,6 +575,12 @@ impl WalletState {
                         t.spent = true;
                         t.spent_height = height;
                         summary.spent += 1;
+                        summary.events.push(RefreshEvent::Spent {
+                            height,
+                            txid,
+                            amount: t.amount,
+                            subaddress: t.subaddress,
+                        });
                     }
                     spent += t.amount;
                     account = Some(t.subaddress.major);
@@ -529,14 +597,11 @@ impl WalletState {
 
         let mut received = 0u64;
         for r in found {
-            if Some(r.subaddress.major) == account {
-                received += r.amount;
-            }
             let key_image = r.key_image;
             // Found again by a rescan, and already spent by a transaction
             // still waiting for a block.
             let spent_by_pending = key_image.is_some_and(|k| self.is_pending_input(&k));
-            self.transfers.push(Transfer {
+            let receipt = self.add_transfer(Transfer {
                 block_height: height,
                 txid,
                 derivation: r.derivation,
@@ -556,10 +621,24 @@ impl WalletState {
                 is_coinbase,
                 timestamp,
             });
-            if let Some(k) = key_image {
-                self.by_key_image.insert(k, self.transfers.len() - 1);
+            let burnt = match receipt {
+                Receipt::Ignored => continue,
+                Receipt::New => {
+                    summary.received += 1;
+                    0
+                }
+                Receipt::Replaced { burnt } => burnt,
+            };
+            if Some(r.subaddress.major) == account {
+                received += r.amount - burnt;
             }
-            summary.received += 1;
+            summary.events.push(RefreshEvent::Received {
+                height,
+                txid,
+                amount: r.amount,
+                burnt,
+                subaddress: r.subaddress,
+            });
         }
 
         if let Some(account) = account {
@@ -578,6 +657,38 @@ impl WalletState {
                 key_images,
             });
         }
+    }
+
+    /// Record an output found in a block, once per public key: `m_pub_keys`
+    /// in `wallet2::process_new_transaction`.
+    ///
+    /// Two outputs can carry the same one-time public key -- a sender reusing a
+    /// transaction key, by mistake or to cheat -- and then they share a key
+    /// image, so only one of them can ever be spent. The larger is kept and
+    /// the other ignored, as the reference does. Holding both would leave one
+    /// looking spendable after the other was spent, and every transaction
+    /// built from it would be refused as a double spend.
+    fn add_transfer(&mut self, t: Transfer) -> Receipt {
+        if let Some(&i) = self.by_public_key.get(&t.public_key) {
+            let held = &mut self.transfers[i];
+            if held.spent || held.amount >= t.amount {
+                return Receipt::Ignored;
+            }
+            let burnt = held.amount;
+            // The key image is the same: it depends only on the one-time key.
+            *held = Transfer {
+                key_image: held.key_image.or(t.key_image),
+                ..t
+            };
+            return Receipt::Replaced { burnt };
+        }
+        let i = self.transfers.len();
+        if let Some(k) = t.key_image {
+            self.by_key_image.insert(k, i);
+        }
+        self.by_public_key.insert(t.public_key, i);
+        self.transfers.push(t);
+        Receipt::New
     }
 }
 
@@ -982,6 +1093,20 @@ mod tests {
         assert_eq!(w.transfers[0].global_output_index, 4_242);
         assert!(!w.transfers[0].spent);
         assert_eq!(w.balance(), 1_234_000_000);
+        assert_eq!(s.current_height, 3, "the daemon's height");
+        assert!(
+            matches!(
+                s.events.as_slice(),
+                [RefreshEvent::Received {
+                    height: 1,
+                    amount: 1_234_000_000,
+                    burnt: 0,
+                    ..
+                }]
+            ),
+            "{:?}",
+            s.events
+        );
     }
 
     /// An output the wallet owns, then spent, is marked spent and leaves the
@@ -1005,6 +1130,18 @@ mod tests {
         assert!(w.transfers[0].spent);
         assert_eq!(w.transfers[0].spent_height, 1);
         assert_eq!(w.balance(), 0);
+        assert!(
+            matches!(
+                s.events.as_slice(),
+                [RefreshEvent::Spent {
+                    height: 1,
+                    amount: 500,
+                    ..
+                }]
+            ),
+            "{:?}",
+            s.events
+        );
     }
 
     /// A reorg detaches the wallet's chain and rescans. The payment in the
@@ -1273,6 +1410,61 @@ mod tests {
         assert_eq!(w.balance(), 777, "it still sees the money");
         assert_eq!(w.transfers[0].key_image, None);
         assert!(w.by_key_image.is_empty());
+    }
+
+    /// Two outputs with the same one-time key share a key image, so only one
+    /// can ever be spent. The larger is held and the other ignored, as
+    /// `wallet2` does; holding both would leave one looking spendable after
+    /// the other was spent.
+    #[test]
+    fn a_reused_output_key_is_held_once() {
+        let mut w = state(7, 0);
+        let first = Transfer {
+            block_height: 10,
+            txid: [1u8; 32],
+            derivation: wow_crypto::types::KeyDerivation::ZERO,
+            internal_output_index: 0,
+            global_output_index: 0,
+            public_key: PublicKey([4u8; 32]),
+            key_image: Some(KeyImage([3u8; 32])),
+            mask: [0u8; 32],
+            amount: 500,
+            subaddress: SubaddressIndex::MAIN,
+            spent: false,
+            spent_height: 0,
+            unlock_time: 0,
+            is_coinbase: false,
+            timestamp: 0,
+        };
+        assert_eq!(w.add_transfer(first.clone()), Receipt::New);
+
+        let smaller = Transfer {
+            txid: [2u8; 32],
+            amount: 400,
+            ..first.clone()
+        };
+        assert_eq!(w.add_transfer(smaller), Receipt::Ignored);
+
+        let larger = Transfer {
+            txid: [3u8; 32],
+            block_height: 12,
+            amount: 900,
+            ..first.clone()
+        };
+        assert_eq!(w.add_transfer(larger), Receipt::Replaced { burnt: 500 });
+        assert_eq!(w.transfers.len(), 1);
+        assert_eq!(w.transfers[0].txid, [3u8; 32]);
+        assert_eq!(w.balance(), 900);
+        assert_eq!(w.by_key_image.len(), 1);
+
+        // Once spent, even a larger one is ignored: its key image is used up.
+        w.transfers[0].spent = true;
+        let later = Transfer {
+            amount: 5_000,
+            ..first
+        };
+        assert_eq!(w.add_transfer(later), Receipt::Ignored);
+        assert_eq!(w.balance(), 0);
     }
 
     /// A refresh with nothing new is a no-op that reports caught up.

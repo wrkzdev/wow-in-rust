@@ -5,13 +5,18 @@
 //! "unknown command" to `export_outputs` tells a user nothing about whether it
 //! will ever work.
 
+use std::time::Instant;
+
+use wow_daemon_client::KeyImageStatus;
 use wow_types::address::{Address, AddressKind};
 use wow_wallet::decoys::{self, GammaPicker};
 use wow_wallet::history::{EntryKind, PROPAGATION_TIMEOUT};
 use wow_wallet::spend::{self, SpendOptions};
 use wow_wallet::transfer::{self, Destination, SpendableOutput};
+use wow_wallet::{PoolCheck, RefreshEvent};
 
 use crate::fmt;
+use crate::progress::Progress;
 use crate::session::{balance_line, now, Session};
 use crate::term;
 
@@ -341,8 +346,10 @@ fn refresh(session: &mut Session) -> Result<(), String> {
         .ok_or("no daemon set; use `set_daemon <host:port>`")?;
 
     let start = session.state.scan_height();
-    let mut received = 0usize;
-    let mut spent = 0usize;
+    let started = Instant::now();
+    let mut progress = Progress::new();
+    let (mut received, mut received_amount) = (0usize, 0u64);
+    let (mut spent, mut spent_amount) = (0usize, 0u64);
 
     loop {
         let s = session
@@ -351,50 +358,140 @@ fn refresh(session: &mut Session) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         received += s.received;
         spent += s.spent;
+        // The daemon's height as it grows, so a long refresh aims at the tip
+        // it will reach rather than the one there was when it started.
+        if s.current_height > 0 {
+            session.daemon_height = s.current_height;
+        }
 
         if let Some(h) = s.reorg_to {
+            progress.clear();
             println!("Reorganisation: the chain changed below height {h}; rescanned from there.");
         }
+        for e in &s.events {
+            match *e {
+                RefreshEvent::Received { amount, burnt, .. } => received_amount += amount - burnt,
+                RefreshEvent::Spent { amount, .. } => spent_amount += amount,
+            }
+            progress.clear();
+            println!("{}", describe_event(e));
+        }
         if s.blocks_scanned > 0 {
-            println!("  {}", session.describe_progress());
+            progress.update(session.state.scan_height(), session.chain_height());
         }
         if s.caught_up {
             break;
         }
     }
+    progress.clear();
 
     if let Ok(info) = client.get_info() {
         session.daemon_height = info.height;
     }
     session.dirty = true;
+    println!("  {}", session.describe_progress());
 
     // Caught up, so a sent transaction missing from both the chain and the
     // pool really is missing.
     match session.check_pending() {
-        Ok(failed) => {
-            for txid in failed {
-                println!(
-                    "Transaction {} is in neither a block nor the daemon's pool \
-                     {PROPAGATION_TIMEOUT} seconds after it was sent. Marked failed; its inputs \
-                     can be spent again.",
-                    wow_crypto::hex::encode(&txid)
-                );
-            }
-        }
+        Ok(check) => report_pool(session, &check),
         Err(e) => eprintln!("{e}"),
     }
 
     let scanned = session.state.scan_height().saturating_sub(start);
-    println!("Scanned {scanned} block(s).");
+    let elapsed = started.elapsed();
+    if elapsed.as_secs() > 0 && scanned > 0 {
+        println!(
+            "Scanned {scanned} block(s) in {} ({:.0} blocks/s).",
+            fmt::duration(elapsed.as_secs()),
+            scanned as f64 / elapsed.as_secs_f64()
+        );
+    } else {
+        println!("Scanned {scanned} block(s).");
+    }
     if received > 0 {
-        println!("Received {received} new output(s).");
+        println!(
+            "Received {received} new output(s), {} in all.",
+            fmt::amount(received_amount)
+        );
     }
     if spent > 0 {
-        println!("{spent} of this wallet's outputs were spent.");
+        println!(
+            "{spent} of this wallet's outputs were spent, {} in all.",
+            fmt::amount(spent_amount)
+        );
     }
     let (balance, unlocked) = session.balances();
     println!("{}", balance_line(balance, unlocked));
     Ok(())
+}
+
+/// A payment found or a spend of this wallet's, as
+/// `simple_wallet::on_money_received` and `on_money_spent` print them.
+fn describe_event(e: &RefreshEvent) -> String {
+    match *e {
+        RefreshEvent::Received {
+            height,
+            txid,
+            amount,
+            burnt,
+            subaddress,
+        } => {
+            let burn = if burnt > 0 {
+                format!(
+                    " ({} yet {} was burnt)",
+                    fmt::amount(amount),
+                    fmt::amount(burnt)
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "Height {height}, txid {}, {}{burn}, idx {}/{}",
+                wow_crypto::hex::encode(&txid),
+                fmt::amount(amount - burnt),
+                subaddress.major,
+                subaddress.minor
+            )
+        }
+        RefreshEvent::Spent {
+            height,
+            txid,
+            amount,
+            subaddress,
+        } => format!(
+            "Height {height}, txid {}, spent {}, idx {}/{}",
+            wow_crypto::hex::encode(&txid),
+            fmt::amount(amount),
+            subaddress.major,
+            subaddress.minor
+        ),
+    }
+}
+
+/// What the daemon's pool showed about this wallet's money.
+fn report_pool(session: &Session, check: &PoolCheck) {
+    for txid in &check.noted {
+        let Some(s) = session.state.sent.iter().find(|s| s.txid == *txid) else {
+            continue;
+        };
+        println!(
+            "Transaction {} in the daemon's pool spends {} of this wallet's outputs, {} in all. \
+             It was not sent from this wallet file; those outputs count as spent while it waits \
+             for a block.",
+            wow_crypto::hex::encode(txid),
+            s.key_images.len(),
+            fmt::amount(s.amount_in)
+        );
+    }
+    for txid in &check.failed {
+        println!(
+            "Transaction {} is in neither a block nor the daemon's pool {PROPAGATION_TIMEOUT} \
+             seconds after this wallet sent it or first saw it. Marked failed; its inputs can be \
+             spent again.",
+            wow_crypto::hex::encode(txid)
+        );
+    }
 }
 
 fn rescan(session: &mut Session) -> Result<(), String> {
@@ -709,6 +806,19 @@ fn send(
         .copied()
         .unwrap_or(0);
 
+    // Another copy of this wallet may have spent some of these outputs since
+    // the last refresh. Better found in the pool now than as a refusal.
+    match session.note_pool_spends() {
+        Ok(noted) => report_pool(
+            session,
+            &PoolCheck {
+                noted,
+                failed: Vec::new(),
+            },
+        ),
+        Err(e) => eprintln!("{e}"),
+    }
+
     let options = SpendOptions {
         ring_size,
         fee_per_byte,
@@ -864,8 +974,67 @@ fn send(
             }
         }
         println!("  status: {}", result.status);
+        if result.double_spend {
+            explain_double_spend(session, &client, &plan);
+        }
     }
     Ok(())
+}
+
+/// After a refusal as a double spend: say which input was spent, and where,
+/// and keep it out of the next transaction if the pool has the spend.
+fn explain_double_spend(
+    session: &mut Session,
+    client: &wow_daemon_client::DaemonClient,
+    plan: &spend::SpendPlan,
+) {
+    match session.note_pool_spends() {
+        Ok(noted) => report_pool(
+            session,
+            &PoolCheck {
+                noted,
+                failed: Vec::new(),
+            },
+        ),
+        Err(e) => eprintln!("  {e}"),
+    }
+
+    let inputs: Vec<(usize, [u8; 32])> = plan
+        .inputs
+        .iter()
+        .filter_map(|&i| Some((i, session.state.transfers[i].key_image?.0)))
+        .collect();
+    let images: Vec<[u8; 32]> = inputs.iter().map(|(_, k)| *k).collect();
+    let status = match client.is_key_image_spent(&images) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("  cannot ask the daemon which input was spent: {e}");
+            return;
+        }
+    };
+    for ((i, image), status) in inputs.iter().zip(status) {
+        let t = &session.state.transfers[*i];
+        let what = format!(
+            "  the {} output with key image {}",
+            fmt::amount(t.amount),
+            wow_crypto::hex::encode(image)
+        );
+        match status {
+            KeyImageStatus::SpentInPool if t.spent => println!(
+                "{what} is being spent by a transaction in the daemon's pool. It counts as spent \
+                 now; send again to use other outputs."
+            ),
+            KeyImageStatus::SpentInPool => println!(
+                "{what} is being spent by a transaction in the daemon's pool, which the daemon \
+                 does not list, so this wallet cannot hold the output back."
+            ),
+            KeyImageStatus::SpentInChain => println!(
+                "{what} was spent in a block, and this wallet's scan did not see it go. \
+                 `rescan_bc` scans again."
+            ),
+            KeyImageStatus::Unspent => {}
+        }
+    }
 }
 
 /// The one-time secret key for an output, recomputed rather than stored.

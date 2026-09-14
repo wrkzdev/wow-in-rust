@@ -1147,7 +1147,8 @@ mod tests {
     fn a_rejection_names_every_rule_broken() {
         assert_eq!(
             rejection_details(&Rejection::DoubleSpend {
-                key_image: KeyImage([0; 32])
+                key_image: KeyImage([0; 32]),
+                in_pool: None,
             }),
             "double spend"
         );

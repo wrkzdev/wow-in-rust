@@ -18,6 +18,7 @@
 
 mod commands;
 mod fmt;
+mod progress;
 mod session;
 mod startup;
 mod term;

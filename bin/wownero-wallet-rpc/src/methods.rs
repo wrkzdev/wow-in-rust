@@ -885,6 +885,10 @@ fn build_and_send(
         .copied()
         .unwrap_or(0);
 
+    // Another copy of this wallet may have spent some of these outputs since
+    // the last refresh; an unreadable pool is no reason to refuse the send.
+    let _ = session.note_pool_spends();
+
     let options = SpendOptions {
         ring_size,
         fee_per_byte,
@@ -990,6 +994,12 @@ fn build_and_send(
         .send_raw_transaction(&blob, do_not_relay)
         .map_err(|e| Error::new(errors::NO_DAEMON_CONNECTION, e.to_string()))?;
     if !result.accepted() {
+        if result.double_spend {
+            // If the first spend is in the pool, hold its outputs back, so the
+            // next attempt does not pick them again.
+            let _ = session.note_pool_spends();
+            session.dirty = true;
+        }
         return Err(Error::new(
             errors::GENERIC_TRANSFER_ERROR,
             format!("the daemon rejected the transaction: {}", result.reason),

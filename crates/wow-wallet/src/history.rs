@@ -10,8 +10,8 @@
 //!
 //! A transaction that spends this wallet's outputs but was not sent from here
 //! (by another copy of the wallet, or before a restore) is recorded when a
-//! block shows it, with what the block can tell: what left, the fee, and what
-//! came back as change. Not where the rest went.
+//! block or the daemon's pool shows it, with what the transaction can tell:
+//! what left, the fee, and what came back as change. Not where the rest went.
 //!
 //! Transaction secret keys are not kept. `get_tx_key` needs them, and the
 //! cache they would be written to is not encrypted.
@@ -19,8 +19,10 @@
 use std::collections::{HashMap, HashSet};
 
 use wow_crypto::types::{Hash256, KeyImage};
+use wow_types::tx::{Transaction, TxIn};
 
 use crate::refresh::{unlocked_at, WalletState};
+use crate::scan::scan_transaction;
 use crate::spend::SpendPlan;
 
 /// How long a sent transaction may be in neither a block nor the daemon's pool
@@ -66,8 +68,8 @@ pub struct SentTx {
     pub payment_id: Option<[u8; 8]>,
     /// When it was sent, until a block carries it; then that block's timestamp.
     pub timestamp: u64,
-    /// When it was sent from here, or zero for one found in a block. The
-    /// propagation timeout counts from this.
+    /// When it was sent from here or first seen in the daemon's pool, or zero
+    /// for one found in a block. The propagation timeout counts from this.
     pub sent_time: u64,
     pub unlock_time: u64,
     /// The subaddress account its inputs came from, and their minor indices.
@@ -149,6 +151,15 @@ impl HistoryEntry {
         self.height
             .is_some_and(|h| unlocked_at(self.unlock_time, h, chain_height, now))
     }
+}
+
+/// A transaction waiting in the daemon's pool.
+#[derive(Clone, Debug)]
+pub struct PooledTx {
+    pub txid: Hash256,
+    pub tx: Transaction,
+    /// When the daemon received it, or zero if it did not say.
+    pub receive_time: u64,
 }
 
 /// What a transaction in a block showed about this wallet's spending.
@@ -246,7 +257,6 @@ impl WalletState {
     /// failed then would hand its inputs back to be spent twice.
     pub fn update_pending(&mut self, pool: &HashSet<Hash256>, now: u64) -> Vec<Hash256> {
         let mut failed = Vec::new();
-        let mut spend = Vec::new();
         let mut unspend = Vec::new();
         for s in &mut self.sent {
             if s.height().is_some() {
@@ -254,7 +264,6 @@ impl WalletState {
             }
             if pool.contains(&s.txid) {
                 s.state = SentState::Pending;
-                spend.extend_from_slice(&s.key_images);
             } else if s.state == SentState::Pending
                 && now > s.sent_time.saturating_add(PROPAGATION_TIMEOUT)
             {
@@ -263,9 +272,90 @@ impl WalletState {
                 failed.push(s.txid);
             }
         }
-        self.set_inputs_spent(&spend, true);
+        // Given back first, then spent again for everything still waiting, so
+        // an output named by a failed transaction and a pending one stays
+        // spent.
         self.set_inputs_spent(&unspend, false);
+        self.spend_pending_inputs();
         failed
+    }
+
+    /// Pool transactions that spend this wallet's outputs and were not sent
+    /// from here: sent by another copy of the wallet, or by this one before a
+    /// restore. `wallet2::process_new_transaction` for a pool transaction,
+    /// which adds such a one to `m_unconfirmed_txs` as though it had been
+    /// sent.
+    ///
+    /// Each is recorded as a pending send, and its inputs spent, so the next
+    /// transaction does not pick them and get refused as a double spend. From
+    /// then on it is a pending send like any other: confirmed by the block
+    /// that carries it, or failed once gone from the pool for
+    /// [`PROPAGATION_TIMEOUT`], which gives its inputs back.
+    ///
+    /// Unlike [`update_pending`](Self::update_pending) this is safe without a
+    /// refresh, because it only ever spends. Returns the transactions recorded
+    /// just now.
+    pub fn note_pool_spends(&mut self, pool: &[PooledTx], now: u64) -> Vec<Hash256> {
+        let mut noted = Vec::new();
+        for p in pool {
+            if self.sent.iter().any(|s| s.txid == p.txid) {
+                continue;
+            }
+            let mut amount_in = 0u64;
+            let mut account = None;
+            let mut minors = Vec::new();
+            let mut key_images = Vec::new();
+            for input in &p.tx.prefix.vin {
+                let TxIn::ToKey { k_image, .. } = input else {
+                    continue;
+                };
+                let Some(&i) = self.by_key_image.get(k_image) else {
+                    continue;
+                };
+                let t = &self.transfers[i];
+                amount_in += t.amount;
+                account = Some(t.subaddress.major);
+                minors.push(t.subaddress.minor);
+                key_images.push(*k_image);
+            }
+            let Some(account) = account else {
+                continue;
+            };
+            minors.sort_unstable();
+            minors.dedup();
+
+            // What it pays back to the account it spends from is change.
+            let change = scan_transaction(&p.tx, &self.keys())
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.subaddress.major == account)
+                .map(|r| r.amount)
+                .sum();
+            let fee = p.tx.fee().unwrap_or(0);
+            self.sent.push(SentTx {
+                txid: p.txid,
+                state: SentState::Pending,
+                amount_in,
+                amount_out: amount_in.saturating_sub(fee),
+                change,
+                destinations: Vec::new(),
+                payment_id: None,
+                timestamp: if p.receive_time > 0 {
+                    p.receive_time
+                } else {
+                    now
+                },
+                // Never zero, which would read as "found in a block".
+                sent_time: now.max(1),
+                unlock_time: p.tx.prefix.unlock_time,
+                account,
+                minors,
+                key_images,
+            });
+            noted.push(p.txid);
+        }
+        self.spend_pending_inputs();
+        noted
     }
 
     /// The change still to come back from transactions not yet in a block.
@@ -398,6 +488,11 @@ impl WalletState {
             }
             _ => true,
         });
+        self.spend_pending_inputs();
+    }
+
+    /// Spend the inputs of every transaction still waiting for a block.
+    fn spend_pending_inputs(&mut self) {
         let pending: Vec<KeyImage> = self
             .sent
             .iter()
@@ -538,6 +633,66 @@ mod tests {
             "it turned up after all"
         );
         assert!(w.transfers[0].spent);
+    }
+
+    /// A pool transaction this wallet did not send, spending one of its
+    /// outputs, holds that output as a send from here would: spent at once,
+    /// pending until a block, and given back once it has been gone from the
+    /// pool past the timeout. This is what stops a restored wallet offering an
+    /// output another copy has already spent, and the daemon refusing it.
+    #[test]
+    fn a_spend_in_the_pool_not_sent_from_here_holds_its_input() {
+        let mut w = wallet();
+        let spending = |image: [u8; 32]| {
+            let mut tx = Transaction::default();
+            tx.prefix.version = 2;
+            tx.prefix.vin = vec![TxIn::ToKey {
+                amount: 0,
+                key_offsets: vec![1],
+                k_image: KeyImage(image),
+            }];
+            tx
+        };
+        let ours = [6u8; 32];
+        let pool = vec![
+            PooledTx {
+                txid: ours,
+                tx: spending([9u8; 32]),
+                receive_time: SENT - 20,
+            },
+            PooledTx {
+                txid: [7u8; 32],
+                tx: spending([1u8; 32]),
+                receive_time: SENT,
+            },
+        ];
+
+        assert_eq!(
+            w.note_pool_spends(&pool, SENT),
+            vec![ours],
+            "only the one spending our output"
+        );
+        assert!(w.transfers[0].spent, "held by the pool transaction");
+        assert_eq!(w.transfers[0].spent_height, 0);
+        assert_eq!(w.balance(), 0);
+        let s = &w.sent[0];
+        assert_eq!((s.state, s.amount_in), (SentState::Pending, 10_000));
+        assert_eq!(s.timestamp, SENT - 20, "when the daemon received it");
+        assert!(s.destinations.is_empty(), "the pool does not say where");
+
+        assert!(w.note_pool_spends(&pool, SENT + 60).is_empty(), "not twice");
+        assert_eq!(w.sent.len(), 1);
+
+        let in_pool: HashSet<Hash256> = [ours].into();
+        assert!(w.update_pending(&in_pool, SENT + 10_000).is_empty());
+        assert!(w.transfers[0].spent, "still waiting");
+
+        assert_eq!(w.update_pending(&HashSet::new(), SENT + 10_001), vec![ours]);
+        assert!(
+            !w.transfers[0].spent,
+            "gone from the pool: the output is back"
+        );
+        assert_eq!(w.balance(), 10_000);
     }
 
     /// A payment in, a send out with where it went, and the send's change left
