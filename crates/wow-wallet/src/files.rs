@@ -14,7 +14,8 @@
 //! and the instruction is to define our own format and rebuild from the chain
 //! when a C++ cache is found. So this writes `<name>.rscache` — a different
 //! name, so both implementations can hold the same wallet without either
-//! corrupting the other's cache.
+//! corrupting the other's cache. It is sealed the way the C++ seals its own,
+//! under the same key ([`cache::seal`]).
 //!
 //! The keys file **is** shared, and is read and written compatibly. That is
 //! where the money is; a cache is a few minutes of rescanning.
@@ -92,6 +93,9 @@ pub struct Session {
     pub dirty: bool,
     /// Where the keys file and the cache are read from and written to.
     store: Box<dyn Store>,
+    /// The key the cache is sealed under, derived from the password once
+    /// rather than by a CryptoNight on every save.
+    cache_key: crate::chacha::Key,
 }
 
 impl Session {
@@ -149,6 +153,7 @@ impl Session {
             restore_height,
             network,
         );
+        let cache_key = KeysFile::cache_key(password.as_bytes(), kdf_rounds);
 
         let mut s = Session {
             keys_file,
@@ -160,6 +165,7 @@ impl Session {
             daemon_height: 0,
             dirty: true,
             store,
+            cache_key,
         };
         s.save()?;
         let address = s.primary_address();
@@ -225,8 +231,9 @@ impl Session {
         );
 
         // Load the cache if there is one; otherwise the wallet rescans.
+        let cache_key = KeysFile::cache_key(password.as_bytes(), kdf_rounds);
         match store.read_cache()? {
-            CacheRead::Found(raw) => cache::load(&mut state, &raw)?,
+            CacheRead::Found(raw) => cache::load_sealed(&mut state, &raw, &cache_key)?,
             CacheRead::WrittenByCpp { ours } => {
                 println!(
                     "This wallet's cache was written by the C++ wallet, whose format is a Boost\n\
@@ -248,21 +255,24 @@ impl Session {
             daemon_height: 0,
             dirty: false,
             store,
+            cache_key,
         })
     }
 
-    /// Write the keys file and the cache.
+    /// Write the keys file and the sealed cache.
     pub fn save(&mut self) -> Result<(), String> {
         let mut rng = crate::entropy::seeded_rng()?;
         let iv = random_iv(&mut rng);
         let key_iv = random_iv(&mut rng);
+        let cache_iv = random_iv(&mut rng);
 
         let blob = self
             .keys_file
             .to_blob(self.password.as_bytes(), self.kdf_rounds, iv, key_iv)
             .map_err(|e| format!("cannot serialize the wallet: {e}"))?;
         self.store.write_keys(&blob)?;
-        self.store.write_cache(&cache::store(&self.state))?;
+        let sealed = cache::seal(&cache::store(&self.state), &self.cache_key, cache_iv);
+        self.store.write_cache(&sealed)?;
         Ok(())
     }
 
@@ -481,14 +491,21 @@ pub fn now() -> u64 {
 
 /// This implementation's cache format.
 ///
-/// JSON, because the cache is not performance-critical — a refresh is bounded
-/// by the daemon, not by parsing — and because a cache a user can read is a
-/// cache a user can diagnose. `specs/12` §2.2 leaves the choice open.
+/// JSON inside, because the cache is not performance-critical — a refresh is
+/// bounded by the daemon, not by parsing — and because a cache that decrypts to
+/// text is one a user can diagnose. `specs/12` §2.2 leaves the choice open.
+/// Sealed outside, as the C++ seals its own ([`seal`]).
 pub mod cache {
     use super::*;
+    use crate::chacha::{self, Iv, Key};
     use serde_json::{json, Value};
+    use wow_serialize::binary::{Reader, Writer};
 
     const VERSION: u64 = 1;
+
+    /// A sealed cache cannot plausibly exceed this. It is here so that a
+    /// corrupt length is an error, not an allocation.
+    const MAX_SEALED: usize = 1 << 30;
 
     pub fn store(state: &WalletState) -> Vec<u8> {
         let transfers: Vec<Value> = state
@@ -533,10 +550,55 @@ pub mod cache {
         .into_bytes()
     }
 
+    /// Seal a cache for writing: `cache_file_data { iv, cache_data }`, framed
+    /// as the C++ frames its own (`specs/12` §2.2), ChaCha20 under the wallet's
+    /// cache key.
+    ///
+    /// The cache holds every output's amount, mask and key image, and every
+    /// payee when `store-tx-info` is on. Nothing in it spends, but it is the
+    /// wallet's whole history.
+    pub fn seal(plaintext: &[u8], key: &Key, iv: Iv) -> Vec<u8> {
+        let ciphertext = chacha::chacha20(plaintext, key, &iv);
+        let mut w = Writer::with_capacity(ciphertext.len() + 16);
+        w.write_bytes(&iv);
+        w.write_bytes_prefixed(&ciphertext);
+        w.into_vec()
+    }
+
+    /// Load a cache as a store holds it: sealed, or in the clear as a build
+    /// from before the cache was sealed wrote it, which the next save seals.
+    ///
+    /// Taken as sealed only when the container accounts for every byte and
+    /// what it decrypts to parses, so a cache in the clear is never mistaken
+    /// for one.
+    pub fn load_sealed(state: &mut WalletState, raw: &[u8], key: &Key) -> Result<(), String> {
+        if let Some((iv, ciphertext)) = container(raw) {
+            let plaintext = chacha::chacha20(ciphertext, key, &iv);
+            if let Ok(v) = serde_json::from_slice::<Value>(&plaintext) {
+                return load_value(state, v);
+            }
+        }
+        let v: Value = serde_json::from_slice(raw)
+            .map_err(|_| "the cache does not decrypt under this wallet's key".to_string())?;
+        load_value(state, v)
+    }
+
+    /// `cache_file_data`, when `raw` is one and nothing more.
+    fn container(raw: &[u8]) -> Option<(Iv, &[u8])> {
+        let mut r = Reader::new(raw);
+        let iv: Iv = r.read_array().ok()?;
+        let data = r.read_bytes_prefixed(MAX_SEALED, "cache").ok()?;
+        r.is_empty().then_some((iv, data))
+    }
+
+    /// Load a cache in the clear.
     pub fn load(state: &mut WalletState, raw: &[u8]) -> Result<(), String> {
         let v: Value =
             serde_json::from_slice(raw).map_err(|e| format!("the cache is not readable: {e}"))?;
+        load_value(state, v)
+    }
 
+    fn load_value(state: &mut WalletState, v: Value) -> Result<(), String> {
         // A cache from a future version is ignored rather than guessed at: a
         // rescan costs minutes, a misread cache costs correctness.
         if v.get("version").and_then(Value::as_u64) != Some(VERSION) {
@@ -805,6 +867,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The cache is sealed: none of its JSON shows in the sealed bytes, it
+    /// opens under the wallet's key and not another, and a cache an earlier
+    /// build wrote in the clear still opens.
+    #[test]
+    fn the_cache_is_sealed_and_an_old_clear_one_still_opens() {
+        let dir = scratch("sealed");
+        let mut s = fresh_session(&dir, 0);
+        s.state.hashes.push([7u8; 32]);
+        let clear = cache::store(&s.state);
+        let key = KeysFile::cache_key(b"", 1);
+        let sealed = cache::seal(&clear, &key, [9; 8]);
+        assert!(!sealed.windows(6).any(|w| w == b"hashes"), "sealed");
+
+        let fresh = || {
+            let keys = &s.keys_file.account.keys;
+            let table = SubaddressTable::new(&keys.account_address, &keys.view_secret_key, 1, 1);
+            WalletState::new(s.keys_file.account.clone(), table, 0, Network::Mainnet)
+        };
+
+        let mut back = fresh();
+        cache::load_sealed(&mut back, &sealed, &key).expect("opens");
+        assert_eq!(back.hashes, s.state.hashes);
+
+        let other = KeysFile::cache_key(b"another password", 1);
+        assert!(cache::load_sealed(&mut fresh(), &sealed, &other).is_err());
+
+        let mut old = fresh();
+        cache::load_sealed(&mut old, &clear, &key).expect("in the clear");
+        assert_eq!(old.hashes, s.state.hashes);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A wallet that has already scanned is left alone too -- otherwise a
     /// second call would throw away everything it knows.
     #[test]
@@ -864,6 +959,9 @@ mod tests {
 
         let files = kept.files();
         assert_eq!(files.address, Some(s.primary_address()));
+        let sealed = files.cache.clone().expect("a cache");
+        assert!(!sealed.windows(6).any(|w| w == b"hashes"), "sealed");
+
         let keys = files.keys.expect("a keys file");
         let reopened = MemoryStore::holding("browser", keys, files.cache);
         let back = Session::open_in(Box::new(reopened), "pw".into(), 1, None)
