@@ -188,7 +188,7 @@ fn create(paths: Paths, o: &Options) -> Result<Session, String> {
         language.name,
         restore_height,
     )?;
-    println!("Created {}", session.paths.keys().display());
+    println!("Created {}", session.location());
     println!("Address: {}", session.primary_address());
 
     // A new wallet's seed is the only copy of it. A seed in the old English

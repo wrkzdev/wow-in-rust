@@ -42,6 +42,7 @@ pub mod priority;
 pub mod refresh;
 pub mod scan;
 pub mod spend;
+pub mod store;
 pub mod subaddress;
 pub mod transfer;
 

@@ -280,7 +280,7 @@ fn spendkey(session: &mut Session) -> Result<(), String> {
 }
 
 fn wallet_info(session: &mut Session) -> Result<(), String> {
-    println!("file: {}", session.paths.keys().display());
+    println!("file: {}", session.location());
     println!("network: {}", session.network.name());
     println!("address: {}", session.primary_address());
     let keys = &session.keys_file.account.keys;

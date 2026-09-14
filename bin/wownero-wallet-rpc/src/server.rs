@@ -219,7 +219,8 @@ impl State {
         let Some(session) = guard.as_mut() else {
             return Ok(());
         };
-        if session.paths.keys() != paths.keys() {
+        // A wallet opened from files is where its keys file is.
+        if session.location() != paths.keys().display().to_string() {
             return Ok(());
         }
         session

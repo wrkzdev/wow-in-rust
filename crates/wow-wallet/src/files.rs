@@ -1,4 +1,4 @@
-//! An open wallet: its files, its state, and its daemon.
+//! An open wallet: its state, its daemon, and where its files are kept.
 //!
 //! `specs/12` §2. A wallet is three files:
 //!
@@ -19,18 +19,24 @@
 //! The keys file **is** shared, and is read and written compatibly. That is
 //! where the money is; a cache is a few minutes of rescanning.
 //!
+//! # Where they are kept
+//!
+//! In a [`Store`]: files on disk, or bytes a program keeps itself, as a browser
+//! does. [`Session::create`] and [`Session::open`] take paths, and
+//! [`Session::create_in`] and [`Session::open_in`] take any store.
+//!
 //! # One program at a time
 //!
-//! An open wallet holds a lock on its keys file ([`crate::lock`]), as the C++
-//! does. A second open, here or in the C++ wallet, is refused rather than left
-//! to spend the same outputs and write over this one's files.
+//! A wallet open from files holds a lock on its keys file ([`crate::lock`]), as
+//! the C++ does. A second open, here or in the C++ wallet, is refused rather
+//! than left to spend the same outputs and write over this one's files.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::history::{PooledTx, SentDestination, SentState, SentTx};
-use crate::lock::KeysLock;
 use crate::refresh::{Transfer, WalletState};
+use crate::store::{CacheRead, FileStore, Store};
 use crate::subaddress::SubaddressTable;
 use crate::{AccountBase, KeysFile};
 use wow_crypto::types::Hash256;
@@ -74,7 +80,6 @@ impl Paths {
 
 /// An open wallet.
 pub struct Session {
-    pub paths: Paths,
     pub keys_file: KeysFile,
     pub state: WalletState,
     pub network: Network,
@@ -85,13 +90,12 @@ pub struct Session {
     pub daemon_height: u64,
     /// Set when anything has changed since the last save.
     pub dirty: bool,
-    /// The keys file, held while the wallet is open. `None` only while a save
-    /// replaces the file.
-    keys_lock: Option<KeysLock>,
+    /// Where the keys file and the cache are read from and written to.
+    store: Box<dyn Store>,
 }
 
 impl Session {
-    /// Create a new wallet and write its files.
+    /// Create a new wallet as files at `paths`, and write them.
     pub fn create(
         paths: Paths,
         network: Network,
@@ -101,10 +105,31 @@ impl Session {
         seed_language: &str,
         restore_height: u64,
     ) -> Result<Session, String> {
-        if paths.keys().exists() {
+        Session::create_in(
+            Box::new(FileStore::new(paths)),
+            network,
+            password,
+            kdf_rounds,
+            account,
+            seed_language,
+            restore_height,
+        )
+    }
+
+    /// Create a new wallet in `store`, and write it there.
+    pub fn create_in(
+        store: Box<dyn Store>,
+        network: Network,
+        password: String,
+        kdf_rounds: u64,
+        account: AccountBase,
+        seed_language: &str,
+        restore_height: u64,
+    ) -> Result<Session, String> {
+        if store.exists() {
             return Err(format!(
                 "{} already exists; refusing to overwrite a wallet",
-                paths.keys().display()
+                store.location()
             ));
         }
 
@@ -126,7 +151,6 @@ impl Session {
         );
 
         let mut s = Session {
-            paths,
             keys_file,
             state,
             network,
@@ -135,29 +159,37 @@ impl Session {
             daemon: None,
             daemon_height: 0,
             dirty: true,
-            keys_lock: None,
+            store,
         };
-        // The save takes the lock, on the file it has just written.
         s.save()?;
-        s.write_address_file()?;
+        let address = s.primary_address();
+        s.store.write_address(&address)?;
         Ok(s)
     }
 
-    /// Open an existing wallet.
+    /// Open an existing wallet from files at `paths`.
     pub fn open(
         paths: Paths,
         password: String,
         kdf_rounds: u64,
         network: Option<Network>,
     ) -> Result<Session, String> {
-        // Held from here on, as the C++ locks before it loads, so a wallet open
-        // elsewhere is refused before its keys are read. A Windows lock refuses
-        // reads through any other handle, so the keys are read through it.
-        let keys_path = paths.keys();
-        let keys_lock = KeysLock::acquire(&keys_path).map_err(|e| e.to_string())?;
-        let blob = keys_lock
-            .read()
-            .map_err(|e| format!("cannot read {}: {e}", keys_path.display()))?;
+        Session::open_in(
+            Box::new(FileStore::new(paths)),
+            password,
+            kdf_rounds,
+            network,
+        )
+    }
+
+    /// Open the wallet in `store`.
+    pub fn open_in(
+        mut store: Box<dyn Store>,
+        password: String,
+        kdf_rounds: u64,
+        network: Option<Network>,
+    ) -> Result<Session, String> {
+        let blob = store.open_keys()?;
         let keys_file = KeysFile::open(&blob, password.as_bytes(), kdf_rounds)
             .map_err(|e| format!("cannot open the wallet: {e}"))?;
 
@@ -193,22 +225,20 @@ impl Session {
         );
 
         // Load the cache if there is one; otherwise the wallet rescans.
-        match std::fs::read(paths.cache()) {
-            Ok(raw) => cache::load(&mut state, &raw)?,
-            Err(_) if paths.cpp_cache().exists() => {
+        match store.read_cache()? {
+            CacheRead::Found(raw) => cache::load(&mut state, &raw)?,
+            CacheRead::WrittenByCpp { ours } => {
                 println!(
                     "This wallet's cache was written by the C++ wallet, whose format is a Boost\n\
                      archive this implementation does not read. Rescanning from height {}.\n\
-                     The C++ cache is left alone; this wallet writes {}.",
-                    keys_file.refresh_height(),
-                    paths.cache().display()
+                     The C++ cache is left alone; this wallet writes {ours}.",
+                    keys_file.refresh_height()
                 );
             }
-            Err(_) => {}
+            CacheRead::Missing => {}
         }
 
         Ok(Session {
-            paths,
             keys_file,
             state,
             network: file_network,
@@ -217,16 +247,11 @@ impl Session {
             daemon: None,
             daemon_height: 0,
             dirty: false,
-            keys_lock: Some(keys_lock),
+            store,
         })
     }
 
     /// Write the keys file and the cache.
-    ///
-    /// The keys file is replaced by a rename, and a lock left on the file it
-    /// replaced would hold nothing. So the lock is let go for the write and
-    /// taken again on what was written, or on the old file if the write
-    /// failed.
     pub fn save(&mut self) -> Result<(), String> {
         let mut rng = crate::entropy::seeded_rng()?;
         let iv = random_iv(&mut rng);
@@ -236,18 +261,15 @@ impl Session {
             .keys_file
             .to_blob(self.password.as_bytes(), self.kdf_rounds, iv, key_iv)
             .map_err(|e| format!("cannot serialize the wallet: {e}"))?;
-        let keys_path = self.paths.keys();
-        self.keys_lock = None;
-        let written = write_atomically(&keys_path, &blob);
-        self.keys_lock = Some(KeysLock::acquire(&keys_path).map_err(|e| e.to_string())?);
-        written?;
-        write_atomically(&self.paths.cache(), &cache::store(&self.state))?;
+        self.store.write_keys(&blob)?;
+        self.store.write_cache(&cache::store(&self.state))?;
         Ok(())
     }
 
-    fn write_address_file(&self) -> Result<(), String> {
-        let text = format!("{}\n", self.primary_address());
-        write_atomically(&self.paths.address_txt(), text.as_bytes())
+    /// Where the wallet is kept: its keys file's path, or the name its store
+    /// was given.
+    pub fn location(&self) -> String {
+        self.store.location()
     }
 
     pub fn primary_address(&self) -> String {
@@ -455,23 +477,6 @@ fn random_iv(rng: &mut wow_crypto::random::Rng) -> [u8; 8] {
 /// The time now, in seconds since 1970 ([`crate::clock`]).
 pub fn now() -> u64 {
     crate::clock::now()
-}
-
-/// Write to a temporary file and rename over the target.
-///
-/// A keys file half-written is a wallet lost. The rename is atomic on both
-/// platforms this builds for, so a crash leaves either the old file or the new
-/// one.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".new");
-    let tmp = PathBuf::from(tmp);
-
-    std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("cannot replace {}: {e}", path.display())
-    })
 }
 
 /// This implementation's cache format.
@@ -685,6 +690,7 @@ pub mod cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::MemoryStore;
 
     #[test]
     fn the_file_names_are_the_documented_ones() {
@@ -833,5 +839,48 @@ mod tests {
         reopen().expect("free once the first is closed");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A wallet kept in memory, as a browser keeps one, opens again from the
+    /// bytes it saved, and no second wallet is created over it.
+    #[test]
+    fn a_wallet_in_memory_opens_from_what_it_saved() {
+        let spend = wow_crypto::types::SecretKey(wow_crypto::ops::sc_reduce32(&[2u8; 32]));
+        let account = crate::account::AccountBase::from_spend_key(spend, 0).expect("keys");
+        let kept = MemoryStore::new("browser");
+
+        let mut s = Session::create_in(
+            Box::new(kept.clone()),
+            Network::Mainnet,
+            "pw".into(),
+            1,
+            account.clone(),
+            "English",
+            5,
+        )
+        .expect("create");
+        s.state.hashes.push([7u8; 32]);
+        s.save().expect("save");
+
+        let files = kept.files();
+        assert_eq!(files.address, Some(s.primary_address()));
+        let keys = files.keys.expect("a keys file");
+        let reopened = MemoryStore::holding("browser", keys, files.cache);
+        let back = Session::open_in(Box::new(reopened), "pw".into(), 1, None)
+            .expect("open");
+        assert_eq!(back.primary_address(), s.primary_address());
+        assert_eq!(back.state.hashes, s.state.hashes, "the cache came back");
+        assert_eq!(back.location(), "browser");
+
+        let over = Session::create_in(
+            Box::new(kept),
+            Network::Mainnet,
+            "pw".into(),
+            1,
+            account,
+            "English",
+            0,
+        );
+        assert!(over.is_err(), "not written over");
     }
 }
