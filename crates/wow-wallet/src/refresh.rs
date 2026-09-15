@@ -114,6 +114,33 @@ pub fn unlocked_at(unlock_time: u64, block_height: u64, chain_height: u64, now: 
         && block_height + SPENDABLE_AGE <= chain_height
 }
 
+/// How many more blocks until [`unlocked_at`] holds, from a chain of
+/// `chain_height` blocks: zero once it does. An unlock time that is a
+/// timestamp is counted at the target block time, so for one of those this is
+/// an estimate.
+pub fn blocks_until_unlocked(
+    unlock_time: u64,
+    block_height: u64,
+    chain_height: u64,
+    now: u64,
+) -> u64 {
+    use wow_consensus::constants::{
+        CRYPTONOTE_LOCKED_TX_ALLOWED_DELTA_BLOCKS, CRYPTONOTE_LOCKED_TX_ALLOWED_DELTA_SECONDS_V2,
+        CRYPTONOTE_MAX_BLOCK_NUMBER, DIFFICULTY_TARGET_V2,
+    };
+    let age = (block_height + SPENDABLE_AGE).saturating_sub(chain_height);
+    let own = if unlock_time < CRYPTONOTE_MAX_BLOCK_NUMBER {
+        unlock_time.saturating_sub(
+            chain_height.saturating_sub(1) + CRYPTONOTE_LOCKED_TX_ALLOWED_DELTA_BLOCKS,
+        )
+    } else {
+        unlock_time
+            .saturating_sub(now.saturating_add(CRYPTONOTE_LOCKED_TX_ALLOWED_DELTA_SECONDS_V2))
+            .div_ceil(DIFFICULTY_TARGET_V2)
+    };
+    age.max(own)
+}
+
 /// A block and its transactions, as a source hands them over.
 #[derive(Clone, Debug, Default)]
 pub struct BlockBundle {
@@ -335,6 +362,24 @@ impl WalletState {
             .filter(|t| !t.spent && t.unlocked(chain_height, now))
             .map(|t| t.amount)
             .sum()
+    }
+
+    /// What cannot be spent yet: the total of the unspent outputs still
+    /// locked, and how many blocks until the first of them unlocks (`None`
+    /// when none is). Change on its way back is not in it, having no block
+    /// yet to count from.
+    pub fn locked(&self, chain_height: u64, now: u64) -> (u64, Option<u64>) {
+        self.transfers
+            .iter()
+            .filter(|t| !t.spent && !t.unlocked(chain_height, now))
+            .fold((0, None), |(total, soonest): (u64, Option<u64>), t| {
+                let blocks =
+                    blocks_until_unlocked(t.unlock_time, t.block_height, chain_height, now);
+                (
+                    total + t.amount,
+                    Some(soonest.map_or(blocks, |s| s.min(blocks))),
+                )
+            })
     }
 
     /// The short chain history: the last ten hashes, then exponentially spaced
@@ -941,6 +986,32 @@ impl BlockSource for wow_daemon_client::DaemonClient {
 mod tests {
     use super::*;
     use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+
+    /// The count of blocks until an output unlocks agrees with `unlocked_at`
+    /// at every height it passes through: not spendable a block early, and
+    /// spendable on the block it names.
+    #[test]
+    fn blocks_until_unlocked_counts_down_to_the_unlock() {
+        // Received at 100, with no unlock time of its own: four blocks of age.
+        assert_eq!(blocks_until_unlocked(0, 100, 101, 0), 3);
+        assert_eq!(blocks_until_unlocked(0, 100, 104, 0), 0);
+
+        // Locked until a height, as a coinbase is.
+        for chain in 101..400 {
+            let left = blocks_until_unlocked(388, 100, chain, 0);
+            assert_eq!(left == 0, unlocked_at(388, 100, chain, 0), "at {chain}");
+            if left > 0 {
+                assert!(!unlocked_at(388, 100, chain + left - 1, 0), "early, at {chain}");
+                assert!(unlocked_at(388, 100, chain + left, 0), "on time, at {chain}");
+            }
+        }
+
+        // Locked until a time an hour away: 3,300 seconds past the allowed
+        // delta, eleven blocks of five minutes.
+        let now = 1_800_000_000;
+        assert_eq!(blocks_until_unlocked(now + 3_600, 100, 1_000, now), 11);
+        assert_eq!(blocks_until_unlocked(now, 100, 1_000, now), 0);
+    }
     use curve25519_dalek::scalar::Scalar;
     use wow_crypto::ops::encode_point;
     use wow_crypto::types::{AccountPublicAddress, PublicKey, SecretKey};

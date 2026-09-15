@@ -229,6 +229,36 @@ impl SpendPlan {
     }
 }
 
+/// An amount in WOW, as a person reads it: `12`, `0.0003`, with no trailing
+/// zeros. What an error says is in these, not in atomic units, which read as a
+/// hundred billion times too much.
+pub fn money(atomic: u64) -> String {
+    use wow_consensus::constants::{COIN, CRYPTONOTE_DISPLAY_DECIMAL_POINT};
+    let (whole, frac) = (atomic / COIN, atomic % COIN);
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let frac = format!(
+        "{frac:0width$}",
+        width = CRYPTONOTE_DISPLAY_DECIMAL_POINT as usize
+    );
+    format!("{whole}.{}", frac.trim_end_matches('0'))
+}
+
+fn wow(atomic: &u64) -> String {
+    format!("{} WOW", money(*atomic))
+}
+
+/// Before any input is picked there is no fee yet, and "a fee of 0" would
+/// say there is none to pay.
+fn fee_note(fee: &u64) -> String {
+    if *fee == 0 {
+        String::new()
+    } else {
+        format!(", including a fee of {}", wow(fee))
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SpendError {
     #[error("nothing to send")]
@@ -238,7 +268,10 @@ pub enum SpendError {
     #[error("a destination amount is zero")]
     ZeroAmount,
     #[error(
-        "not enough unlocked funds: {available} available, {needed} needed including a fee of {fee}"
+        "not enough unlocked funds: {} available, {} needed{}",
+        wow(.available),
+        wow(.needed),
+        fee_note(.fee)
     )]
     NotEnough {
         available: u64,
@@ -557,6 +590,36 @@ mod tests {
             }
             other => panic!("{other}"),
         }
+    }
+
+    /// It says how much in WOW, not in atomic units: twelve WOW is "12", not
+    /// "1200000000000", and a fee not yet worked out is not "a fee of 0".
+    #[test]
+    fn not_enough_says_how_much_in_wow() {
+        assert_eq!(money(0), "0");
+        assert_eq!(money(1_200_000_000_000), "12");
+        assert_eq!(money(30_000_000), "0.0003");
+        assert_eq!(money(1), "0.00000000001");
+
+        let e = SpendError::NotEnough {
+            available: 0,
+            needed: 1_200_000_000_000,
+            fee: 0,
+        };
+        assert_eq!(
+            e.to_string(),
+            "not enough unlocked funds: 0 WOW available, 12 WOW needed"
+        );
+        let e = SpendError::NotEnough {
+            available: 250_000_000_000,
+            needed: 1_200_030_000_000,
+            fee: 30_000_000,
+        };
+        assert_eq!(
+            e.to_string(),
+            "not enough unlocked funds: 2.5 WOW available, 12.0003 WOW needed, including a fee \
+             of 0.0003 WOW"
+        );
     }
 
     /// Locked, spent and view-only outputs are not spendable.
