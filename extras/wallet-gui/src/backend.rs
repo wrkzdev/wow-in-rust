@@ -173,7 +173,21 @@ impl<P: Platform> Backend<P> {
                 self.send_status();
                 Ok(())
             }
-            Command::PrepareSend(form) => self.prepare(form),
+            // Said beside the send form, where it is read, rather than as a
+            // notice at the foot of the window.
+            Command::PrepareSend(form) => {
+                if let Err(e) = self.prepare(form) {
+                    self.send(Event::SendFailed(e));
+                }
+                Ok(())
+            }
+            Command::EstimateFee(form) => {
+                match self.estimate_fee(&form) {
+                    Ok((amount, fee)) => self.send(Event::FeeEstimate { amount, fee }),
+                    Err(e) => self.send(Event::SendFailed(e)),
+                }
+                Ok(())
+            }
             Command::CommitSend => self.commit(),
             Command::DiscardSend => {
                 if let Some(w) = self.wallet.as_mut() {
@@ -560,6 +574,50 @@ impl<P: Platform> Backend<P> {
         Ok(())
     }
 
+    /// What a send would pay: planned against this wallet's unlocked outputs
+    /// at the fee the node asks now, and not built, so the fee is the one
+    /// `spend::plan` estimates from the weight. Returns the amount it sends
+    /// and the fee.
+    fn estimate_fee(&self, form: &SendForm) -> Result<(u64, u64), String> {
+        use wow_types::address::{Address, AddressKind};
+        use wow_wallet::{priority, spend};
+
+        let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
+        let client = w.session.daemon.clone().ok_or("choose a node first")?;
+        let tiers = client
+            .get_fee_estimate(priority::FEE_ESTIMATE_GRACE_BLOCKS)
+            .map_err(|e| format!("the node gave no fee estimate: {e}"))?;
+        let tier = priority::adjust_priority(
+            &client,
+            form.priority,
+            priority::PrioritySettings::from_keys_file(&w.session.keys_file),
+            w.session.state.scan_height(),
+            &tiers,
+        );
+        // What the address says of itself, so the estimate's extra field is
+        // the size the transaction's will be. One not yet valid estimates as a
+        // plain address.
+        let address = Address::decode_for(form.address.trim(), w.session.network).ok();
+        let subaddress = address.is_some_and(|a| a.kind == AddressKind::Subaddress);
+        let payment_id = address.is_some_and(|a| a.payment_id.is_some())
+            || !form.payment_id.trim().is_empty();
+        let options = spend::SpendOptions {
+            ring_size: wow_wallet::decoys::RING_SIZE,
+            fee_per_byte: priority::fee_per_byte(&tiers, tier),
+            extra_size: spend::extra_size(2, payment_id, subaddress),
+            chain_height: w.session.chain_height(),
+            now: wow_wallet::clock::now(),
+            ..Default::default()
+        };
+        let transfers = w.session.transfers();
+        let plan = match form.amount {
+            Some(amount) => spend::plan(transfers, &[amount], &options),
+            None => spend::plan_sweep(transfers, &options),
+        }
+        .map_err(|e| e.to_string())?;
+        Ok((plan.amounts.first().copied().unwrap_or(0), plan.fee))
+    }
+
     fn commit(&mut self) -> Result<(), String> {
         let prepared = self
             .wallet
@@ -748,11 +806,15 @@ impl<P: Platform> Backend<P> {
             return;
         };
         let (balance, unlocked) = w.session.balances();
+        let chain = w.session.chain_height();
+        let (locked, unlock_blocks) = w.session.state.locked(chain, wow_wallet::clock::now());
         let status = Status {
             balance,
             unlocked,
+            locked,
+            unlock_blocks,
             scanned: w.session.state.scan_height(),
-            chain: w.session.chain_height(),
+            chain,
             node: w.session.daemon.as_ref().map(|d| d.address().to_string()),
             node_error: w.node_error.clone(),
             syncing: w.syncing,

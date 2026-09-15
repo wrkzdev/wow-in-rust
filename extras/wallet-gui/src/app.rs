@@ -159,6 +159,10 @@ struct WalletView {
     seed_password: String,
     subaddress_index: u32,
     subaddress: Option<(u32, String)>,
+    /// Why the last send could not be prepared, shown beside the form.
+    send_error: Option<String>,
+    /// The last fee estimate: the amount it sends, and the fee.
+    estimate: Option<(u64, u64)>,
 }
 
 impl WalletView {
@@ -180,6 +184,8 @@ impl WalletView {
             seed_password: String::new(),
             subaddress_index: 1,
             subaddress: None,
+            send_error: None,
+            estimate: None,
         }
     }
 }
@@ -334,6 +340,17 @@ impl WalletApp {
                 if let Some(w) = &mut self.wallet {
                     w.preview = None;
                     w.rejected = Some(reasons);
+                }
+            }
+            Event::SendFailed(text) => {
+                if let Some(w) = &mut self.wallet {
+                    w.preview = None;
+                    w.send_error = Some(text);
+                }
+            }
+            Event::FeeEstimate { amount, fee } => {
+                if let Some(w) = &mut self.wallet {
+                    w.estimate = Some((amount, fee));
                 }
             }
             Event::Seed(seed) => {
@@ -923,6 +940,7 @@ impl WalletApp {
         }
 
         let mut decision = None;
+        let unlocked = self.wallet.as_ref().map_or(0, |w| w.status.unlocked);
         if let Some(p) = self.wallet.as_ref().and_then(|w| w.preview.as_ref()) {
             modal(ctx, "Send this transaction?", |ui| {
                 ui.label("To");
@@ -943,11 +961,31 @@ impl WalletApp {
                         ui.label("Fee");
                         ui.label(format!("{} WOW ({})", format::amount(p.fee), p.priority));
                         ui.end_row();
+                        ui.label("In all");
+                        ui.label(
+                            RichText::new(format!(
+                                "{} WOW",
+                                format::amount(p.amount.saturating_add(p.fee))
+                            ))
+                            .strong(),
+                        );
+                        ui.end_row();
                         if p.change > 0 {
                             ui.label("Change");
                             ui.label(format!("{} WOW", format::amount(p.change)));
                             ui.end_row();
                         }
+                        // Its inputs leave the unlocked balance now, and the
+                        // change comes back locked, as any payment received does.
+                        let spent = p.amount.saturating_add(p.fee).saturating_add(p.change);
+                        let after = format::amount_short(unlocked.saturating_sub(spent));
+                        ui.label("Spendable after");
+                        ui.label(if p.change > 0 {
+                            format!("{after} WOW, and the change once it unlocks")
+                        } else {
+                            format!("{after} WOW")
+                        });
+                        ui.end_row();
                         ui.label("Inputs");
                         ui.label(format!("{}, {} bytes", p.inputs, p.weight));
                         ui.end_row();
@@ -1056,9 +1094,12 @@ fn overview(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     );
     if w.status.unlocked != w.status.balance {
         ui.label(format!(
-            "{} WOW can be spent now. The rest unlocks as its transactions are confirmed.",
+            "{} WOW can be spent now.",
             format::amount_short(w.status.unlocked)
         ));
+        if let Some(note) = unlock_note(&w.status) {
+            ui.label(RichText::new(note).color(weak));
+        }
     }
     ui.add_space(12.0);
     sync_bar(ui, &w.status);
@@ -1091,13 +1132,81 @@ fn overview(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     }
 }
 
+/// Why money cannot be spent yet, and when the first of it can.
+fn unlock_note(status: &Status) -> Option<String> {
+    let blocks = status.unlock_blocks?;
+    let when = match blocks {
+        0 => "with the next block".to_string(),
+        1 => format!("in 1 block ({})", format::blocks_as_time(1)),
+        n => format!(
+            "in {} blocks ({})",
+            format::grouped(n),
+            format::blocks_as_time(n)
+        ),
+    };
+    Some(format!(
+        "{} WOW is locked, and the first of it unlocks {when}. Money received unlocks after 4 \
+         blocks, and mined money after 288.",
+        format::amount_short(status.locked)
+    ))
+}
+
+/// What a typed address is, or what is wrong with it.
+#[derive(Debug, PartialEq, Eq)]
+enum AddressCheck {
+    Empty,
+    Bad(String),
+    Standard,
+    Subaddress,
+    /// With the payment ID it carries, in hex.
+    Integrated(String),
+}
+
+fn check_address(text: &str, network: Net) -> AddressCheck {
+    use wow_types::address::{Address, AddressError, AddressKind};
+
+    let text = text.trim();
+    if text.is_empty() {
+        return AddressCheck::Empty;
+    }
+    match Address::decode_for(text, network.network()) {
+        Ok(a) => match (a.kind, a.payment_id) {
+            (AddressKind::Integrated, Some(id)) => {
+                AddressCheck::Integrated(wow_crypto::hex::encode(&id))
+            }
+            (AddressKind::Subaddress, _) => AddressCheck::Subaddress,
+            _ => AddressCheck::Standard,
+        },
+        Err(AddressError::WrongNetwork { found, .. }) => AddressCheck::Bad(format!(
+            "That is a {} address, and this is a {} wallet.",
+            found.name(),
+            network.name()
+        )),
+        Err(_) => AddressCheck::Bad("That is not a Wownero address.".into()),
+    }
+}
+
 fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     ui.heading("Send");
     if w.summary.view_only {
         ui.label("A view-only wallet cannot send: it has no spend key.");
         return;
     }
+    let unlocked = w.status.unlocked;
+    let check = check_address(&w.draft.address, w.summary.network);
+    let integrated = matches!(check, AddressCheck::Integrated(_));
     let d = &mut w.draft;
+    if integrated {
+        // The address carries its own, and a second one is refused.
+        d.payment_id.clear();
+    }
+    let before = (
+        d.address.clone(),
+        d.amount.clone(),
+        d.everything,
+        d.priority,
+        d.payment_id.clone(),
+    );
     egui::Grid::new("send")
         .num_columns(2)
         .spacing([12.0, 8.0])
@@ -1109,6 +1218,18 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
                     .desired_width(460.0),
             );
             ui.end_row();
+            ui.label("");
+            match &check {
+                AddressCheck::Empty => ui.label(""),
+                AddressCheck::Bad(why) => ui.colored_label(BAD, why.as_str()),
+                AddressCheck::Standard => ui.colored_label(GOOD, "A standard address."),
+                AddressCheck::Subaddress => ui.colored_label(GOOD, "A subaddress."),
+                AddressCheck::Integrated(id) => ui.colored_label(
+                    GOOD,
+                    format!("An integrated address, carrying the payment ID {id}."),
+                ),
+            };
+            ui.end_row();
             ui.label("Amount");
             ui.horizontal(|ui| {
                 ui.add_enabled(
@@ -1118,7 +1239,8 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
                         .desired_width(160.0),
                 );
                 ui.label("WOW");
-                ui.checkbox(&mut d.everything, "everything unlocked");
+                ui.toggle_value(&mut d.everything, "Max")
+                    .on_hover_text("Send everything that can be spent now, less the fee");
             });
             ui.end_row();
             ui.label("Priority");
@@ -1131,21 +1253,36 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
                 });
             ui.end_row();
             ui.label("Payment ID");
-            ui.add(
+            ui.add_enabled(
+                !integrated,
                 TextEdit::singleline(&mut d.payment_id)
-                    .hint_text("optional: 16 hex characters")
+                    .hint_text(if integrated {
+                        "carried by the address"
+                    } else {
+                        "optional: 16 hex characters"
+                    })
                     .desired_width(220.0),
             );
             ui.end_row();
         });
 
-    ui.label(
-        RichText::new(format!(
-            "Can be spent now: {} WOW",
-            format::amount(w.status.unlocked)
-        ))
-        .small(),
-    );
+    ui.label(format!(
+        "Can be spent now: {} WOW",
+        format::amount_short(unlocked)
+    ));
+    // Nothing to spend: say so, and why, before anyone fills in the form.
+    if unlocked == 0 {
+        let why = if w.status.balance == 0 {
+            "This wallet has nothing to send yet."
+        } else {
+            "Nothing in this wallet can be spent yet."
+        };
+        ui.colored_label(WARN, why);
+        if let Some(note) = unlock_note(&w.status) {
+            ui.label(note);
+        }
+    }
+
     let amount = if d.everything {
         Ok(None)
     } else {
@@ -1153,6 +1290,23 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     };
     if let (false, Err(e)) = (d.everything || d.amount.trim().is_empty(), &amount) {
         ui.colored_label(BAD, e.as_str());
+    }
+    let too_much = matches!(amount, Ok(Some(a)) if a > unlocked);
+    if too_much && unlocked > 0 {
+        ui.colored_label(
+            BAD,
+            format!(
+                "That is more than can be spent now: {} WOW.",
+                format::amount_short(unlocked)
+            ),
+        );
+    }
+    let id_to_subaddress = check == AddressCheck::Subaddress && !d.payment_id.trim().is_empty();
+    if id_to_subaddress {
+        ui.colored_label(
+            BAD,
+            "A payment ID cannot go to a subaddress: its payee could not read it.",
+        );
     }
     let blocked = if w.status.node.is_none() {
         Some("Choose a node first.")
@@ -1164,16 +1318,58 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     if let Some(why) = blocked {
         ui.label(why);
     }
-    let ready = blocked.is_none() && !d.address.trim().is_empty() && amount.is_ok();
-    if ui.add_enabled(ready, Button::new("Review")).clicked() {
-        if let Ok(amount) = amount {
-            host.send(Command::PrepareSend(SendForm {
-                address: d.address.trim().to_string(),
-                amount,
-                priority: d.priority,
-                payment_id: d.payment_id.trim().to_string(),
-            }));
-        }
+    let address_ok = matches!(
+        check,
+        AddressCheck::Standard | AddressCheck::Subaddress | AddressCheck::Integrated(_)
+    );
+    let ready = blocked.is_none()
+        && address_ok
+        && amount.is_ok()
+        && unlocked > 0
+        && !too_much
+        && !id_to_subaddress;
+
+    let after = (
+        d.address.clone(),
+        d.amount.clone(),
+        d.everything,
+        d.priority,
+        d.payment_id.clone(),
+    );
+    let form = SendForm {
+        address: d.address.trim().to_string(),
+        amount: amount.clone().ok().flatten(),
+        priority: d.priority,
+        payment_id: d.payment_id.trim().to_string(),
+    };
+    // A changed form makes the last estimate and the last error stale.
+    if before != after {
+        w.estimate = None;
+        w.send_error = None;
+    }
+
+    let (mut review, mut estimate) = (false, false);
+    ui.horizontal(|ui| {
+        review = ui.add_enabled(ready, Button::new("Review")).clicked();
+        estimate = ui
+            .add_enabled(ready, Button::new("Estimate the fee"))
+            .clicked();
+    });
+    if let Some((sends, fee)) = w.estimate {
+        ui.label(format!(
+            "The fee comes to about {} WOW, so {} WOW leaves this wallet in all.",
+            format::amount_short(fee),
+            format::amount_short(sends.saturating_add(fee))
+        ));
+    }
+    if let Some(e) = &w.send_error {
+        ui.colored_label(BAD, e.as_str());
+    }
+    if review {
+        w.send_error = None;
+        host.send(Command::PrepareSend(form));
+    } else if estimate {
+        host.send(Command::EstimateFee(form));
     }
 
     if let Some(txid) = &w.sent {

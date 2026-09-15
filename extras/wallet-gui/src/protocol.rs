@@ -66,6 +66,9 @@ pub enum Command {
     /// Build and sign a transaction and relay nothing, answered by
     /// [`Event::Prepared`].
     PrepareSend(SendForm),
+    /// What a send would pay, planned and not built, answered by
+    /// [`Event::FeeEstimate`].
+    EstimateFee(SendForm),
     /// Relay the transaction last prepared.
     CommitSend,
     /// Forget the transaction last prepared.
@@ -160,6 +163,13 @@ pub enum Event {
     },
     /// The node refused the transaction, for these reasons.
     Rejected(Vec<String>),
+    /// A send could not be prepared or estimated, and why.
+    SendFailed(String),
+    /// What a send would pay: the amount it sends, and the fee.
+    FeeEstimate {
+        amount: u64,
+        fee: u64,
+    },
     Seed(String),
     Subaddress {
         index: u32,
@@ -220,6 +230,10 @@ pub struct Summary {
 pub struct Status {
     pub balance: u64,
     pub unlocked: u64,
+    /// What is not spendable yet, and how many blocks until the first of it
+    /// is: `None` when nothing is locked.
+    pub locked: u64,
+    pub unlock_blocks: Option<u64>,
     /// How far the wallet has scanned, and the chain's height as last seen.
     pub scanned: u64,
     pub chain: u64,

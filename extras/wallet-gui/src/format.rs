@@ -88,6 +88,19 @@ pub fn grouped(n: u64) -> String {
     out
 }
 
+/// Blocks as a wait, at Wownero's five minutes a block: "about 20 minutes",
+/// "about 3 hours", "about 2 days".
+pub fn blocks_as_time(blocks: u64) -> String {
+    let minutes = blocks.saturating_mul(5);
+    if minutes < 90 {
+        format!("about {minutes} minutes")
+    } else if minutes < 36 * 60 {
+        format!("about {} hours", (minutes + 30) / 60)
+    } else {
+        format!("about {} days", (minutes + 12 * 60) / (24 * 60))
+    }
+}
+
 /// `YYYY-MM-DD HH:MM` in UTC, or an empty string for no time.
 pub fn timestamp(ts: u64) -> String {
     if ts < 1_234_567_890 {
