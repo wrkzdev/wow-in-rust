@@ -1,9 +1,12 @@
 //! A minimal HTTP/1.1 client.
 //!
 //! The mirror of `bin/wownerod/src/rpc/http.rs`, and deliberately the same
-//! shape: `POST` with a `Content-Length` body, no chunked encoding, no
-//! keep-alive, no TLS. `specs/11` §1.2 allows deferring TLS to a reverse proxy
-//! and this does.
+//! shape: `POST` with a `Content-Length` body, no keep-alive, no TLS.
+//! `specs/11` §1.2 allows deferring TLS to a reverse proxy and this does.
+//!
+//! A reply may come back chunked, though. A daemon never sends one, but the
+//! reverse proxy that §1.2 puts in front of it may: nginx and Cloudflare both
+//! re-frame a node's replies as chunks.
 //!
 //! # The daemon is not trusted either
 //!
@@ -247,7 +250,7 @@ impl Endpoint {
     }
 }
 
-fn read_response(stream: TcpStream, path: &str) -> Result<Vec<u8>, HttpError> {
+fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
     let mut reader = BufReader::new(stream);
 
     // Status line.
@@ -293,13 +296,9 @@ fn read_response(stream: TcpStream, path: &str) -> Result<Vec<u8>, HttpError> {
         content_length.map_or_else(|| "absent".to_string(), |l| l.to_string())
     );
 
-    if chunked {
-        // The reference daemon never sends chunked for these endpoints. Say so
-        // rather than half-implementing it.
-        return Err(HttpError::Malformed("chunked transfer encoding"));
-    }
-
+    // Chunked wins over any `Content-Length` alongside it (RFC 9112 §6.3).
     let body = match content_length {
+        _ if chunked => read_chunked(&mut reader)?,
         Some(len) => {
             let mut buf = vec![0u8; len];
             let mut got = 0;
@@ -338,8 +337,8 @@ fn read_response(stream: TcpStream, path: &str) -> Result<Vec<u8>, HttpError> {
     Ok(body)
 }
 
-fn read_line(
-    reader: &mut BufReader<TcpStream>,
+fn read_line<S: Read>(
+    reader: &mut BufReader<S>,
     line: &mut String,
     seen: &mut usize,
 ) -> Result<(), HttpError> {
@@ -353,6 +352,64 @@ fn read_line(
         return Err(HttpError::HeadersTooLarge);
     }
     Ok(())
+}
+
+/// A chunked body (RFC 9112 §7.1): chunks, each a hex size line and that many
+/// bytes, then a zero-size chunk and any trailers.
+///
+/// Held to [`MAX_RESPONSE_BYTES`] in total, checked before each chunk is
+/// allocated, so a size line cannot ask for more than a `Content-Length` can.
+fn read_chunked<S: Read>(reader: &mut BufReader<S>) -> Result<Vec<u8>, HttpError> {
+    let mut body = Vec::new();
+    let mut line = String::new();
+    loop {
+        // Each size line is capped on its own, as a header block is.
+        let mut seen = 0;
+        read_line(reader, &mut line, &mut seen)?;
+        // A size may carry `;name=value` extensions, which mean nothing here.
+        let size_text = line.trim_end().split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|_| HttpError::Malformed("a chunk size is not hex"))?;
+        if size == 0 {
+            break;
+        }
+        let start = body.len();
+        let end = start
+            .checked_add(size)
+            .filter(|end| *end <= MAX_RESPONSE_BYTES)
+            .ok_or(HttpError::BodyTooLarge {
+                len: start.saturating_add(size),
+            })?;
+        body.resize(end, 0);
+        let mut got = start;
+        while got < end {
+            match reader.read(&mut body[got..end]) {
+                Ok(0) => {
+                    return Err(HttpError::Truncated {
+                        got,
+                        expected: end,
+                    })
+                }
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // The line break that closes the chunk's data.
+        let mut seen = 0;
+        read_line(reader, &mut line, &mut seen)?;
+        if !line.trim_end().is_empty() {
+            return Err(HttpError::Malformed("a chunk is longer than its size"));
+        }
+    }
+    // Trailers, if any, and the empty line that ends the message.
+    let mut seen = 0;
+    loop {
+        read_line(reader, &mut line, &mut seen)?;
+        if line.trim_end().is_empty() {
+            return Ok(body);
+        }
+    }
 }
 
 fn parse_status(line: &str) -> Result<u16, HttpError> {
@@ -417,9 +474,9 @@ mod tests {
         assert!(text.contains("host:port"), "{text}");
     }
 
-    /// A body cut short says how much of it arrived.
-    #[test]
-    fn a_body_cut_short_says_how_much_arrived() {
+    /// Answer one request with `reply`, as it is, and close. Returns the
+    /// server's address and its thread.
+    fn answer_once(reply: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("an address").to_string();
         let server = std::thread::spawn(move || {
@@ -435,19 +492,67 @@ mod tests {
                 }
                 request.extend_from_slice(&chunk[..n]);
             }
-            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
-                .expect("write");
+            s.write_all(reply).expect("write");
         });
+        (address, server)
+    }
 
-        let e = Endpoint::new(address)
-            .post("/get_blocks.bin", "application/octet-stream", b"")
-            .expect_err("cut short");
+    fn post_to(reply: &'static [u8]) -> Result<Vec<u8>, HttpError> {
+        let (address, server) = answer_once(reply);
+        let result = Endpoint::new(address).post("/get_info", "application/json", b"{}");
         server.join().expect("the server");
+        result
+    }
+
+    /// A body cut short says how much of it arrived.
+    #[test]
+    fn a_body_cut_short_says_how_much_arrived() {
+        let e = post_to(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc").expect_err("cut short");
         assert!(
             matches!(e, HttpError::Truncated { got: 3, expected: 10 }),
             "{e}"
         );
         assert!(e.to_string().contains("3 of 10"), "{e}");
+    }
+
+    /// A reply a proxy re-framed as chunks reads as the body it carries:
+    /// extensions ignored, trailers skipped, and the chunks winning over a
+    /// `Content-Length` sent alongside them.
+    #[test]
+    fn a_chunked_reply_is_read_whole() {
+        let body = post_to(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n\
+              4\r\nWiki\r\n5;name=value\r\npedia\r\nA\r\n in chunks\r\n0\r\nX-Trailer: 1\r\n\r\n",
+        )
+        .expect("read");
+        assert_eq!(body, b"Wikipedia in chunks");
+    }
+
+    /// A chunk size past the cap is refused before anything is allocated.
+    #[test]
+    fn a_chunk_past_the_cap_is_refused() {
+        let e = post_to(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFF\r\nab")
+            .expect_err("too large");
+        assert!(matches!(e, HttpError::BodyTooLarge { .. }), "{e}");
+    }
+
+    /// A chunk cut short, and a size that is not hex, are errors that say so.
+    #[test]
+    fn a_broken_chunk_is_an_error() {
+        let e = post_to(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nabc")
+            .expect_err("cut short");
+        assert!(
+            matches!(e, HttpError::Truncated { got: 3, expected: 6 }),
+            "{e}"
+        );
+
+        let e = post_to(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nxyz\r\nabc\r\n0\r\n\r\n")
+            .expect_err("not hex");
+        assert!(matches!(e, HttpError::Malformed(_)), "{e}");
+
+        let e = post_to(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nabc\r\n0\r\n\r\n")
+            .expect_err("longer than its size");
+        assert!(matches!(e, HttpError::Malformed(_)), "{e}");
     }
 
     /// The response cap clears a realistic full batch by a wide margin.
