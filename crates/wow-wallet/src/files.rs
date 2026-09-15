@@ -330,6 +330,74 @@ impl Session {
         ))
     }
 
+    /// Keep the wallet under a new password from now on: the keys file and
+    /// the cache are written again under it at once, as `change_password`
+    /// does.
+    ///
+    /// The two are written one after the other, so if the second fails the
+    /// first is put back under the old password: keys and cache under
+    /// different passwords would leave a wallet that does not open.
+    pub fn change_password(&mut self, new: String) -> Result<(), String> {
+        let mut rng = crate::entropy::seeded_rng()?;
+        let serialize = |password: &str, rng: &mut wow_crypto::random::Rng| {
+            self.keys_file
+                .to_blob(
+                    password.as_bytes(),
+                    self.kdf_rounds,
+                    random_iv(rng),
+                    random_iv(rng),
+                )
+                .map_err(|e| format!("cannot serialize the wallet: {e}"))
+        };
+        let keys = serialize(&new, &mut rng)?;
+        let old_keys = serialize(&self.password, &mut rng)?;
+        let cache_key = KeysFile::cache_key(new.as_bytes(), self.kdf_rounds);
+        let sealed = cache::seal(&cache::store(&self.state), &cache_key, random_iv(&mut rng));
+
+        self.store.write_keys(&keys)?;
+        if let Err(e) = self.store.write_cache(&sealed) {
+            return Err(match self.store.write_keys(&old_keys) {
+                Ok(()) => format!("the password was not changed: {e}"),
+                Err(again) => format!(
+                    "the keys file is under the new password but the cache could not be \
+                     written ({e}), and the keys file could not be put back ({again}); open \
+                     the wallet with the new password, and it will scan again"
+                ),
+            });
+        }
+        self.password = new;
+        self.cache_key = cache_key;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// This wallet as a view-only keys file under `password`: the address and
+    /// the view key, and no spend key, so a copy of it sees what is paid in
+    /// and can spend nothing. The rest of its settings come with it: the
+    /// network and the restore height.
+    pub fn view_only_keys(&self, password: &str) -> Result<Vec<u8>, String> {
+        let mut account = self.keys_file.account.clone();
+        account.forget_spend_key();
+        let mut keys_file = KeysFile {
+            account,
+            settings: self.keys_file.settings.clone(),
+        };
+        keys_file
+            .settings
+            .insert("watch_only".into(), serde_json::Value::from(1u64));
+        let mut rng = crate::entropy::seeded_rng()?;
+        let (iv, key_iv) = (random_iv(&mut rng), random_iv(&mut rng));
+        keys_file
+            .to_blob(password.as_bytes(), self.kdf_rounds, iv, key_iv)
+            .map_err(|e| format!("cannot serialize the view-only wallet: {e}"))
+    }
+
+    /// The secret view key, in hex: what lets its holder see every payment to
+    /// this wallet, and spend none of it.
+    pub fn view_key_hex(&self) -> String {
+        wow_crypto::hex::encode(&self.keys_file.account.keys.view_secret_key.0)
+    }
+
     /// Balance and unlocked balance, as a pair.
     pub fn balances(&self) -> (u64, u64) {
         let height = self.chain_height();
@@ -988,6 +1056,66 @@ mod tests {
 
         drop(s);
         reopen().expect("free once the first is closed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new password opens the wallet and the old one no longer does, and the
+    /// cache comes back under the new one.
+    #[test]
+    fn a_changed_password_opens_the_wallet_and_the_old_one_does_not() {
+        let spend = wow_crypto::types::SecretKey(wow_crypto::ops::sc_reduce32(&[3u8; 32]));
+        let account = crate::account::AccountBase::from_spend_key(spend, 0).expect("keys");
+        let kept = MemoryStore::new("browser");
+        let mut s = Session::create_in(
+            Box::new(kept.clone()),
+            Network::Mainnet,
+            "old".into(),
+            1,
+            account,
+            "English",
+            5,
+        )
+        .expect("create");
+        s.state.hashes.push([9u8; 32]);
+        s.change_password("new".into()).expect("changed");
+        assert_eq!(s.password, "new");
+
+        let files = kept.files();
+        let open = |password: &str| {
+            let store = MemoryStore::holding(
+                "browser",
+                files.keys.clone().expect("a keys file"),
+                files.cache.clone(),
+            );
+            Session::open_in(Box::new(store), password.into(), 1, None)
+        };
+        assert!(open("old").is_err(), "the old password no longer opens it");
+        let back = open("new").expect("the new one does");
+        assert_eq!(back.primary_address(), s.primary_address());
+        assert_eq!(back.state.hashes, s.state.hashes, "and the cache came with it");
+    }
+
+    /// A view-only copy has the wallet's address and view key and no spend
+    /// key: it opens as view-only, with no seed phrase to show.
+    #[test]
+    fn a_view_only_copy_watches_and_cannot_spend() {
+        let dir = scratch("viewonly");
+        let s = fresh_session(&dir, 42);
+        let blob = s.view_only_keys("watch").expect("a view-only keys file");
+        let copy = Session::open_in(
+            Box::new(MemoryStore::holding("copy", blob, None)),
+            "watch".into(),
+            1,
+            None,
+        )
+        .expect("it opens");
+        assert!(copy.is_view_only());
+        assert!(!s.is_view_only());
+        assert_eq!(copy.primary_address(), s.primary_address());
+        assert_eq!(copy.keys_file.refresh_height(), 42);
+        assert_eq!(copy.view_key_hex(), s.view_key_hex());
+        assert!(copy.seed("English").is_err(), "no seed without a spend key");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

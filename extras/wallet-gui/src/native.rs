@@ -269,9 +269,53 @@ impl Host for NativeHost {
         false
     }
 
-    fn download(&mut self, _name: &str, _bytes: &[u8]) {}
+    /// Save where the person says, in the system's own save dialog.
+    fn download(&mut self, name: &str, bytes: &[u8]) {
+        let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() else {
+            return;
+        };
+        self.local.push(match std::fs::write(&path, bytes) {
+            Ok(()) => Event::Notice(format!("Saved {}.", path.display())),
+            Err(e) => Event::Error(format!("{} could not be written: {e}", path.display())),
+        });
+    }
 
     fn pick_file(&mut self, _purpose: Pick) {}
+
+    fn utc_offset(&self, timestamp: u64) -> i64 {
+        use chrono::{Offset, TimeZone};
+        chrono::Local
+            .timestamp_opt(timestamp as i64, 0)
+            .single()
+            .map_or(0, |t| i64::from(t.offset().fix().local_minus_utc()))
+    }
+
+    fn pick_folder(&mut self, start: &str) -> Option<String> {
+        let mut dialog = rfd::FileDialog::new();
+        if !start.trim().is_empty() {
+            dialog = dialog.set_directory(start.trim());
+        }
+        dialog.pick_folder().map(|p| p.display().to_string())
+    }
+
+    /// Files on a disk stay where they are put.
+    fn storage_persisted(&self) -> Option<bool> {
+        None
+    }
+
+    /// The folder, in the system's own file manager.
+    fn open_folder(&mut self, path: &str) {
+        #[cfg(windows)]
+        let program = "explorer";
+        #[cfg(target_os = "macos")]
+        let program = "open";
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let program = "xdg-open";
+        if let Err(e) = std::process::Command::new(program).arg(path).spawn() {
+            self.local
+                .push(Event::Error(format!("{path} could not be opened: {e}")));
+        }
+    }
 
     fn fetch_nodes(&mut self, url: &str) {
         let events = self.events_out.clone();

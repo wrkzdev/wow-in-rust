@@ -227,6 +227,48 @@ impl<P: Platform> Backend<P> {
                 self.send(Event::HeightOn { date, height });
                 Ok(())
             }
+            Command::ShowViewKey { password } => {
+                let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
+                if password != w.session.password {
+                    return Err("that is not this wallet's password".into());
+                }
+                let key = w.session.view_key_hex();
+                self.send(Event::ViewKey(key));
+                Ok(())
+            }
+            Command::ChangePassword { old, new } => {
+                match &self.wallet {
+                    None => return Err(NO_WALLET.into()),
+                    Some(w) if old != w.session.password => {
+                        return Err("that is not this wallet's password".into())
+                    }
+                    Some(_) => {}
+                }
+                // Two CryptoNight hashes, one for each file's key: a moment.
+                self.working("Changing the password…");
+                let w = self.wallet.as_mut().ok_or(NO_WALLET)?;
+                w.session.change_password(new)?;
+                let name = w.name.clone();
+                self.platform.saved(&name);
+                self.send(Event::PasswordChanged);
+                Ok(())
+            }
+            Command::ExportViewOnly {
+                password,
+                copy_password,
+            } => {
+                let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
+                if password != w.session.password {
+                    return Err("that is not this wallet's password".into());
+                }
+                let keys = w.session.view_only_keys(&copy_password)?;
+                let name = w.name.clone();
+                self.send(Event::ViewOnlyExported {
+                    name,
+                    keys: Bytes(keys),
+                });
+                Ok(())
+            }
             Command::Refresh => {
                 let w = self.wallet.as_mut().ok_or(NO_WALLET)?;
                 if w.session.daemon.is_none() {
@@ -983,6 +1025,13 @@ impl<P: Platform> Backend<P> {
                 timestamp: e.timestamp,
                 amount: e.amount,
                 fee: e.fee,
+                destinations: e
+                    .destinations
+                    .iter()
+                    .map(|d| (d.address.clone(), d.amount))
+                    .collect(),
+                payment_id: e.payment_id.map(|p| wow_crypto::hex::encode(&p)),
+                minors: e.minors.clone(),
             })
             .collect();
         self.send(Event::History(rows));

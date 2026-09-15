@@ -26,3 +26,14 @@ egui = "0.31"
 eframe = { version = "0.31", features = ["persistence"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# An address as a QR code, drawn as rectangles: no image crates.
+qrcodegen = "1.8"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Times in the history as the local clock reads them, from the system's time
+# zone. A browser gives its own.
+chrono = { version = "0.4.38", default-features = false, features = ["clock", "std"] }
+# Choosing the wallets folder, and where a saved file goes. On Linux through
+# the XDG desktop portal, over D-Bus, with no GTK or Wayland library to link,
+# so a cross-build still needs no system packages.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }

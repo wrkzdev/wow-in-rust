@@ -50,14 +50,27 @@ window.wowPage = {
   isSecure() {
     return location.protocol === 'https:';
   },
+
+  // Whether the browser promised to keep this site's storage: undefined until
+  // it has answered.
+  persisted: undefined,
+
+  storagePersisted() {
+    return window.wowPage.persisted;
+  },
 };
 
 const status = document.getElementById('status');
 try {
   // Ask the browser not to clear this site's storage, where the wallets are,
-  // when space runs low. It may still say no; exported files are the backup.
+  // when space runs low. It may still say no: exported files are the backup,
+  // and the wallet says so when it did.
   if (navigator.storage && navigator.storage.persist) {
-    navigator.storage.persist().catch(() => {});
+    navigator.storage.persist()
+      .then((granted) => { window.wowPage.persisted = granted; })
+      .catch(() => { window.wowPage.persisted = false; });
+  } else {
+    window.wowPage.persisted = false;
   }
 
   await init();

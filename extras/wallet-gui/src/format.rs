@@ -173,9 +173,41 @@ pub fn height_on(date: u64, chain: u64, now: u64) -> u64 {
     chain.saturating_sub(back).saturating_sub(A_DAY)
 }
 
+/// `YYYY-MM-DD HH:MM` in a time zone `offset` seconds east of UTC, or an
+/// empty string for no time.
+pub fn timestamp_in(ts: u64, offset: i64) -> String {
+    if ts < 1_234_567_890 {
+        return String::new();
+    }
+    timestamp(ts.saturating_add_signed(offset))
+}
+
+/// A field of a CSV file: quoted when it holds a comma, a quote or a line
+/// break, with its quotes doubled.
+pub fn csv_field(text: &str) -> String {
+    if text.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_times_and_csv_fields() {
+        let ts = 1_789_000_000;
+        assert_eq!(timestamp_in(ts, 0), timestamp(ts));
+        assert_eq!(timestamp_in(ts, 3_600), timestamp(ts + 3_600));
+        assert_eq!(timestamp_in(ts, -3_600), timestamp(ts - 3_600));
+        assert_eq!(timestamp_in(0, 3_600), "");
+
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
 
     #[test]
     fn dates_are_read_as_days_in_utc() {

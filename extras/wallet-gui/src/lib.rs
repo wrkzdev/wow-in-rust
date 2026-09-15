@@ -14,6 +14,7 @@ pub mod backend;
 pub mod format;
 pub mod nodes;
 pub mod protocol;
+pub mod qr;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;

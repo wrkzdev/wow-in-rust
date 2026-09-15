@@ -93,6 +93,18 @@ pub enum Command {
     /// Forget the transaction last prepared.
     DiscardSend,
     ShowSeed { password: String },
+    /// The secret view key, answered by [`Event::ViewKey`].
+    ShowViewKey { password: String },
+    /// Keep the open wallet under `new` from now on; `old` must be its
+    /// password now. Answered by [`Event::PasswordChanged`].
+    ChangePassword { old: String, new: String },
+    /// A view-only keys file of the open wallet under `copy_password`,
+    /// answered by [`Event::ViewOnlyExported`]. `password` must be the
+    /// wallet's.
+    ExportViewOnly {
+        password: String,
+        copy_password: String,
+    },
     /// The subaddress at this index of the first account.
     Subaddress(u32),
     /// Keep a wallet's files, as exported from here or written by another
@@ -200,6 +212,15 @@ pub enum Event {
     /// asked.
     HeightOn { date: u64, height: u64 },
     Seed(String),
+    /// The open wallet's secret view key, in hex.
+    ViewKey(String),
+    /// The open wallet is under the new password now.
+    PasswordChanged,
+    /// A view-only keys file of the wallet named `name`.
+    ViewOnlyExported {
+        name: String,
+        keys: Bytes,
+    },
     Subaddress {
         index: u32,
         address: String,
@@ -285,6 +306,12 @@ pub struct Row {
     pub amount: u64,
     pub fee: u64,
     pub unlocked: bool,
+    /// Sent: where it went, and how much, as this wallet wrote them down.
+    pub destinations: Vec<(String, u64)>,
+    /// The payment ID it carried, in hex.
+    pub payment_id: Option<String>,
+    /// Received: the subaddress it came in on. Sent: those it spent from.
+    pub minors: Vec<u32>,
 }
 
 /// What a node said when tested.

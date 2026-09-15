@@ -97,7 +97,33 @@ struct WebHost {
     inbox: Rc<RefCell<Inbox>>,
 }
 
+#[wasm_bindgen]
+extern "C" {
+    // `window.wowPage.storagePersisted`, in static/app.js: `undefined` until
+    // the browser has answered.
+    #[wasm_bindgen(js_namespace = wowPage, js_name = storagePersisted)]
+    fn page_storage_persisted() -> Option<bool>;
+}
+
 impl Host for WebHost {
+    fn utc_offset(&self, timestamp: u64) -> i64 {
+        // `getTimezoneOffset` is minutes behind UTC: -60 in UTC+1.
+        let date = js_sys::Date::new(&JsValue::from_f64(timestamp as f64 * 1_000.0));
+        -(date.get_timezone_offset() as i64) * 60
+    }
+
+    /// A browser keeps wallets in its own storage, not in a folder.
+    fn pick_folder(&mut self, _start: &str) -> Option<String> {
+        None
+    }
+
+    fn storage_persisted(&self) -> Option<bool> {
+        page_storage_persisted()
+    }
+
+    /// A browser keeps wallets in its own storage, with no folder to open.
+    fn open_folder(&mut self, _path: &str) {}
+
     fn send(&mut self, command: Command) {
         let json = match serde_json::to_string(&command) {
             Ok(json) => json,

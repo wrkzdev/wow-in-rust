@@ -3,7 +3,7 @@
 //! It holds no wallet. It sends [`Command`]s through its [`Host`] and draws
 //! what the [`Event`]s that come back say.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use egui::{
@@ -29,6 +29,9 @@ pub const DISCLAIMER: &str = "This wallet is very new software. It has not been 
 
 /// Seconds a notice stays up. Errors stay until dismissed.
 const NOTICE_SECS: f64 = 12.0;
+
+/// Seconds a Copy button says Copied.
+const COPIED_SECS: f64 = 2.0;
 
 /// The wallet watches subaddresses up to its lookahead, 200 by default.
 const MAX_SUBADDRESS: u32 = 199;
@@ -77,12 +80,24 @@ pub trait Host {
     fn in_browser(&self) -> bool;
     /// Whether a browser loaded the wallet over https.
     fn secure_page(&self) -> bool;
-    /// Offer bytes as a file to save. The browser only.
+    /// Offer bytes as a file to save: a download in a browser, the save
+    /// dialog on the desktop.
     fn download(&mut self, name: &str, bytes: &[u8]);
     /// Ask for a file, which arrives as [`Event::Picked`]. The browser only.
     fn pick_file(&mut self, purpose: Pick);
     /// Fetch the public node list, which arrives as [`Event::NodeList`].
     fn fetch_nodes(&mut self, url: &str);
+    /// Seconds east of UTC where the wallet runs, at `timestamp`: for times
+    /// as the local clock reads them.
+    fn utc_offset(&self, timestamp: u64) -> i64;
+    /// Ask for a folder, starting at `start`; `None` when none was chosen.
+    /// The desktop only.
+    fn pick_folder(&mut self, start: &str) -> Option<String>;
+    /// Show a folder in the system's file manager. The desktop only.
+    fn open_folder(&mut self, path: &str);
+    /// Whether the browser promised to keep this site's storage: `None`
+    /// where that is not a question, or while it has not answered.
+    fn storage_persisted(&self) -> Option<bool>;
 }
 
 /// Light or dark, or as the system is.
@@ -134,6 +149,18 @@ pub struct Settings {
     pub log_level: Option<u8>,
     /// Write the log to a file as well. The desktop only.
     pub log_to_file: bool,
+    /// Show the balance as dots until it is asked for.
+    pub hide_balance: bool,
+    /// Close an open wallet after this many minutes with nothing done; 0 for
+    /// never.
+    pub idle_minutes: u32,
+    /// Times in the history in UTC rather than as the local clock reads them.
+    pub history_utc: bool,
+    /// Labels given to subaddresses, by wallet and index. Kept with these
+    /// settings, not in the wallet's files.
+    pub labels: BTreeMap<String, BTreeMap<u32, String>>,
+    /// Wallets whose files have been exported from this browser.
+    pub exported: Vec<String>,
 }
 
 impl Default for Settings {
@@ -151,6 +178,11 @@ impl Default for Settings {
             // Warnings and errors, kept in memory for the Logs section.
             log_level: Some(0),
             log_to_file: false,
+            hide_balance: false,
+            idle_minutes: 0,
+            history_utc: false,
+            labels: BTreeMap::new(),
+            exported: Vec::new(),
         }
     }
 }
@@ -199,6 +231,9 @@ pub struct WalletApp {
     start_error: Option<String>,
     wallet_error: Option<String>,
     log: LogView,
+    /// egui's clock when someone last did something, for closing a wallet
+    /// left alone.
+    last_activity: f64,
 }
 
 struct Message {
@@ -282,8 +317,20 @@ enum SettingsTab {
     #[default]
     Node,
     Appearance,
+    Privacy,
     Logs,
     About,
+}
+
+/// Which transfers the history shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HistoryFilter {
+    #[default]
+    All,
+    Received,
+    Sent,
+    /// Not in a block yet.
+    Pending,
 }
 
 struct WalletView {
@@ -310,6 +357,20 @@ struct WalletView {
     rescan_keep: bool,
     /// Scan again was pressed, and waits for a yes.
     rescan_asked: bool,
+    /// The balance, shown for now though the settings hide it.
+    balance_shown: bool,
+    history_filter: HistoryFilter,
+    /// The transfer whose details are open, by transaction ID.
+    selected_tx: Option<String>,
+    view_key: Option<String>,
+    view_key_password: String,
+    old_password: String,
+    new_password: String,
+    new_password_again: String,
+    /// A view-only copy: this wallet's password, and the copy's.
+    copy_wallet_password: String,
+    copy_password: String,
+    copy_password_again: String,
 }
 
 impl WalletView {
@@ -337,6 +398,17 @@ impl WalletView {
             rescan_date: String::new(),
             rescan_keep: false,
             rescan_asked: false,
+            balance_shown: false,
+            history_filter: HistoryFilter::All,
+            selected_tx: None,
+            view_key: None,
+            view_key_password: String::new(),
+            old_password: String::new(),
+            new_password: String::new(),
+            new_password_again: String::new(),
+            copy_wallet_password: String::new(),
+            copy_password: String::new(),
+            copy_password_again: String::new(),
         }
     }
 }
@@ -425,9 +497,7 @@ fn logs_settings(
             host.send(Command::ReadLog);
         }
         copy = ui.button("Copy").clicked();
-        if in_browser {
-            download = ui.button("Download").clicked();
-        }
+        download = ui.button("Save").clicked();
         if ui.button("Clear").clicked() {
             host.send(Command::ClearLog);
         }
@@ -518,6 +588,7 @@ impl WalletApp {
             start_error: None,
             wallet_error: None,
             log: LogView::default(),
+            last_activity: 0.0,
         }
     }
 
@@ -579,6 +650,38 @@ impl WalletApp {
         ctx.set_zoom_factor(self.settings.text_scale);
     }
 
+    /// Close an open wallet nobody has touched for as long as the settings
+    /// allow.
+    fn close_when_idle(&mut self, ctx: &egui::Context) {
+        let active = ctx.input(|i| {
+            !i.events.is_empty() || i.pointer.is_moving() || i.pointer.any_down()
+        });
+        if active || self.wallet.is_none() || self.working.is_some() {
+            self.last_activity = self.now;
+            return;
+        }
+        let minutes = self.settings.idle_minutes;
+        if minutes == 0 {
+            return;
+        }
+        // Frames come only with input or news, so ask for one to notice the
+        // time passing.
+        ctx.request_repaint_after(Duration::from_secs(20));
+        if self.now - self.last_activity < f64::from(minutes) * 60.0 {
+            return;
+        }
+        self.last_activity = self.now;
+        let name = self
+            .wallet
+            .as_ref()
+            .map(|w| w.summary.name.clone())
+            .unwrap_or_default();
+        self.host.send(Command::Close);
+        self.notice(format!(
+            "Closed {name}, left alone for {minutes} minutes. It opens again with its password."
+        ));
+    }
+
     fn on_event(&mut self, event: Event) {
         match event {
             Event::Ready => self.ready = true,
@@ -606,6 +709,7 @@ impl WalletApp {
                     &mut form.passphrase,
                     &mut form.name,
                     &mut form.height,
+                    &mut form.date,
                 ] {
                     field.clear();
                 }
@@ -615,6 +719,7 @@ impl WalletApp {
                 if self.settings_tab == SettingsTab::Node {
                     self.settings_tab = SettingsTab::Wallet;
                 }
+                self.last_activity = self.now;
                 self.wallet = Some(WalletView::new(summary));
             }
             Event::NewSeed(seed) => {
@@ -697,6 +802,29 @@ impl WalletApp {
                     w.seed = Some(seed);
                 }
             }
+            Event::ViewKey(key) => {
+                self.awaiting = None;
+                if let Some(w) = &mut self.wallet {
+                    w.view_key = Some(key);
+                }
+            }
+            Event::PasswordChanged => {
+                self.awaiting = None;
+                if let Some(w) = &mut self.wallet {
+                    w.new_password.clear();
+                    w.new_password_again.clear();
+                }
+                self.notice("The password is changed: the wallet's files are under the new one.");
+            }
+            Event::ViewOnlyExported { name, keys } => {
+                self.awaiting = None;
+                self.host
+                    .download(&format!("{name}-view-only.keys"), &keys.0);
+                self.notice(format!(
+                    "A view-only copy of {name}: it opens with the copy's password, sees what is \
+                     paid in, and cannot spend."
+                ));
+            }
             Event::Subaddress { index, address } => {
                 if let Some(w) = &mut self.wallet {
                     w.subaddress = Some((index, address));
@@ -707,6 +835,9 @@ impl WalletApp {
                 self.host.download(&format!("{name}.keys"), &keys.0);
                 if let Some(cache) = cache {
                     self.host.download(&format!("{name}.rscache"), &cache.0);
+                }
+                if !self.settings.exported.contains(&name) {
+                    self.settings.exported.push(name.clone());
                 }
                 self.notice(format!(
                     "Exported {name}. The keys file is only as safe as its password."
@@ -873,23 +1004,23 @@ impl WalletApp {
         };
         let host = &mut *self.host;
         match page {
-            Page::Overview => overview(ui, w, host, &mut self.settings_tab),
+            Page::Overview => overview(ui, w, host, &self.settings, &mut self.settings_tab),
             Page::Send => send_page(ui, w, host),
-            Page::Receive => receive_page(ui, w, host),
-            Page::History => {
-                ui.heading("History");
-                if w.history.is_empty() {
-                    ui.label("No transfers yet.");
-                } else {
-                    history_grid(ui, &w.history, "history");
-                }
+            Page::Receive => {
+                let labels = self
+                    .settings
+                    .labels
+                    .entry(w.summary.name.clone())
+                    .or_default();
+                receive_page(ui, w, host, labels);
             }
+            Page::History => history_page(ui, w, host, &mut self.settings),
             Page::Settings => {}
         }
     }
 
     /// Settings, with a wallet open or not: that wallet's, the node, how the
-    /// interface looks, and what this is.
+    /// interface looks, privacy, the log, and what this is.
     fn settings_page(&mut self, ui: &mut Ui) {
         let in_browser = self.host.in_browser();
         let secure = self.host.secure_page();
@@ -906,6 +1037,7 @@ impl WalletApp {
             tabs.extend([
                 (SettingsTab::Node, "Node"),
                 (SettingsTab::Appearance, "Appearance"),
+                (SettingsTab::Privacy, "Privacy"),
                 (SettingsTab::Logs, "Logs"),
                 (SettingsTab::About, "About"),
             ]);
@@ -966,6 +1098,7 @@ impl WalletApp {
                 node_picker(ui, &mut self.nodes, &mut self.settings, &mut *self.host, cx);
             }
             SettingsTab::Appearance => appearance(ui, &mut self.settings, in_browser),
+            SettingsTab::Privacy => privacy(ui, &mut self.settings),
             SettingsTab::About => about(ui),
         }
     }
@@ -1019,16 +1152,36 @@ impl WalletApp {
 
     fn open_tab(&mut self, ui: &mut Ui, in_browser: bool) {
         let mut use_folder = false;
+        let mut choose = false;
+        let mut show = false;
         if !in_browser {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Folder");
                 ui.add(
                     TextEdit::singleline(&mut self.start.folder)
                         .hint_text(self.location.as_str())
                         .desired_width(360.0),
                 );
+                choose = ui.button("Choose…").clicked();
                 use_folder = ui.button("Use").clicked();
+                show = ui
+                    .button("Open")
+                    .on_hover_text("Show the folder in the file manager")
+                    .clicked();
             });
+        }
+        let folder_now = match self.start.folder.trim() {
+            "" => self.location.clone(),
+            typed => typed.to_string(),
+        };
+        if choose {
+            if let Some(path) = self.host.pick_folder(&folder_now) {
+                self.start.folder = path;
+                use_folder = true;
+            }
+        }
+        if show {
+            self.host.open_folder(&folder_now);
         }
         if use_folder {
             self.settings.folder = self.start.folder.trim().to_string();
@@ -1407,6 +1560,8 @@ impl WalletApp {
             match answer {
                 Some(true) => {
                     self.forget = None;
+                    self.settings.labels.remove(&name);
+                    self.settings.exported.retain(|n| n != &name);
                     self.send_from(Place::Start, Command::Forget(name));
                 }
                 Some(false) => self.forget = None,
@@ -1511,6 +1666,7 @@ impl eframe::App for WalletApp {
         for event in self.host.receive() {
             self.on_event(event);
         }
+        self.close_when_idle(ctx);
         let now = self.now;
         self.messages.retain(|m| m.error || now - m.at < NOTICE_SECS);
         let narrow = ctx.screen_rect().width() < NARROW;
@@ -1571,17 +1727,57 @@ impl eframe::App for WalletApp {
     }
 }
 
-fn overview(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host, tab: &mut SettingsTab) {
+fn overview(
+    ui: &mut Ui,
+    w: &mut WalletView,
+    host: &mut dyn Host,
+    settings: &Settings,
+    tab: &mut SettingsTab,
+) {
     let t = tones(ui);
     let weak = ui.visuals().weak_text_color();
+    // What a browser can lose along with its storage.
+    if host.in_browser() {
+        if !settings.exported.contains(&w.summary.name) {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    t.warn,
+                    "This wallet's files have not been exported from this browser yet. The \
+                     browser can clear what a site stores, so keep a copy, and the seed phrase.",
+                );
+                if ui.small_button("Export now").clicked() {
+                    host.send(Command::Export(w.summary.name.clone()));
+                }
+            });
+        }
+        if host.storage_persisted() == Some(false) {
+            ui.colored_label(
+                t.warn,
+                "This browser has not promised to keep this site's storage, and may clear it when \
+                 space runs low.",
+            );
+        }
+    }
+
     ui.add_space(8.0);
     ui.label(RichText::new("Balance").color(weak));
-    ui.label(
-        RichText::new(format!("{} WOW", format::amount_short(w.status.balance)))
-            .size(34.0)
-            .strong(),
-    );
-    if w.status.unlocked != w.status.balance {
+    let hidden = settings.hide_balance && !w.balance_shown;
+    ui.horizontal(|ui| {
+        let text = if hidden {
+            "••••• WOW".to_string()
+        } else {
+            format!("{} WOW", format::amount_short(w.status.balance))
+        };
+        ui.label(RichText::new(text).size(34.0).strong());
+        if settings.hide_balance
+            && ui
+                .small_button(if w.balance_shown { "Hide" } else { "Show" })
+                .clicked()
+        {
+            w.balance_shown = !w.balance_shown;
+        }
+    });
+    if !hidden && w.status.unlocked != w.status.balance {
         ui.label(format!(
             "{} WOW can be spent now.",
             format::amount_short(w.status.unlocked)
@@ -1618,7 +1814,19 @@ fn overview(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host, tab: &mut Sett
     if w.history.is_empty() {
         ui.label("Nothing yet.");
     } else {
-        history_grid(ui, &w.history[..w.history.len().min(5)], "recent");
+        let recent: Vec<&Row> = w.history.iter().take(5).collect();
+        let chosen = history_grid(
+            ui,
+            &recent,
+            "recent",
+            &*host,
+            settings.history_utc,
+            w.status.chain,
+        );
+        if let Some(txid) = chosen {
+            w.selected_tx = Some(txid);
+            w.page = Page::History;
+        }
     }
 }
 
@@ -1866,7 +2074,10 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     if let Some(txid) = &w.sent {
         ui.add_space(12.0);
         ui.label("Sent. Its transaction ID:");
-        address_box(ui, txid);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(txid.as_str()).monospace());
+            copy_button(ui, txid);
+        });
     }
     let mut dismiss = false;
     if let Some(reasons) = &w.rejected {
@@ -1882,19 +2093,35 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     }
 }
 
-fn receive_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
+fn receive_page(
+    ui: &mut Ui,
+    w: &mut WalletView,
+    host: &mut dyn Host,
+    labels: &mut BTreeMap<u32, String>,
+) {
+    let t = tones(ui);
+    let weak = ui.visuals().weak_text_color();
     ui.heading("Receive");
     ui.label("Primary address");
     address_box(ui, &w.summary.address);
     ui.add_space(16.0);
     ui.label("A subaddress gives each payer an address of their own. All of them pay into this wallet.");
-    ui.horizontal(|ui| {
+
+    // The subaddresses already paid, as the history shows them.
+    let paid: BTreeSet<u32> = w
+        .history
+        .iter()
+        .filter(|r| r.incoming)
+        .flat_map(|r| r.minors.iter().copied())
+        .collect();
+    let mut show = None;
+    ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(w.subaddress_index > 1, Button::new("<"))
             .clicked()
         {
             w.subaddress_index -= 1;
-            host.send(Command::Subaddress(w.subaddress_index));
+            show = Some(w.subaddress_index);
         }
         ui.label(format!("Subaddress {}", w.subaddress_index));
         if ui
@@ -1902,21 +2129,291 @@ fn receive_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
             .clicked()
         {
             w.subaddress_index += 1;
-            host.send(Command::Subaddress(w.subaddress_index));
+            show = Some(w.subaddress_index);
         }
         let shown = matches!(&w.subaddress, Some((i, _)) if *i == w.subaddress_index);
         if !shown && ui.button("Show").clicked() {
-            host.send(Command::Subaddress(w.subaddress_index));
+            show = Some(w.subaddress_index);
+        }
+        if ui
+            .button("Next unused")
+            .on_hover_text("The first subaddress nobody has paid yet")
+            .clicked()
+        {
+            let next = (1..=MAX_SUBADDRESS)
+                .find(|i| !paid.contains(i))
+                .unwrap_or(MAX_SUBADDRESS);
+            w.subaddress_index = next;
+            show = Some(next);
         }
     });
+    if let Some(index) = show {
+        host.send(Command::Subaddress(index));
+    }
     if let Some((index, address)) = &w.subaddress {
         if *index == w.subaddress_index {
+            let index = *index;
+            ui.horizontal(|ui| {
+                ui.label("Label");
+                let mut text = labels.get(&index).cloned().unwrap_or_default();
+                let edited = ui
+                    .add(
+                        TextEdit::singleline(&mut text)
+                            .hint_text("who it is for")
+                            .desired_width(240.0),
+                    )
+                    .changed();
+                if edited {
+                    if text.trim().is_empty() {
+                        labels.remove(&index);
+                    } else {
+                        labels.insert(index, text);
+                    }
+                }
+            });
+            if paid.contains(&index) {
+                ui.colored_label(
+                    t.warn,
+                    "This subaddress has been paid before. A fresh one keeps payers apart.",
+                );
+            } else {
+                ui.label(RichText::new("Not paid yet.").color(weak));
+            }
             address_box(ui, address);
+        }
+    }
+
+    // The subaddresses given labels, to find them again.
+    if !labels.is_empty() {
+        ui.add_space(16.0);
+        ui.label(RichText::new("Labelled").strong());
+        let mut pick = None;
+        egui::Grid::new("labels")
+            .striped(true)
+            .num_columns(4)
+            .spacing([16.0, 4.0])
+            .show(ui, |ui| {
+                for (index, label) in labels.iter() {
+                    ui.label(format!("#{index}"));
+                    ui.label(label.as_str());
+                    ui.label(if paid.contains(index) {
+                        "paid"
+                    } else {
+                        "not paid yet"
+                    });
+                    if ui.small_button("Show").clicked() {
+                        pick = Some(*index);
+                    }
+                    ui.end_row();
+                }
+            });
+        if let Some(index) = pick {
+            w.subaddress_index = index;
+            host.send(Command::Subaddress(index));
         }
     }
 }
 
-/// The open wallet's settings: what it is, its seed phrase, its files.
+fn history_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host, settings: &mut Settings) {
+    let weak = ui.visuals().weak_text_color();
+    ui.heading("History");
+    if w.history.is_empty() {
+        ui.label("No transfers yet.");
+        return;
+    }
+    let mut export = false;
+    ui.horizontal_wrapped(|ui| {
+        for (filter, label) in [
+            (HistoryFilter::All, "All"),
+            (HistoryFilter::Received, "Received"),
+            (HistoryFilter::Sent, "Sent"),
+            (HistoryFilter::Pending, "Not in a block yet"),
+        ] {
+            ui.selectable_value(&mut w.history_filter, filter, label);
+        }
+        ui.separator();
+        ui.checkbox(&mut settings.history_utc, "Times in UTC");
+        export = ui.button("Export as CSV").clicked();
+    });
+    if export {
+        let csv = history_csv(&w.history, &*host, settings.history_utc);
+        host.download(&format!("{}-history.csv", w.summary.name), csv.as_bytes());
+    }
+    if w.history.len() >= 1_000 {
+        ui.label(RichText::new("The newest 1,000 transfers.").color(weak));
+    }
+
+    let filter = w.history_filter;
+    let rows: Vec<&Row> = w
+        .history
+        .iter()
+        .filter(|r| match filter {
+            HistoryFilter::All => true,
+            HistoryFilter::Received => r.incoming,
+            HistoryFilter::Sent => !r.incoming,
+            HistoryFilter::Pending => r.height.is_none(),
+        })
+        .collect();
+    let chosen = history_grid(
+        ui,
+        &rows,
+        "history",
+        &*host,
+        settings.history_utc,
+        w.status.chain,
+    );
+    if let Some(txid) = chosen {
+        w.selected_tx = if w.selected_tx.as_deref() == Some(txid.as_str()) {
+            None
+        } else {
+            Some(txid)
+        };
+    }
+
+    // The transfer chosen, in full.
+    let mut close = false;
+    let selected = w.selected_tx.clone();
+    if let Some(row) = selected.and_then(|id| w.history.iter().find(|r| r.txid == id)) {
+        ui.add_space(12.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Details").strong());
+            close = ui.small_button("Close").clicked();
+        });
+        egui::Grid::new("details")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Transaction");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(row.txid.as_str()).monospace());
+                    copy_button(ui, &row.txid);
+                });
+                ui.end_row();
+                ui.label("When");
+                ui.label(when(&*host, settings.history_utc, row.timestamp));
+                ui.end_row();
+                ui.label("Kind");
+                ui.label(row.kind.as_str());
+                ui.end_row();
+                ui.label("Amount");
+                ui.label(format!(
+                    "{}{} WOW",
+                    if row.incoming { "+" } else { "-" },
+                    format::amount(row.amount)
+                ));
+                ui.end_row();
+                if row.fee > 0 {
+                    ui.label("Fee");
+                    ui.label(format!("{} WOW", format::amount(row.fee)));
+                    ui.end_row();
+                }
+                ui.label("Height");
+                ui.label(
+                    row.height
+                        .map_or_else(|| "not in a block yet".to_string(), format::grouped),
+                );
+                ui.end_row();
+                ui.label("Confirmations");
+                ui.label(confirmations(row, w.status.chain));
+                ui.end_row();
+                if row.incoming {
+                    ui.label("Spendable");
+                    ui.label(if row.unlocked { "yes" } else { "not yet" });
+                    ui.end_row();
+                }
+                if let Some(id) = &row.payment_id {
+                    ui.label("Payment ID");
+                    ui.label(RichText::new(id.as_str()).monospace());
+                    ui.end_row();
+                }
+                if !row.minors.is_empty() {
+                    ui.label(if row.incoming {
+                        "Paid to"
+                    } else {
+                        "Spent from"
+                    });
+                    let names: Vec<String> = row
+                        .minors
+                        .iter()
+                        .map(|m| match m {
+                            0 => "the primary address".to_string(),
+                            m => format!("subaddress {m}"),
+                        })
+                        .collect();
+                    ui.label(names.join(", "));
+                    ui.end_row();
+                }
+                for (address, amount) in &row.destinations {
+                    ui.label("To");
+                    ui.label(format!(
+                        "{} WOW to {}",
+                        format::amount(*amount),
+                        format::elide(address, 12)
+                    ))
+                    .on_hover_text(address.as_str());
+                    ui.end_row();
+                }
+            });
+    }
+    if close {
+        w.selected_tx = None;
+    }
+}
+
+/// A time as the local clock reads it, or in UTC.
+fn when(host: &dyn Host, utc: bool, timestamp: u64) -> String {
+    if utc {
+        format::timestamp(timestamp)
+    } else {
+        format::timestamp_in(timestamp, host.utc_offset(timestamp))
+    }
+}
+
+/// How many blocks carry a transfer: the one it is in, and those after.
+fn confirmations(row: &Row, chain: u64) -> String {
+    match row.height {
+        None => "in the pool".to_string(),
+        Some(height) => format::grouped(chain.saturating_sub(height)),
+    }
+}
+
+/// The history as CSV, newest first, for a spreadsheet.
+fn history_csv(rows: &[Row], host: &dyn Host, utc: bool) -> String {
+    let mut out = String::from(if utc {
+        "date (UTC),kind,amount,fee,height,transaction,payment ID,destinations\n"
+    } else {
+        "date,kind,amount,fee,height,transaction,payment ID,destinations\n"
+    });
+    for row in rows {
+        let destinations: Vec<String> = row
+            .destinations
+            .iter()
+            .map(|(address, amount)| format!("{address} {}", format::amount(*amount)))
+            .collect();
+        let fields = [
+            when(host, utc, row.timestamp),
+            row.kind.clone(),
+            format!(
+                "{}{}",
+                if row.incoming { "" } else { "-" },
+                format::amount(row.amount)
+            ),
+            format::amount(row.fee),
+            row.height.map_or_else(String::new, |h| h.to_string()),
+            row.txid.clone(),
+            row.payment_id.clone().unwrap_or_default(),
+            destinations.join("; "),
+        ];
+        let line: Vec<String> = fields.iter().map(|f| format::csv_field(f)).collect();
+        out.push_str(&line.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+/// The open wallet's settings: what it is, its keys, its password, and its
+/// files.
 fn wallet_settings(
     ui: &mut Ui,
     w: &mut WalletView,
@@ -1926,6 +2423,7 @@ fn wallet_settings(
     awaiting: &mut Option<Place>,
 ) {
     let t = tones(ui);
+    let weak = ui.visuals().weak_text_color();
     egui::Grid::new("wallet-facts")
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -1950,6 +2448,13 @@ fn wallet_settings(
             });
             ui.end_row();
         });
+    if !in_browser && ui.button("Show its folder").clicked() {
+        let folder = std::path::Path::new(&w.summary.location)
+            .parent()
+            .filter(|_| w.summary.location.ends_with(".keys"))
+            .map_or_else(|| w.summary.location.clone(), |p| p.display().to_string());
+        host.open_folder(&folder);
+    }
     // Why what was asked for here failed.
     if let Some(e) = error.as_ref() {
         ui.add_space(8.0);
@@ -1990,6 +2495,146 @@ fn wallet_settings(
     }
     if hide {
         w.seed = None;
+    }
+
+    ui.add_space(16.0);
+    ui.label(RichText::new("View key").strong());
+    ui.label(
+        RichText::new(
+            "With the address, it lets whoever holds it see every payment to this wallet. It \
+             cannot spend.",
+        )
+        .color(weak),
+    );
+    let mut hide_view_key = false;
+    if let Some(key) = &w.view_key {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(key.as_str()).monospace());
+            copy_button(ui, key);
+            hide_view_key = ui.small_button("Hide").clicked();
+        });
+    } else {
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(&mut w.view_key_password)
+                    .password(true)
+                    .hint_text("wallet password")
+                    .desired_width(200.0),
+            );
+            if ui.button("Show view key").clicked() {
+                *error = None;
+                *awaiting = Some(Place::Wallet);
+                host.send(Command::ShowViewKey {
+                    password: std::mem::take(&mut w.view_key_password),
+                });
+            }
+        });
+    }
+    if hide_view_key {
+        w.view_key = None;
+    }
+
+    ui.add_space(16.0);
+    ui.label(RichText::new("Password").strong());
+    egui::Grid::new("password")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Now");
+            ui.add(
+                TextEdit::singleline(&mut w.old_password)
+                    .password(true)
+                    .desired_width(220.0),
+            );
+            ui.end_row();
+            ui.label("New");
+            ui.add(
+                TextEdit::singleline(&mut w.new_password)
+                    .password(true)
+                    .desired_width(220.0),
+            );
+            ui.end_row();
+            ui.label("Again");
+            ui.add(
+                TextEdit::singleline(&mut w.new_password_again)
+                    .password(true)
+                    .desired_width(220.0),
+            );
+            ui.end_row();
+        });
+    let mismatch = w.new_password != w.new_password_again;
+    if mismatch && !w.new_password_again.is_empty() {
+        ui.colored_label(t.bad, "The new passwords do not match.");
+    }
+    let touched = !w.old_password.is_empty() || !w.new_password.is_empty();
+    if touched && w.new_password.is_empty() && !mismatch {
+        ui.colored_label(
+            t.warn,
+            "With no password, anyone who copies the wallet's files can spend from it.",
+        );
+    }
+    if ui
+        .add_enabled(touched && !mismatch, Button::new("Change password"))
+        .clicked()
+    {
+        *error = None;
+        *awaiting = Some(Place::Wallet);
+        host.send(Command::ChangePassword {
+            old: std::mem::take(&mut w.old_password),
+            new: w.new_password.clone(),
+        });
+    }
+
+    ui.add_space(16.0);
+    ui.label(RichText::new("View-only copy").strong());
+    ui.label(
+        RichText::new(
+            "A keys file with the view key and no spend key, to open elsewhere and watch for \
+             payments without being able to spend.",
+        )
+        .color(weak),
+    );
+    egui::Grid::new("view-only")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("This wallet's password");
+            ui.add(
+                TextEdit::singleline(&mut w.copy_wallet_password)
+                    .password(true)
+                    .desired_width(220.0),
+            );
+            ui.end_row();
+            ui.label("The copy's password");
+            ui.add(
+                TextEdit::singleline(&mut w.copy_password)
+                    .password(true)
+                    .desired_width(220.0),
+            );
+            ui.end_row();
+            ui.label("Again");
+            ui.add(
+                TextEdit::singleline(&mut w.copy_password_again)
+                    .password(true)
+                    .desired_width(220.0),
+            );
+            ui.end_row();
+        });
+    let copy_mismatch = w.copy_password != w.copy_password_again;
+    if copy_mismatch && !w.copy_password_again.is_empty() {
+        ui.colored_label(t.bad, "The copy's passwords do not match.");
+    }
+    if ui
+        .add_enabled(!copy_mismatch, Button::new("Save a view-only copy"))
+        .clicked()
+    {
+        *error = None;
+        *awaiting = Some(Place::Wallet);
+        host.send(Command::ExportViewOnly {
+            password: std::mem::take(&mut w.copy_wallet_password),
+            copy_password: std::mem::take(&mut w.copy_password),
+        });
+        w.copy_password_again.clear();
     }
 
     // Reading the chain again, from a height or from the height on a date.
@@ -2157,6 +2802,29 @@ fn appearance(ui: &mut Ui, settings: &mut Settings, in_browser: bool) {
         &mut settings.hide_notice,
         "Hide the risk notice at the foot of the window",
     );
+}
+
+/// What is shown to someone looking over a shoulder, and a wallet left open.
+fn privacy(ui: &mut Ui, settings: &mut Settings) {
+    ui.checkbox(
+        &mut settings.hide_balance,
+        "Hide the balance until it is asked for",
+    );
+
+    ui.add_space(16.0);
+    ui.label(RichText::new("Close an open wallet left alone").strong());
+    ui.horizontal_wrapped(|ui| {
+        for (minutes, label) in [
+            (0, "Never"),
+            (5, "After 5 minutes"),
+            (15, "After 15 minutes"),
+            (30, "After 30 minutes"),
+            (60, "After an hour"),
+        ] {
+            ui.selectable_value(&mut settings.idle_minutes, minutes, label);
+        }
+    });
+    ui.label("It is saved as it closes, and opens again with its password.");
 }
 
 /// What this is, and the risk of using it.
@@ -2465,19 +3133,29 @@ fn sync_bar(ui: &mut Ui, s: &Status) {
     ui.add(egui::ProgressBar::new(fraction).text(text));
 }
 
-fn history_grid(ui: &mut Ui, rows: &[Row], id: &str) {
+/// Transfers as a table. Returns the transaction whose Details was pressed.
+fn history_grid(
+    ui: &mut Ui,
+    rows: &[&Row],
+    id: &str,
+    host: &dyn Host,
+    utc: bool,
+    chain: u64,
+) -> Option<String> {
     let t = tones(ui);
+    let mut chosen = None;
     egui::Grid::new(id)
         .striped(true)
-        .num_columns(5)
+        .num_columns(6)
         .spacing([16.0, 4.0])
         .show(ui, |ui| {
-            for heading in ["Date (UTC)", "", "Amount (WOW)", "Height", "Transaction"] {
+            let date = if utc { "Date (UTC)" } else { "Date" };
+            for heading in [date, "", "Amount (WOW)", "Confirmations", "Transaction", ""] {
                 ui.label(RichText::new(heading).strong());
             }
             ui.end_row();
             for row in rows {
-                ui.label(format::timestamp(row.timestamp));
+                ui.label(when(host, utc, row.timestamp));
                 let color = match row.kind.as_str() {
                     "failed" => t.bad,
                     "pending" => t.warn,
@@ -2496,23 +3174,41 @@ fn history_grid(ui: &mut Ui, rows: &[Row], id: &str) {
                 if row.fee > 0 {
                     amount.on_hover_text(format!("fee {}", format::amount(row.fee)));
                 }
-                ui.label(
-                    row.height
-                        .map_or_else(|| "in the pool".to_string(), format::grouped),
-                );
+                ui.label(confirmations(row, chain));
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format::elide(&row.txid, 6)).monospace())
                         .on_hover_text(row.txid.as_str());
-                    if ui.small_button("Copy").clicked() {
-                        ui.ctx().copy_text(row.txid.clone());
-                    }
+                    copy_button(ui, &row.txid);
                 });
+                if ui.small_button("Details").clicked() {
+                    chosen = Some(row.txid.clone());
+                }
                 ui.end_row();
             }
         });
+    chosen
 }
 
-/// Selectable, wrapped, read-only text with a Copy button.
+/// A Copy button that says Copied for a moment after.
+fn copy_button(ui: &mut Ui, text: &str) {
+    let id = egui::Id::new(("copied", text));
+    let now = ui.input(|i| i.time);
+    let copied = ui
+        .ctx()
+        .data(|d| d.get_temp::<f64>(id))
+        .is_some_and(|at| now - at < COPIED_SECS);
+    if ui
+        .small_button(if copied { "Copied" } else { "Copy" })
+        .clicked()
+    {
+        ui.ctx().copy_text(text.to_string());
+        ui.ctx().data_mut(|d| d.insert_temp(id, now));
+        ui.ctx()
+            .request_repaint_after(Duration::from_secs_f64(COPIED_SECS));
+    }
+}
+
+/// An address: selectable text, Copy, and a QR code to scan it from.
 fn address_box(ui: &mut Ui, text: &str) {
     let mut shown = text;
     ui.add(
@@ -2521,8 +3217,17 @@ fn address_box(ui: &mut Ui, text: &str) {
             .desired_rows(2)
             .desired_width(f32::INFINITY),
     );
-    if ui.button("Copy").clicked() {
-        ui.ctx().copy_text(text.to_string());
+    let qr_id = egui::Id::new(("qr", text));
+    let mut qr = ui.ctx().data(|d| d.get_temp::<bool>(qr_id)).unwrap_or(false);
+    ui.horizontal(|ui| {
+        copy_button(ui, text);
+        if ui.selectable_label(qr, "QR code").clicked() {
+            qr = !qr;
+            ui.ctx().data_mut(|d| d.insert_temp(qr_id, qr));
+        }
+    });
+    if qr {
+        crate::qr::show(ui, text, 240.0);
     }
 }
 
