@@ -64,6 +64,9 @@ pub trait Platform {
     fn connect(&self, node: &NodeAddress, any_certificate: bool) -> DaemonClient;
     /// A clock for timing a node's answer, in milliseconds from any start.
     fn millis(&self) -> f64;
+    /// Where the log is written, when it is written to a file; `None` where
+    /// there are no files.
+    fn log_file(&self) -> Option<std::path::PathBuf>;
 }
 
 /// The open wallet and what is known about it.
@@ -171,6 +174,51 @@ impl<P: Platform> Backend<P> {
             }
             Command::AcceptAnyCertificate(on) => {
                 self.any_certificate = on;
+                Ok(())
+            }
+            Command::SetLog { level, to_file } => {
+                // Lines kept for the log window, and how the file rotates.
+                const KEPT_LINES: usize = 2_000;
+                const FILE_BYTES: u64 = 10 * 1024 * 1024;
+                const OLD_FILES: usize = 5;
+                match level {
+                    Some(n) => wow_log::set_level(n)?,
+                    // Nothing logs at FATAL, so this is as good as off.
+                    None => wow_log::set_categories("*:FATAL")?,
+                }
+                wow_log::set_memory(KEPT_LINES);
+                // A window has no terminal to write to.
+                wow_log::set_stderr(false);
+                let file = self
+                    .platform
+                    .log_file()
+                    .filter(|_| to_file && level.is_some());
+                match file {
+                    Some(path) if wow_log::file().as_ref() != Some(&path) => {
+                        if let Some(dir) = path.parent() {
+                            std::fs::create_dir_all(dir)
+                                .map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+                        }
+                        wow_log::set_file(path, FILE_BYTES, OLD_FILES, true)?;
+                    }
+                    Some(_) => {}
+                    None => wow_log::close_file(),
+                }
+                wow_log::info!(
+                    "global",
+                    "wownero-wallet-gui {}, logging at {}",
+                    env!("CARGO_PKG_VERSION"),
+                    level.map_or_else(|| "nothing".to_string(), |n| format!("level {n}"))
+                );
+                Ok(())
+            }
+            Command::ReadLog => {
+                self.send_log();
+                Ok(())
+            }
+            Command::ClearLog => {
+                wow_log::clear_recent();
+                self.send_log();
                 Ok(())
             }
             Command::Refresh => {
@@ -789,6 +837,15 @@ impl<P: Platform> Backend<P> {
             self.send_history();
         }
         self.send_status();
+    }
+
+    /// The log lines kept in memory, and the file the log goes to.
+    fn send_log(&mut self) {
+        let file = wow_log::file().map(|p| p.display().to_string());
+        self.send(Event::Log {
+            lines: wow_log::recent(),
+            file,
+        });
     }
 
     fn working(&mut self, what: impl Into<String>) {

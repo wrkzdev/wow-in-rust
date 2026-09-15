@@ -225,6 +225,15 @@ impl Platform for Folder {
     fn millis(&self) -> f64 {
         self.started.elapsed().as_secs_f64() * 1_000.0
     }
+
+    /// `wownero-wallet-gui.log`, beside the default wallets folder rather
+    /// than in whichever folder is chosen: in `%APPDATA%\wownero-rs` on
+    /// Windows, say.
+    fn log_file(&self) -> Option<PathBuf> {
+        let wallets = default_folder();
+        let dir = wallets.parent().map(PathBuf::from).unwrap_or_default();
+        Some(dir.join("wownero-wallet-gui.log"))
+    }
 }
 
 struct NativeHost {

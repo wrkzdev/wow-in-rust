@@ -154,6 +154,17 @@ impl Platform for Browser {
     fn millis(&self) -> f64 {
         js_sys::Date::now()
     }
+
+    /// A browser has no files to log to; the log is kept in memory, and the
+    /// page can download it.
+    fn log_file(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+/// `Date.now()`, for the log's timestamps, which would otherwise all say 1970.
+fn log_clock() -> std::time::Duration {
+    std::time::Duration::from_millis(js_sys::Date::now() as u64)
 }
 
 #[wasm_bindgen]
@@ -170,6 +181,7 @@ impl WalletWorker {
     #[wasm_bindgen(constructor)]
     pub fn new(post: js_sys::Function) -> WalletWorker {
         wow_wallet::clock::set_clock(clock);
+        wow_log::set_clock(log_clock);
         wow_wallet::entropy::set_random_source(fill_random);
         WalletWorker {
             post,

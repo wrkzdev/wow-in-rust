@@ -65,6 +65,13 @@ pub enum Command {
     /// node with a self-signed certificate needs. The desktop only: a browser
     /// decides that itself.
     AcceptAnyCertificate(bool),
+    /// Log from now on at `level`, 0 to 4 as `--log-level` takes it, or not
+    /// at all with `None`; and to a file too, where the platform has one.
+    SetLog { level: Option<u8>, to_file: bool },
+    /// The log lines kept in memory, answered by [`Event::Log`].
+    ReadLog,
+    /// Forget the log lines kept in memory, answered by [`Event::Log`].
+    ClearLog,
     /// Look for new blocks now rather than at the next interval.
     Refresh,
     /// Build and sign a transaction and relay nothing, answered by
@@ -173,6 +180,11 @@ pub enum Event {
     FeeEstimate {
         amount: u64,
         fee: u64,
+    },
+    /// The log lines kept, oldest first, and the file the log is written to.
+    Log {
+        lines: Vec<String>,
+        file: Option<String>,
     },
     Seed(String),
     Subaddress {

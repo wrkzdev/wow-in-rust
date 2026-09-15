@@ -16,6 +16,7 @@ crate-type = ["cdylib"]
 wownero-wallet-gui = { path = "../wallet-gui" }
 wow-daemon-client = { path = "../../crates/wow-daemon-client" }
 wow-wallet = { path = "../../crates/wow-wallet" }
+wow-log = { path = "../../crates/wow-log" }
 
 eframe = { version = "0.31", features = ["persistence"] }
 serde_json = "1"

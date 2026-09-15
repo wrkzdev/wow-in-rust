@@ -129,6 +129,11 @@ pub struct Settings {
     /// The risk notice along the foot of the window, once read and hidden.
     /// It stays under Settings, About.
     pub hide_notice: bool,
+    /// How much to log: 0 to 4, as `--log-level` takes it, or `None` for
+    /// nothing.
+    pub log_level: Option<u8>,
+    /// Write the log to a file as well. The desktop only.
+    pub log_to_file: bool,
 }
 
 impl Default for Settings {
@@ -143,6 +148,9 @@ impl Default for Settings {
             theme: Theme::System,
             text_scale: 1.0,
             hide_notice: false,
+            // Warnings and errors, kept in memory for the Logs section.
+            log_level: Some(0),
+            log_to_file: false,
         }
     }
 }
@@ -190,12 +198,25 @@ pub struct WalletApp {
     awaiting: Option<Place>,
     start_error: Option<String>,
     wallet_error: Option<String>,
+    log: LogView,
 }
 
 struct Message {
     text: String,
     error: bool,
     at: f64,
+}
+
+/// The log, as last read from the wallet side.
+#[derive(Default)]
+struct LogView {
+    lines: Vec<String>,
+    /// The file it is written to, if any.
+    file: Option<String>,
+    /// Only lines holding this are shown.
+    filter: String,
+    /// Whether it has been read since the Logs section was opened.
+    read: bool,
 }
 
 /// Where a failure is said.
@@ -259,6 +280,7 @@ enum SettingsTab {
     #[default]
     Node,
     Appearance,
+    Logs,
     About,
 }
 
@@ -333,9 +355,124 @@ enum Test {
     Done(Result<NodeReport, String>),
 }
 
+/// How much is logged, where to, and the lines themselves.
+fn logs_settings(
+    ui: &mut Ui,
+    settings: &mut Settings,
+    log: &mut LogView,
+    host: &mut dyn Host,
+    in_browser: bool,
+) {
+    let t = tones(ui);
+    if !log.read {
+        log.read = true;
+        host.send(Command::ReadLog);
+    }
+
+    let before = (settings.log_level, settings.log_to_file);
+    ui.label(RichText::new("How much to log").strong());
+    egui::ComboBox::from_id_salt("log-level")
+        .selected_text(log_level_label(settings.log_level))
+        .show_ui(ui, |ui| {
+            for level in [None, Some(0), Some(1), Some(2), Some(3), Some(4)] {
+                ui.selectable_value(&mut settings.log_level, level, log_level_label(level));
+            }
+        });
+    // A browser has no files to write to; there the log can be downloaded.
+    if !in_browser {
+        ui.add_enabled(
+            settings.log_level.is_some(),
+            egui::Checkbox::new(&mut settings.log_to_file, "Write the log to a file as well"),
+        );
+    }
+    if settings.log_level.is_some_and(|level| level >= 1) {
+        ui.colored_label(
+            t.warn,
+            "The log names the node, heights and transaction IDs. It never holds a seed, a key \
+             or a password, but share it with care.",
+        );
+    }
+    if (settings.log_level, settings.log_to_file) != before {
+        host.send(Command::SetLog {
+            level: settings.log_level,
+            to_file: settings.log_to_file,
+        });
+        host.send(Command::ReadLog);
+    }
+    if let Some(file) = &log.file {
+        ui.label(format!("Written to {file}"));
+    }
+
+    ui.add_space(12.0);
+    let mut copy = false;
+    let mut download = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("The log").strong());
+        if ui.button("Refresh").clicked() {
+            host.send(Command::ReadLog);
+        }
+        copy = ui.button("Copy").clicked();
+        if in_browser {
+            download = ui.button("Download").clicked();
+        }
+        if ui.button("Clear").clicked() {
+            host.send(Command::ClearLog);
+        }
+        ui.add(
+            TextEdit::singleline(&mut log.filter)
+                .hint_text("show lines holding…")
+                .desired_width(200.0),
+        );
+    });
+    let filter = log.filter.to_lowercase();
+    let shown: Vec<&str> = log
+        .lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| filter.is_empty() || line.to_lowercase().contains(&filter))
+        .collect();
+    if copy {
+        ui.ctx().copy_text(shown.join("\n"));
+    }
+    if download {
+        host.download("wownero-wallet.log", shown.join("\n").as_bytes());
+    }
+    ui.label(format!(
+        "{} of the last {} lines",
+        shown.len(),
+        log.lines.len()
+    ));
+    // Only the rows in view are laid out: the log keeps two thousand lines.
+    let row = ui.text_style_height(&TextStyle::Monospace);
+    egui::ScrollArea::both()
+        .id_salt("log-lines")
+        .max_height(380.0)
+        .stick_to_bottom(true)
+        .show_rows(ui, row, shown.len(), |ui, rows| {
+            for line in &shown[rows] {
+                ui.label(RichText::new(*line).monospace());
+            }
+        });
+}
+
+fn log_level_label(level: Option<u8>) -> &'static str {
+    match level {
+        None => "Nothing",
+        Some(0) => "Warnings and errors",
+        Some(1) => "What the wallet does",
+        Some(2) => "Debugging",
+        Some(3) => "Tracing",
+        _ => "Everything",
+    }
+}
+
 impl WalletApp {
     pub fn new(settings: Settings, mut host: Box<dyn Host>) -> WalletApp {
         host.send(Command::AcceptAnyCertificate(settings.any_certificate));
+        host.send(Command::SetLog {
+            level: settings.log_level,
+            to_file: settings.log_to_file,
+        });
         let start = StartForm {
             selected: settings.last_wallet.clone(),
             folder: settings.folder.clone(),
@@ -367,6 +504,7 @@ impl WalletApp {
             awaiting: None,
             start_error: None,
             wallet_error: None,
+            log: LogView::default(),
         }
     }
 
@@ -521,6 +659,10 @@ impl WalletApp {
                 if let Some(w) = &mut self.wallet {
                     w.estimate = Some((amount, fee));
                 }
+            }
+            Event::Log { lines, file } => {
+                self.log.lines = lines;
+                self.log.file = file;
             }
             Event::Seed(seed) => {
                 self.awaiting = None;
@@ -737,6 +879,7 @@ impl WalletApp {
             tabs.extend([
                 (SettingsTab::Node, "Node"),
                 (SettingsTab::Appearance, "Appearance"),
+                (SettingsTab::Logs, "Logs"),
                 (SettingsTab::About, "About"),
             ]);
             for (tab, label) in tabs {
@@ -744,7 +887,18 @@ impl WalletApp {
             }
         });
         ui.separator();
+        // The log is read afresh each time its section is opened.
+        if self.settings_tab != SettingsTab::Logs {
+            self.log.read = false;
+        }
         match self.settings_tab {
+            SettingsTab::Logs => logs_settings(
+                ui,
+                &mut self.settings,
+                &mut self.log,
+                &mut *self.host,
+                in_browser,
+            ),
             SettingsTab::Wallet => {
                 if let Some(w) = self.wallet.as_mut() {
                     wallet_settings(
