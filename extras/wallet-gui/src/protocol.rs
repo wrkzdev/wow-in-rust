@@ -72,6 +72,14 @@ pub enum Command {
     ReadLog,
     /// Forget the log lines kept in memory, answered by [`Event::Log`].
     ClearLog,
+    /// Forget what the open wallet scanned and scan again from `height`, as
+    /// wallet-cli's `rescan_bc` does. With `keep`, that height becomes its
+    /// restore height too.
+    Rescan { height: u64, keep: bool },
+    /// The height the chain had reached by `date`, in seconds since 1970:
+    /// reckoned from the open wallet's node, or from `node` when no wallet
+    /// is open. Answered by [`Event::HeightOn`].
+    HeightOn { date: u64, node: String },
     /// Look for new blocks now rather than at the next interval.
     Refresh,
     /// Build and sign a transaction and relay nothing, answered by
@@ -186,6 +194,11 @@ pub enum Event {
         lines: Vec<String>,
         file: Option<String>,
     },
+    /// The open wallet's restore height is now this.
+    RestoreHeight(u64),
+    /// The height the chain had reached by `date`, as [`Command::HeightOn`]
+    /// asked.
+    HeightOn { date: u64, height: u64 },
     Seed(String),
     Subaddress {
         index: u32,

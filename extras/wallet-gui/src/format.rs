@@ -135,9 +135,70 @@ pub fn elide(text: &str, keep: usize) -> String {
     format!("{head}…{tail}")
 }
 
+/// A date as typed, `YYYY-MM-DD`, as the start of that day in UTC, in seconds
+/// since 1970.
+pub fn parse_date(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let bad = || format!("`{text}` is not a date written as 2024-05-31");
+    let mut parts = text.splitn(3, '-');
+    let (Some(y), Some(m), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(bad());
+    };
+    let year: i64 = y.parse().map_err(|_| bad())?;
+    let month: i64 = m.parse().map_err(|_| bad())?;
+    let day: i64 = d.parse().map_err(|_| bad())?;
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(bad());
+    }
+    // `days_from_civil`, from Howard Hinnant's date algorithms: the inverse of
+    // what `timestamp` does.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Ok(days as u64 * 86_400)
+}
+
+/// The height the chain had reached by `date`, reckoned back from `chain`
+/// blocks at `now`, at five minutes a block.
+///
+/// Blocks do not come evenly, so it is kept a day early: a restore height a
+/// little low costs a longer scan, where one too high hides payments.
+pub fn height_on(date: u64, chain: u64, now: u64) -> u64 {
+    const BLOCK_SECS: u64 = 300;
+    const A_DAY: u64 = 288;
+    let back = now.saturating_sub(date) / BLOCK_SECS;
+    chain.saturating_sub(back).saturating_sub(A_DAY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dates_are_read_as_days_in_utc() {
+        assert_eq!(parse_date("1970-01-01").expect("a date"), 0);
+        assert_eq!(parse_date(" 2000-02-29 ").expect("a leap day"), 951_782_400);
+        assert_eq!(
+            timestamp(parse_date("2026-09-15").expect("a date")),
+            "2026-09-15 00:00"
+        );
+        for bad in ["", "2026", "2026-13-01", "2026-00-10", "2026-09-32", "15/09/2026", "1969-12-31"] {
+            assert!(parse_date(bad).is_err(), "`{bad}`");
+        }
+    }
+
+    #[test]
+    fn a_height_on_a_date_is_reckoned_back_and_kept_early() {
+        let now = 1_800_000_000;
+        // A day back is 288 blocks, and a day's margin 288 more.
+        assert_eq!(height_on(now - 86_400, 10_000, now), 9_424);
+        // Before the chain began, and in the future, it stays in range.
+        assert_eq!(height_on(0, 10_000, now), 0);
+        assert_eq!(height_on(now + 86_400, 10_000, now), 9_712);
+    }
 
     const CASES: &[(u64, &str)] = &[
         (0, "0.00000000000"),

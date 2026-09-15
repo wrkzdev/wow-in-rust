@@ -221,6 +221,12 @@ impl<P: Platform> Backend<P> {
                 self.send_log();
                 Ok(())
             }
+            Command::Rescan { height, keep } => self.rescan(height, keep),
+            Command::HeightOn { date, node } => {
+                let height = self.height_on(date, &node)?;
+                self.send(Event::HeightOn { date, height });
+                Ok(())
+            }
             Command::Refresh => {
                 let w = self.wallet.as_mut().ok_or(NO_WALLET)?;
                 if w.session.daemon.is_none() {
@@ -629,6 +635,73 @@ impl<P: Platform> Backend<P> {
         }
         self.send(Event::Prepared(preview));
         Ok(())
+    }
+
+    /// Forget what the open wallet scanned and scan it again from `height`, as
+    /// wallet-cli's `rescan_bc` does; with `keep`, that height becomes the
+    /// wallet's restore height too.
+    ///
+    /// Where this wallet's own transactions went is not on the chain, so
+    /// those records are kept (`WalletState::rescan_from`).
+    fn rescan(&mut self, height: u64, keep: bool) -> Result<(), String> {
+        let w = self.wallet.as_mut().ok_or(NO_WALLET)?;
+        if w.prepared.is_some() {
+            return Err("send or cancel the transaction waiting first".into());
+        }
+        let chain = w.session.chain_height();
+        if chain > 0 && height >= chain {
+            return Err(format!(
+                "height {} is past the chain, which is {} blocks long",
+                format::grouped(height),
+                format::grouped(chain)
+            ));
+        }
+        w.session.state.rescan_from(height);
+        if keep {
+            w.session.keys_file.set_refresh_height(height);
+        }
+        w.session.dirty = true;
+        w.syncing = w.session.daemon.is_some();
+        save(&mut self.platform, w)?;
+        if keep {
+            self.send(Event::RestoreHeight(height));
+        }
+        self.send(Event::Notice(format!(
+            "Scanning again from height {}. The balance and the history fill in as it goes.",
+            format::grouped(height)
+        )));
+        self.send_history();
+        self.send_status();
+        Ok(())
+    }
+
+    /// The height the chain had reached by `date`: counted back from the open
+    /// wallet's node, or from `node` when no wallet is open.
+    fn height_on(&self, date: u64, node: &str) -> Result<u64, String> {
+        let open = self
+            .wallet
+            .as_ref()
+            .filter(|w| w.session.daemon.is_some());
+        let chain = match open {
+            Some(w) => w.session.chain_height(),
+            None => {
+                let address = NodeAddress::parse(node)?;
+                if let Some(why) = address
+                    .unreachable_reason(self.platform.in_browser(), self.platform.secure_page())
+                {
+                    return Err(why.to_string());
+                }
+                self.platform
+                    .connect(&address, self.any_certificate)
+                    .get_info()
+                    .map_err(|e| self.unanswered(&address, &e.to_string()))?
+                    .height
+            }
+        };
+        if chain == 0 {
+            return Err("the node does not know how long the chain is yet".into());
+        }
+        Ok(format::height_on(date, chain, wow_wallet::clock::now()))
     }
 
     /// What a send would pay: planned against this wallet's unlocked outputs

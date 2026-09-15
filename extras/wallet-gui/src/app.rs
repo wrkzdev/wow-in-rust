@@ -251,6 +251,8 @@ struct StartForm {
     seed: String,
     passphrase: String,
     height: String,
+    /// The date the restore height is to be found for, as typed.
+    date: String,
     keys: Option<(String, Vec<u8>)>,
     cache: Option<(String, Vec<u8>)>,
 }
@@ -301,6 +303,13 @@ struct WalletView {
     send_error: Option<String>,
     /// The last fee estimate: the amount it sends, and the fee.
     estimate: Option<(u64, u64)>,
+    /// Scanning again: from which height, or the height on which date, and
+    /// whether that becomes the restore height.
+    rescan_height: String,
+    rescan_date: String,
+    rescan_keep: bool,
+    /// Scan again was pressed, and waits for a yes.
+    rescan_asked: bool,
 }
 
 impl WalletView {
@@ -324,6 +333,10 @@ impl WalletView {
             subaddress: None,
             send_error: None,
             estimate: None,
+            rescan_height: String::new(),
+            rescan_date: String::new(),
+            rescan_keep: false,
+            rescan_asked: false,
         }
     }
 }
@@ -663,6 +676,20 @@ impl WalletApp {
             Event::Log { lines, file } => {
                 self.log.lines = lines;
                 self.log.file = file;
+            }
+            Event::RestoreHeight(height) => {
+                if let Some(w) = &mut self.wallet {
+                    w.summary.restore_height = height;
+                }
+            }
+            // For the form that asked: scanning again with a wallet open, or
+            // restoring one.
+            Event::HeightOn { height, .. } => {
+                self.awaiting = None;
+                match &mut self.wallet {
+                    Some(w) => w.rescan_height = height.to_string(),
+                    None => self.start.height = height.to_string(),
+                }
             }
             Event::Seed(seed) => {
                 self.awaiting = None;
@@ -1134,6 +1161,7 @@ impl WalletApp {
 
     fn restore_tab(&mut self, ui: &mut Ui) {
         let t = tones(ui);
+        let mut find = false;
         let f = &mut self.start;
         egui::Grid::new("restore")
             .num_columns(2)
@@ -1162,6 +1190,22 @@ impl WalletApp {
                         .desired_width(160.0),
                 );
                 ui.end_row();
+                ui.label("or the date it was made");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut f.date)
+                            .hint_text("2024-05-31")
+                            .desired_width(120.0),
+                    );
+                    find = ui
+                        .add_enabled(!f.date.trim().is_empty(), Button::new("Find its height"))
+                        .on_hover_text(
+                            "Asks the chosen node how long the chain is, and counts back at five \
+                             minutes a block, with a day to spare.",
+                        )
+                        .clicked();
+                });
+                ui.end_row();
                 ui.label("Name");
                 ui.add(TextEdit::singleline(&mut f.name).desired_width(260.0));
                 ui.end_row();
@@ -1183,6 +1227,16 @@ impl WalletApp {
                 network_combo(ui, &mut self.settings.network);
                 ui.end_row();
             });
+
+        if find {
+            match format::parse_date(&self.start.date) {
+                Ok(date) => {
+                    let node = self.settings.node.clone();
+                    self.send_from(Place::Start, Command::HeightOn { date, node });
+                }
+                Err(e) => self.start_error = Some(e),
+            }
+        }
 
         let f = &self.start;
         let words = f.seed.split_whitespace().count();
@@ -1936,6 +1990,99 @@ fn wallet_settings(
     }
     if hide {
         w.seed = None;
+    }
+
+    // Reading the chain again, from a height or from the height on a date.
+    ui.add_space(16.0);
+    ui.label(RichText::new("Scan again").strong());
+    ui.label(
+        "Forget what this wallet has read from the chain and read it again: for payments a scan \
+         that started too late missed, or a history that looks wrong. What this wallet sent, and \
+         to whom, is kept.",
+    );
+    let mut find = false;
+    egui::Grid::new("rescan")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("From height");
+            ui.add(
+                TextEdit::singleline(&mut w.rescan_height)
+                    .hint_text(format::grouped(w.summary.restore_height))
+                    .desired_width(160.0),
+            );
+            ui.end_row();
+            ui.label("or from the date");
+            ui.horizontal(|ui| {
+                ui.add(
+                    TextEdit::singleline(&mut w.rescan_date)
+                        .hint_text("2024-05-31")
+                        .desired_width(120.0),
+                );
+                find = ui
+                    .add_enabled(
+                        !w.rescan_date.trim().is_empty(),
+                        Button::new("Find its height"),
+                    )
+                    .clicked();
+            });
+            ui.end_row();
+        });
+    ui.checkbox(&mut w.rescan_keep, "Make it this wallet's restore height too");
+    if find {
+        match format::parse_date(&w.rescan_date) {
+            Ok(date) => {
+                *error = None;
+                *awaiting = Some(Place::Wallet);
+                // The wallet's own node answers.
+                host.send(Command::HeightOn {
+                    date,
+                    node: String::new(),
+                });
+            }
+            Err(e) => *error = Some(e),
+        }
+    }
+    let from = match w.rescan_height.trim().replace([',', '_'], "") {
+        h if h.is_empty() => Ok(w.summary.restore_height),
+        h => h
+            .parse::<u64>()
+            .map_err(|_| "the height to scan from is a block number".to_string()),
+    };
+    match (&from, w.rescan_asked) {
+        (Err(e), _) => {
+            ui.colored_label(t.bad, e.as_str());
+        }
+        (Ok(_), false) => {
+            if ui.button("Scan again").clicked() {
+                w.rescan_asked = true;
+            }
+        }
+        (Ok(height), true) => {
+            let height = *height;
+            ui.colored_label(
+                t.warn,
+                format!(
+                    "Scan again from height {}? The balance and the history are rebuilt as the \
+                     scan goes, which can take a while.",
+                    format::grouped(height)
+                ),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Scan again now").clicked() {
+                    *error = None;
+                    *awaiting = Some(Place::Wallet);
+                    host.send(Command::Rescan {
+                        height,
+                        keep: w.rescan_keep,
+                    });
+                    w.rescan_asked = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    w.rescan_asked = false;
+                }
+            });
+        }
     }
 
     if in_browser {
