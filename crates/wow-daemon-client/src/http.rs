@@ -745,9 +745,11 @@ mod tests {
 
         let (key, _) = wow_tls::provider::generate_p256().expect("a key");
         let signer = wow_tls::provider::CertSigner::new(&key).expect("a signer");
-        let cert = rcgen::CertificateParams::default()
-            .self_signed(&signer)
-            .expect("a certificate");
+        // rcgen asks for a serial number when the key signing is not its own,
+        // as `wownerod` gives its generated certificate one.
+        let mut params = rcgen::CertificateParams::default();
+        params.serial_number = Some(rcgen::SerialNumber::from(1u64));
+        let cert = params.self_signed(&signer).expect("a certificate");
         let der = CertificateDer::from_pem_slice(cert.pem().as_bytes()).expect("its PEM");
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             wow_tls::provider::provider(),

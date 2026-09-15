@@ -521,7 +521,7 @@ impl<D: BlockchainDb> Blockchain<D> {
         if let Some(d) = self.fixed_difficulty {
             return Ok(if self.height() > 0 { d } else { 1 });
         }
-        let count = difficulty_blocks_count(version) as usize;
+        let count = difficulty_blocks_count(version);
         let mut timestamps = Vec::with_capacity(count);
         let mut cumulative = Vec::with_capacity(count);
 

@@ -1292,7 +1292,7 @@ mod tests {
         ) -> std::result::Result<Batch, Never> {
             // `on_get_blocks`: a history whose newest hash is the top block has
             // nothing new.
-            if block_ids.first().is_some() && block_ids.first() == self.hashes.last() {
+            if !block_ids.is_empty() && block_ids.first() == self.hashes.last() {
                 return Ok(Batch {
                     blocks: Vec::new(),
                     start_height: 0,
