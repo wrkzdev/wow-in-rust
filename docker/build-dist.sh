@@ -12,7 +12,8 @@
 #   dist/gui-<os>/wownero-rs-wallet-gui-<version>-<rust-target>.{tar.gz,zip}
 #   dist/SHA256SUMS                       # every archive under dist/
 #
-# Needs Docker with BuildKit (Docker Desktop, or Engine 23+). Every build runs
+# Needs Docker with the buildx plugin (Docker Desktop has it; on Linux it is
+# docker-buildx-plugin from Docker's repo, or docker-buildx). Every build runs
 # in a linux/amd64 container, so the host OS does not matter; on an arm64 host
 # that means emulation, which is slow but gives the same result.
 #
@@ -39,6 +40,30 @@ for p in "$@"; do
       esac
       ;;
   esac
+done
+
+# Everything but gui-macos builds with `docker buildx`. Without the plugin,
+# docker reads `buildx` as an unknown command and stops at its first flag
+# ("unknown flag: --platform"), so say what is missing before starting.
+for p in "${platforms[@]}"; do
+  [ "$p" = gui-macos ] && continue
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "docker is not on PATH" >&2
+    exit 1
+  fi
+  if ! docker buildx version >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+docker buildx is missing, and every Docker build here needs it.
+  Docker's apt/dnf repo:   install docker-buildx-plugin
+  distro docker.io:        install docker-buildx
+  anything else:           save the binary for your OS/arch from
+                           https://github.com/docker/buildx/releases as
+                           ~/.docker/cli-plugins/docker-buildx, chmod +x it
+Then `docker buildx version` should print a version.
+EOF
+    exit 1
+  fi
+  break
 done
 
 # Provenance for BUILDINFO. A tree with uncommitted changes says so, rather
