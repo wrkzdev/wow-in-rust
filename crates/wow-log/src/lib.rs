@@ -359,9 +359,7 @@ fn keep(line: &str) {
 /// Rename the current file aside with a timestamp, start a new one, and drop
 /// the oldest rotated files past the limit.
 fn rotate(s: &mut FileSink) {
-    let stamp = timestamp(now())
-        .replace([' ', ':'], "-")
-        .replace('.', "-");
+    let stamp = timestamp(now()).replace([' ', ':'], "-").replace('.', "-");
     let mut aside = s.path.clone().into_os_string();
     aside.push(format!("-{stamp}"));
     let _ = std::fs::rename(&s.path, &aside);
@@ -546,10 +544,18 @@ mod tests {
         assert!(kept[2].ends_with("line 4"), "{kept:?}");
 
         // A line past the limit is cut on a character, and says so.
-        log("test.memory", Level::Info, format_args!("{}", "é".repeat(800)));
+        log(
+            "test.memory",
+            Level::Info,
+            format_args!("{}", "é".repeat(800)),
+        );
         let long = recent().pop().expect("a line");
         assert!(long.ends_with('…'), "{long}");
-        assert!(long.len() <= MAX_KEPT_LINE + '…'.len_utf8(), "{}", long.len());
+        assert!(
+            long.len() <= MAX_KEPT_LINE + '…'.len_utf8(),
+            "{}",
+            long.len()
+        );
 
         clear_recent();
         assert!(recent().is_empty());

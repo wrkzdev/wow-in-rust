@@ -263,7 +263,7 @@ fn the_daemon_answers_from_the_short_chain_history() {
         0,
         wow_wallet::refresh::MAX_BLOCKS_PER_CALL,
     )
-        .expect("get_blocks");
+    .expect("get_blocks");
     assert_eq!(batch.start_height, 3, "from the newest block both have");
     assert_eq!(batch.blocks.len(), hashes.len() - 3);
     assert_eq!(batch.current_height, hashes.len() as u64);
@@ -312,7 +312,9 @@ fn output_indices_line_up_with_the_blocks() {
     let c = client(d.port);
 
     // A history of genesis alone. The reference refuses an empty one.
-    let res = c.get_blocks(&hashes[..1], 0, false, false, 0).expect("get_blocks");
+    let res = c
+        .get_blocks(&hashes[..1], 0, false, false, 0)
+        .expect("get_blocks");
     assert_eq!(res.blocks.len(), 6, "genesis plus five");
 
     for (h, b) in res.blocks.iter().enumerate() {
@@ -343,7 +345,9 @@ fn get_o_indexes_matches_get_blocks() {
     let (d, hashes) = start("oindexes", 4);
     let c = client(d.port);
 
-    let res = c.get_blocks(&hashes[..1], 0, false, false, 0).expect("get_blocks");
+    let res = c
+        .get_blocks(&hashes[..1], 0, false, false, 0)
+        .expect("get_blocks");
     let block = Block::from_blob(&res.blocks[2].block).expect("parses");
     let txid = wow_types::hashes::transaction_hash(&block.miner_tx).expect("a hash");
 
@@ -360,7 +364,9 @@ fn get_outs_returns_ring_members() {
     let (d, hashes) = start("outs", 6);
     let c = client(d.port);
 
-    let res = c.get_blocks(&hashes[..1], 0, false, false, 0).expect("get_blocks");
+    let res = c
+        .get_blocks(&hashes[..1], 0, false, false, 0)
+        .expect("get_blocks");
     // A RingCT output is filed under amount zero (`specs/10` §5.1).
     let indices: Vec<u64> = res
         .blocks

@@ -1001,8 +1001,14 @@ mod tests {
             let left = blocks_until_unlocked(388, 100, chain, 0);
             assert_eq!(left == 0, unlocked_at(388, 100, chain, 0), "at {chain}");
             if left > 0 {
-                assert!(!unlocked_at(388, 100, chain + left - 1, 0), "early, at {chain}");
-                assert!(unlocked_at(388, 100, chain + left, 0), "on time, at {chain}");
+                assert!(
+                    !unlocked_at(388, 100, chain + left - 1, 0),
+                    "early, at {chain}"
+                );
+                assert!(
+                    unlocked_at(388, 100, chain + left, 0),
+                    "on time, at {chain}"
+                );
             }
         }
 
@@ -1919,7 +1925,11 @@ mod tests {
         let s = w.refresh_once(&chain).expect("refresh");
         assert_eq!(s.reorg_to, None, "the tip sent again is not a split");
         assert_eq!(s.blocks_scanned, 1, "only the new block is scanned");
-        assert!(s.events.is_empty(), "nothing is found twice: {:?}", s.events);
+        assert!(
+            s.events.is_empty(),
+            "nothing is found twice: {:?}",
+            s.events
+        );
         assert_eq!(w.transfers.len(), 1);
         assert_eq!(w.hashes, chain.hashes);
     }
@@ -1955,7 +1965,11 @@ mod tests {
             let asked = Asked(&chain, RefCell::new(Vec::new()));
             let s = w.refresh(&asked, 10).expect("refresh");
             assert!(s.caught_up);
-            assert_eq!(asked.1.into_inner(), vec![5], "no history yet, so the height");
+            assert_eq!(
+                asked.1.into_inner(),
+                vec![5],
+                "no history yet, so the height"
+            );
         }
         assert_eq!(w.hashes, chain.hashes[5..]);
 
@@ -2024,7 +2038,9 @@ mod tests {
                 _start: u64,
                 _max: u64,
             ) -> std::result::Result<Batch, Never> {
-                let mut batch = self.0.get_blocks(&[self.0.hashes[0]], 0, MAX_BLOCKS_PER_CALL)?;
+                let mut batch = self
+                    .0
+                    .get_blocks(&[self.0.hashes[0]], 0, MAX_BLOCKS_PER_CALL)?;
                 batch.current_height += 10;
                 Ok(batch)
             }
@@ -2034,7 +2050,13 @@ mod tests {
             .refresh_once(&Stale(&chain))
             .expect_err("no progress is refused");
         assert!(
-            matches!(e, RefreshError::NoProgress { from: 0, current: 14 }),
+            matches!(
+                e,
+                RefreshError::NoProgress {
+                    from: 0,
+                    current: 14
+                }
+            ),
             "{e}"
         );
         assert_eq!(w.hashes, chain.hashes, "and nothing was dropped");
@@ -2108,7 +2130,9 @@ mod tests {
                 if max > self.1 {
                     return Err("the connection closed early");
                 }
-                self.0.get_blocks(ids, start, max).map_err(|_| "unreachable")
+                self.0
+                    .get_blocks(ids, start, max)
+                    .map_err(|_| "unreachable")
             }
 
             fn cut_short(_error: &&'static str) -> bool {

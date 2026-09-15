@@ -1093,7 +1093,10 @@ mod tests {
         assert!(open("old").is_err(), "the old password no longer opens it");
         let back = open("new").expect("the new one does");
         assert_eq!(back.primary_address(), s.primary_address());
-        assert_eq!(back.state.hashes, s.state.hashes, "and the cache came with it");
+        assert_eq!(
+            back.state.hashes, s.state.hashes,
+            "and the cache came with it"
+        );
     }
 
     /// A view-only copy has the wallet's address and view key and no spend
@@ -1148,8 +1151,7 @@ mod tests {
 
         let keys = files.keys.expect("a keys file");
         let reopened = MemoryStore::holding("browser", keys, files.cache);
-        let back = Session::open_in(Box::new(reopened), "pw".into(), 1, None)
-            .expect("open");
+        let back = Session::open_in(Box::new(reopened), "pw".into(), 1, None).expect("open");
         assert_eq!(back.primary_address(), s.primary_address());
         assert_eq!(back.state.hashes, s.state.hashes, "the cache came back");
         assert_eq!(back.location(), "browser");

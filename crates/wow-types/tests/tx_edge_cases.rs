@@ -428,7 +428,10 @@ fn a_pruned_blob_parses_base_only() {
     assert_eq!(base.prefix, whole.prefix);
     assert_eq!(base.rct_signatures.ty, whole.rct_signatures.ty);
     assert_eq!(base.rct_signatures.txn_fee, whole.rct_signatures.txn_fee);
-    assert_eq!(base.rct_signatures.ecdh_info, whole.rct_signatures.ecdh_info);
+    assert_eq!(
+        base.rct_signatures.ecdh_info,
+        whole.rct_signatures.ecdh_info
+    );
     assert_eq!(base.rct_signatures.out_pk, whole.rct_signatures.out_pk);
     assert_eq!(base.unprunable_size, whole.unprunable_size);
     assert!(

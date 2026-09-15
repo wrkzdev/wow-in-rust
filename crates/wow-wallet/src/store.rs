@@ -49,7 +49,9 @@ pub enum CacheRead {
     /// None of ours, but the C++ wallet's is here, in a format this does not
     /// read (`specs/12` §2.2). The wallet rescans, and writes its own at
     /// `ours`.
-    WrittenByCpp { ours: String },
+    WrittenByCpp {
+        ours: String,
+    },
 }
 
 /// A wallet as files on disk: `<name>.keys`, `<name>.rscache` and

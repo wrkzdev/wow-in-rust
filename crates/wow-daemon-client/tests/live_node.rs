@@ -180,7 +180,10 @@ fn a_second_batch_starts_at_the_last_block_of_the_first() {
     let first = c
         .get_blocks(&[genesis], 0, false, false, 0)
         .expect("first batch");
-    assert_eq!(first.start_height, 0, "a history of genesis alone starts at it");
+    assert_eq!(
+        first.start_height, 0,
+        "a history of genesis alone starts at it"
+    );
     let last = first.blocks.last().expect("blocks");
     let last_id = wow_types::block::Block::from_blob(&last.block)
         .expect("parses")
@@ -191,7 +194,10 @@ fn a_second_batch_starts_at_the_last_block_of_the_first() {
     let second = c
         .get_blocks(&[last_id, genesis], 0, false, false, 0)
         .expect("second batch");
-    assert_eq!(second.start_height, last_height, "the block both have, again");
+    assert_eq!(
+        second.start_height, last_height,
+        "the block both have, again"
+    );
     assert_eq!(
         second.blocks.first().map(|b| &b.block),
         Some(&last.block),

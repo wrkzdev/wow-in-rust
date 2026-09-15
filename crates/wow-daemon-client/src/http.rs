@@ -531,12 +531,7 @@ fn read_chunked<S: Read>(reader: &mut BufReader<S>) -> Result<Vec<u8>, HttpError
         let mut got = start;
         while got < end {
             match reader.read(&mut body[got..end]) {
-                Ok(0) => {
-                    return Err(HttpError::Truncated {
-                        got,
-                        expected: end,
-                    })
-                }
+                Ok(0) => return Err(HttpError::Truncated { got, expected: end }),
                 Ok(n) => got += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e.into()),
@@ -687,9 +682,16 @@ mod tests {
     /// A body cut short says how much of it arrived.
     #[test]
     fn a_body_cut_short_says_how_much_arrived() {
-        let e = post_to(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc").expect_err("cut short");
+        let e =
+            post_to(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc").expect_err("cut short");
         assert!(
-            matches!(e, HttpError::Truncated { got: 3, expected: 10 }),
+            matches!(
+                e,
+                HttpError::Truncated {
+                    got: 3,
+                    expected: 10
+                }
+            ),
             "{e}"
         );
         assert!(e.to_string().contains("3 of 10"), "{e}");
@@ -722,16 +724,25 @@ mod tests {
         let e = post_to(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nabc")
             .expect_err("cut short");
         assert!(
-            matches!(e, HttpError::Truncated { got: 3, expected: 6 }),
+            matches!(
+                e,
+                HttpError::Truncated {
+                    got: 3,
+                    expected: 6
+                }
+            ),
             "{e}"
         );
 
-        let e = post_to(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nxyz\r\nabc\r\n0\r\n\r\n")
-            .expect_err("not hex");
+        let e = post_to(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nxyz\r\nabc\r\n0\r\n\r\n",
+        )
+        .expect_err("not hex");
         assert!(matches!(e, HttpError::Malformed(_)), "{e}");
 
-        let e = post_to(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nabc\r\n0\r\n\r\n")
-            .expect_err("longer than its size");
+        let e =
+            post_to(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nabc\r\n0\r\n\r\n")
+                .expect_err("longer than its size");
         assert!(matches!(e, HttpError::Malformed(_)), "{e}");
     }
 
@@ -751,14 +762,13 @@ mod tests {
         params.serial_number = Some(rcgen::SerialNumber::from(1u64));
         let cert = params.self_signed(&signer).expect("a certificate");
         let der = CertificateDer::from_pem_slice(cert.pem().as_bytes()).expect("its PEM");
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            wow_tls::provider::provider(),
-        ))
-        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-        .expect("the versions")
-        .with_no_client_auth()
-        .with_single_cert(vec![der], key)
-        .expect("the pair");
+        let config =
+            rustls::ServerConfig::builder_with_provider(Arc::new(wow_tls::provider::provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .expect("the versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![der], key)
+                .expect("the pair");
         let config = Arc::new(config);
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
