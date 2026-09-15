@@ -61,6 +61,10 @@ pub enum Command {
     UseNode(String),
     /// Ask a node what it is, without using it.
     TestNode { address: String, network: Net },
+    /// Whether an https node's certificate is accepted whoever signed it, as a
+    /// node with a self-signed certificate needs. The desktop only: a browser
+    /// decides that itself.
+    AcceptAnyCertificate(bool),
     /// Look for new blocks now rather than at the next interval.
     Refresh,
     /// Build and sign a transaction and relay nothing, answered by

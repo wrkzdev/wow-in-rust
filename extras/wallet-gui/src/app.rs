@@ -64,13 +64,21 @@ pub struct Settings {
     pub folder: String,
     pub accepted_risk: bool,
     pub last_wallet: String,
+    /// Accept an https node's certificate whoever signed it. The desktop
+    /// only.
+    pub any_certificate: bool,
 }
 
 impl Settings {
     pub fn load(storage: Option<&dyn eframe::Storage>) -> Settings {
-        storage
+        let mut settings: Settings = storage
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // A wallet with no node chosen yet starts with the default one.
+        if settings.node.trim().is_empty() {
+            settings.node = nodes::DEFAULT_NODE.to_string();
+        }
+        settings
     }
 }
 
@@ -218,7 +226,8 @@ enum Test {
 }
 
 impl WalletApp {
-    pub fn new(settings: Settings, host: Box<dyn Host>) -> WalletApp {
+    pub fn new(settings: Settings, mut host: Box<dyn Host>) -> WalletApp {
+        host.send(Command::AcceptAnyCertificate(settings.any_certificate));
         let start = StartForm {
             selected: settings.last_wallet.clone(),
             folder: settings.folder.clone(),
@@ -376,13 +385,15 @@ impl WalletApp {
             Event::Error(text) => self.push(text, true),
             Event::NodeList(result) => {
                 self.nodes.fetching = false;
+                // The default node first, whether the public list came or not.
+                let network = self.network();
                 match result {
                     Ok(list) => {
-                        self.nodes.list = list;
+                        self.nodes.list = nodes::with_own_nodes(network, list);
                         self.nodes.note = None;
                     }
                     Err(e) => {
-                        self.nodes.list = nodes::snapshot(self.network());
+                        self.nodes.list = nodes::with_own_nodes(network, nodes::snapshot(network));
                         self.nodes.note = Some(e);
                     }
                 }
@@ -1511,7 +1522,7 @@ struct NodeContext {
     secure: bool,
 }
 
-/// A node typed in or picked from the public list, each with a Test button.
+/// A node typed in or picked from the list, each with a Test button.
 fn node_picker(
     ui: &mut Ui,
     picker: &mut NodePicker,
@@ -1519,28 +1530,26 @@ fn node_picker(
     host: &mut dyn Host,
     cx: NodeContext,
 ) {
-    // The public list, fetched the first time it is shown for a network.
+    // The public list, fetched the first time it is shown for a network. The
+    // default node is listed while it comes.
     if picker.fetched != Some(cx.network) && !picker.fetching {
         picker.fetched = Some(cx.network);
         picker.fetching = true;
-        picker.list.clear();
+        picker.list = nodes::own_nodes(cx.network);
         host.fetch_nodes(&nodes::list_url(cx.network));
     }
     let use_label = if cx.wallet_open { "Use" } else { "Choose" };
+    let weak = ui.visuals().weak_text_color();
 
     let mut test = None;
     let mut chosen = None;
     ui.add_space(8.0);
     ui.label(RichText::new("Node address").strong());
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.add(
             TextEdit::singleline(&mut picker.input)
-                .hint_text(if cx.in_browser {
-                    "https://host:port"
-                } else {
-                    "host:port"
-                })
-                .desired_width(300.0),
+                .hint_text("https://host:port")
+                .desired_width(320.0),
         );
         let valid = NodeAddress::parse(&picker.input).is_ok();
         if ui.add_enabled(valid, Button::new("Test")).clicked() {
@@ -1548,6 +1557,13 @@ fn node_picker(
         }
         if ui.add_enabled(valid, Button::new(use_label)).clicked() {
             chosen = Some(picker.input.trim().to_string());
+        }
+        if ui
+            .button("Default")
+            .on_hover_text(nodes::DEFAULT_NODE)
+            .clicked()
+        {
+            picker.input = nodes::DEFAULT_NODE.to_string();
         }
     });
     let input = picker.input.trim().to_string();
@@ -1569,10 +1585,33 @@ fn node_picker(
             settings.node
         ));
     }
+    // A browser decides about certificates itself.
+    if !cx.in_browser {
+        let mut any = settings.any_certificate;
+        let changed = ui
+            .checkbox(&mut any, "Accept an https node's certificate whoever signed it")
+            .on_hover_text(
+                "For a node you run yourself, with a self-signed certificate. The connection is \
+                 still encrypted, but nothing checks who is at the other end of it.",
+            )
+            .changed();
+        if changed {
+            settings.any_certificate = any;
+            host.send(Command::AcceptAnyCertificate(any));
+        }
+        if any {
+            ui.colored_label(
+                WARN,
+                "Certificates are not checked, so someone between this computer and the node \
+                 could pose as it.",
+            );
+        }
+    }
 
     ui.add_space(16.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Public nodes").strong());
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Nodes").strong());
+        ui.label("the default, and public ones");
         ui.hyperlink_to("listed by monero.fail", "https://monero.fail/?crypto=wownero");
         if picker.fetching {
             ui.spinner();
@@ -1583,44 +1622,68 @@ fn node_picker(
     if let Some(note) = &picker.note {
         ui.colored_label(WARN, note.as_str());
     }
-    ui.label(
-        RichText::new(if cx.in_browser {
-            "A browser can use a node only if the node allows requests from web pages (CORS), and \
-             a page loaded over https can use https nodes only. The Browser column is monero.fail's \
-             own check; Test shows what this browser can reach."
-        } else {
-            "The desktop wallet reaches http:// nodes only, until it speaks TLS. A node you run \
-             yourself is the most private choice."
-        })
-        .small(),
-    );
+    ui.label(if cx.in_browser {
+        "A browser can use a node only if the node allows requests from web pages (CORS), and a \
+         page loaded over https can use https nodes only. The Browser column is monero.fail's own \
+         check; Test shows what this browser can reach."
+    } else {
+        "http:// and https:// nodes both work. A node you run yourself is the most private choice."
+    });
     if !picker.list.is_empty() {
+        let headings: &[&str] = if cx.in_browser {
+            &["Node", "Note", "Height", "Browser", "", ""]
+        } else {
+            &["Node", "Note", "Height", "", ""]
+        };
         egui::Grid::new("public-nodes")
             .striped(true)
-            .num_columns(5)
+            .num_columns(headings.len())
             .spacing([12.0, 4.0])
             .show(ui, |ui| {
-                for heading in ["Node", "Height", "Browser", "", ""] {
-                    ui.label(RichText::new(heading).strong());
+                for heading in headings {
+                    ui.label(RichText::new(*heading).strong());
                 }
                 ui.end_row();
                 for node in &picker.list {
+                    let unusable = NodeAddress::parse(&node.url)
+                        .ok()
+                        .and_then(|a| a.unreachable_reason(cx.in_browser, cx.secure));
                     ui.label(RichText::new(node.url.as_str()).monospace())
                         .on_hover_text(node.country_name.as_deref().unwrap_or("location unknown"));
+                    ui.label(node.note.as_deref().unwrap_or(""));
                     ui.label(node.last_height.map_or_else(String::new, format::grouped));
-                    ui.label(if node.web_compatible { "yes" } else { "no" });
+                    if cx.in_browser {
+                        ui.label(if node.web_compatible { "yes" } else { "no" });
+                    }
                     ui.horizontal(|ui| {
-                        if ui.small_button("Test").clicked() {
+                        let usable = unusable.is_none();
+                        if ui.add_enabled(usable, Button::new("Test").small()).clicked() {
                             test = Some(node.url.clone());
                         }
-                        if ui.small_button(use_label).clicked() {
+                        if ui
+                            .add_enabled(usable, Button::new(use_label).small())
+                            .clicked()
+                        {
                             chosen = Some(node.url.clone());
                         }
                     });
-                    test_line(ui, picker.tests.get(&node.url), false);
+                    match unusable {
+                        Some(why) => {
+                            ui.label(RichText::new("not usable here").color(weak))
+                                .on_hover_text(why);
+                        }
+                        None => test_line(ui, picker.tests.get(&node.url), false),
+                    }
                     ui.end_row();
                 }
             });
+        // Why a test failed, in full, under the list rather than squeezed into
+        // a column.
+        for node in &picker.list {
+            if let Some(Test::Done(Err(e))) = picker.tests.get(&node.url) {
+                ui.colored_label(BAD, e.as_str());
+            }
+        }
     }
 
     if let Some(address) = test {
@@ -1675,7 +1738,9 @@ fn test_line(ui: &mut Ui, test: Option<&Test>, full: bool) {
             if full {
                 ui.colored_label(BAD, e.as_str());
             } else {
-                ui.colored_label(BAD, "failed").on_hover_text(e.as_str());
+                // Written out in full under the list.
+                ui.colored_label(BAD, "failed: see below")
+                    .on_hover_text(e.as_str());
             }
         }
     }

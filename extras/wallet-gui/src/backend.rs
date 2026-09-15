@@ -59,7 +59,9 @@ pub trait Platform {
     fn in_browser(&self) -> bool;
     /// Whether a browser loaded the wallet over https.
     fn secure_page(&self) -> bool;
-    fn connect(&self, node: &NodeAddress) -> DaemonClient;
+    /// A client for `node`. `any_certificate` accepts an https node's
+    /// certificate whoever signed it, where the platform decides that.
+    fn connect(&self, node: &NodeAddress, any_certificate: bool) -> DaemonClient;
     /// A clock for timing a node's answer, in milliseconds from any start.
     fn millis(&self) -> f64;
 }
@@ -85,6 +87,8 @@ pub struct Backend<P: Platform> {
     wallet: Option<Open>,
     /// Whether the command being handled said it was working.
     working: bool,
+    /// [`Command::AcceptAnyCertificate`], for the next connection.
+    any_certificate: bool,
 }
 
 impl<P: Platform> Backend<P> {
@@ -94,6 +98,7 @@ impl<P: Platform> Backend<P> {
             emit: Box::new(emit),
             wallet: None,
             working: false,
+            any_certificate: false,
         }
     }
 
@@ -162,6 +167,10 @@ impl<P: Platform> Backend<P> {
             Command::TestNode { address, network } => {
                 let result = self.test_node(&address, network);
                 self.send(Event::NodeTested { address, result });
+                Ok(())
+            }
+            Command::AcceptAnyCertificate(on) => {
+                self.any_certificate = on;
                 Ok(())
             }
             Command::Refresh => {
@@ -462,7 +471,7 @@ impl<P: Platform> Backend<P> {
         {
             return Err(why.to_string());
         }
-        let client = self.platform.connect(&node);
+        let client = self.platform.connect(&node, self.any_certificate);
         let info = client
             .get_info()
             .map_err(|e| self.unanswered(&node, &e.to_string()))?;
@@ -487,7 +496,7 @@ impl<P: Platform> Backend<P> {
         let started = self.platform.millis();
         let info = self
             .platform
-            .connect(&node)
+            .connect(&node, self.any_certificate)
             .get_info()
             .map_err(|e| self.unanswered(&node, &e.to_string()))?;
         let millis = (self.platform.millis() - started).max(0.0) as u64;

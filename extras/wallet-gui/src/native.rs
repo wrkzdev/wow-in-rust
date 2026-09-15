@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use wow_daemon_client::DaemonClient;
+use wow_daemon_client::{Certificates, DaemonClient, Endpoint};
 use wow_wallet::files::Paths;
 use wow_wallet::store::{FileStore, Store};
 
 use crate::app::{Host, Settings, WalletApp};
 use crate::backend::{Backend, Platform};
-use crate::nodes::NodeAddress;
+use crate::nodes::{self, Node, NodeAddress};
 use crate::protocol::{Command, Event, Pick};
 
 /// How long an exiting program waits for the open wallet to be saved.
@@ -41,6 +41,8 @@ pub fn run() -> eframe::Result {
                 path => PathBuf::from(path),
             };
             let ctx = cc.egui_ctx.clone();
+            let host_events = events_out.clone();
+            let host_ctx = ctx.clone();
             let spawned = std::thread::Builder::new()
                 .name("wallet".into())
                 .spawn(move || {
@@ -61,6 +63,8 @@ pub fn run() -> eframe::Result {
                 to_wallet,
                 events,
                 local: Vec::new(),
+                events_out: host_events,
+                ctx: host_ctx,
             };
             Ok(Box::new(WalletApp::new(settings, Box::new(host))))
         }),
@@ -209,8 +213,13 @@ impl Platform for Folder {
         false
     }
 
-    fn connect(&self, node: &NodeAddress) -> DaemonClient {
-        DaemonClient::new(node.host_port())
+    fn connect(&self, node: &NodeAddress, any_certificate: bool) -> DaemonClient {
+        let certificates = if any_certificate {
+            Certificates::Any
+        } else {
+            Certificates::Checked
+        };
+        DaemonClient::with_endpoint(Endpoint::new(node.url()).with_certificates(certificates))
     }
 
     fn millis(&self) -> f64 {
@@ -223,6 +232,9 @@ struct NativeHost {
     events: Receiver<Event>,
     /// Answers the host gives itself.
     local: Vec<Event>,
+    /// For what the host fetches on a thread of its own: the public list.
+    events_out: Sender<Event>,
+    ctx: egui::Context,
 }
 
 impl Host for NativeHost {
@@ -252,11 +264,40 @@ impl Host for NativeHost {
 
     fn pick_file(&mut self, _purpose: Pick) {}
 
-    fn fetch_nodes(&mut self, _url: &str) {
-        self.local.push(Event::NodeList(Err(
-            "The desktop wallet cannot fetch the public list until it speaks TLS, so this is the \
-             list as it stood on 15 September 2026."
-                .into(),
-        )));
+    fn fetch_nodes(&mut self, url: &str) {
+        let events = self.events_out.clone();
+        let ctx = self.ctx.clone();
+        let url = url.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("node list".into())
+            .spawn(move || {
+                let result = fetch_list(&url).map_err(|e| unfetched(&e));
+                if events.send(Event::NodeList(result)).is_ok() {
+                    ctx.request_repaint();
+                }
+            });
+        if let Err(e) = spawned {
+            self.local
+                .push(Event::NodeList(Err(unfetched(&e.to_string()))));
+        }
     }
+}
+
+/// The public list, over https. `url` is on [`nodes::LIST_SITE`].
+fn fetch_list(url: &str) -> Result<Vec<Node>, String> {
+    let path = url
+        .strip_prefix(nodes::LIST_SITE)
+        .ok_or_else(|| format!("{url} is not on {}", nodes::LIST_SITE))?;
+    let body = Endpoint::new(nodes::LIST_SITE)
+        .get(path)
+        .map_err(|e| e.to_string())?;
+    let text = String::from_utf8(body).map_err(|e| e.to_string())?;
+    nodes::parse_listing(&text)
+}
+
+fn unfetched(why: &str) -> String {
+    format!(
+        "The public node list could not be fetched ({why}), so this is the list as it stood on \
+         15 September 2026."
+    )
 }

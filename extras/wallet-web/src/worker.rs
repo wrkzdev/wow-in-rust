@@ -145,7 +145,9 @@ impl Platform for Browser {
         worker_is_secure()
     }
 
-    fn connect(&self, node: &NodeAddress) -> DaemonClient {
+    /// The browser checks a node's certificate itself, and a page cannot tell
+    /// it to accept one it does not trust.
+    fn connect(&self, node: &NodeAddress, _any_certificate: bool) -> DaemonClient {
         DaemonClient::with_transport(Arc::new(BrowserTransport { base: node.url() }))
     }
 
