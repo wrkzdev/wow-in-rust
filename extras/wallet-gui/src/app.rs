@@ -6,7 +6,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use egui::{Align, Align2, Button, Color32, Layout, RichText, TextEdit, Ui};
+use egui::{
+    Align, Align2, Button, Color32, FontFamily, FontId, Layout, RichText, TextEdit, TextStyle,
+    ThemePreference, Ui,
+};
 use serde::{Deserialize, Serialize};
 use wow_crypto::mnemonic::{self, Language, WordList};
 
@@ -24,11 +27,6 @@ pub const DISCLAIMER: &str = "This wallet is very new software. It has not been 
     tested, and it may have bugs that lose funds. Use it at your own risk, with amounts you can \
     afford to lose.";
 
-const ACCENT: Color32 = Color32::from_rgb(0xe0, 0x4f, 0xd8);
-const GOOD: Color32 = Color32::from_rgb(0x4c, 0xb8, 0x6a);
-const BAD: Color32 = Color32::from_rgb(0xe0, 0x5c, 0x50);
-const WARN: Color32 = Color32::from_rgb(0xe0, 0xa0, 0x30);
-
 /// Seconds a notice stays up. Errors stay until dismissed.
 const NOTICE_SECS: f64 = 12.0;
 
@@ -37,6 +35,39 @@ const MAX_SUBADDRESS: u32 = 199;
 
 /// Below this width the pages are tabs across the top, as on a phone.
 const NARROW: f32 = 700.0;
+
+/// The sizes the interface can be zoomed to, and the step between them.
+const MIN_SCALE: f32 = 0.8;
+const MAX_SCALE: f32 = 1.6;
+const SCALE_STEP: f32 = 0.1;
+
+/// The colours that say how something went, for the theme in force: those
+/// that read well on a dark background are too pale on a light one.
+#[derive(Clone, Copy)]
+struct Tones {
+    accent: Color32,
+    good: Color32,
+    bad: Color32,
+    warn: Color32,
+}
+
+fn tones(ui: &Ui) -> Tones {
+    if ui.visuals().dark_mode {
+        Tones {
+            accent: Color32::from_rgb(0xe0, 0x4f, 0xd8),
+            good: Color32::from_rgb(0x4c, 0xb8, 0x6a),
+            bad: Color32::from_rgb(0xe0, 0x5c, 0x50),
+            warn: Color32::from_rgb(0xe0, 0xa0, 0x30),
+        }
+    } else {
+        Tones {
+            accent: Color32::from_rgb(0xa0, 0x1e, 0x98),
+            good: Color32::from_rgb(0x1b, 0x7a, 0x3a),
+            bad: Color32::from_rgb(0xb4, 0x23, 0x18),
+            warn: Color32::from_rgb(0x96, 0x58, 0x00),
+        }
+    }
+}
 
 /// What the interface needs from where it runs.
 pub trait Host {
@@ -54,8 +85,33 @@ pub trait Host {
     fn fetch_nodes(&mut self, url: &str);
 }
 
+/// Light or dark, or as the system is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    const ALL: [(Theme, &'static str); 3] = [
+        (Theme::System, "As the system is"),
+        (Theme::Light, "Light"),
+        (Theme::Dark, "Dark"),
+    ];
+
+    fn preference(self) -> ThemePreference {
+        match self {
+            Theme::System => ThemePreference::System,
+            Theme::Light => ThemePreference::Light,
+            Theme::Dark => ThemePreference::Dark,
+        }
+    }
+}
+
 /// What is remembered between runs. Never a password or a seed.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub node: String,
@@ -67,6 +123,28 @@ pub struct Settings {
     /// Accept an https node's certificate whoever signed it. The desktop
     /// only.
     pub any_certificate: bool,
+    pub theme: Theme,
+    /// The whole interface's zoom, 1 being this wallet's own text sizes.
+    pub text_scale: f32,
+    /// The risk notice along the foot of the window, once read and hidden.
+    /// It stays under Settings, About.
+    pub hide_notice: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            node: nodes::DEFAULT_NODE.to_string(),
+            network: Net::Mainnet,
+            folder: String::new(),
+            accepted_risk: false,
+            last_wallet: String::new(),
+            any_certificate: false,
+            theme: Theme::System,
+            text_scale: 1.0,
+            hide_notice: false,
+        }
+    }
 }
 
 impl Settings {
@@ -77,6 +155,9 @@ impl Settings {
         // A wallet with no node chosen yet starts with the default one.
         if settings.node.trim().is_empty() {
             settings.node = nodes::DEFAULT_NODE.to_string();
+        }
+        if !(MIN_SCALE..=MAX_SCALE).contains(&settings.text_scale) {
+            settings.text_scale = 1.0;
         }
         settings
     }
@@ -100,12 +181,30 @@ pub struct WalletApp {
     risk_understood: bool,
     /// A wallet waiting for a yes before it is deleted.
     forget: Option<String>,
+    settings_tab: SettingsTab,
+    /// Whether the saved theme, text size and text styles have been handed
+    /// to egui.
+    look_applied: bool,
+    /// Where the command last sent says why it failed, when that is beside
+    /// the form that sent it rather than at the foot of the window.
+    awaiting: Option<Place>,
+    start_error: Option<String>,
+    wallet_error: Option<String>,
 }
 
 struct Message {
     text: String,
     error: bool,
     at: f64,
+}
+
+/// Where a failure is said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// Under the form on the start page.
+    Start,
+    /// Under the wallet's settings.
+    Wallet,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -115,7 +214,7 @@ enum StartTab {
     Create,
     Restore,
     Import,
-    Node,
+    Settings,
 }
 
 #[derive(Default)]
@@ -141,18 +240,27 @@ enum Page {
     Send,
     Receive,
     History,
-    Node,
-    Wallet,
+    Settings,
 }
 
-const PAGES: [(Page, &str); 6] = [
+const PAGES: [(Page, &str); 5] = [
     (Page::Overview, "Overview"),
     (Page::Send, "Send"),
     (Page::Receive, "Receive"),
     (Page::History, "History"),
-    (Page::Node, "Node"),
-    (Page::Wallet, "Wallet"),
+    (Page::Settings, "Settings"),
 ];
+
+/// The sections of the settings page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsTab {
+    /// The open wallet's: only while one is open.
+    Wallet,
+    #[default]
+    Node,
+    Appearance,
+    About,
+}
 
 struct WalletView {
     summary: Summary,
@@ -254,6 +362,11 @@ impl WalletApp {
             seed_written: false,
             risk_understood: false,
             forget: None,
+            settings_tab: SettingsTab::default(),
+            look_applied: false,
+            awaiting: None,
+            start_error: None,
+            wallet_error: None,
         }
     }
 
@@ -276,6 +389,43 @@ impl WalletApp {
         if self.messages.len() > 6 {
             self.messages.remove(0);
         }
+    }
+
+    /// Send a command whose failure is said beside the form it came from.
+    fn send_from(&mut self, place: Place, command: Command) {
+        match place {
+            Place::Start => self.start_error = None,
+            Place::Wallet => self.wallet_error = None,
+        }
+        self.awaiting = Some(place);
+        self.host.send(command);
+    }
+
+    /// The saved theme and text size, and this wallet's text styles, on the
+    /// first frame; after that, egui's zoom is what is kept.
+    fn apply_look(&mut self, ctx: &egui::Context) {
+        if self.look_applied {
+            // The Appearance buttons change egui's zoom, and so do Ctrl and +
+            // or -. Whatever it is now is what is saved.
+            self.settings.text_scale = ctx.zoom_factor();
+            return;
+        }
+        self.look_applied = true;
+        ctx.all_styles_mut(|style| {
+            style.text_styles = [
+                (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
+                (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
+                (TextStyle::Button, FontId::new(15.0, FontFamily::Proportional)),
+                (TextStyle::Heading, FontId::new(22.0, FontFamily::Proportional)),
+                (TextStyle::Monospace, FontId::new(14.0, FontFamily::Monospace)),
+            ]
+            .into();
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+            style.spacing.button_padding = egui::vec2(8.0, 4.0);
+        });
+        ctx.set_theme(self.settings.theme.preference());
+        // In force from the next frame.
+        ctx.set_zoom_factor(self.settings.text_scale);
     }
 
     fn on_event(&mut self, event: Event) {
@@ -308,13 +458,23 @@ impl WalletApp {
                 ] {
                     field.clear();
                 }
+                self.awaiting = None;
+                self.start_error = None;
+                self.wallet_error = None;
+                if self.settings_tab == SettingsTab::Node {
+                    self.settings_tab = SettingsTab::Wallet;
+                }
                 self.wallet = Some(WalletView::new(summary));
             }
             Event::NewSeed(seed) => {
                 self.new_seed = Some(seed);
                 self.seed_written = false;
             }
-            Event::Closed => self.wallet = None,
+            Event::Closed => {
+                self.wallet = None;
+                self.wallet_error = None;
+                self.awaiting = None;
+            }
             Event::Status(status) => {
                 if let Some(w) = &mut self.wallet {
                     w.status = status;
@@ -363,6 +523,7 @@ impl WalletApp {
                 }
             }
             Event::Seed(seed) => {
+                self.awaiting = None;
                 if let Some(w) = &mut self.wallet {
                     w.seed = Some(seed);
                 }
@@ -373,6 +534,7 @@ impl WalletApp {
                 }
             }
             Event::Exported { name, keys, cache } => {
+                self.awaiting = None;
                 self.host.download(&format!("{name}.keys"), &keys.0);
                 if let Some(cache) = cache {
                     self.host.download(&format!("{name}.rscache"), &cache.0);
@@ -381,8 +543,15 @@ impl WalletApp {
                     "Exported {name}. The keys file is only as safe as its password."
                 ));
             }
-            Event::Notice(text) => self.push(text, false),
-            Event::Error(text) => self.push(text, true),
+            Event::Notice(text) => {
+                self.awaiting = None;
+                self.push(text, false);
+            }
+            Event::Error(text) => match self.awaiting.take() {
+                Some(Place::Start) => self.start_error = Some(text),
+                Some(Place::Wallet) => self.wallet_error = Some(text),
+                None => self.push(text, true),
+            },
             Event::NodeList(result) => {
                 self.nodes.fetching = false;
                 // The default node first, whether the public list came or not.
@@ -418,28 +587,36 @@ impl WalletApp {
     }
 
     fn top_bar(&mut self, ui: &mut Ui) {
+        let t = tones(ui);
+        // `Some(None)` opens the settings as they were last left.
+        let mut go: Option<Option<SettingsTab>> = None;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("Wownero Wallet")
                     .strong()
-                    .size(18.0)
-                    .color(ACCENT),
+                    .size(20.0)
+                    .color(t.accent),
             );
-            ui.label(RichText::new("BETA").small().strong().color(WARN))
+            ui.label(RichText::new("BETA").small().strong().color(t.warn))
                 .on_hover_text(DISCLAIMER);
             if let Some(w) = &self.wallet {
                 ui.separator();
                 ui.label(RichText::new(w.summary.name.as_str()).strong());
                 if w.summary.network != Net::Mainnet {
-                    ui.label(RichText::new(w.summary.network.name()).color(WARN));
+                    ui.label(RichText::new(w.summary.network.name()).color(t.warn));
                 }
                 if w.summary.view_only {
-                    ui.label(RichText::new("view-only").color(WARN));
+                    ui.label(RichText::new("view-only").color(t.warn));
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Settings").clicked() {
+                    go = Some(None);
+                }
                 if let Some(w) = &self.wallet {
-                    node_chip(ui, &w.status);
+                    if node_chip(ui, &w.status).clicked() {
+                        go = Some(Some(SettingsTab::Node));
+                    }
                 }
                 if let Some(what) = &self.working {
                     ui.label(what.as_str());
@@ -447,9 +624,19 @@ impl WalletApp {
                 }
             });
         });
+        if let Some(tab) = go {
+            if let Some(tab) = tab {
+                self.settings_tab = tab;
+            }
+            match &mut self.wallet {
+                Some(w) => w.page = Page::Settings,
+                None => self.start.tab = StartTab::Settings,
+            }
+        }
     }
 
     fn message_list(&mut self, ui: &mut Ui) {
+        let t = tones(ui);
         let mut dismissed = None;
         for (i, m) in self.messages.iter().enumerate().rev() {
             ui.horizontal(|ui| {
@@ -457,7 +644,7 @@ impl WalletApp {
                     dismissed = Some(i);
                 }
                 let color = if m.error {
-                    BAD
+                    t.bad
                 } else {
                     ui.visuals().text_color()
                 };
@@ -504,14 +691,20 @@ impl WalletApp {
     }
 
     fn wallet_page(&mut self, ui: &mut Ui) {
-        let in_browser = self.host.in_browser();
-        let secure = self.host.secure_page();
+        let page = match &self.wallet {
+            Some(w) => w.page,
+            None => return,
+        };
+        if page == Page::Settings {
+            self.settings_page(ui);
+            return;
+        }
         let Some(w) = self.wallet.as_mut() else {
             return;
         };
         let host = &mut *self.host;
-        match w.page {
-            Page::Overview => overview(ui, w, host),
+        match page {
+            Page::Overview => overview(ui, w, host, &mut self.settings_tab),
             Page::Send => send_page(ui, w, host),
             Page::Receive => receive_page(ui, w, host),
             Page::History => {
@@ -522,24 +715,77 @@ impl WalletApp {
                     history_grid(ui, &w.history, "history");
                 }
             }
-            Page::Node => {
-                ui.heading("Node");
-                match &w.status.node {
-                    Some(n) => ui.label(format!("In use: {n}")),
-                    None => ui.label("No node in use."),
-                };
-                if let Some(e) = &w.status.node_error {
-                    ui.colored_label(BAD, e.as_str());
+            Page::Settings => {}
+        }
+    }
+
+    /// Settings, with a wallet open or not: that wallet's, the node, how the
+    /// interface looks, and what this is.
+    fn settings_page(&mut self, ui: &mut Ui) {
+        let in_browser = self.host.in_browser();
+        let secure = self.host.secure_page();
+        let open = self.wallet.is_some();
+        if !open && self.settings_tab == SettingsTab::Wallet {
+            self.settings_tab = SettingsTab::Node;
+        }
+        ui.heading("Settings");
+        ui.horizontal_wrapped(|ui| {
+            let mut tabs = Vec::new();
+            if open {
+                tabs.push((SettingsTab::Wallet, "Wallet"));
+            }
+            tabs.extend([
+                (SettingsTab::Node, "Node"),
+                (SettingsTab::Appearance, "Appearance"),
+                (SettingsTab::About, "About"),
+            ]);
+            for (tab, label) in tabs {
+                ui.selectable_value(&mut self.settings_tab, tab, label);
+            }
+        });
+        ui.separator();
+        match self.settings_tab {
+            SettingsTab::Wallet => {
+                if let Some(w) = self.wallet.as_mut() {
+                    wallet_settings(
+                        ui,
+                        w,
+                        &mut *self.host,
+                        in_browser,
+                        &mut self.wallet_error,
+                        &mut self.awaiting,
+                    );
+                }
+            }
+            SettingsTab::Node => {
+                let t = tones(ui);
+                match &self.wallet {
+                    Some(w) => {
+                        match &w.status.node {
+                            Some(n) => ui.label(format!("In use: {n}")),
+                            None => ui.label("No node in use."),
+                        };
+                        if let Some(e) = &w.status.node_error {
+                            ui.colored_label(t.bad, e.as_str());
+                        }
+                    }
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.label("Network");
+                            network_combo(ui, &mut self.settings.network);
+                        });
+                    }
                 }
                 let cx = NodeContext {
-                    network: w.summary.network,
-                    wallet_open: true,
+                    network: self.network(),
+                    wallet_open: open,
                     in_browser,
                     secure,
                 };
-                node_picker(ui, &mut self.nodes, &mut self.settings, host, cx);
+                node_picker(ui, &mut self.nodes, &mut self.settings, &mut *self.host, cx);
             }
-            Page::Wallet => wallet_settings(ui, w, host, in_browser),
+            SettingsTab::Appearance => appearance(ui, &mut self.settings, in_browser),
+            SettingsTab::About => about(ui),
         }
     }
 
@@ -553,6 +799,7 @@ impl WalletApp {
         }
         let in_browser = self.host.in_browser();
         ui.add_space(8.0);
+        let before = self.start.tab;
         ui.horizontal_wrapped(|ui| {
             let mut tabs = vec![
                 (StartTab::Open, "Open"),
@@ -562,34 +809,35 @@ impl WalletApp {
             if in_browser {
                 tabs.push((StartTab::Import, "Import"));
             }
-            tabs.push((StartTab::Node, "Node"));
+            tabs.push((StartTab::Settings, "Settings"));
             for (tab, label) in tabs {
                 ui.selectable_value(&mut self.start.tab, tab, label);
             }
         });
+        if self.start.tab != before {
+            self.start_error = None;
+        }
         ui.separator();
         match self.start.tab {
             StartTab::Open => self.open_tab(ui, in_browser),
             StartTab::Create => self.create_tab(ui),
             StartTab::Restore => self.restore_tab(ui),
             StartTab::Import => self.import_tab(ui),
-            StartTab::Node => {
-                ui.horizontal(|ui| {
-                    ui.label("Network");
-                    network_combo(ui, &mut self.settings.network);
-                });
-                let cx = NodeContext {
-                    network: self.settings.network,
-                    wallet_open: false,
-                    in_browser,
-                    secure: self.host.secure_page(),
-                };
-                node_picker(ui, &mut self.nodes, &mut self.settings, &mut *self.host, cx);
+            StartTab::Settings => {
+                self.settings_page(ui);
+                return;
             }
+        }
+        // Why what this form asked for failed, where it was asked.
+        if let Some(e) = &self.start_error {
+            let t = tones(ui);
+            ui.add_space(8.0);
+            ui.colored_label(t.bad, e.as_str());
         }
     }
 
     fn open_tab(&mut self, ui: &mut Ui, in_browser: bool) {
+        let mut use_folder = false;
         if !in_browser {
             ui.horizontal(|ui| {
                 ui.label("Folder");
@@ -598,12 +846,13 @@ impl WalletApp {
                         .hint_text(self.location.as_str())
                         .desired_width(360.0),
                 );
-                if ui.button("Use").clicked() {
-                    self.settings.folder = self.start.folder.trim().to_string();
-                    self.host
-                        .send(Command::SetFolder(self.settings.folder.clone()));
-                }
+                use_folder = ui.button("Use").clicked();
             });
+        }
+        if use_folder {
+            self.settings.folder = self.start.folder.trim().to_string();
+            let folder = self.settings.folder.clone();
+            self.send_from(Place::Start, Command::SetFolder(folder));
         }
         ui.add_space(8.0);
         if self.wallets.is_empty() {
@@ -645,20 +894,22 @@ impl WalletApp {
             }
         });
         if self.settings.node.is_empty() {
+            let t = tones(ui);
             ui.colored_label(
-                WARN,
-                "No node chosen yet, so the wallet opens offline. Choose one on the Node tab.",
+                t.warn,
+                "No node chosen yet, so the wallet opens offline. Choose one in Settings, under Node.",
             );
         }
         if open {
-            self.host.send(Command::Open(OpenWallet {
+            let command = Command::Open(OpenWallet {
                 name: self.start.selected.clone(),
                 password: std::mem::take(&mut self.start.password),
                 node: self.settings.node.clone(),
-            }));
+            });
+            self.send_from(Place::Start, command);
         }
         if let Some(name) = export {
-            self.host.send(Command::Export(name));
+            self.send_from(Place::Start, Command::Export(name));
         }
         if forget.is_some() {
             self.forget = forget;
@@ -716,17 +967,19 @@ impl WalletApp {
             .add_enabled(checks, Button::new("Create wallet"))
             .clicked()
         {
-            self.host.send(Command::Create(NewWallet {
+            let command = Command::Create(NewWallet {
                 name: f.name.clone(),
                 password: f.new_password.clone(),
                 network: self.settings.network,
                 language: f.language.clone(),
                 node: self.settings.node.clone(),
-            }));
+            });
+            self.send_from(Place::Start, command);
         }
     }
 
     fn restore_tab(&mut self, ui: &mut Ui) {
+        let t = tones(ui);
         let f = &mut self.start;
         egui::Grid::new("restore")
             .num_columns(2)
@@ -780,7 +1033,7 @@ impl WalletApp {
         let f = &self.start;
         let words = f.seed.split_whitespace().count();
         if words > 0 && words < 24 {
-            ui.colored_label(WARN, format!("{words} words so far; a seed phrase has 25."));
+            ui.colored_label(t.warn, format!("{words} words so far; a seed phrase has 25."));
         }
         let height = match f.height.trim().replace([',', '_'], "") {
             h if h.is_empty() => Ok(0),
@@ -790,7 +1043,7 @@ impl WalletApp {
         };
         match &height {
             Err(e) => {
-                ui.colored_label(BAD, e.as_str());
+                ui.colored_label(t.bad, e.as_str());
             }
             Ok(0) => {
                 ui.label(
@@ -807,7 +1060,7 @@ impl WalletApp {
             .clicked()
         {
             if let Ok(restore_height) = height {
-                self.host.send(Command::Restore(Restore {
+                let command = Command::Restore(Restore {
                     name: f.name.clone(),
                     password: f.new_password.clone(),
                     network: self.settings.network,
@@ -815,12 +1068,14 @@ impl WalletApp {
                     passphrase: f.passphrase.clone(),
                     restore_height,
                     node: self.settings.node.clone(),
-                }));
+                });
+                self.send_from(Place::Start, command);
             }
         }
     }
 
     fn import_tab(&mut self, ui: &mut Ui) {
+        let t = tones(ui);
         ui.label(
             "Import a wallet from its files: a .keys file, from this wallet or from Wownero's own \
              wallets, and if you have it this wallet's .rscache file. Without the cache the wallet \
@@ -863,17 +1118,18 @@ impl WalletApp {
 
         let problem = name_problem(&self.start.name);
         if let Some(p) = &problem {
-            ui.colored_label(BAD, p.as_str());
+            ui.colored_label(t.bad, p.as_str());
         }
         let ready = self.start.keys.is_some() && !self.start.name.is_empty() && problem.is_none();
         if ui.add_enabled(ready, Button::new("Import")).clicked() {
             if let Some((_, keys)) = self.start.keys.take() {
                 let cache = self.start.cache.take().map(|(_, c)| Bytes(c));
-                self.host.send(Command::Import {
+                let command = Command::Import {
                     name: std::mem::take(&mut self.start.name),
                     keys: Bytes(keys),
                     cache,
-                });
+                };
+                self.send_from(Place::Start, command);
             }
         }
     }
@@ -943,7 +1199,7 @@ impl WalletApp {
             match answer {
                 Some(true) => {
                     self.forget = None;
-                    self.host.send(Command::Forget(name));
+                    self.send_from(Place::Start, Command::Forget(name));
                 }
                 Some(false) => self.forget = None,
                 None => {}
@@ -1042,6 +1298,7 @@ impl WalletApp {
 
 impl eframe::App for WalletApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_look(ctx);
         self.now = ctx.input(|i| i.time);
         for event in self.host.receive() {
             self.on_event(event);
@@ -1051,11 +1308,23 @@ impl eframe::App for WalletApp {
         let narrow = ctx.screen_rect().width() < NARROW;
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_bar(ui));
-        egui::TopBottomPanel::bottom("risk").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.label(RichText::new(DISCLAIMER).small().color(WARN));
-            ui.add_space(2.0);
-        });
+        if !self.settings.hide_notice {
+            egui::TopBottomPanel::bottom("risk").show(ctx, |ui| {
+                let t = tones(ui);
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(DISCLAIMER).color(t.warn));
+                    if ui
+                        .small_button("Hide")
+                        .on_hover_text("It stays under Settings, About.")
+                        .clicked()
+                    {
+                        self.settings.hide_notice = true;
+                    }
+                });
+                ui.add_space(2.0);
+            });
+        }
         if !self.messages.is_empty() {
             egui::TopBottomPanel::bottom("messages").show(ctx, |ui| self.message_list(ui));
         }
@@ -1065,7 +1334,7 @@ impl eframe::App for WalletApp {
             } else {
                 egui::SidePanel::left("pages")
                     .resizable(false)
-                    .exact_width(160.0)
+                    .exact_width(170.0)
                     .show(ctx, |ui| self.page_tabs(ui, false));
             }
         }
@@ -1073,7 +1342,7 @@ impl eframe::App for WalletApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.set_max_width(900.0);
+                    ui.set_max_width(960.0);
                     if self.wallet.is_some() {
                         self.wallet_page(ui);
                     } else {
@@ -1094,13 +1363,14 @@ impl eframe::App for WalletApp {
     }
 }
 
-fn overview(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
+fn overview(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host, tab: &mut SettingsTab) {
+    let t = tones(ui);
     let weak = ui.visuals().weak_text_color();
     ui.add_space(8.0);
     ui.label(RichText::new("Balance").color(weak));
     ui.label(
         RichText::new(format!("{} WOW", format::amount_short(w.status.balance)))
-            .size(32.0)
+            .size(34.0)
             .strong(),
     );
     if w.status.unlocked != w.status.balance {
@@ -1115,7 +1385,7 @@ fn overview(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     ui.add_space(12.0);
     sync_bar(ui, &w.status);
     if let Some(e) = &w.status.node_error {
-        ui.colored_label(BAD, e.as_str());
+        ui.colored_label(t.bad, e.as_str());
     }
     ui.horizontal(|ui| {
         let can_refresh = w.status.node.is_some() && !w.status.syncing;
@@ -1126,7 +1396,8 @@ fn overview(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
             host.send(Command::Refresh);
         }
         if w.status.node.is_none() && ui.button("Choose a node").clicked() {
-            w.page = Page::Node;
+            *tab = SettingsTab::Node;
+            w.page = Page::Settings;
         }
     });
 
@@ -1198,6 +1469,7 @@ fn check_address(text: &str, network: Net) -> AddressCheck {
 }
 
 fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
+    let t = tones(ui);
     ui.heading("Send");
     if w.summary.view_only {
         ui.label("A view-only wallet cannot send: it has no spend key.");
@@ -1226,17 +1498,17 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
             ui.add(
                 TextEdit::singleline(&mut d.address)
                     .hint_text("a Wownero address")
-                    .desired_width(460.0),
+                    .desired_width(480.0),
             );
             ui.end_row();
             ui.label("");
             match &check {
                 AddressCheck::Empty => ui.label(""),
-                AddressCheck::Bad(why) => ui.colored_label(BAD, why.as_str()),
-                AddressCheck::Standard => ui.colored_label(GOOD, "A standard address."),
-                AddressCheck::Subaddress => ui.colored_label(GOOD, "A subaddress."),
+                AddressCheck::Bad(why) => ui.colored_label(t.bad, why.as_str()),
+                AddressCheck::Standard => ui.colored_label(t.good, "A standard address."),
+                AddressCheck::Subaddress => ui.colored_label(t.good, "A subaddress."),
                 AddressCheck::Integrated(id) => ui.colored_label(
-                    GOOD,
+                    t.good,
                     format!("An integrated address, carrying the payment ID {id}."),
                 ),
             };
@@ -1288,7 +1560,7 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
         } else {
             "Nothing in this wallet can be spent yet."
         };
-        ui.colored_label(WARN, why);
+        ui.colored_label(t.warn, why);
         if let Some(note) = unlock_note(&w.status) {
             ui.label(note);
         }
@@ -1300,12 +1572,12 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
         format::parse_amount(&d.amount).map(Some)
     };
     if let (false, Err(e)) = (d.everything || d.amount.trim().is_empty(), &amount) {
-        ui.colored_label(BAD, e.as_str());
+        ui.colored_label(t.bad, e.as_str());
     }
     let too_much = matches!(amount, Ok(Some(a)) if a > unlocked);
     if too_much && unlocked > 0 {
         ui.colored_label(
-            BAD,
+            t.bad,
             format!(
                 "That is more than can be spent now: {} WOW.",
                 format::amount_short(unlocked)
@@ -1315,7 +1587,7 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     let id_to_subaddress = check == AddressCheck::Subaddress && !d.payment_id.trim().is_empty();
     if id_to_subaddress {
         ui.colored_label(
-            BAD,
+            t.bad,
             "A payment ID cannot go to a subaddress: its payee could not read it.",
         );
     }
@@ -1374,7 +1646,7 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
         ));
     }
     if let Some(e) = &w.send_error {
-        ui.colored_label(BAD, e.as_str());
+        ui.colored_label(t.bad, e.as_str());
     }
     if review {
         w.send_error = None;
@@ -1391,7 +1663,7 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     let mut dismiss = false;
     if let Some(reasons) = &w.rejected {
         ui.add_space(12.0);
-        ui.colored_label(BAD, "The node refused the transaction:");
+        ui.colored_label(t.bad, "The node refused the transaction:");
         for r in reasons {
             ui.label(format!("• {r}"));
         }
@@ -1436,8 +1708,16 @@ fn receive_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
     }
 }
 
-fn wallet_settings(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host, in_browser: bool) {
-    ui.heading("Wallet");
+/// The open wallet's settings: what it is, its seed phrase, its files.
+fn wallet_settings(
+    ui: &mut Ui,
+    w: &mut WalletView,
+    host: &mut dyn Host,
+    in_browser: bool,
+    error: &mut Option<String>,
+    awaiting: &mut Option<Place>,
+) {
+    let t = tones(ui);
     egui::Grid::new("wallet-facts")
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -1462,6 +1742,11 @@ fn wallet_settings(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host, in_brow
             });
             ui.end_row();
         });
+    // Why what was asked for here failed.
+    if let Some(e) = error.as_ref() {
+        ui.add_space(8.0);
+        ui.colored_label(t.bad, e.as_str());
+    }
 
     ui.add_space(16.0);
     ui.label(RichText::new("Seed phrase").strong());
@@ -1469,7 +1754,7 @@ fn wallet_settings(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host, in_brow
     if w.summary.view_only {
         ui.label("A view-only wallet has no seed phrase.");
     } else if let Some(seed) = &w.seed {
-        ui.colored_label(WARN, "Anyone who sees these words can take this wallet's money.");
+        ui.colored_label(t.warn, "Anyone who sees these words can take this wallet's money.");
         let mut text = seed.as_str();
         ui.add(
             TextEdit::multiline(&mut text)
@@ -1487,6 +1772,8 @@ fn wallet_settings(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host, in_brow
                     .desired_width(200.0),
             );
             if ui.button("Show seed").clicked() {
+                *error = None;
+                *awaiting = Some(Place::Wallet);
                 host.send(Command::ShowSeed {
                     password: std::mem::take(&mut w.seed_password),
                 });
@@ -1505,6 +1792,8 @@ fn wallet_settings(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host, in_brow
              wallet's password. The browser can clear what a site stores, so keep a copy.",
         );
         if ui.button("Export files").clicked() {
+            *error = None;
+            *awaiting = Some(Place::Wallet);
             host.send(Command::Export(w.summary.name.clone()));
         }
     }
@@ -1512,6 +1801,82 @@ fn wallet_settings(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host, in_brow
     if ui.button("Close wallet").clicked() {
         host.send(Command::Close);
     }
+}
+
+/// How the interface looks: its theme and its size.
+fn appearance(ui: &mut Ui, settings: &mut Settings, in_browser: bool) {
+    ui.label(RichText::new("Theme").strong());
+    ui.horizontal_wrapped(|ui| {
+        for (theme, label) in Theme::ALL {
+            if ui
+                .selectable_value(&mut settings.theme, theme, label)
+                .clicked()
+            {
+                ui.ctx().set_theme(theme.preference());
+            }
+        }
+    });
+
+    ui.add_space(16.0);
+    ui.label(RichText::new("Text size").strong());
+    let zoom = ui.ctx().zoom_factor();
+    let step = |by: f32| {
+        ((zoom + by) * 10.0)
+            .round()
+            .clamp(MIN_SCALE * 10.0, MAX_SCALE * 10.0)
+            / 10.0
+    };
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(zoom > MIN_SCALE + 0.01, Button::new("Smaller"))
+            .clicked()
+        {
+            ui.ctx().set_zoom_factor(step(-SCALE_STEP));
+        }
+        ui.label(format!("{:.0}%", zoom * 100.0));
+        if ui
+            .add_enabled(zoom < MAX_SCALE - 0.01, Button::new("Larger"))
+            .clicked()
+        {
+            ui.ctx().set_zoom_factor(step(SCALE_STEP));
+        }
+        if ui
+            .add_enabled((zoom - 1.0).abs() > 0.01, Button::new("Reset"))
+            .clicked()
+        {
+            ui.ctx().set_zoom_factor(1.0);
+        }
+    });
+    if !in_browser {
+        ui.label("Ctrl and + or - change it too.");
+    }
+
+    ui.add_space(16.0);
+    ui.checkbox(
+        &mut settings.hide_notice,
+        "Hide the risk notice at the foot of the window",
+    );
+}
+
+/// What this is, and the risk of using it.
+fn about(ui: &mut Ui) {
+    let t = tones(ui);
+    ui.label(RichText::new(format!("Wownero Wallet {}", env!("CARGO_PKG_VERSION"))).strong());
+    ui.label(
+        "A Wownero wallet written in Rust. The desktop wallet and the web wallet share this \
+         interface, and the wallet library wownero-wallet-cli uses.",
+    );
+    ui.add_space(8.0);
+    ui.colored_label(t.warn, DISCLAIMER);
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Source code:");
+        ui.hyperlink_to(
+            "github.com/wrkzdev/wow-in-rust",
+            "https://github.com/wrkzdev/wow-in-rust",
+        );
+    });
+    ui.label("Licence: BSD-3-Clause.");
 }
 
 /// Where the node picker is shown.
@@ -1530,6 +1895,7 @@ fn node_picker(
     host: &mut dyn Host,
     cx: NodeContext,
 ) {
+    let t = tones(ui);
     // The public list, fetched the first time it is shown for a network. The
     // default node is listed while it comes.
     if picker.fetched != Some(cx.network) && !picker.fetching {
@@ -1570,11 +1936,11 @@ fn node_picker(
     match NodeAddress::parse(&input) {
         Ok(node) => {
             if let Some(why) = node.unreachable_reason(cx.in_browser, cx.secure) {
-                ui.colored_label(WARN, why);
+                ui.colored_label(t.warn, why);
             }
         }
         Err(e) if !input.is_empty() => {
-            ui.colored_label(BAD, e.as_str());
+            ui.colored_label(t.bad, e.as_str());
         }
         Err(_) => {}
     }
@@ -1601,7 +1967,7 @@ fn node_picker(
         }
         if any {
             ui.colored_label(
-                WARN,
+                t.warn,
                 "Certificates are not checked, so someone between this computer and the node \
                  could pose as it.",
             );
@@ -1620,7 +1986,7 @@ fn node_picker(
         }
     });
     if let Some(note) = &picker.note {
-        ui.colored_label(WARN, note.as_str());
+        ui.colored_label(t.warn, note.as_str());
     }
     ui.label(if cx.in_browser {
         "A browser can use a node only if the node allows requests from web pages (CORS), and a \
@@ -1681,7 +2047,7 @@ fn node_picker(
         // a column.
         for node in &picker.list {
             if let Some(Test::Done(Err(e))) = picker.tests.get(&node.url) {
-                ui.colored_label(BAD, e.as_str());
+                ui.colored_label(t.bad, e.as_str());
             }
         }
     }
@@ -1704,6 +2070,7 @@ fn node_picker(
 
 /// A test's outcome: in full under the address box, and short in the list.
 fn test_line(ui: &mut Ui, test: Option<&Test>, full: bool) {
+    let t = tones(ui);
     match test {
         None => {
             if !full {
@@ -1726,29 +2093,32 @@ fn test_line(ui: &mut Ui, test: Option<&Test>, full: bool) {
             }
             parts.push(format!("{} ms", r.millis));
             let (color, lead) = if !r.right_network {
-                (BAD, "wrong network: ")
+                (t.bad, "wrong network: ")
             } else if syncing {
-                (WARN, "answers, ")
+                (t.warn, "answers, ")
             } else {
-                (GOOD, "works: ")
+                (t.good, "works: ")
             };
             ui.colored_label(color, format!("{lead}{}", parts.join(" · ")));
         }
         Some(Test::Done(Err(e))) => {
             if full {
-                ui.colored_label(BAD, e.as_str());
+                ui.colored_label(t.bad, e.as_str());
             } else {
                 // Written out in full under the list.
-                ui.colored_label(BAD, "failed: see below")
+                ui.colored_label(t.bad, "failed: see below")
                     .on_hover_text(e.as_str());
             }
         }
     }
 }
 
-fn node_chip(ui: &mut Ui, status: &Status) {
+/// The node's state in a word or two, which opens the node settings when
+/// clicked.
+fn node_chip(ui: &mut Ui, status: &Status) -> egui::Response {
+    let t = tones(ui);
     let (color, text) = if status.node_error.is_some() {
-        (BAD, "node problem".to_string())
+        (t.bad, "node problem".to_string())
     } else if status.node.is_none() {
         (ui.visuals().weak_text_color(), "no node".to_string())
     } else if status.syncing {
@@ -1760,17 +2130,20 @@ fn node_chip(ui: &mut Ui, status: &Status) {
                 status.scanned as f64 * 100.0 / status.chain as f64
             )
         };
-        (WARN, format!("syncing{percent}"))
+        (t.warn, format!("syncing{percent}"))
     } else {
-        (GOOD, format!("synced at {}", format::grouped(status.scanned)))
+        (t.good, format!("synced at {}", format::grouped(status.scanned)))
     };
     let hover = match (&status.node_error, &status.node) {
         (Some(e), _) => e.clone(),
         (None, Some(node)) => node.clone(),
-        (None, None) => "Choose a node on the Node page.".to_string(),
+        (None, None) => "No node in use.".to_string(),
     };
-    ui.label(RichText::new(format!("• {text}")).color(color))
-        .on_hover_text(hover);
+    ui.add(
+        egui::Label::new(RichText::new(format!("• {text}")).color(color))
+            .sense(egui::Sense::click()),
+    )
+    .on_hover_text(format!("{hover}\nClick for the node settings."))
 }
 
 fn sync_bar(ui: &mut Ui, s: &Status) {
@@ -1792,6 +2165,7 @@ fn sync_bar(ui: &mut Ui, s: &Status) {
 }
 
 fn history_grid(ui: &mut Ui, rows: &[Row], id: &str) {
+    let t = tones(ui);
     egui::Grid::new(id)
         .striped(true)
         .num_columns(5)
@@ -1804,9 +2178,9 @@ fn history_grid(ui: &mut Ui, rows: &[Row], id: &str) {
             for row in rows {
                 ui.label(format::timestamp(row.timestamp));
                 let color = match row.kind.as_str() {
-                    "failed" => BAD,
-                    "pending" => WARN,
-                    _ if row.incoming => GOOD,
+                    "failed" => t.bad,
+                    "pending" => t.warn,
+                    _ if row.incoming => t.good,
                     _ => ui.visuals().text_color(),
                 };
                 let kind = if row.incoming && !row.unlocked && row.height.is_some() {
@@ -1864,17 +2238,18 @@ fn network_combo(ui: &mut Ui, network: &mut Net) {
 /// Shows what is wrong with a new wallet's name and password, and says
 /// whether nothing is.
 fn new_wallet_checks(ui: &mut Ui, name: &str, password: &str, confirm: &str) -> bool {
+    let t = tones(ui);
     let problem = name_problem(name);
     if let Some(p) = &problem {
-        ui.colored_label(BAD, p.as_str());
+        ui.colored_label(t.bad, p.as_str());
     }
     let mismatch = password != confirm;
     if mismatch && !confirm.is_empty() {
-        ui.colored_label(BAD, "The passwords do not match.");
+        ui.colored_label(t.bad, "The passwords do not match.");
     }
     if password.is_empty() {
         ui.colored_label(
-            WARN,
+            t.warn,
             "With no password, anyone who copies the wallet's files can spend from it.",
         );
     }
@@ -1913,7 +2288,7 @@ fn modal(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut Ui)) {
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_max_width(480.0);
+            ui.set_max_width(520.0);
             add(ui);
         });
 }
