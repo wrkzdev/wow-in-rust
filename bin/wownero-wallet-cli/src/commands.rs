@@ -162,7 +162,7 @@ Wallet
   save                          write the keys file and cache
 
 Chain
-  set_daemon <host:port>        point at a daemon
+  set_daemon <address>          point at a daemon: host:port, or https://host:port
   refresh                       scan up to the daemon's tip
   rescan_bc                     forget what was scanned and start over
   bc_height / status            where the wallet and the daemon are

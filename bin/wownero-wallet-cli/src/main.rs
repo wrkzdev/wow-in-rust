@@ -151,7 +151,8 @@ Whatever the options below leave out is asked for.
 
   --password <pass>                 (a password file is safer; see below)
   --password-file <path>
-  --daemon-address <host:port>      default 127.0.0.1:34568
+  --daemon-address <address>        host:port, or https://host:port for TLS;
+                                    default 127.0.0.1:34568
   --testnet / --stagenet
   --restore-height <n>
   --mnemonic-language <lang>

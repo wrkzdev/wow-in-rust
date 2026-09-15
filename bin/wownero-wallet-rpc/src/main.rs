@@ -39,7 +39,8 @@ wownero-wallet-rpc — the Wownero wallet RPC (specs/14)
   --rpc-login <user:pass>           HTTP Basic
   --disable-rpc-login               explicitly run without authentication
 
-  --daemon-address <host:port>      default 127.0.0.1:34568
+  --daemon-address <address>        host:port, or https://host:port for TLS;
+                                    default 127.0.0.1:34568
   --testnet / --stagenet
   --kdf-rounds <n>                  default 1
   --no-initial-sync

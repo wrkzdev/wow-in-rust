@@ -22,6 +22,7 @@ wow-p2p.workspace = true
 wow-zmq.workspace = true
 wow-randomwow.workspace = true
 wow-wallet.workspace = true
+wow-tls.workspace = true
 curve25519-dalek.workspace = true
 rustls.workspace = true
 rcgen.workspace = true

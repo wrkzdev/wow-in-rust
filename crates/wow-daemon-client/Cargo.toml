@@ -13,8 +13,19 @@ wow-serialize.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+# TLS to an `https://` node, on the node's own provider. A browser build has no
+# sockets to put it on, and reaches a node through the browser's TLS instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wow-tls.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+
 [dev-dependencies]
 # Only the live-node tests need these, and only to build the request a real
 # wallet would send.
 wow-consensus.workspace = true
 wow-types.workspace = true
+
+# The TLS tests' server certificate.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rcgen.workspace = true

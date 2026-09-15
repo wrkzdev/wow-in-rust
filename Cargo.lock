@@ -1121,6 +1121,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1246,12 +1255,16 @@ dependencies = [
 name = "wow-daemon-client"
 version = "0.11.4"
 dependencies = [
+ "rcgen",
+ "rustls",
  "serde_json",
  "thiserror",
+ "webpki-roots",
  "wow-consensus",
  "wow-crypto",
  "wow-log",
  "wow-serialize",
+ "wow-tls",
  "wow-types",
 ]
 
@@ -1305,6 +1318,24 @@ dependencies = [
  "wow-log",
  "wow-serialize",
  "wow-types",
+]
+
+[[package]]
+name = "wow-tls"
+version = "0.11.4"
+dependencies = [
+ "aes-gcm",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "hmac",
+ "p256",
+ "p384",
+ "rand_core",
+ "rcgen",
+ "rsa",
+ "rustls",
+ "sha2",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -1398,6 +1429,7 @@ dependencies = [
  "wow-randomwow",
  "wow-serialize",
  "wow-storage",
+ "wow-tls",
  "wow-types",
  "wow-wallet",
  "wow-zmq",

@@ -33,7 +33,7 @@
 //!
 //! All of it is [`provider`]'s: pure Rust, no ring, aws-lc-rs or OpenSSL.
 
-mod provider;
+use wow_tls::provider;
 #[cfg(test)]
 mod provider_tests;
 

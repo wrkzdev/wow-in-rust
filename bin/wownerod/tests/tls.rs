@@ -23,10 +23,8 @@ use wow_storage::env::OpenMode;
 use wow_storage::lmdb::LmdbDb;
 use wow_types::{Block, Network};
 
-/// The daemon's own provider, so the client here is as pure Rust as it is.
-#[path = "../src/rpc/tls/provider.rs"]
-#[allow(dead_code)]
-mod provider;
+// The daemon's own provider, so the client here is as pure Rust as it is.
+use wow_tls::provider;
 
 struct Scratch(PathBuf);
 

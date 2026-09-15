@@ -32,14 +32,37 @@
 //! cause an unbounded allocation, a panic, or a hang.
 
 pub mod http;
+#[cfg(not(target_arch = "wasm32"))]
+mod tls;
 pub mod types;
+
+/// A browser build reaches a node through the browser, and its TLS is the
+/// browser's.
+#[cfg(target_arch = "wasm32")]
+mod tls {
+    use crate::http::{Certificates, HttpError};
+
+    pub type Stream = std::net::TcpStream;
+
+    pub fn connect(
+        _tcp: std::net::TcpStream,
+        _host: &str,
+        _certificates: Certificates,
+    ) -> Result<Stream, HttpError> {
+        Err(HttpError::Tls("this build has no TLS of its own".into()))
+    }
+
+    pub fn describe(_e: &std::io::Error) -> Option<String> {
+        None
+    }
+}
 
 use std::sync::Arc;
 
 use serde_json::{json, Value as Json};
 use wow_serialize::epee::{self, Section};
 
-pub use http::{Endpoint, HttpError, Transport};
+pub use http::{Certificates, Endpoint, HttpError, Transport};
 pub use types::*;
 
 /// A connection to one daemon. Clones share one transport.
@@ -71,7 +94,10 @@ pub enum DaemonError {
 type Result<T> = std::result::Result<T, DaemonError>;
 
 impl DaemonClient {
-    /// `address` is `host:port`, as typed on a command line, reached over TCP.
+    /// `address` is `host:port`, as typed on a command line, reached over TCP,
+    /// or that with `http://` or `https://` in front. An `https://` node's
+    /// certificate must be trusted ([`Endpoint::with_certificates`] says
+    /// otherwise).
     pub fn new(address: impl Into<String>) -> DaemonClient {
         DaemonClient::with_endpoint(Endpoint::new(address))
     }

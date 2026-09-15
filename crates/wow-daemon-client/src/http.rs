@@ -1,12 +1,16 @@
 //! A minimal HTTP/1.1 client.
 //!
 //! The mirror of `bin/wownerod/src/rpc/http.rs`, and deliberately the same
-//! shape: `POST` with a `Content-Length` body, no keep-alive, no TLS.
-//! `specs/11` §1.2 allows deferring TLS to a reverse proxy and this does.
+//! shape: `POST` with a `Content-Length` body, and no keep-alive.
 //!
-//! A reply may come back chunked, though. A daemon never sends one, but the
-//! reverse proxy that §1.2 puts in front of it may: nginx and Cloudflare both
-//! re-frame a node's replies as chunks.
+//! An address is `host:port`, as typed on a command line, or that with
+//! `http://` or `https://` in front. `https://` is TLS (`specs/11` §1.2), on
+//! the node's own pure-Rust provider, with the certificate checked as
+//! [`Certificates`] says.
+//!
+//! A reply may come back chunked. A daemon never sends one, but the reverse
+//! proxy §1.2 lets a node sit behind may: nginx and Cloudflare both re-frame a
+//! node's replies as chunks.
 //!
 //! # The daemon is not trusted either
 //!
@@ -51,12 +55,13 @@ pub enum HttpError {
     Io(std::io::Error),
     /// The address did not resolve.
     BadAddress(String),
-    /// The address carried a URL scheme. `https://` in particular cannot be
-    /// honoured: this client speaks plain HTTP.
+    /// The address carried a URL scheme other than `http://` or `https://`.
     Scheme {
         address: String,
         scheme: String,
     },
+    /// TLS failed: most often, a certificate that is not trusted.
+    Tls(String),
     /// The response status line or headers exceeded [`MAX_HEADER_BYTES`].
     HeadersTooLarge,
     /// The response body exceeded [`MAX_RESPONSE_BYTES`].
@@ -85,19 +90,12 @@ impl std::fmt::Display for HttpError {
         match self {
             HttpError::Io(e) => write!(f, "io: {e}"),
             HttpError::BadAddress(a) => write!(f, "cannot resolve `{a}`"),
-            HttpError::Scheme { address, scheme } => {
-                if scheme == "https" {
-                    write!(
-                        f,
-                        "`{address}` is an https address, and this client speaks plain HTTP only (`specs/11` §1.2 defers TLS to a reverse proxy). Give it a host:port, and put a proxy in front if the daemon needs TLS."
-                    )
-                } else {
-                    write!(
-                        f,
-                        "`{address}` has a `{scheme}://` scheme; give a host:port instead"
-                    )
-                }
-            }
+            HttpError::Scheme { address, scheme } => write!(
+                f,
+                "`{address}` has a `{scheme}://` scheme; use http:// or https://, or give a \
+                 host:port"
+            ),
+            HttpError::Tls(what) => write!(f, "TLS: {what}"),
             HttpError::HeadersTooLarge => {
                 write!(f, "response headers exceed {MAX_HEADER_BYTES} bytes")
             }
@@ -119,7 +117,10 @@ impl std::error::Error for HttpError {}
 
 impl From<std::io::Error> for HttpError {
     fn from(e: std::io::Error) -> Self {
-        HttpError::Io(e)
+        match crate::tls::describe(&e) {
+            Some(what) => HttpError::Tls(what),
+            None => HttpError::Io(e),
+        }
     }
 }
 
@@ -150,16 +151,31 @@ impl Transport for Endpoint {
     }
 }
 
+/// How an `https://` endpoint checks the certificate it is shown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Certificates {
+    /// Against the Mozilla roots, for the host's name, as a browser checks it.
+    #[default]
+    Checked,
+    /// Any certificate: a node's self-signed one, as the C++'s
+    /// `--daemon-ssl-allow-any-cert`. The connection is still encrypted, but
+    /// nothing says who is at the other end of it.
+    Any,
+}
+
 /// Where a daemon is, and how long to wait for it.
 #[derive(Clone, Debug)]
 pub struct Endpoint {
-    /// `host:port`, as typed on a command line.
+    /// As it was given: `host:port`, or that with `http://` or `https://` in
+    /// front.
     pub address: String,
     pub connect_timeout: Duration,
     /// Applies to reads and writes separately, not to the whole exchange — a
     /// long `get_blocks.bin` is slow because it is large, not because it is
     /// stalled.
     pub timeout: Duration,
+    /// For an `https://` address.
+    pub certificates: Certificates,
 }
 
 impl Endpoint {
@@ -168,23 +184,25 @@ impl Endpoint {
             address: address.into(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             timeout: DEFAULT_TIMEOUT,
+            certificates: Certificates::Checked,
         }
     }
 
-    fn connect(&self) -> Result<TcpStream, HttpError> {
-        // A scheme resolves to nothing, so without this the failure reads
-        // "cannot resolve `https://node:34568`" -- which sends whoever typed it
-        // looking at their DNS rather than at the one thing that is wrong.
-        if let Some((scheme, _)) = self.address.split_once("://") {
-            return Err(HttpError::Scheme {
-                address: self.address.clone(),
-                scheme: scheme.to_ascii_lowercase(),
-            });
-        }
+    pub fn with_certificates(mut self, certificates: Certificates) -> Endpoint {
+        self.certificates = certificates;
+        self
+    }
+
+    fn connect(&self) -> Result<Connection, HttpError> {
+        // The scheme comes off first. One that is neither http nor https is
+        // named as the problem, rather than failing as "cannot resolve
+        // `ftp://node:34568`", which sends whoever typed it looking at their
+        // DNS instead.
+        let target = Target::parse(&self.address)?;
 
         let mut last = None;
-        let addrs = self
-            .address
+        let addrs = target
+            .host_port
             .to_socket_addrs()
             .map_err(|_| HttpError::BadAddress(self.address.clone()))?;
         for addr in addrs {
@@ -193,7 +211,11 @@ impl Endpoint {
                     s.set_read_timeout(Some(self.timeout))?;
                     s.set_write_timeout(Some(self.timeout))?;
                     s.set_nodelay(true)?;
-                    return Ok(s);
+                    if !target.tls {
+                        return Ok(Connection::Plain(s));
+                    }
+                    let tls = crate::tls::connect(s, &target.host, self.certificates)?;
+                    return Ok(Connection::Tls(Box::new(tls)));
                 }
                 Err(e) => last = Some(e),
             }
@@ -225,6 +247,7 @@ impl Endpoint {
 
     /// One request and its response, on a connection of its own.
     fn exchange(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
+        let host = Target::parse(&self.address)?.host_header;
         let mut stream = self.connect()?;
 
         // No `Connection: close`, though this connection carries one request
@@ -239,7 +262,6 @@ impl Endpoint {
              Content-Length: {len}\r\n\
              Accept: */*\r\n\
              \r\n",
-            host = self.address,
             len = body.len(),
         );
         stream.write_all(head.as_bytes())?;
@@ -247,6 +269,123 @@ impl Endpoint {
         stream.flush()?;
 
         read_response(stream, path)
+    }
+
+    /// `GET path`, for what is not a daemon's RPC: a public list of nodes, say.
+    ///
+    /// With `Connection: close`, which a web server needs to close the
+    /// connection once it has answered. The daemon that cuts replies to it is
+    /// not what this is for.
+    pub fn get(&self, path: &str) -> Result<Vec<u8>, HttpError> {
+        let host = Target::parse(&self.address)?.host_header;
+        let mut stream = self.connect()?;
+        let head = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Accept: */*\r\n\
+             Connection: close\r\n\
+             \r\n"
+        );
+        stream.write_all(head.as_bytes())?;
+        stream.flush()?;
+        read_response(stream, path)
+    }
+}
+
+/// An address, taken apart.
+#[derive(Debug, PartialEq, Eq)]
+struct Target {
+    tls: bool,
+    /// What to connect to: with the port the address gave, or else its
+    /// scheme's.
+    host_port: String,
+    /// The host alone, without brackets: the name a certificate is checked
+    /// for.
+    host: String,
+    /// `Host:`, as the address gave it, less the scheme.
+    host_header: String,
+}
+
+impl Target {
+    fn parse(address: &str) -> Result<Target, HttpError> {
+        let (scheme, rest) = match address.split_once("://") {
+            Some((scheme, rest)) => (Some(scheme.to_ascii_lowercase()), rest),
+            None => (None, address),
+        };
+        let tls = match scheme.as_deref() {
+            None | Some("http") => false,
+            Some("https") => true,
+            Some(other) => {
+                return Err(HttpError::Scheme {
+                    address: address.to_string(),
+                    scheme: other.to_string(),
+                })
+            }
+        };
+        let rest = rest.trim_end_matches('/');
+        let (host, has_port) = match rest.strip_prefix('[') {
+            // `[::1]`, or `[::1]:34568`.
+            Some(inner) => match inner.split_once(']') {
+                Some((host, after)) => (host, !after.is_empty()),
+                None => return Err(HttpError::BadAddress(address.to_string())),
+            },
+            None => match rest.rsplit_once(':') {
+                Some((host, _)) => (host, true),
+                None => (rest, false),
+            },
+        };
+        // A bare host with no scheme keeps failing to resolve, as it always
+        // has: which port a daemon is on is not this crate's to guess.
+        let host_port = match (has_port, &scheme) {
+            (false, Some(_)) => format!("{rest}:{}", if tls { 443 } else { 80 }),
+            _ => rest.to_string(),
+        };
+        Ok(Target {
+            tls,
+            host_port,
+            host: host.to_string(),
+            host_header: rest.to_string(),
+        })
+    }
+}
+
+/// A connection to a daemon: plain, or TLS.
+enum Connection {
+    Plain(TcpStream),
+    Tls(Box<crate::tls::Stream>),
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Connection::Plain(_) => "a plain connection",
+            Connection::Tls(_) => "a TLS connection",
+        })
+    }
+}
+
+impl Read for Connection {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Connection::Plain(s) => s.read(buf),
+            Connection::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Connection {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Connection::Plain(s) => s.write(buf),
+            Connection::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Connection::Plain(s) => s.flush(),
+            Connection::Tls(s) => s.flush(),
+        }
     }
 }
 
@@ -292,8 +431,9 @@ fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
 
     wow_log::debug!(
         LOG,
-        "{path}: HTTP {code}, Content-Length {}",
-        content_length.map_or_else(|| "absent".to_string(), |l| l.to_string())
+        "{path}: HTTP {code}, Content-Length {}{}",
+        content_length.map_or_else(|| "absent".to_string(), |l| l.to_string()),
+        if chunked { ", chunked" } else { "" }
     );
 
     // Chunked wins over any `Content-Length` alongside it (RFC 9112 §6.3).
@@ -319,9 +459,16 @@ fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
         None => {
             // Read to EOF, still bounded.
             let mut buf = Vec::new();
-            reader
+            match reader
                 .take(MAX_RESPONSE_BYTES as u64 + 1)
-                .read_to_end(&mut buf)?;
+                .read_to_end(&mut buf)
+            {
+                Ok(_) => {}
+                // A TLS server that closes without saying so first, as many
+                // do once they have answered: what arrived is the body.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(e) => return Err(e.into()),
+            }
             if buf.len() > MAX_RESPONSE_BYTES {
                 return Err(HttpError::BodyTooLarge { len: buf.len() });
             }
@@ -450,28 +597,59 @@ mod tests {
         assert!(matches!(e.connect(), Err(HttpError::BadAddress(_))));
     }
 
-    /// A URL says what is wrong, rather than blaming DNS.
-    ///
     /// Public node lists give addresses as `http://host:port` and
-    /// `https://host:port`, so this is the first thing anyone pastes. Without
-    /// the check it fails as "cannot resolve", which sends them looking at
-    /// their network instead of at the scheme.
+    /// `https://host:port`, so this is the first thing anyone pastes. Both
+    /// are taken; any other scheme is named as what is wrong, rather than
+    /// failing as "cannot resolve", which sends people looking at their
+    /// network instead.
     #[test]
-    fn a_url_scheme_is_named_as_the_problem() {
-        let e = Endpoint::new("https://wownero.stackwallet.com:34568");
-        let err = e.connect().expect_err("no scheme is supported");
+    fn a_url_scheme_other_than_http_is_named_as_the_problem() {
+        let e = Endpoint::new("ftp://node.example:34568");
+        let err = e.connect().expect_err("not a scheme this speaks");
+        assert!(matches!(err, HttpError::Scheme { .. }), "{err}");
         let text = err.to_string();
-        assert!(text.contains("https"), "{text}");
-        assert!(
-            text.contains("plain HTTP"),
-            "it says why, not just that: {text}"
-        );
-        assert!(text.contains("host:port"), "and what to do instead: {text}");
+        assert!(text.contains("ftp://"), "{text}");
+        assert!(text.contains("https://"), "and what to use instead: {text}");
+    }
 
-        // http:// is just as unusable, and says so without the TLS advice.
-        let e = Endpoint::new("http://node2.monerodevs.org:34568");
-        let text = e.connect().expect_err("still a scheme").to_string();
-        assert!(text.contains("host:port"), "{text}");
+    #[test]
+    fn addresses_are_taken_apart() {
+        let t = Target::parse("127.0.0.1:34568").expect("ok");
+        assert_eq!(
+            t,
+            Target {
+                tls: false,
+                host_port: "127.0.0.1:34568".into(),
+                host: "127.0.0.1".into(),
+                host_header: "127.0.0.1:34568".into(),
+            }
+        );
+
+        // A scheme with no port means the scheme's.
+        let t = Target::parse("https://wow-node.0z.network/").expect("ok");
+        assert!(t.tls);
+        assert_eq!(t.host_port, "wow-node.0z.network:443");
+        assert_eq!(t.host, "wow-node.0z.network");
+        assert_eq!(t.host_header, "wow-node.0z.network");
+
+        let t = Target::parse("HTTPS://wow-node.0z.network:443").expect("ok");
+        assert!(t.tls);
+        assert_eq!(t.host_port, "wow-node.0z.network:443");
+        assert_eq!(t.host_header, "wow-node.0z.network:443");
+
+        let t = Target::parse("http://[::1]").expect("ok");
+        assert!(!t.tls);
+        assert_eq!(t.host_port, "[::1]:80");
+        assert_eq!(t.host, "::1");
+
+        let t = Target::parse("[::1]:34568").expect("ok");
+        assert_eq!(t.host_port, "[::1]:34568");
+        assert_eq!(t.host, "::1");
+
+        assert!(matches!(
+            Target::parse("http://[::1:34568"),
+            Err(HttpError::BadAddress(_))
+        ));
     }
 
     /// Answer one request with `reply`, as it is, and close. Returns the
@@ -497,9 +675,11 @@ mod tests {
         (address, server)
     }
 
+    /// A request with no body, so the server has read all of it once it has
+    /// the headers.
     fn post_to(reply: &'static [u8]) -> Result<Vec<u8>, HttpError> {
         let (address, server) = answer_once(reply);
-        let result = Endpoint::new(address).post("/get_info", "application/json", b"{}");
+        let result = Endpoint::new(address).post("/get_info", "application/json", b"");
         server.join().expect("the server");
         result
     }
@@ -555,16 +735,74 @@ mod tests {
         assert!(matches!(e, HttpError::Malformed(_)), "{e}");
     }
 
-    /// The response cap clears a realistic full batch by a wide margin.
-    ///
-    /// A `get_blocks.bin` returns at most 20,000 transactions (`specs/11`
-    /// §5.1). A ring-size-22 RingCT transaction with a Bulletproof+ is on the
-    /// order of 2 KB, so a saturated batch is tens of megabytes.
+    /// A TLS server on `127.0.0.1` with a self-signed certificate, made by the
+    /// node's own provider, that answers one request with `reply`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tls_answer_once(reply: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::CertificateDer;
+        use std::sync::Arc;
+
+        let (key, _) = wow_tls::provider::generate_p256().expect("a key");
+        let signer = wow_tls::provider::CertSigner::new(&key).expect("a signer");
+        let cert = rcgen::CertificateParams::default()
+            .self_signed(&signer)
+            .expect("a certificate");
+        let der = CertificateDer::from_pem_slice(cert.pem().as_bytes()).expect("its PEM");
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            wow_tls::provider::provider(),
+        ))
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .expect("the versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![der], key)
+        .expect("the pair");
+        let config = Arc::new(config);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("an address").port();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let conn = rustls::ServerConnection::new(config).expect("a connection");
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            // A handshake the client refused ends the read, with nothing to
+            // answer.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match tls.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = tls.write_all(reply);
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+        });
+        (format!("https://127.0.0.1:{port}"), server)
+    }
+
+    /// Over TLS, a self-signed certificate is refused unless accepted as it
+    /// is, and then the reply reads as over plain HTTP.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn the_response_cap_clears_a_full_block_batch() {
-        const MAX_TX_COUNT: usize = 20_000;
-        const TYPICAL_TX_BYTES: usize = 2_048;
-        // A compile-time fact, so it cannot silently stop holding.
-        const _: () = assert!(MAX_RESPONSE_BYTES > MAX_TX_COUNT * TYPICAL_TX_BYTES * 4);
+    fn tls_checks_the_certificate_unless_told_not_to() {
+        const REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n{\"height\":1}";
+
+        let (address, server) = tls_answer_once(REPLY);
+        let e = Endpoint::new(address)
+            .post("/get_info", "application/json", b"")
+            .expect_err("a self-signed certificate is not trusted");
+        server.join().expect("the server");
+        assert!(matches!(e, HttpError::Tls(_)), "{e}");
+        assert!(e.to_string().contains("not trusted"), "{e}");
+
+        let (address, server) = tls_answer_once(REPLY);
+        let body = Endpoint::new(address)
+            .with_certificates(Certificates::Any)
+            .post("/get_info", "application/json", b"")
+            .expect("accepted as it is");
+        server.join().expect("the server");
+        assert_eq!(body, b"{\"height\":1}");
     }
 }
