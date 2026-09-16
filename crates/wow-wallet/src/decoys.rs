@@ -561,6 +561,95 @@ pub fn fetch_members(
         .collect())
 }
 
+/// The RingCT output distribution, kept between sends.
+///
+/// `get_output_distribution` is the largest thing a wallet asks a node for:
+/// one cumulative count per block since genesis, which on mainnet is about
+/// 875,000 of them. Fetching the whole array before every transaction meant
+/// several megabytes and several seconds each time, on a node that is usually
+/// somebody else's and usually public.
+///
+/// It is also almost entirely the same array as last time. `wallet2` keeps it
+/// (`m_rct_offsets`) and asks only for the blocks since, and so does this.
+///
+/// # Why appending is sound
+///
+/// A cumulative answer for `from_height..=to_height` already has `base` --
+/// the count of everything below `from_height` -- added into every element by
+/// [`wow_daemon_client::DaemonClient::get_output_distribution`], so the tail
+/// continues the array rather than restarting it.
+///
+/// Outputs are append-only, so a block's cumulative count never changes...
+/// except across a reorganisation, where blocks are replaced and the counts
+/// below the tip can move. Two guards for that: a tip below what is already
+/// held throws the cache away, and a tail whose first element is *below* the
+/// last one held means the chain was rewritten under us, which also throws it
+/// away. Both are cheap, and getting this wrong picks decoys from a
+/// distribution nobody else has, which is the one failure in decoy selection
+/// that is invisible and permanent.
+#[derive(Debug, Default)]
+pub struct DistributionCache {
+    /// `offsets[i]` is the number of RingCT outputs in blocks `0..=i`.
+    ///
+    /// Shared rather than lent out, so holding the distribution does not hold
+    /// a borrow of the wallet for the length of a send.
+    offsets: std::sync::Arc<Vec<u64>>,
+}
+
+impl DistributionCache {
+    /// The cumulative distribution through `to_height`, fetching only the part
+    /// not already held.
+    pub fn get(
+        &mut self,
+        client: &wow_daemon_client::DaemonClient,
+        to_height: u64,
+    ) -> Result<std::sync::Arc<Vec<u64>>, wow_daemon_client::DaemonError> {
+        use std::sync::Arc;
+        let want = to_height as usize + 1;
+
+        // The chain is shorter than what is held: a reorganisation, or a
+        // different node. Nothing cached can be trusted to line up.
+        if self.offsets.len() > want {
+            self.offsets = Arc::new(Vec::new());
+        }
+
+        if self.offsets.len() < want {
+            let from = self.offsets.len() as u64;
+            let tail = client.get_output_distribution(0, from, to_height)?;
+            let continues = from > 0
+                && tail.len() == want - from as usize
+                && tail.first() >= self.offsets.last();
+            if continues {
+                Arc::make_mut(&mut self.offsets).extend_from_slice(&tail);
+            } else if from == 0 && tail.len() == want {
+                self.offsets = Arc::new(tail);
+            } else {
+                // Either the chain moved under us or the node answered with a
+                // range nobody asked for. Start again rather than splice two
+                // distributions together.
+                self.offsets = Arc::new(client.get_output_distribution(0, 0, to_height)?);
+            }
+        }
+
+        Ok(Arc::clone(&self.offsets))
+    }
+
+    /// Forget everything held, for a wallet that has changed node or rescanned.
+    pub fn clear(&mut self) {
+        self.offsets = std::sync::Arc::new(Vec::new());
+    }
+
+    /// How many blocks are held. For tests, and for saying why a send that
+    /// used to take seconds did not.
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

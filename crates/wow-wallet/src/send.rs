@@ -172,10 +172,17 @@ impl Session {
 
         // A ring for each input, of members the chain has unlocked, or no node
         // will take the transaction.
-        let distribution = client
-            .get_output_distribution(0, 0, self.chain_height().saturating_sub(1))
+        //
+        // The distribution is one cumulative count per block since genesis --
+        // the largest thing this wallet asks a node for. It is kept between
+        // sends and only the blocks since the last one are fetched, which is
+        // what `wallet2` does with `m_rct_offsets`.
+        let to_height = self.chain_height().saturating_sub(1);
+        let distribution = self
+            .distribution
+            .get(&client, to_height)
             .map_err(SendError::Distribution)?;
-        let picker = GammaPicker::new(&distribution).map_err(SendError::Ring)?;
+        let picker = GammaPicker::new(distribution.as_slice()).map_err(SendError::Ring)?;
         let mut rng = crate::entropy::seeded_rng().map_err(SendError::Entropy)?;
 
         let mut inputs = Vec::with_capacity(plan.inputs.len());
