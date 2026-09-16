@@ -349,6 +349,13 @@ git -C reference/wownero checkout 9f4f22c72
 git -C reference/wownero submodule update --init external/randomwow
 ```
 
+## Donate
+
+If any of this was useful to you:
+
+* **Wownero** — `So1e4FFiHd6aizfQRyYBm4Dj3nUgP78Y2Re6iN8HYBSLh2qZTfnJQ6sBnnTJtaPqQFA1z9sKeTJnQ7ZwMzaSzMMRJv1NiHmoB522xXvtS8MQ`
+* **Monero** — `4Hh8CAoojaYFZPjA9R7ndGMV6kjLMg1dqKAceg6eJxSp9QUtUpY4Do6QF3931WYSSMVVCY6u6BtCjKMEAzbnZgsmJKJQvfUazBDRK9j4AM`
+
 ## Licence
 
 BSD-3-Clause, matching the reference implementation.
