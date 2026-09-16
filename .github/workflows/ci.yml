@@ -92,7 +92,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: no C, C++ or assembly sources in the tree
         run: |
-          found=$(find . -path ./target -prune -o -path ./.git -prune -o             \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx'                -o -name '*.h' -o -name '*.hpp' -o -name '*.S' -o -name '*.asm' \) -print)
+          found=$(find . -path ./target -prune -o -path ./.git -prune -o \
+            \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
+               -o -name '*.h' -o -name '*.hpp' -o -name '*.S' -o -name '*.asm' \) -print)
           if [ -n "$found" ]; then echo "$found"; exit 1; fi
       - name: no dependency compiles C that we did not choose
         run: bash scripts/check-no-c.sh

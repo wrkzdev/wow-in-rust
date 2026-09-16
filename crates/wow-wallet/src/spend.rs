@@ -311,7 +311,8 @@ pub enum SpendError {
     #[error("the fee did not settle after {0} attempts")]
     FeeDidNotSettle(usize),
     #[error(
-        "the transaction would weigh {weight}, over the {limit} a node will relay:          send a smaller amount, or sweep, which splits by weight"
+        "the transaction would weigh {weight}, over the {limit} a node will relay: \
+         send a smaller amount, or sweep, which splits by weight"
     )]
     TooHeavy { weight: u64, limit: u64 },
 }

@@ -1632,7 +1632,10 @@ impl WalletApp {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(format!(
-                            "This does not sweep everything. {} more output(s) would make the                              transaction too heavy for a node to relay, so the largest {} are                              being swept. Sweep again afterwards to take the rest.",
+                            "This does not sweep everything. {} more output(s) would \
+                             make the transaction too heavy for a node to relay, so the \
+                             largest {} are being swept. Sweep again afterwards to take \
+                             the rest.",
                             p.left_behind, p.inputs
                         ))
                         .color(tones(ui).warn),

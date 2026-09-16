@@ -870,7 +870,9 @@ fn send(
     if plan.left_behind > 0 {
         println!();
         println!(
-            "This does NOT sweep everything: {} more output(s) would make the transaction              too heavy for a node to relay, so the largest {} are being swept and the rest              are left. Run sweep_all again afterwards to take them.",
+            "This does NOT sweep everything: {} more output(s) would make the \
+             transaction too heavy for a node to relay, so the largest {} are being \
+             swept and the rest are left. Run sweep_all again afterwards to take them.",
             plan.left_behind,
             plan.inputs.len()
         );

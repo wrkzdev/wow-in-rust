@@ -145,7 +145,8 @@ impl Rejection {
             }
             Rejection::NotParseable(w) => format!("the transaction does not parse: {w}"),
             Rejection::UnsupportedRctType { ty } => format!(
-                "RCT type {ty:?} is not one this node can verify yet, so the transaction is                  refused rather than taken on trust"
+                "RCT type {ty:?} is not one this node can verify yet, so the \
+                 transaction is refused rather than taken on trust"
             ),
         }
     }
