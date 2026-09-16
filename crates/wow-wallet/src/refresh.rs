@@ -38,13 +38,15 @@
 
 use std::collections::HashMap;
 
-use wow_crypto::types::{Hash256, Hash8, KeyDerivation, KeyImage, PublicKey, SubaddressIndex};
+use wow_crypto::types::{
+    Hash256, Hash8, KeyDerivation, KeyImage, PublicKey, SecretKey, SubaddressIndex,
+};
 use wow_types::block::Block;
 use wow_types::tx::{Transaction, TxIn};
 
 use crate::account::AccountBase;
 use crate::history::{SeenSpend, SentTx};
-use crate::scan::{scan_transaction, ScanKeys};
+use crate::scan::ScanKeys;
 use crate::subaddress::SubaddressTable;
 
 /// `COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT`.
@@ -583,6 +585,10 @@ impl WalletState {
             return Ok(summary);
         }
 
+        // The scalar multiplications for the whole batch, on every core, before
+        // anything is decided. See `precompute_derivations`.
+        let ready = precompute_derivations(&batch, &self.account.keys.view_secret_key);
+
         for (n, bundle) in batch.blocks.iter().enumerate() {
             let height = batch.start_height + n as u64;
             // Below where this wallet starts, from a daemon that did not answer
@@ -606,7 +612,7 @@ impl WalletState {
                 self.detach(height);
                 summary.reorg_to = Some(height);
             }
-            self.process_block(height, &block, block_hash, bundle, &mut summary)?;
+            self.process_block(height, &block, block_hash, bundle, &mut summary, &ready)?;
             summary.blocks_scanned += 1;
         }
 
@@ -671,6 +677,7 @@ impl WalletState {
         block_hash: Hash256,
         bundle: &BlockBundle,
         summary: &mut RefreshSummary,
+        ready: &Derivations,
     ) -> Result<()> {
         // The chain must be continuous. A daemon that serves a block whose
         // parent we do not have at the height below is serving a different
@@ -711,6 +718,7 @@ impl WalletState {
             wow_types::hashes::transaction_hash(&block.miner_tx).unwrap_or(wow_crypto::NULL_HASH),
             &coinbase_indices,
             summary,
+            ready.get(height, 0),
         );
 
         for (i, (blob, &txid)) in bundle.txs.iter().zip(&block.tx_hashes).enumerate() {
@@ -728,7 +736,15 @@ impl WalletState {
                 .get(i + 1)
                 .cloned()
                 .unwrap_or_default();
-            self.process_transaction(height, timestamp, &tx, txid, &indices, summary);
+            self.process_transaction(
+                height,
+                timestamp,
+                &tx,
+                txid,
+                &indices,
+                summary,
+                ready.get(height, i + 1),
+            );
         }
 
         if height == self.scan_height() {
@@ -737,6 +753,7 @@ impl WalletState {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_transaction(
         &mut self,
         height: u64,
@@ -745,6 +762,7 @@ impl WalletState {
         txid: Hash256,
         global_indices: &[u64],
         summary: &mut RefreshSummary,
+        ready: Option<&crate::scan::Derivations>,
     ) {
         let is_coinbase = matches!(tx.prefix.vin.first(), Some(TxIn::Gen { .. }));
 
@@ -781,7 +799,7 @@ impl WalletState {
         // Then receipts. A scan failure is a fact about the transaction, not
         // about the wallet: a malformed transaction on chain must not stop a
         // refresh, and the reference logs and moves on too.
-        let found = scan_transaction(tx, &self.keys()).unwrap_or_default();
+        let found = crate::scan::scan_transaction_with(tx, &self.keys(), ready).unwrap_or_default();
         // Decrypting the payment id costs a scalar multiplication, so only a
         // transaction that paid this wallet is asked for one.
         let payment_id = if found.is_empty() {
@@ -889,6 +907,117 @@ impl WalletState {
 }
 
 /// Parse a block a source sent, and hash it.
+/// Every transaction's key derivations in a batch, by height and slot.
+///
+/// Slot 0 is the coinbase and slot `i + 1` the `i`th transaction, the same
+/// numbering `output_indices` uses.
+///
+/// # Why this exists
+///
+/// Scanning a transaction is one scalar multiplication and then some very
+/// cheap arithmetic: the view tag rejects almost every output after a single
+/// hash. So a refresh is, to within rounding, one curve multiplication per
+/// transaction — and they are all independent of each other and of the wallet.
+///
+/// A derivation is a pure function of the transaction's public keys and the
+/// view secret key, so computing them all in advance cannot change what a scan
+/// finds. It only decides when the work happens, which is the same argument
+/// `wownerod` makes for hashing a sync batch's proofs of work before it takes
+/// the chain lock, and what `wallet2` does with its thread pool.
+///
+/// A miss is not an error. Anything absent — a browser build, where there are
+/// no threads, or a transaction that did not parse here — is computed by the
+/// scan itself, exactly as before.
+#[derive(Debug, Default)]
+struct Derivations {
+    by_slot: std::collections::HashMap<(u64, usize), crate::scan::Derivations>,
+}
+
+impl Derivations {
+    fn get(&self, height: u64, slot: usize) -> Option<&crate::scan::Derivations> {
+        self.by_slot.get(&(height, slot))
+    }
+}
+
+/// One batch's worth of transactions, as `(height, slot, blob)`.
+///
+/// The blobs are borrowed from the batch; the coinbase is re-serialized,
+/// because it arrives inside the block rather than beside it.
+fn batch_transactions(batch: &Batch) -> Vec<(u64, usize, bool, std::borrow::Cow<'_, [u8]>)> {
+    use std::borrow::Cow;
+    let mut out = Vec::new();
+    for (n, bundle) in batch.blocks.iter().enumerate() {
+        let height = batch.start_height + n as u64;
+        if let Ok(block) = Block::from_blob(&bundle.block) {
+            let mut w = wow_serialize::binary::Writer::with_capacity(1024);
+            block.miner_tx.write(&mut w);
+            // A coinbase is never pruned: it arrives inside the block.
+            out.push((height, 0, false, Cow::Owned(w.as_slice().to_vec())));
+        }
+        for (i, blob) in bundle.txs.iter().enumerate() {
+            out.push((height, i + 1, bundle.pruned, Cow::Borrowed(blob.as_slice())));
+        }
+    }
+    out
+}
+
+/// Compute a batch's derivations on every core.
+#[cfg(not(target_arch = "wasm32"))]
+fn precompute_derivations(batch: &Batch, view_secret_key: &SecretKey) -> Derivations {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let work = batch_transactions(batch);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(work.len());
+    if threads <= 1 {
+        // One core, or one transaction: the scan does it itself and saves a
+        // parse.
+        return Derivations::default();
+    }
+
+    let out = Mutex::new(std::collections::HashMap::with_capacity(work.len()));
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut mine = Vec::new();
+                while let Some((height, slot, pruned, blob)) =
+                    work.get(next.fetch_add(1, Ordering::Relaxed))
+                {
+                    let parsed = if *pruned {
+                        Transaction::from_blob_base_only(blob)
+                    } else {
+                        Transaction::from_blob(blob)
+                    };
+                    // A blob that does not parse is left out. The serial pass
+                    // parses it again and reports the failure with the height
+                    // and the reason, which this cannot.
+                    if let Ok(tx) = parsed {
+                        if let Some(d) = crate::scan::derivations_for(&tx, view_secret_key) {
+                            mine.push(((*height, *slot), d));
+                        }
+                    }
+                }
+                let mut held = out.lock().unwrap_or_else(|e| e.into_inner());
+                held.extend(mine);
+            });
+        }
+    });
+
+    Derivations {
+        by_slot: out.into_inner().unwrap_or_else(|e| e.into_inner()),
+    }
+}
+
+/// A browser has no threads to spread this over, so the scan does its own
+/// derivations as it always did.
+#[cfg(target_arch = "wasm32")]
+fn precompute_derivations(_batch: &Batch, _view_secret_key: &SecretKey) -> Derivations {
+    Derivations::default()
+}
+
 fn parse_block(height: u64, bundle: &BlockBundle) -> Result<(Block, Hash256)> {
     let block = Block::from_blob(&bundle.block).map_err(|e| RefreshError::BadBlock {
         height,

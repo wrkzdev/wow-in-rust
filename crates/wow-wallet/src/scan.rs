@@ -82,19 +82,67 @@ pub struct ScanKeys<'a> {
 /// overwhelmingly common case and is not an error; the errors here mean the
 /// transaction is malformed or the output is ours but inconsistent.
 pub fn scan_transaction(tx: &Transaction, keys: &ScanKeys<'_>) -> Result<Vec<Received>, ScanError> {
+    scan_transaction_with(tx, keys, None)
+}
+
+/// The key derivations scanning one transaction needs.
+///
+/// Every scalar multiplication [`scan_transaction`] does, and nothing else.
+/// They are a pure function of the transaction's public keys and the view
+/// secret key, which is what makes it safe to compute them anywhere — ahead
+/// of time, on another thread, for a whole batch at once.
+#[derive(Clone, Debug)]
+pub struct Derivations {
+    main: Option<KeyDerivation>,
+    additional: Vec<Option<KeyDerivation>>,
+}
+
+/// Compute a transaction's derivations, for [`scan_transaction_with`].
+///
+/// Returns `None` for a transaction with no public key in `tx_extra`, which
+/// [`scan_transaction`] refuses; the refusal is left to it so this can be run
+/// over a batch without deciding anything.
+pub fn derivations_for(tx: &Transaction, view_secret_key: &SecretKey) -> Option<Derivations> {
+    let extra = wow_types::tx_extra::parse_tx_extra(&tx.prefix.extra);
+    let tx_pub_key = extra.tx_pubkey()?;
+    let additional = extra.additional_pubkeys().unwrap_or(&[]);
+    Some(Derivations {
+        main: wow_crypto::generate_key_derivation(&tx_pub_key, view_secret_key),
+        additional: additional
+            .iter()
+            .map(|k| wow_crypto::generate_key_derivation(k, view_secret_key))
+            .collect(),
+    })
+}
+
+/// [`scan_transaction`], with the derivations supplied rather than computed.
+///
+/// `ready` is only ever the value [`derivations_for`] returns for this same
+/// transaction and view key, so passing one changes how long the scan takes
+/// and nothing about what it finds. A caller that is unsure passes `None`.
+pub fn scan_transaction_with(
+    tx: &Transaction,
+    keys: &ScanKeys<'_>,
+    ready: Option<&Derivations>,
+) -> Result<Vec<Received>, ScanError> {
     let extra = wow_types::tx_extra::parse_tx_extra(&tx.prefix.extra);
     let tx_pub_key = extra.tx_pubkey().ok_or(ScanError::NoTxPublicKey)?;
     let additional = extra.additional_pubkeys().unwrap_or(&[]);
 
-    // One scalar multiplication for the whole transaction.
-    let main_derivation = wow_crypto::generate_key_derivation(&tx_pub_key, keys.view_secret_key);
-
-    // And one per additional key, computed lazily — most transactions have
-    // none, and a transaction that has them is paying a subaddress.
-    let additional_derivations: Vec<Option<KeyDerivation>> = additional
-        .iter()
-        .map(|k| wow_crypto::generate_key_derivation(k, keys.view_secret_key))
-        .collect();
+    // One scalar multiplication for the whole transaction, and one per
+    // additional key — most transactions have none, and one that does is
+    // paying a subaddress. This is the whole cost of a scan, which is why a
+    // caller is allowed to have done it already.
+    let computed = ready.is_none().then(|| Derivations {
+        main: wow_crypto::generate_key_derivation(&tx_pub_key, keys.view_secret_key),
+        additional: additional
+            .iter()
+            .map(|k| wow_crypto::generate_key_derivation(k, keys.view_secret_key))
+            .collect(),
+    });
+    let d = ready.or(computed.as_ref()).expect("one or the other");
+    let main_derivation = d.main;
+    let additional_derivations = &d.additional;
 
     let mut found = Vec::new();
     for (i, out) in tx.prefix.vout.iter().enumerate() {
@@ -402,6 +450,40 @@ mod tests {
         assert_eq!(found[0].subaddress, SubaddressIndex::MAIN);
         assert!(found[0].had_view_tag);
         assert!(found[0].key_image.is_some());
+
+        // Supplying the derivations rather than computing them changes when
+        // the scalar multiplications happen and nothing else. That is the
+        // whole safety argument for a refresh precomputing a batch of them on
+        // every core, so it is asserted rather than assumed.
+        let ready = derivations_for(&tx, &w.view).expect("derivations");
+        assert_eq!(
+            scan_transaction_with(&tx, &w.keys(), Some(&ready)).expect("scan"),
+            found
+        );
+    }
+
+    /// And a wallet the transaction does not pay finds nothing either way.
+    /// The empty result is the case that happens millions of times over a
+    /// refresh, so it is the one worth pinning.
+    #[test]
+    fn precomputed_derivations_find_nothing_where_a_scan_finds_nothing() {
+        let w = wallet(7);
+        let theirs = wallet(8);
+        let (r, big_r) = tx_key(4);
+        let sent = send_to(&r, &w.address, 0, 5_000, true);
+        let tx = transaction(
+            vec![sent],
+            vec![TxExtraField::Pubkey(big_r)],
+            RctType::BulletproofPlus,
+        );
+
+        let ready = derivations_for(&tx, &theirs.view).expect("derivations");
+        assert!(scan_transaction(&tx, &theirs.keys())
+            .expect("scan")
+            .is_empty());
+        assert!(scan_transaction_with(&tx, &theirs.keys(), Some(&ready))
+            .expect("scan")
+            .is_empty());
     }
 
     /// A different wallet sees nothing. This is the case that happens millions
