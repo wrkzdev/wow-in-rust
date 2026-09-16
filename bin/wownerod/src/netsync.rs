@@ -163,9 +163,25 @@ impl wow_core::pow::PowVerifier for ChainPow {
                 .seeds
                 .get(seed_hash)
                 .map_err(|e| wow_core::pow::PowError::RandomWow(e.to_string()))?;
-            // Light mode: a cache rather than the 2 GiB dataset. Verification
-            // is one hash per block, where mining is millions, so the dataset's
-            // build cost would dwarf what it saves.
+            // Light mode: a cache rather than the 2 GiB dataset, and not a
+            // thing to "improve" later.
+            //
+            // The dataset makes a hash roughly ten times faster and has to be
+            // rebuilt every time the seed changes, which is every
+            // `SEEDHASH_EPOCH_BLOCKS` -- 2,048 blocks. Verifying is one hash
+            // per block, so the arithmetic goes the wrong way at every
+            // plausible build time:
+            //
+            // | range | blocks | epochs | light, 16 cores | dataset builds |
+            // |---|---|---|---|---|
+            // | above the last checkpoint | 35,540 | 17 | ~170 s | 520-2,080 s |
+            // | every RandomWOW block | 759,372 | 371 | ~3,600 s | 11,000-44,000 s |
+            //
+            // Three to twelve times *slower*, before counting 2 GiB of memory.
+            // This is why `monerod` verifies in light mode too and builds a
+            // dataset only for mining, where the same seed does millions of
+            // hashes. The lever that would actually help is a JIT for the VM,
+            // which is in `docs/daemon-review.md`.
             //
             // Kept per thread rather than built per call. A VM carries a 2 MiB
             // scratchpad and its program buffers, and this path runs once for

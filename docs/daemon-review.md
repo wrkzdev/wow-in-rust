@@ -163,7 +163,12 @@ Statuses:
   those versions.
 * RandomWOW's VM is interpreted, and SuperscalarHash is compiled only on
   x86-64. A JIT for the VM, and for aarch64, would bring verification and
-  mining closer to the C++ speed.
+  mining closer to the C++ speed. This is the only lever that helps
+  verification: the 2 GiB dataset, which is the other way to make a hash
+  faster, has to be rebuilt every 2,048 blocks when the seed changes, and at
+  one hash per block that costs three to twelve times what light mode does
+  — the arithmetic is written out at `ChainPow::pow_hash`. `monerod`
+  reaches the same conclusion and builds a dataset only for mining.
 * The Docker release builds have not been run since the C++ toolchain was
   removed from their images.
 * An RSA key on the RPC TLS port is signed by `rsa` 0.9, which is not
