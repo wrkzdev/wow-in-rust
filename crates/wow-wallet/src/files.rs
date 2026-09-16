@@ -87,6 +87,11 @@ pub struct Session {
     pub password: String,
     pub kdf_rounds: u64,
     pub daemon: Option<DaemonClient>,
+    /// For a daemon started with `--rpc-login`. Kept on the session rather
+    /// than on the client so that changing the node's address does not lose
+    /// it, and never written to the wallet file: a node's password is not the
+    /// wallet's to keep.
+    pub daemon_login: Option<wow_daemon_client::digest::Credentials>,
     /// The daemon's height at the last refresh, for progress reporting.
     pub daemon_height: u64,
     /// Set when anything has changed since the last save.
@@ -166,6 +171,7 @@ impl Session {
             password,
             kdf_rounds,
             daemon: None,
+            daemon_login: None,
             daemon_height: 0,
             dirty: true,
             store,
@@ -257,6 +263,7 @@ impl Session {
             password,
             kdf_rounds,
             daemon: None,
+            daemon_login: None,
             daemon_height: 0,
             dirty: false,
             store,
@@ -458,6 +465,20 @@ impl Session {
     /// otherwise how far it has scanned.
     pub fn chain_height(&self) -> u64 {
         self.daemon_height.max(self.state.scan_height())
+    }
+
+    /// A client for `address`, carrying this session's daemon login if it has
+    /// one.
+    ///
+    /// Every place that points a wallet at a node goes through here, so a
+    /// login survives `set_daemon` and is not something each front end has to
+    /// remember to apply.
+    pub fn client_for(&self, address: &str) -> DaemonClient {
+        let mut endpoint = wow_daemon_client::Endpoint::new(address);
+        if let Some(c) = &self.daemon_login {
+            endpoint = endpoint.with_login(c.clone());
+        }
+        DaemonClient::with_endpoint(endpoint)
     }
 
     pub fn describe_progress(&self) -> String {

@@ -75,6 +75,10 @@ in a C toolchain.
   folder, with a folder chooser, and shows it in the file manager.
 - An open wallet is locked: wallet-cli and the C++ wallet cannot open it at the
   same time.
+- A node started with `--rpc-login` needs a user name and password: Settings,
+  Node. They are kept until the window closes and are never written to the
+  settings file, so a node's password does not end up on disk. The web wallet
+  has no such field — a browser's `fetch` does not do HTTP Digest.
 - Nodes over plain HTTP or TLS. An https node's certificate is checked against
   the Mozilla roots. A node with a self-signed certificate, as `wownerod` makes
   one, needs "Accept an https node's certificate whoever signed it" in

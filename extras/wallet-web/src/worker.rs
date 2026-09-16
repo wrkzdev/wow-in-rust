@@ -147,7 +147,15 @@ impl Platform for Browser {
 
     /// The browser checks a node's certificate itself, and a page cannot tell
     /// it to accept one it does not trust.
-    fn connect(&self, node: &NodeAddress, _any_certificate: bool) -> DaemonClient {
+    /// `login` is ignored here: requests go through the browser's `fetch`,
+    /// which does not do HTTP Digest, and the interface does not offer the
+    /// field in a browser build.
+    fn connect(
+        &self,
+        node: &NodeAddress,
+        _any_certificate: bool,
+        _login: Option<&wow_daemon_client::digest::Credentials>,
+    ) -> DaemonClient {
         DaemonClient::with_transport(Arc::new(BrowserTransport { base: node.url() }))
     }
 

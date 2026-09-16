@@ -65,6 +65,13 @@ pub enum Command {
     /// node with a self-signed certificate needs. The desktop only: a browser
     /// decides that itself.
     AcceptAnyCertificate(bool),
+    /// Log in to a node started with `--rpc-login`, or stop trying with
+    /// `None`. The desktop only: a browser's `fetch` does not do HTTP Digest.
+    ///
+    /// Deliberately not part of [`crate::app::Settings`], which is written to
+    /// disk. A node's password is not this wallet's to keep, so it lasts as
+    /// long as the window does.
+    SetNodeLogin(Option<(String, String)>),
     /// Log from now on at `level`, 0 to 4 as `--log-level` takes it, or not
     /// at all with `None`; and to a file too, where the platform has one.
     SetLog { level: Option<u8>, to_file: bool },

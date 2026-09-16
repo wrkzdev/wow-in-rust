@@ -62,6 +62,9 @@ struct Options {
     view_key: Option<String>,
     spend_key: Option<String>,
     daemon: Option<String>,
+    /// `--daemon-login <user>:<password>`, for a node started with
+    /// `--rpc-login`.
+    daemon_login: Option<String>,
     /// `None` when not given, so a restore knows to ask.
     restore_height: Option<u64>,
     kdf_rounds: u64,
@@ -91,6 +94,7 @@ impl std::fmt::Debug for Options {
             .field("view_key", &redacted(&self.view_key))
             .field("spend_key", &redacted(&self.spend_key))
             .field("daemon", &self.daemon)
+            .field("daemon_login", &redacted(&self.daemon_login))
             .field("restore_height", &self.restore_height)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("language", &self.language)
@@ -116,6 +120,7 @@ impl Default for Options {
             view_key: None,
             spend_key: None,
             daemon: None,
+            daemon_login: None,
             restore_height: None,
             kdf_rounds: 1,
             language: None,
@@ -153,6 +158,7 @@ Whatever the options below leave out is asked for.
   --password-file <path>
   --daemon-address <address>        host:port, or https://host:port for TLS;
                                     default 127.0.0.1:34568
+  --daemon-login <user>:<pass>      for a daemon started with --rpc-login
   --testnet / --stagenet
   --restore-height <n>
   --mnemonic-language <lang>
@@ -218,6 +224,7 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
                 o.password = Some(text.trim_end_matches(['\r', '\n']).to_string());
             }
             "--daemon-address" => o.daemon = Some(next("--daemon-address")?),
+            "--daemon-login" => o.daemon_login = Some(next("--daemon-login")?),
             "--daemon-host" => {
                 let host = next("--daemon-host")?;
                 o.daemon = Some(format!("{host}:34568"));
@@ -370,6 +377,15 @@ fn start_logging(o: &Options) -> Result<(), String> {
 fn run(mut options: Options) -> Result<(), String> {
     start_logging(&options)?;
     let mut session = startup::start(&mut options)?;
+
+    // Before the first connection: a daemon with --rpc-login refuses
+    // everything, including the get_info that `set_daemon` checks with.
+    if let Some(text) = &options.daemon_login {
+        match wow_daemon_client::digest::Credentials::parse(text) {
+            Some(c) => session.daemon_login = Some(c),
+            None => return Err("--daemon-login takes <user>:<password>".into()),
+        }
+    }
 
     // Connect, and sync unless told not to.
     let daemon = options

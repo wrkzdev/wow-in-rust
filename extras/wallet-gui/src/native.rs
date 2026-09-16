@@ -213,13 +213,22 @@ impl Platform for Folder {
         false
     }
 
-    fn connect(&self, node: &NodeAddress, any_certificate: bool) -> DaemonClient {
+    fn connect(
+        &self,
+        node: &NodeAddress,
+        any_certificate: bool,
+        login: Option<&wow_daemon_client::digest::Credentials>,
+    ) -> DaemonClient {
         let certificates = if any_certificate {
             Certificates::Any
         } else {
             Certificates::Checked
         };
-        DaemonClient::with_endpoint(Endpoint::new(node.url()).with_certificates(certificates))
+        let mut endpoint = Endpoint::new(node.url()).with_certificates(certificates);
+        if let Some(c) = login {
+            endpoint = endpoint.with_login(c.clone());
+        }
+        DaemonClient::with_endpoint(endpoint)
     }
 
     fn millis(&self) -> f64 {

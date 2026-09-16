@@ -433,6 +433,13 @@ struct NodePicker {
     fetched: Option<Net>,
     /// By the address as it was sent to be tested.
     tests: HashMap<String, Test>,
+    /// A login for a node started with `--rpc-login`.
+    ///
+    /// Here rather than in [`Settings`] on purpose: settings are written to
+    /// disk, and a node's password is not this wallet's to keep. It lasts as
+    /// long as the window does.
+    login_user: String,
+    login_pass: String,
 }
 
 enum Test {
@@ -2956,6 +2963,45 @@ fn node_picker(
                 "Certificates are not checked, so someone between this computer and the node \
                  could pose as it.",
             );
+        }
+
+        // A node started with --rpc-login refuses everything, including the
+        // height check the Test button makes, until a request carries a
+        // login. Without this a wallet simply cannot use one.
+        ui.add_space(8.0);
+        ui.label(RichText::new("Login").strong());
+        ui.label("Only for a node started with --rpc-login. Most public nodes need none.");
+        let mut login_changed = false;
+        egui::Grid::new("node-login")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("User");
+                login_changed |= ui
+                    .add(
+                        TextEdit::singleline(&mut picker.login_user)
+                            .desired_width(200.0)
+                            .hint_text("empty for no login"),
+                    )
+                    .changed();
+                ui.end_row();
+                ui.label("Password");
+                login_changed |= ui
+                    .add(
+                        TextEdit::singleline(&mut picker.login_pass)
+                            .password(true)
+                            .desired_width(200.0),
+                    )
+                    .changed();
+                ui.end_row();
+            });
+        if login_changed {
+            let login = (!picker.login_user.is_empty())
+                .then(|| (picker.login_user.clone(), picker.login_pass.clone()));
+            host.send(Command::SetNodeLogin(login));
+        }
+        if !picker.login_user.is_empty() {
+            ui.label("Kept until this window closes; it is not saved with the settings.");
         }
     }
 

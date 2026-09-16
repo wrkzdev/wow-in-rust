@@ -31,6 +31,7 @@
 //! guarantees is narrower and still worth stating: nothing a daemon sends can
 //! cause an unbounded allocation, a panic, or a hang.
 
+pub mod digest;
 pub mod http;
 #[cfg(not(target_arch = "wasm32"))]
 mod tls;

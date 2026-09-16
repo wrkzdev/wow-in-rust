@@ -61,7 +61,14 @@ pub trait Platform {
     fn secure_page(&self) -> bool;
     /// A client for `node`. `any_certificate` accepts an https node's
     /// certificate whoever signed it, where the platform decides that.
-    fn connect(&self, node: &NodeAddress, any_certificate: bool) -> DaemonClient;
+    /// `login` is for a node started with `--rpc-login`, where the platform
+    /// can send one.
+    fn connect(
+        &self,
+        node: &NodeAddress,
+        any_certificate: bool,
+        login: Option<&wow_daemon_client::digest::Credentials>,
+    ) -> DaemonClient;
     /// A clock for timing a node's answer, in milliseconds from any start.
     fn millis(&self) -> f64;
     /// Where the log is written, when it is written to a file; `None` where
@@ -92,6 +99,9 @@ pub struct Backend<P: Platform> {
     working: bool,
     /// [`Command::AcceptAnyCertificate`], for the next connection.
     any_certificate: bool,
+    /// [`Command::SetNodeLogin`], for a node started with `--rpc-login`. In
+    /// memory only, and never written with the settings.
+    node_login: Option<wow_daemon_client::digest::Credentials>,
 }
 
 impl<P: Platform> Backend<P> {
@@ -102,6 +112,7 @@ impl<P: Platform> Backend<P> {
             wallet: None,
             working: false,
             any_certificate: false,
+            node_login: None,
         }
     }
 
@@ -174,6 +185,11 @@ impl<P: Platform> Backend<P> {
             }
             Command::AcceptAnyCertificate(on) => {
                 self.any_certificate = on;
+                Ok(())
+            }
+            Command::SetNodeLogin(login) => {
+                self.node_login = login
+                    .map(|(user, pass)| wow_daemon_client::digest::Credentials { user, pass });
                 Ok(())
             }
             Command::SetLog { level, to_file } => {
@@ -567,7 +583,9 @@ impl<P: Platform> Backend<P> {
         {
             return Err(why.to_string());
         }
-        let client = self.platform.connect(&node, self.any_certificate);
+        let client = self
+            .platform
+            .connect(&node, self.any_certificate, self.node_login.as_ref());
         let info = client
             .get_info()
             .map_err(|e| self.unanswered(&node, &e.to_string()))?;
@@ -592,7 +610,7 @@ impl<P: Platform> Backend<P> {
         let started = self.platform.millis();
         let info = self
             .platform
-            .connect(&node, self.any_certificate)
+            .connect(&node, self.any_certificate, self.node_login.as_ref())
             .get_info()
             .map_err(|e| self.unanswered(&node, &e.to_string()))?;
         let millis = (self.platform.millis() - started).max(0.0) as u64;
@@ -735,7 +753,7 @@ impl<P: Platform> Backend<P> {
                     return Err(why.to_string());
                 }
                 self.platform
-                    .connect(&address, self.any_certificate)
+                    .connect(&address, self.any_certificate, self.node_login.as_ref())
                     .get_info()
                     .map_err(|e| self.unanswered(&address, &e.to_string()))?
                     .height

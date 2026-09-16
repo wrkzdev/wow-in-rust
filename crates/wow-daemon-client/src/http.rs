@@ -80,6 +80,19 @@ pub enum HttpError {
     Status {
         code: u16,
     },
+    /// `401`, with the `WWW-Authenticate` header it came with when it had one.
+    ///
+    /// Its own variant because it is the only status a caller can do something
+    /// about: answer the challenge. [`Endpoint::exchange`] handles it and this
+    /// never reaches a caller with a login configured — one without a login
+    /// gets [`HttpError::Status`] with 401, as before.
+    Unauthorized {
+        challenge: Option<String>,
+    },
+    /// The daemon refused the credentials it was given.
+    BadLogin {
+        user: String,
+    },
     /// A [`Transport`] other than [`Endpoint`] failed, in its own words: a
     /// browser refusing a cross-origin request, say.
     Transport(String),
@@ -108,6 +121,14 @@ impl std::fmt::Display for HttpError {
                 "the connection closed after {got} of {expected} body bytes"
             ),
             HttpError::Status { code } => write!(f, "daemon returned HTTP {code}"),
+            HttpError::Unauthorized { .. } => write!(
+                f,
+                "the daemon wants a login (it was started with --rpc-login); give one with                  --daemon-login <user>:<password>"
+            ),
+            HttpError::BadLogin { user } => write!(
+                f,
+                "the daemon refused the login for `{user}`. Check the user name and the                  password: three wrong attempts and it blocks this address for a day,                  unless it was started with --disable-rpc-ban"
+            ),
             HttpError::Transport(what) => write!(f, "{what}"),
         }
     }
@@ -176,6 +197,10 @@ pub struct Endpoint {
     pub timeout: Duration,
     /// For an `https://` address.
     pub certificates: Certificates,
+    /// For a node started with `--rpc-login`. Shared rather than owned so a
+    /// cloned `Endpoint` keeps answering with the same nonce counter, which
+    /// the daemon requires to rise.
+    pub login: Option<std::sync::Arc<crate::digest::Login>>,
 }
 
 impl Endpoint {
@@ -185,11 +210,18 @@ impl Endpoint {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             timeout: DEFAULT_TIMEOUT,
             certificates: Certificates::Checked,
+            login: None,
         }
     }
 
     pub fn with_certificates(mut self, certificates: Certificates) -> Endpoint {
         self.certificates = certificates;
+        self
+    }
+
+    /// Log in to a daemon started with `--rpc-login`.
+    pub fn with_login(mut self, credentials: crate::digest::Credentials) -> Endpoint {
+        self.login = Some(std::sync::Arc::new(crate::digest::Login::new(credentials)));
         self
     }
 
@@ -246,7 +278,49 @@ impl Endpoint {
     }
 
     /// One request and its response, on a connection of its own.
+    ///
+    /// A daemon with `--rpc-login` answers `401` with a challenge until a
+    /// request carries an `Authorization`. The held challenge is sent first,
+    /// so the usual call costs one round trip; a `401` is answered and the
+    /// request sent again, once. Twice would mean the credentials are wrong,
+    /// and a daemon blocks an address after three failures.
     fn exchange(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
+        let authorization = self.login.as_ref().and_then(|l| l.authorization("POST", path));
+        match self.exchange_once(path, content_type, body, authorization.as_deref()) {
+            Err(HttpError::Unauthorized { challenge }) => {
+                let Some(login) = self.login.as_ref() else {
+                    return Err(HttpError::Status { code: 401 });
+                };
+                // The nonce we had, if any, is no longer one the daemon will
+                // take.
+                login.stale();
+                let Some(answer) = challenge
+                    .as_deref()
+                    .and_then(|c| login.answer(c, "POST", path))
+                else {
+                    return Err(HttpError::Status { code: 401 });
+                };
+                match self.exchange_once(path, content_type, body, Some(&answer)) {
+                    // Answered, and still refused: the user name or the
+                    // password is wrong. Said plainly, because "HTTP 401" sends
+                    // people to look at their node's logs instead.
+                    Err(HttpError::Unauthorized { .. }) => Err(HttpError::BadLogin {
+                        user: login.user().to_string(),
+                    }),
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn exchange_once(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+        authorization: Option<&str>,
+    ) -> Result<Vec<u8>, HttpError> {
         let host = Target::parse(&self.address)?.host_header;
         let mut stream = self.connect()?;
 
@@ -255,15 +329,20 @@ impl Endpoint {
         // connection as soon as it has answered a request that asks for that,
         // cancelling the reply it is still writing, so a large one arrives cut
         // short. `wallet2` never sends it, and neither does this.
-        let head = format!(
+        let mut head = format!(
             "POST {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
              Content-Type: {content_type}\r\n\
              Content-Length: {len}\r\n\
-             Accept: */*\r\n\
-             \r\n",
+             Accept: */*\r\n",
             len = body.len(),
         );
+        if let Some(a) = authorization {
+            head.push_str("Authorization: ");
+            head.push_str(a);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
         stream.write_all(head.as_bytes())?;
         stream.write_all(body)?;
         stream.flush()?;
@@ -403,6 +482,8 @@ fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
     // this talks to always give a length.
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
+    // Kept for a 401: it is what says how to log in.
+    let mut challenge: Option<String> = None;
     loop {
         line.clear();
         read_line(&mut reader, &mut line, &mut header_bytes)?;
@@ -426,6 +507,16 @@ fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
             content_length = Some(len);
         } else if name == "transfer-encoding" && value.eq_ignore_ascii_case("chunked") {
             chunked = true;
+        } else if name == "www-authenticate" && value.len() <= MAX_HEADER_BYTES {
+            // A server may offer several schemes in separate headers. Digest
+            // is the only one spoken here, so prefer it over whatever came
+            // first.
+            let digest = value
+                .get(..6)
+                .is_some_and(|s| s.eq_ignore_ascii_case("digest"));
+            if challenge.is_none() || digest {
+                challenge = Some(value.to_string());
+            }
         }
     }
 
@@ -478,6 +569,9 @@ fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
 
     // The status is checked after the body is drained, so an error response
     // with a useful JSON payload is still available to the caller.
+    if code == 401 {
+        return Err(HttpError::Unauthorized { challenge });
+    }
     if !(200..300).contains(&code) {
         return Err(HttpError::Status { code });
     }

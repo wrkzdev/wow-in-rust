@@ -763,7 +763,7 @@ fn set_daemon(session: &mut Session, params: &Value) -> MethodResult {
         .get("address")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::new(errors::NO_DAEMON_CONNECTION, "address is missing"))?;
-    let client = wow_daemon_client::DaemonClient::new(address);
+    let client = session.client_for(address);
     let info = client.get_info().map_err(|e| {
         Error::new(
             errors::NO_DAEMON_CONNECTION,

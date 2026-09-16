@@ -39,6 +39,7 @@ wownero-wallet-rpc — the Wownero wallet RPC (specs/14)
   --rpc-login <user:pass>           HTTP Basic
   --disable-rpc-login               explicitly run without authentication
 
+  --daemon-login <user>:<pass>      for a daemon started with --rpc-login
   --daemon-address <address>        host:port, or https://host:port for TLS;
                                     default 127.0.0.1:34568
   --testnet / --stagenet
@@ -66,6 +67,9 @@ struct Options {
     login: Option<(String, String)>,
     disable_login: bool,
     daemon: String,
+    /// `--daemon-login <user>:<password>`, for a node started with
+    /// `--rpc-login`.
+    daemon_login: Option<String>,
     network: Network,
     kdf_rounds: u64,
     no_initial_sync: bool,
@@ -94,6 +98,7 @@ impl std::fmt::Debug for Options {
             )
             .field("disable_login", &self.disable_login)
             .field("daemon", &self.daemon)
+            .field("daemon_login", &self.daemon_login.as_ref().map(|_| "<redacted>"))
             .field("network", &self.network)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("no_initial_sync", &self.no_initial_sync)
@@ -117,6 +122,7 @@ impl Default for Options {
             login: None,
             disable_login: false,
             daemon: "127.0.0.1:34568".into(),
+            daemon_login: None,
             network: Network::Mainnet,
             kdf_rounds: 1,
             no_initial_sync: false,
@@ -164,6 +170,7 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             }
             "--disable-rpc-login" => o.disable_login = true,
             "--daemon-address" => o.daemon = next("--daemon-address")?,
+            "--daemon-login" => o.daemon_login = Some(next("--daemon-login")?),
             "--testnet" => o.network = Network::Testnet,
             "--stagenet" => o.network = Network::Stagenet,
             "--kdf-rounds" => {
@@ -288,6 +295,14 @@ fn run(options: Options) -> Result<(), String> {
         _ => unreachable!("validated above"),
     };
 
+    let daemon_login = match &options.daemon_login {
+        Some(text) => Some(
+            wow_daemon_client::digest::Credentials::parse(text)
+                .ok_or("--daemon-login takes <user>:<password>")?,
+        ),
+        None => None,
+    };
+
     let state = Arc::new(State::new(
         source,
         options.network,
@@ -297,6 +312,7 @@ fn run(options: Options) -> Result<(), String> {
         // no wallet yet, and every wallet a client opens or creates later must
         // reach the same daemon.
         options.daemon.clone(),
+        daemon_login,
     ));
 
     state.open_at_startup()?;

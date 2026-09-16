@@ -166,8 +166,12 @@ Statuses:
 
 **Wallets**
 
-* Neither wallet can send daemon login credentials, so they cannot use a
-  daemon started with `--rpc-login`.
+* The web wallet cannot send daemon login credentials. Requests go through
+  the browser's `fetch`, which does not do HTTP Digest, so a node started
+  with `--rpc-login` is out of reach from a browser. `wownero-wallet-cli`,
+  `wownero-wallet-rpc` and the desktop GUI all can — `--daemon-login
+  <user>:<password>`, `set_daemon <address> <user>:<password>`, or Settings,
+  Node in the GUI.
 
 **Verification**
 

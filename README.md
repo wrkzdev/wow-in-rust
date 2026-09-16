@@ -121,8 +121,10 @@ at least one alternative block filed off the main chain.
 Dandelion++ relay, reorgs, the admin and mining RPC, HTTP Digest login, RPC over
 TLS, the ZMQ RPC and publisher — and the miner, on regtest.
 
-**Not built:** in the wallets, transaction proofs, key-image import/export and
-multiple accounts; in the daemon, proxies and i2p/Tor, rate limits, pruning,
+**Not built:** in the web wallet, a daemon login — a browser's `fetch` does
+not do HTTP Digest, so a node started with `--rpc-login` is out of reach from
+one; the other three front ends can log in. In the wallets, transaction
+proofs, key-image import/export and multiple accounts; in the daemon, proxies and i2p/Tor, rate limits, pruning,
 bootstrap daemons, background mining, extra messages in mined blocks, and ZMQ
 over `ipc://` or with CURVE/PLAIN security. The daemon's `--help` names what is
 missing rather than accepting options it cannot honour.

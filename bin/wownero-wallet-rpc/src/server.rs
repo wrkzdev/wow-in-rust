@@ -58,6 +58,9 @@ pub struct State {
     /// afterwards came up with no daemon and `refresh` answered "no daemon is
     /// set" -- on a server that had been given one on the command line.
     daemon_address: Mutex<String>,
+    /// `--daemon-login`, for a node started with `--rpc-login`. Applied to
+    /// every wallet this server points at a daemon.
+    daemon_login: Option<wow_daemon_client::digest::Credentials>,
     stop: AtomicBool,
 }
 
@@ -68,6 +71,7 @@ impl State {
         kdf_rounds: u64,
         login: Option<(String, String)>,
         daemon_address: String,
+        daemon_login: Option<wow_daemon_client::digest::Credentials>,
     ) -> State {
         State {
             wallet: Mutex::new(None),
@@ -76,6 +80,7 @@ impl State {
             kdf_rounds,
             login,
             daemon_address: Mutex::new(daemon_address),
+            daemon_login,
             stop: AtomicBool::new(false),
         }
     }
@@ -108,7 +113,8 @@ impl State {
         if address.is_empty() {
             return;
         }
-        let client = wow_daemon_client::DaemonClient::new(&address);
+        session.daemon_login = self.daemon_login.clone();
+        let client = session.client_for(&address);
         match client.get_info() {
             Ok(info) => {
                 session.daemon_height = info.height;
@@ -625,6 +631,7 @@ mod tests {
             1,
             login.map(|(u, p)| (u.to_string(), p.to_string())),
             String::new(),
+            None,
         )
     }
 

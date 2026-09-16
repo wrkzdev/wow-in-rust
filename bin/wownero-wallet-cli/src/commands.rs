@@ -162,7 +162,9 @@ Wallet
   save                          write the keys file and cache
 
 Chain
-  set_daemon <address>          point at a daemon: host:port, or https://host:port
+  set_daemon <address> [<user>:<pass>]
+                                point at a daemon: host:port, or https://host:port.
+                                A login is needed for one started with --rpc-login
   refresh                       scan up to the daemon's tip
   rescan_bc                     forget what was scanned and start over
   bc_height / status            where the wallet and the daemon are
@@ -313,8 +315,18 @@ fn save(session: &mut Session) -> Result<(), String> {
 // -- chain -----------------------------------------------------------------
 
 fn set_daemon(session: &mut Session, args: &[&str]) -> Result<(), String> {
-    let address = args.first().ok_or("usage: set_daemon <host:port>")?;
-    let client = wow_daemon_client::DaemonClient::new(*address);
+    let address = args
+        .first()
+        .ok_or("usage: set_daemon <host:port> [<user>:<password>]")?;
+    // A login given here replaces whatever --daemon-login set; one left out
+    // keeps it, so pointing at a second node on the same box does not mean
+    // typing the password again.
+    if let Some(text) = args.get(1) {
+        let c = wow_daemon_client::digest::Credentials::parse(text)
+            .ok_or("a daemon login is <user>:<password>")?;
+        session.daemon_login = Some(c);
+    }
+    let client = session.client_for(address);
     let info = client
         .get_info()
         .map_err(|e| format!("cannot reach {address}: {e}"))?;
