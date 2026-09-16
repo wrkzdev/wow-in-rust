@@ -100,9 +100,11 @@ Against public nodes — `https://wow-node.0z.network:443`,
   Above it every rule is enforced, transactions included: each one's ring
   signatures, range proof, commitment sum and ring members are checked with the
   same code that guards the pool, a whole sync batch at a time on every core.
-  A sync from scratch is many hours — roughly 11 blocks/s, ~78% of it waiting
-  on the peer — so point a wallet at a public node unless you specifically want
-  your own chain.
+  A sync from scratch is many hours, so point a wallet at a public node unless
+  you specifically want your own chain. (The often-quoted 11 blocks/s with 78%
+  spent waiting is `--sync-from`, the single-peer diagnostic path, which
+  deliberately does one thing at a time. `--serve` reserves spans across every
+  connection and applies them while others are still arriving.)
 
 Run the live checks yourself:
 

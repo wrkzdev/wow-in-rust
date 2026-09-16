@@ -2122,6 +2122,19 @@ fn advance(shared: &Shared, conn: &Conn, proto: &mut Proto) {
 
     match reserved {
         Some((start, ids)) => {
+            // One request in flight per connection, which is what `pending`
+            // being a single slot means and what the reference does.
+            //
+            // A second in flight would hide the round trip, and it is worth
+            // knowing why that is not done here. Parallelism across *peers* is
+            // the reference's answer and this node's: a dozen connections each
+            // filling a span is already a dozen requests in the air, and the
+            // applier is the thing they queue behind. A second request per
+            // connection would also mean matching an answer to the request it
+            // belongs to -- `RESPONSE_GET_OBJECTS` does not name one -- and
+            // deciding what a span whose partner failed should do. That is a
+            // protocol change, on the path that has to agree with C++ peers,
+            // for a saving the peer count already buys.
             conn.notify(
                 command::REQUEST_GET_OBJECTS,
                 &messages::request_objects(&ids, false),
