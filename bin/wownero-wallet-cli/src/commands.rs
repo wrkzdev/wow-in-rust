@@ -397,7 +397,11 @@ fn refresh(session: &mut Session) -> Result<(), String> {
             println!("{}", describe_event(e));
         }
         if s.blocks_scanned > 0 {
-            progress.update(session.state.scan_height(), session.chain_height());
+            progress.update(
+                session.state.start_height,
+                session.state.scan_height(),
+                session.chain_height(),
+            );
         }
         if s.caught_up {
             break;

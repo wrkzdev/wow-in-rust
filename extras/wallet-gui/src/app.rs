@@ -1839,7 +1839,12 @@ fn overview(
         }
     }
     ui.add_space(12.0);
-    sync_bar(ui, &w.status, sync_rate(&w.sync_samples));
+    sync_bar(
+        ui,
+        &w.status,
+        w.summary.restore_height,
+        sync_rate(&w.sync_samples),
+    );
     if let Some(e) = &w.status.node_error {
         ui.colored_label(t.bad, e.as_str());
     }
@@ -3219,12 +3224,26 @@ fn sync_rate(samples: &std::collections::VecDeque<(f64, u64)>) -> Option<f64> {
     (secs >= 1.0 && h1 > h0).then(|| (h1 - h0) as f64 / secs)
 }
 
-fn sync_bar(ui: &mut Ui, s: &Status, rate: Option<f64>) {
+/// The progress bar, measured over the blocks this wallet actually has to
+/// scan.
+///
+/// `from` is the height the wallet starts at. Measuring from genesis instead
+/// would open a wallet restored at 800,000 on an 874,000 chain at "91%" and
+/// leave it creeping there for an hour, which is a bar that lies twice: about
+/// how much is done and about how much is left.
+fn sync_bar(ui: &mut Ui, s: &Status, from: u64, rate: Option<f64>) {
     if s.chain == 0 {
         ui.label("Not synced with any node yet.");
         return;
     }
-    let fraction = (s.scanned as f64 / s.chain as f64).clamp(0.0, 1.0) as f32;
+    let from = from.min(s.scanned);
+    let span = s.chain.saturating_sub(from);
+    let done = s.scanned.saturating_sub(from);
+    let fraction = if span == 0 {
+        1.0
+    } else {
+        (done as f64 / span as f64).clamp(0.0, 1.0) as f32
+    };
     let text = if s.scanned >= s.chain {
         format!("Synced at height {}", format::grouped(s.scanned))
     } else {
