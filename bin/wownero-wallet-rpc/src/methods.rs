@@ -903,13 +903,15 @@ fn sweep_single(session: &mut Session, params: &Value) -> MethodResult {
         .get("address")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::new(errors::WRONG_ADDRESS, "address is missing"))?;
+    // `WRONG_KEY_IMAGE` for both, as the reference: a missing `key_image` is
+    // an empty string to it, and fails the same parse.
     let image_text = params
         .get("key_image")
         .and_then(Value::as_str)
-        .ok_or_else(|| Error::new(errors::WRONG_PARAM, "key_image is missing"))?;
+        .ok_or_else(|| Error::new(errors::WRONG_KEY_IMAGE, "key_image is missing"))?;
     let image: [u8; 32] = wow_crypto::hex::decode(image_text)
         .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| Error::new(errors::WRONG_PARAM, "key_image is 64 hex characters"))?;
+        .ok_or_else(|| Error::new(errors::WRONG_KEY_IMAGE, "key_image is 64 hex characters"))?;
 
     let outcome = build_and_send_output(
         session,

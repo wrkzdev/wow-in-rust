@@ -723,40 +723,6 @@ impl Core for NodeCore {
         taken
     }
 
-    /// Note where the chain has reached, for [`NodeCore::blocks_per_second`].
-    ///
-    /// Called after blocks are applied rather than on a timer: a sample that
-    /// repeats the same height says nothing about the speed, and a run of them
-    /// during a stall would drag the estimate towards zero when the right
-    /// answer is "no idea".
-    fn note_progress(&self) {
-        let now = std::time::Instant::now();
-        let height = self.db.height();
-        let mut held = lock(&self.progress);
-        if held.back().is_some_and(|(_, h)| *h == height) {
-            return;
-        }
-        held.push_back((now, height));
-        while held.len() > 2 && now.duration_since(held[0].0) > RATE_WINDOW {
-            held.pop_front();
-        }
-    }
-
-    /// Blocks per second over the last [`RATE_WINDOW`], once there is a second
-    /// of it to measure.
-    pub fn blocks_per_second(&self) -> Option<f64> {
-        let held = lock(&self.progress);
-        let (t0, h0) = *held.front()?;
-        let (t1, h1) = *held.back()?;
-        let secs = t1.duration_since(t0).as_secs_f64();
-        // And nothing at all if the last sample is stale: a speed measured
-        // over blocks that stopped arriving a minute ago is not a speed.
-        if t1.elapsed() > RATE_WINDOW {
-            return None;
-        }
-        (secs >= 1.0 && h1 > h0).then(|| (h1 - h0) as f64 / secs)
-    }
-
     fn new_block(&self, entry: &BlockEntry) -> BlockVerdict {
         match self.fill(entry) {
             Ok(txs) => {
@@ -828,6 +794,40 @@ impl Core for NodeCore {
 }
 
 impl NodeCore {
+    /// Note where the chain has reached, for [`NodeCore::blocks_per_second`].
+    ///
+    /// Called after blocks are applied rather than on a timer: a sample that
+    /// repeats the same height says nothing about the speed, and a run of them
+    /// during a stall would drag the estimate towards zero when the right
+    /// answer is "no idea".
+    fn note_progress(&self) {
+        let now = std::time::Instant::now();
+        let height = self.db.height();
+        let mut held = lock(&self.progress);
+        if held.back().is_some_and(|(_, h)| *h == height) {
+            return;
+        }
+        held.push_back((now, height));
+        while held.len() > 2 && now.duration_since(held[0].0) > RATE_WINDOW {
+            held.pop_front();
+        }
+    }
+
+    /// Blocks per second over the last [`RATE_WINDOW`], once there is a second
+    /// of it to measure.
+    pub fn blocks_per_second(&self) -> Option<f64> {
+        let held = lock(&self.progress);
+        let (t0, h0) = *held.front()?;
+        let (t1, h1) = *held.back()?;
+        let secs = t1.duration_since(t0).as_secs_f64();
+        // And nothing at all if the last sample is stale: a speed measured
+        // over blocks that stopped arriving a minute ago is not a speed.
+        if t1.elapsed() > RATE_WINDOW {
+            return None;
+        }
+        (secs >= 1.0 && h1 > h0).then(|| (h1 - h0) as f64 / secs)
+    }
+
     /// The `(seed, hashing blob)` of each block in a sync batch whose proof the
     /// chain is going to compute: RandomWOW blocks at or above both the tip and
     /// the trusted range. A seed at or above the tip is an earlier block of the
