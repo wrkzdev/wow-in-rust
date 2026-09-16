@@ -1,7 +1,8 @@
 //! A minimal HTTP/1.1 client.
 //!
 //! The mirror of `bin/wownerod/src/rpc/http.rs`, and deliberately the same
-//! shape: `POST` with a `Content-Length` body, and no keep-alive.
+//! shape: `POST` with a `Content-Length` body. Unlike it, a connection is kept
+//! for the next call when the framing allows (see `Response::reusable`).
 //!
 //! An address is `host:port`, as typed on a command line, or that with
 //! `http://` or `https://` in front. `https://` is TLS (`specs/11` §1.2), on
@@ -289,7 +290,7 @@ impl Endpoint {
         result
     }
 
-    /// One request and its response, on a connection of its own.
+    /// One request and its response.
     ///
     /// A daemon with `--rpc-login` answers `401` with a challenge until a
     /// request carries an `Authorization`. The held challenge is sent first,
@@ -350,7 +351,13 @@ impl Endpoint {
             .take();
         let reused = held.is_some();
         match self.exchange_on(held, path, content_type, body, authorization) {
-            Err(HttpError::Io(_)) | Err(HttpError::Truncated { .. }) if reused => {
+            // A server that closed the kept connection while it sat idle is
+            // most often seen as nothing to read, not as an I/O error: the
+            // request writes into the socket without complaint, and the
+            // server's FIN is already waiting behind it.
+            Err(HttpError::Io(_) | HttpError::Truncated { .. } | HttpError::Malformed(NO_REPLY))
+                if reused =>
+            {
                 wow_log::debug!(LOG, "{path}: the kept connection was gone; opening a new one");
                 self.exchange_on(None, path, content_type, body, authorization)
             }
@@ -372,8 +379,8 @@ impl Endpoint {
             None => BufReader::new(self.connect()?),
         };
 
-        // No `Connection: close`, though this connection carries one request
-        // and is closed once the body is read. Wownero 0.11.3 stops a
+        // No `Connection: close`, and not only because the connection may be
+        // kept for the next call. Wownero 0.11.3 stops a
         // connection as soon as it has answered a request that asks for that,
         // cancelling the reply it is still writing, so a large one arrives cut
         // short. `wallet2` never sends it, and neither does this.
@@ -542,12 +549,21 @@ struct Response {
     reusable: bool,
 }
 
-fn read_response<S: Read>(reader: &mut BufReader<S>, path: &str) -> Result<Response, HttpError> {
+/// What [`read_response`] says when not one byte of a reply arrived.
+///
+/// Its own words because it is what a kept connection the server has since
+/// closed reads as, and that is worth a second try on a new one.
+const NO_REPLY: &str = "the connection closed before a status line";
 
-    // Status line.
+fn read_response<S: Read>(reader: &mut BufReader<S>, path: &str) -> Result<Response, HttpError> {
+    // Status line. `read_line` only says `Malformed` for a read of nothing at
+    // all: a line cut short still reads, and fails in `parse_status` instead.
     let mut line = String::new();
     let mut header_bytes = 0usize;
-    read_line(&mut reader, &mut line, &mut header_bytes)?;
+    match read_line(reader, &mut line, &mut header_bytes) {
+        Err(HttpError::Malformed(_)) => return Err(HttpError::Malformed(NO_REPLY)),
+        other => other?,
+    }
     let code = parse_status(&line)?;
 
     // Headers. A body without a `Content-Length` runs to the end of the
@@ -560,7 +576,7 @@ fn read_response<S: Read>(reader: &mut BufReader<S>, path: &str) -> Result<Respo
     let mut server_closes = false;
     loop {
         line.clear();
-        read_line(&mut reader, &mut line, &mut header_bytes)?;
+        read_line(reader, &mut line, &mut header_bytes)?;
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
             break;
@@ -860,34 +876,76 @@ mod tests {
         let address = listener.local_addr().expect("an address").to_string();
         let server = std::thread::spawn(move || {
             let mut accepted = 0usize;
-            let mut left = replies.into_iter();
-            let mut current: Option<std::net::TcpStream> = None;
-            loop {
-                let Some(reply) = left.next() else {
-                    return accepted;
-                };
-                let s = match current.take() {
+            let mut kept: Option<std::net::TcpStream> = None;
+            for reply in replies {
+                // A kept socket that ends before a request is one the client
+                // let go of: its request is coming on a new connection.
+                let still_used = kept.take().and_then(|mut s| {
+                    if read_request(&mut s) {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                });
+                let mut s = match still_used {
                     Some(s) => s,
                     None => {
                         accepted += 1;
-                        listener.accept().expect("accept").0
+                        let mut s = listener.accept().expect("accept").0;
+                        if !read_request(&mut s) {
+                            return accepted;
+                        }
+                        s
                     }
                 };
-                let mut s = s;
-                let mut request = Vec::new();
-                let mut chunk = [0u8; 1024];
-                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let n = s.read(&mut chunk).expect("read");
-                    if n == 0 {
-                        return accepted;
-                    }
-                    request.extend_from_slice(&chunk[..n]);
-                }
                 s.write_all(reply).expect("write");
-                current = Some(s);
+                kept = Some(s);
             }
+            accepted
         });
         (address, server)
+    }
+
+    /// Read a request's head, returning whether one came before the
+    /// connection ended.
+    ///
+    /// A reset counts as ended: a client that closes with some of a reply
+    /// still unread resets the connection rather than ending it.
+    fn read_request(s: &mut std::net::TcpStream) -> bool {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => request.extend_from_slice(&chunk[..n]),
+            }
+        }
+        true
+    }
+
+    /// A kept connection the server closed while it sat idle is not an error:
+    /// the call goes again on a new one.
+    #[test]
+    fn a_kept_connection_the_server_closed_is_replaced() {
+        const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("an address").to_string();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().expect("accept");
+                assert!(read_request(&mut s), "a request");
+                s.write_all(OK).expect("write");
+                // Dropped here: closed, with the client still keeping it.
+            }
+        });
+        let endpoint = Endpoint::new(address);
+        for _ in 0..2 {
+            assert_eq!(
+                endpoint.post("/get_info", "application/json", b"").expect("ok"),
+                b"hi"
+            );
+        }
+        server.join().expect("the server");
     }
 
     /// A second call goes down the same socket. Over TLS that is a whole
