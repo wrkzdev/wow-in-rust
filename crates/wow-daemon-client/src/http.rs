@@ -201,6 +201,12 @@ pub struct Endpoint {
     /// cloned `Endpoint` keeps answering with the same nonce counter, which
     /// the daemon requires to rise.
     pub login: Option<std::sync::Arc<crate::digest::Login>>,
+    /// The connection from the last exchange, when it can carry another.
+    ///
+    /// Shared, so cloning an `Endpoint` shares the socket rather than opening
+    /// a second one. One at a time: a wallet makes one call at a time, and a
+    /// pool of several would need a policy for how many and for how long.
+    idle: std::sync::Arc<std::sync::Mutex<Option<BufReader<Connection>>>>,
 }
 
 impl Endpoint {
@@ -211,6 +217,7 @@ impl Endpoint {
             timeout: DEFAULT_TIMEOUT,
             certificates: Certificates::Checked,
             login: None,
+            idle: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -260,9 +267,14 @@ impl Endpoint {
 
     /// `POST path` with `body`, returning the response body.
     ///
-    /// One request per connection. Keep-alive would save a handshake per call
-    /// and cost a pool and its failure modes; a refresh makes one call per
-    /// thousand blocks, so it is not where the time goes.
+    /// The connection from the last call is used when there is one. A refresh
+    /// makes one call per thousand blocks, which sounds like few until a cold
+    /// sync makes nearly a thousand of them — and against an `https://` node
+    /// each one was a full TLS handshake, on a provider of pure-Rust crates
+    /// that is not the fastest way to do one.
+    ///
+    /// The connection is only kept when the framing leaves nothing in doubt:
+    /// see [`Response::reusable`].
     pub fn post(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
         let started = std::time::Instant::now();
         wow_log::debug!(LOG, "POST {}{path}, {} byte(s)", self.address, body.len());
@@ -314,6 +326,16 @@ impl Endpoint {
         }
     }
 
+    /// One request and its response, on the connection from last time when
+    /// there is one.
+    ///
+    /// A reused connection can be closed by the far end at any moment,
+    /// including between the last response and this request, and the failure
+    /// looks exactly like a write to a dead socket. That race is not avoidable
+    /// -- it is the one thing every keep-alive implementation has to handle --
+    /// so a *reused* connection gets exactly one retry on a fresh one. A
+    /// connection that was fresh to begin with gets none: a failure there is
+    /// the node being unreachable, and retrying would only say so twice.
     fn exchange_once(
         &self,
         path: &str,
@@ -321,8 +343,34 @@ impl Endpoint {
         body: &[u8],
         authorization: Option<&str>,
     ) -> Result<Vec<u8>, HttpError> {
+        let held = self
+            .idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let reused = held.is_some();
+        match self.exchange_on(held, path, content_type, body, authorization) {
+            Err(HttpError::Io(_)) | Err(HttpError::Truncated { .. }) if reused => {
+                wow_log::debug!(LOG, "{path}: the kept connection was gone; opening a new one");
+                self.exchange_on(None, path, content_type, body, authorization)
+            }
+            other => other,
+        }
+    }
+
+    fn exchange_on(
+        &self,
+        held: Option<BufReader<Connection>>,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+        authorization: Option<&str>,
+    ) -> Result<Vec<u8>, HttpError> {
         let host = Target::parse(&self.address)?.host_header;
-        let mut stream = self.connect()?;
+        let mut reader = match held {
+            Some(r) => r,
+            None => BufReader::new(self.connect()?),
+        };
 
         // No `Connection: close`, though this connection carries one request
         // and is closed once the body is read. Wownero 0.11.3 stops a
@@ -343,11 +391,21 @@ impl Endpoint {
             head.push_str("\r\n");
         }
         head.push_str("\r\n");
-        stream.write_all(head.as_bytes())?;
-        stream.write_all(body)?;
-        stream.flush()?;
+        {
+            let stream = reader.get_mut();
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(body)?;
+            stream.flush()?;
+        }
 
-        read_response(stream, path)
+        // The reader is kept, not the socket: after a `Content-Length` body it
+        // may hold bytes of the next response already, and dropping it would
+        // lose them and misframe everything after.
+        let response = read_response(&mut reader, path)?;
+        if response.reusable {
+            *self.idle.lock().unwrap_or_else(|e| e.into_inner()) = Some(reader);
+        }
+        Ok(response.body)
     }
 
     /// `GET path`, for what is not a daemon's RPC: a public list of nodes, say.
@@ -367,7 +425,9 @@ impl Endpoint {
         );
         stream.write_all(head.as_bytes())?;
         stream.flush()?;
-        read_response(stream, path)
+        // Never pooled: this asks for `Connection: close`, so there is nothing
+        // to keep.
+        Ok(read_response(&mut BufReader::new(stream), path)?.body)
     }
 }
 
@@ -468,8 +528,21 @@ impl Write for Connection {
     }
 }
 
-fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
-    let mut reader = BufReader::new(stream);
+/// A response, and whether the connection it came on may carry another.
+struct Response {
+    body: Vec<u8>,
+    /// The body was framed by an exact `Content-Length` that was read in full,
+    /// the server did not say `Connection: close`, and nothing else about the
+    /// exchange is ambiguous.
+    ///
+    /// Anything less and the socket is dropped. A connection reused when the
+    /// framing was not certain hands the *next* call somebody else's bytes,
+    /// and a wallet that reads one answer as another is a far worse outcome
+    /// than a handshake.
+    reusable: bool,
+}
+
+fn read_response<S: Read>(reader: &mut BufReader<S>, path: &str) -> Result<Response, HttpError> {
 
     // Status line.
     let mut line = String::new();
@@ -484,6 +557,7 @@ fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
     let mut chunked = false;
     // Kept for a 401: it is what says how to log in.
     let mut challenge: Option<String> = None;
+    let mut server_closes = false;
     loop {
         line.clear();
         read_line(&mut reader, &mut line, &mut header_bytes)?;
@@ -507,6 +581,10 @@ fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
             content_length = Some(len);
         } else if name == "transfer-encoding" && value.eq_ignore_ascii_case("chunked") {
             chunked = true;
+        } else if name == "connection" {
+            server_closes = value
+                .split(',')
+                .any(|v| v.trim().eq_ignore_ascii_case("close"));
         } else if name == "www-authenticate" && value.len() <= MAX_HEADER_BYTES {
             // A server may offer several schemes in separate headers. Digest
             // is the only one spoken here, so prefer it over whatever came
@@ -529,7 +607,7 @@ fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
 
     // Chunked wins over any `Content-Length` alongside it (RFC 9112 §6.3).
     let body = match content_length {
-        _ if chunked => read_chunked(&mut reader)?,
+        _ if chunked => read_chunked(reader)?,
         Some(len) => {
             let mut buf = vec![0u8; len];
             let mut got = 0;
@@ -567,6 +645,12 @@ fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
         }
     };
 
+    // Only an exact `Content-Length`, read in full, on a connection the server
+    // did not say it was closing. Chunked is excluded because this reader
+    // stops at the terminating chunk and does not consume trailers, and a
+    // length-less body ran to end-of-file by definition.
+    let reusable = !chunked && content_length.is_some() && !server_closes;
+
     // The status is checked after the body is drained, so an error response
     // with a useful JSON payload is still available to the caller.
     if code == 401 {
@@ -575,7 +659,7 @@ fn read_response<S: Read>(stream: S, path: &str) -> Result<Vec<u8>, HttpError> {
     if !(200..300).contains(&code) {
         return Err(HttpError::Status { code });
     }
-    Ok(body)
+    Ok(Response { body, reusable })
 }
 
 fn read_line<S: Read>(
@@ -762,6 +846,99 @@ mod tests {
             s.write_all(reply).expect("write");
         });
         (address, server)
+    }
+
+    /// A server that answers `replies.len()` requests, all on connections it
+    /// accepts, and reports how many it accepted.
+    ///
+    /// The count is the point: one accept for several requests is the whole
+    /// claim being tested.
+    fn answer_several(
+        replies: Vec<&'static [u8]>,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("an address").to_string();
+        let server = std::thread::spawn(move || {
+            let mut accepted = 0usize;
+            let mut left = replies.into_iter();
+            let mut current: Option<std::net::TcpStream> = None;
+            loop {
+                let Some(reply) = left.next() else {
+                    return accepted;
+                };
+                let s = match current.take() {
+                    Some(s) => s,
+                    None => {
+                        accepted += 1;
+                        listener.accept().expect("accept").0
+                    }
+                };
+                let mut s = s;
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = s.read(&mut chunk).expect("read");
+                    if n == 0 {
+                        return accepted;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                s.write_all(reply).expect("write");
+                current = Some(s);
+            }
+        });
+        (address, server)
+    }
+
+    /// A second call goes down the same socket. Over TLS that is a whole
+    /// handshake saved, and a cold wallet sync makes hundreds of calls.
+    #[test]
+    fn a_second_request_reuses_the_connection() {
+        const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        let (address, server) = answer_several(vec![OK, OK, OK]);
+        let endpoint = Endpoint::new(address);
+        for _ in 0..3 {
+            assert_eq!(
+                endpoint.post("/get_info", "application/json", b"").expect("ok"),
+                b"hi"
+            );
+        }
+        assert_eq!(server.join().expect("the server"), 1, "one connection, three calls");
+    }
+
+    /// A server that says it is closing is believed, and the next call opens a
+    /// new connection rather than writing into a socket that is going away.
+    #[test]
+    fn a_connection_the_server_is_closing_is_not_kept() {
+        const CLOSING: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi";
+        let (address, server) = answer_several(vec![CLOSING, CLOSING]);
+        let endpoint = Endpoint::new(address);
+        for _ in 0..2 {
+            assert_eq!(
+                endpoint.post("/get_info", "application/json", b"").expect("ok"),
+                b"hi"
+            );
+        }
+        assert_eq!(server.join().expect("the server"), 2, "a connection each");
+    }
+
+    /// A chunked answer is never kept: this reader stops at the terminating
+    /// chunk and does not consume trailers, so what is left in the socket is
+    /// not known.
+    #[test]
+    fn a_chunked_answer_is_not_kept() {
+        const CHUNKED: &[u8] =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n";
+        let (address, server) = answer_several(vec![CHUNKED, CHUNKED]);
+        let endpoint = Endpoint::new(address);
+        for _ in 0..2 {
+            assert_eq!(
+                endpoint.post("/get_info", "application/json", b"").expect("ok"),
+                b"hi"
+            );
+        }
+        assert_eq!(server.join().expect("the server"), 2, "a connection each");
     }
 
     /// A request with no body, so the server has read all of it once it has
