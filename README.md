@@ -317,8 +317,30 @@ cargo fmt --all --check
 cargo test -p wow-randomwow --release -- --ignored   # ~2.3 GiB dataset build
 ```
 
-The desktop and web wallets are built separately, in Docker or by hand:
-[`extras/README.md`](extras/README.md) has both.
+### Release builds
+
+Everything ships from one script, in Docker, so a build does not depend on
+what happens to be installed. Output lands in `dist/<platform>/`, with hashes
+in `dist/SHA256SUMS`.
+
+```sh
+bash docker/build-dist.sh              # linux windows macos android
+bash docker/build-dist.sh linux        # x86_64 and aarch64, glibc >= 2.36
+bash docker/build-dist.sh windows      # x86_64, static, no DLLs
+bash docker/build-dist.sh macos        # arm64 and x86_64, macOS 13+, unsigned
+bash docker/build-dist.sh android      # arm64 and x86_64, API 24+
+bash docker/build-dist.sh extras       # web, gui-linux, gui-windows, gui-macos
+```
+
+**Android is `wownerod`, `wownero-wallet-cli` and `wownero-wallet-rpc` as
+command-line binaries** — for Termux or `adb shell`, not an APK, and there is
+no mobile interface. No `armeabi-v7a`: `wow-storage` does not compile for a
+32-bit target yet, so there is nothing to package until it does.
+
+`gui-macos` builds natively on a Mac and is skipped anywhere else: the GUI
+needs Apple's SDK, which no container has. The desktop and web wallets are a
+workspace of their own — [`extras/README.md`](extras/README.md) has the
+without-Docker route for both.
 
 A Rust toolchain and a C compiler are all it needs. LMDB, built by
 `lmdb-master-sys`, is the only code in the node and the command-line wallets
