@@ -23,6 +23,7 @@
 //! — a transaction that comes out lighter than estimated pays slightly over the
 //! odds, which is fine, where one that comes out heavier would be rejected.
 
+use wow_consensus::constants;
 use wow_consensus::fee::{quantize_up, FEE_QUANTIZATION_MASK};
 use wow_crypto::types::SubaddressIndex;
 
@@ -33,6 +34,25 @@ pub const FEE_CALCULATION_MAX_RETRIES: usize = 10;
 
 /// `BULLETPROOF_PLUS_MAX_OUTPUTS`.
 pub const MAX_OUTPUTS: usize = 16;
+
+/// The heaviest transaction this wallet will build:
+/// `TX_WEIGHT_TARGET(get_upper_transaction_weight_limit())`.
+///
+/// `get_upper_transaction_weight_limit` is `full_reward_zone / 2` less the
+/// coinbase reserve, and `TX_WEIGHT_TARGET` takes two thirds of that. The
+/// reference derives the zone from the daemon's current median; this uses the
+/// constant, which is what the daemon reports unless blocks have been running
+/// large, and errs small -- a transaction under the limit is relayed whatever
+/// the median is doing, where one over it is refused after the wallet has
+/// already fetched every ring and signed every input.
+///
+/// At ring size 22 an input costs about 880 bytes, so this is a little over a
+/// hundred of them in one transaction.
+pub const fn default_weight_limit() -> u64 {
+    let upper =
+        constants::BLOCK_GRANTED_FULL_REWARD_ZONE_V5 / 2 - constants::COINBASE_BLOB_RESERVED_SIZE as u64;
+    upper * 2 / 3
+}
 
 /// The smallest transaction the rules allow: one destination plus change, or a
 /// dummy if there is no change (`specs/12` §4.4, the HF 15 rule).
@@ -152,6 +172,8 @@ pub struct SpendOptions {
     /// The chain height, for the unlock check.
     pub chain_height: u64,
     pub now: u64,
+    /// The heaviest transaction to build. See [`default_weight_limit`].
+    pub weight_limit: u64,
 }
 
 impl Default for SpendOptions {
@@ -165,6 +187,7 @@ impl Default for SpendOptions {
             ignore_below: 0,
             chain_height: 0,
             now: 0,
+            weight_limit: default_weight_limit(),
         }
     }
 }
@@ -186,6 +209,13 @@ pub struct SpendPlan {
     pub estimated_weight: u64,
     /// A sweep pays its fee out of the amount sent rather than out of change.
     pub sweep: bool,
+    /// Outputs a sweep left behind because taking them would have made the
+    /// transaction too heavy to relay.
+    ///
+    /// Zero for every other plan, and for a sweep that took everything. When
+    /// it is not zero the caller has to say so: someone who asked to sweep a
+    /// wallet and was told nothing would reasonably believe it is now empty.
+    pub left_behind: usize,
 }
 
 impl SpendPlan {
@@ -280,6 +310,10 @@ pub enum SpendError {
     },
     #[error("the fee did not settle after {0} attempts")]
     FeeDidNotSettle(usize),
+    #[error(
+        "the transaction would weigh {weight}, over the {limit} a node will relay:          send a smaller amount, or sweep, which splits by weight"
+    )]
+    TooHeavy { weight: u64, limit: u64 },
 }
 
 /// Which transfers are eligible to spend.
@@ -360,6 +394,16 @@ pub fn plan(
         let outputs = (destinations.len() + 1).max(MIN_OUTPUTS);
         let next_weight =
             estimate_tx_weight(chosen.len(), options.ring_size, outputs, options.extra_size);
+
+        // Refused here rather than by the node. A wallet that built one anyway
+        // would find out only after fetching a ring for every input and
+        // signing each one -- the slowest, most expensive way to learn it.
+        if next_weight > options.weight_limit {
+            return Err(SpendError::TooHeavy {
+                weight: next_weight,
+                limit: options.weight_limit,
+            });
+        }
         let next_fee = fee_from_weight(options.fee_per_byte, next_weight);
 
         if next_fee == fee && in_total >= sending + fee {
@@ -372,6 +416,7 @@ pub fn plan(
                 fee,
                 estimated_weight: weight,
                 sweep: false,
+                left_behind: 0,
             });
         }
         fee = next_fee;
@@ -398,7 +443,7 @@ pub fn plan(
 /// calculation rather than an input — the fee comes out of what is being sent,
 /// so there is no change and the destination gets whatever is left.
 pub fn plan_sweep(transfers: &[Transfer], options: &SpendOptions) -> Result<SpendPlan, SpendError> {
-    let candidates = spendable(transfers, options);
+    let mut candidates = spendable(transfers, options);
     if candidates.is_empty() {
         return Err(SpendError::NotEnough {
             available: 0,
@@ -407,10 +452,41 @@ pub fn plan_sweep(transfers: &[Transfer], options: &SpendOptions) -> Result<Spen
         });
     }
 
+    // Largest first, so a sweep that cannot take everything takes the most
+    // money it can and leaves the smallest outputs for the next one.
+    candidates.sort_by_key(|(_, t)| std::cmp::Reverse(t.amount));
+
+    // How many inputs fit. At ring size 22 an input costs about 880 bytes, so
+    // a wallet with a few hundred outputs used to produce a transaction
+    // several times over the relay limit: perfectly valid, signed, and
+    // refused by every node it was offered to.
+    //
+    // `wallet2` splits a sweep across as many transactions as it needs. This
+    // builds one and reports what it left, so sweeping such a wallet is
+    // running `sweep_all` until it says it took everything. Less convenient,
+    // and it never signs a transaction that cannot be relayed.
+    let mut n = 0usize;
+    while n < candidates.len() {
+        // A sweep still needs two outputs, so the second is a zero-amount
+        // dummy.
+        let weight = estimate_tx_weight(n + 1, options.ring_size, MIN_OUTPUTS, options.extra_size);
+        if weight > options.weight_limit {
+            break;
+        }
+        n += 1;
+    }
+    if n == 0 {
+        return Err(SpendError::TooHeavy {
+            weight: estimate_tx_weight(1, options.ring_size, MIN_OUTPUTS, options.extra_size),
+            limit: options.weight_limit,
+        });
+    }
+    let left_behind = candidates.len() - n;
+    candidates.truncate(n);
+
     let inputs: Vec<usize> = candidates.iter().map(|(i, _)| *i).collect();
     let in_total: u64 = candidates.iter().map(|(_, t)| t.amount).sum();
 
-    // A sweep still needs two outputs, so the second is a zero-amount dummy.
     let weight = estimate_tx_weight(
         inputs.len(),
         options.ring_size,
@@ -433,6 +509,7 @@ pub fn plan_sweep(transfers: &[Transfer], options: &SpendOptions) -> Result<Spen
         fee,
         estimated_weight: weight,
         sweep: true,
+        left_behind,
     })
 }
 
@@ -514,6 +591,87 @@ mod tests {
         let size3 = estimate_tx_size(1, 22, 3, 44) as u64;
         let weight3 = estimate_tx_weight(1, 22, 3, 44);
         assert!(weight3 > size3, "three outputs pay a clawback");
+    }
+
+    /// A sweep of a wallet with more outputs than fit takes the largest it
+    /// can and says how many it left.
+    ///
+    /// This is the case that used to produce a signed, valid transaction
+    /// several times over the relay limit, which every node refuses. At ring
+    /// size 22 an input costs about 880 bytes, so the cap lands a little over
+    /// a hundred.
+    #[test]
+    fn a_sweep_too_heavy_for_one_transaction_is_capped_and_says_so() {
+        // Amounts spread widely, so "largest first" is a decision with a
+        // consequence rather than an ordering of equals.
+        let transfers: Vec<Transfer> = (0..255u16)
+            .map(|i| transfer(1_000 * (u64::from(i) + 1), 1, i as u8))
+            .collect();
+        let opts = options(3);
+
+        let p = plan_sweep(&transfers, &opts).expect("a sweep");
+        assert!(
+            p.inputs.len() < transfers.len(),
+            "255 inputs cannot fit in one transaction"
+        );
+        assert_eq!(
+            p.left_behind,
+            transfers.len() - p.inputs.len(),
+            "what it could not take is reported, not silently dropped"
+        );
+        assert!(
+            p.estimated_weight <= opts.weight_limit,
+            "{} is over the {} a node will relay",
+            p.estimated_weight,
+            opts.weight_limit
+        );
+        // One more input would not have fitted: the cap is tight, not timid.
+        assert!(
+            estimate_tx_weight(p.inputs.len() + 1, opts.ring_size, MIN_OUTPUTS, opts.extra_size)
+                > opts.weight_limit
+        );
+
+        // Largest first, so what is left behind is the small change.
+        let taken: u64 = p.inputs.iter().map(|&i| transfers[i].amount).sum();
+        let everything: u64 = transfers.iter().map(|t| t.amount).sum();
+        assert!(taken > everything / 2, "the money goes, not the dust");
+    }
+
+    /// A sweep that fits takes everything and leaves nothing to report.
+    #[test]
+    fn a_sweep_that_fits_leaves_nothing_behind() {
+        let transfers = vec![transfer(5_000, 1, 1), transfer(3_000, 1, 2)];
+        let p = plan_sweep(&transfers, &options(3)).expect("a sweep");
+        assert_eq!(p.inputs.len(), 2);
+        assert_eq!(p.left_behind, 0);
+    }
+
+    /// An ordinary send that would not be relayed is refused while it is still
+    /// arithmetic — before a ring has been fetched for every input and every
+    /// one of them signed.
+    #[test]
+    fn a_send_too_heavy_to_relay_is_refused_before_it_is_built() {
+        // Dust, so covering the amount takes every one of them.
+        let transfers: Vec<Transfer> = (0..255u16)
+            .map(|i| transfer(1_000, 1, i as u8))
+            .collect();
+        let e = plan(&transfers, &[250_000], &options(3)).expect_err("too heavy");
+        match e {
+            SpendError::TooHeavy { weight, limit } => {
+                assert!(weight > limit);
+                assert_eq!(limit, default_weight_limit());
+            }
+            other => panic!("expected TooHeavy, got {other}"),
+        }
+    }
+
+    /// The limit is `TX_WEIGHT_TARGET(get_upper_transaction_weight_limit())`
+    /// over the default weight zone, and a single input is nowhere near it.
+    #[test]
+    fn the_default_weight_limit_is_the_references() {
+        assert_eq!(default_weight_limit(), (300_000 / 2 - 600) * 2 / 3);
+        assert_eq!(default_weight_limit(), 99_600);
+        assert!(estimate_tx_weight(1, 22, 2, 44) < default_weight_limit());
     }
 
     /// The fee is the weight times the per-byte rate, rounded up to the

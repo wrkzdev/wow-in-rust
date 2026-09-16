@@ -912,6 +912,9 @@ fn sweep_all(session: &mut Session, params: &Value) -> MethodResult {
         "multisig_txset": "",
         "unsigned_txset": "",
         "spent_key_images_list": [outcome["spent_key_images"].clone()],
+        // See `build_and_send`: non-zero means this swept as much as one
+        // transaction can carry and `sweep_all` should be called again.
+        "outputs_left_behind": outcome["outputs_left_behind"],
     }))
 }
 
@@ -1003,6 +1006,11 @@ fn build_and_send(
         "multisig_txset": "",
         "unsigned_txset": "",
         "spent_key_images": { "key_images": spent_images },
+        // Not a C++ field. The reference's `sweep_all` splits across as many
+        // transactions as it needs and returns them all; this builds one, so a
+        // client has to be told when there is more to take. Zero on every
+        // other call.
+        "outputs_left_behind": plan.left_behind,
     });
     if params.get("get_tx_hex").and_then(Value::as_bool) == Some(true) {
         out["tx_blob"] = json!(wow_crypto::hex::encode(&prepared.blob));

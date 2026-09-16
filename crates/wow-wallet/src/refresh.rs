@@ -1864,6 +1864,7 @@ mod tests {
             fee: 500,
             estimated_weight: 0,
             sweep: false,
+            left_behind: 0,
         };
         w.record_sent(txid, &plan, &["Wo1payee"], None, 1_700_000_000);
         assert!(w.transfers[0].spent, "spent from the moment it is relayed");

@@ -340,6 +340,13 @@ pub struct Preview {
     /// The fee tier's name.
     pub priority: String,
     pub payment_id: Option<String>,
+    /// Outputs a sweep is leaving behind because taking them would make the
+    /// transaction too heavy to relay. Zero for an ordinary send.
+    ///
+    /// Shown before the send is confirmed, not after: someone who asked to
+    /// empty a wallet and was told nothing would reasonably believe it is now
+    /// empty.
+    pub left_behind: usize,
 }
 
 /// Bytes that travel as base64 in JSON rather than as an array of numbers.

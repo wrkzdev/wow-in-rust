@@ -1268,6 +1268,7 @@ mod tests {
             fee,
             estimated_weight: estimate,
             sweep: false,
+            left_behind: 0,
         };
 
         let settled = construct_settled(
@@ -1322,6 +1323,7 @@ mod tests {
             fee,
             estimated_weight: estimate,
             sweep: true,
+            left_behind: 0,
         };
 
         let settled = construct_settled(

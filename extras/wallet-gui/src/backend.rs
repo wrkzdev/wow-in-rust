@@ -669,6 +669,7 @@ impl<P: Platform> Backend<P> {
             weight: plan.estimated_weight,
             priority: tier_name(prepared.priority).to_string(),
             payment_id: prepared.payment_id.map(|p| wow_crypto::hex::encode(&p)),
+            left_behind: plan.left_behind,
         };
         w.prepared = Some(prepared);
 

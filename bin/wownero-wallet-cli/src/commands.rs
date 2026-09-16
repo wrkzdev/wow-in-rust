@@ -867,6 +867,14 @@ fn send(
         plan.inputs.len(),
         plan.estimated_weight
     );
+    if plan.left_behind > 0 {
+        println!();
+        println!(
+            "This does NOT sweep everything: {} more output(s) would make the transaction              too heavy for a node to relay, so the largest {} are being swept and the rest              are left. Run sweep_all again afterwards to take them.",
+            plan.left_behind,
+            plan.inputs.len()
+        );
+    }
     if let Some(p) = prepared.payment_id {
         println!("payment id  {}", wow_crypto::hex::encode(&p));
     }
@@ -892,6 +900,12 @@ fn send(
             "(the change is in the balance now, and can be spent once the transaction is mined \
              and four blocks have passed)"
         );
+        if plan.left_behind > 0 {
+            println!(
+                "{} output(s) were left behind; run sweep_all again to take them.",
+                plan.left_behind
+            );
+        }
     } else {
         println!("The daemon rejected the transaction.");
         if !result.reason.is_empty() {
