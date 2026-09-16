@@ -21,7 +21,10 @@ wow-log = { path = "../../crates/wow-log" }
 egui = "0.31"
 # With its defaults: OpenGL through glow, and winit's X11 and Wayland, which are
 # loaded at run time rather than linked, so a Linux build (a cross-build
-# included) needs no system development packages. "persistence" keeps the
+# included) needs no system development packages -- though `wayland-backend`,
+# which the defaults reach through winit, does compile a small C shim, so a C
+# compiler for the target is still needed (`scripts/check-no-c.sh` names it).
+# "persistence" keeps the
 # settings: the node, the network, the folder. Never a password.
 eframe = { version = "0.31", features = ["persistence"] }
 serde = { version = "1", features = ["derive"] }

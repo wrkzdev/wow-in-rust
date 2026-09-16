@@ -121,8 +121,10 @@ Statuses:
 | Item | Status | Notes |
 |---|---|---|
 | RandomWOW, from the pinned C++ library | Done | Rewritten in Rust ([`wow-randomwow`](../crates/wow-randomwow)). The submodule, `build.rs`, and CMake, Ninja and the C++ runtime are gone from the builds, CI and Docker images. The fork changes `AesGenerator4R`'s keys as well as `configuration.h` ([spec-deltas §25](spec-deltas.md)). Checked against upstream RandomX's published hashes, hashes from the C++ library, and 26 mainnet blocks. SuperscalarHash is compiled to machine code on x86-64; the VM is interpreted. A light-mode hash takes about 75 ms on a 16-thread desktop; the C++ took 19 ms with its JIT and 389 ms without |
-| ring, under the RPC TLS | Done | Replaced by the RustCrypto provider (see D). Tested with every suite, group and key type, with record vectors computed by OpenSSL, and against OpenSSL's `s_client` with an RSA-4096 pair laid out as the C++ leaves it. `cargo tree` finds no ring, aws-lc-rs or OpenSSL |
-| LMDB | Kept | The one C dependency, by design: `data.mdb` must stay byte-compatible with the C++ node |
+| ring, under the RPC TLS | Done | Replaced by the RustCrypto provider (see D). Tested with every suite, group and key type, with record vectors computed by OpenSSL, and against OpenSSL's `s_client` with an RSA-4096 pair laid out as the C++ leaves it. No ring, aws-lc-rs or OpenSSL is in either workspace's dependency graph |
+| LMDB | Kept | The one C dependency of the node and the command-line wallets, by design: `data.mdb` must stay byte-compatible with the C++ node |
+| Wayland, under the desktop GUI | Kept | Found by [`scripts/check-no-c.sh`](../scripts/check-no-c.sh), which was written to pin the two rows above and immediately turned up a third. `wayland-backend` compiles a small C shim on Linux, reached from eframe's default features through winit and smithay-client-toolkit. Distinct from *linking* libwayland, which still happens at run time through `wayland-sys`, so a Linux build needs no system development packages — but it is C, and "LMDB is the only C" was wrong without this asterisk. Dropping it would mean dropping Wayland support |
+| Anything else | Checked | [`scripts/check-no-c.sh`](../scripts/check-no-c.sh) resolves both workspaces for every target that is actually shipped — Linux, Windows, macOS, Android, wasm — and fails on any crate that compiles C and is not on its list. A CI job runs it. Per target rather than `--target all`, which drags in Haiku and Android dependencies for platforms nothing here ships |
 
 ## Still open, in one place
 

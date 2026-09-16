@@ -302,8 +302,15 @@ The desktop and web wallets are built separately, in Docker or by hand:
 [`extras/README.md`](extras/README.md) has both.
 
 A Rust toolchain and a C compiler are all it needs. LMDB, built by
-`lmdb-master-sys`, is the only code that is not Rust; RandomWOW, which used to
-need CMake and a C++ toolchain, is Rust now.
+`lmdb-master-sys`, is the only code in the node and the command-line wallets
+that is not Rust; RandomWOW, which used to need CMake and a C++ toolchain, is
+Rust now. The desktop wallet adds one more on Linux — `wayland-backend`
+compiles a small shim, reached from eframe's defaults — and nothing else
+anywhere compiles C. That is checked rather than asserted:
+
+```sh
+bash scripts/check-no-c.sh   # also a CI job; per target, both workspaces
+```
 
 The workspace pins `opt-level = 3` for dependencies even in the test profile:
 an unoptimised `curve25519-dalek` makes the vector suite take minutes rather
