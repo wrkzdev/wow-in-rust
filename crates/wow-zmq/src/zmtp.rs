@@ -415,6 +415,69 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// Arbitrary bytes are a `Result`, never a panic.
+    ///
+    /// `specs/15` §4.4 and the third rule in the README: these parsers face
+    /// the network before anything is authenticated, so a panic here is a
+    /// remote crash. The ZMQ port is bound to loopback by default, but
+    /// `--zmq-rpc-bind-ip` opens it, and the greeting and the first frames are
+    /// read before this code knows who is at the other end.
+    ///
+    /// A cheap deterministic generator rather than a fuzzer: this runs on
+    /// every `cargo test`, and its job is to stop an obvious slicing panic
+    /// reaching a release, not to replace fuzzing.
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for _ in 0..4_000 {
+            let len = (next() % 96) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+
+            // The three that take bytes straight off the wire.
+            let _ = parse_properties(&bytes);
+            let _ = error_reason(&bytes);
+            let _ = SocketType::from_name(&bytes);
+
+            // And the framed readers, over a stream that simply ends.
+            let _ = read_frame(&mut Cursor::new(bytes.clone()), 1 << 20);
+            let _ = read_message(&mut Cursor::new(bytes.clone()));
+
+            // A greeting is fixed-length, so give it exactly that many bytes.
+            let mut g = [0u8; GREETING_LEN];
+            for (i, b) in g.iter_mut().enumerate() {
+                *b = bytes.get(i).copied().unwrap_or((next() & 0xff) as u8);
+            }
+            let _ = check_greeting(&g);
+        }
+    }
+
+    /// The shapes that made `parse_properties` reach past the end before its
+    /// bounds checks were right: a length octet with nothing after it, a name
+    /// that runs off the end, and a value length that does.
+    #[test]
+    fn a_truncated_property_is_an_error_not_a_panic() {
+        for bad in [
+            vec![1],
+            vec![4, b'a'],
+            vec![1, b'a', 0, 0, 0],
+            vec![1, b'a', 0, 0, 0, 4],
+            vec![1, b'a', 0, 0, 0, 4, 1, 2],
+            vec![255],
+            vec![0, 0xff, 0xff, 0xff, 0xff],
+        ] {
+            assert!(parse_properties(&bad).is_err(), "{bad:?}");
+        }
+        // And the empty case is an empty list, not an error.
+        assert_eq!(parse_properties(&[]).unwrap(), Vec::new());
+    }
+
     #[test]
     fn a_greeting_is_checked() {
         assert_eq!(check_greeting(&greeting()).unwrap(), 1);

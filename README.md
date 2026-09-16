@@ -359,8 +359,11 @@ chain split. Each one this milestone touches has a test naming it.
 
 **3. A parse failure is a `Result`, never a panic.** The epee parser faces the
 network before any authentication; a panic there is a remote crash
-([`specs/15`](specs/15-testing-and-conformance.md) §4.4). Every parser here has
-a `never_panics` test. `wow-crypto`, `wow-serialize` and `wow-types` set
+([`specs/15`](specs/15-testing-and-conformance.md) §4.4). Every parser that
+reads from a socket has a test that throws arbitrary bytes at it: the epee
+and consensus archives, varints, base58, mnemonics, addresses, `tx_extra`,
+blocks and transactions, the Levin codec and its reassembly, the daemon's
+HTTP request line, and ZMTP. `wow-crypto`, `wow-serialize` and `wow-types` set
 `#![forbid(unsafe_code)]`; `wow-randomwow` cannot, since it uses AES-NI and
 runs SuperscalarHash as machine code, so it sets
 `#![deny(unsafe_op_in_unsafe_fn)]` and every `unsafe` block carries a `SAFETY`
