@@ -4,7 +4,7 @@ The review of `wownerod` started when `--serve` would not start on an empty
 data directory. This file tracks what became of each item it raised, in the
 review's own order.
 
-Last updated 2026-09-13.
+Last updated 2026-09-16.
 
 Statuses:
 
@@ -15,10 +15,16 @@ Statuses:
   and ignored.
 
 > [!NOTE]
-> Everything marked Done has been exercised between local daemons (mostly on
-> regtest), not by running for a long time against live C++ peers. The one
-> path verified against mainnet before this review, `--sync-from`, is
-> unchanged.
+> **Done means built and covered by tests, not proven on mainnet.** Since this
+> note was first written the node has run against live C++ peers and held the
+> network's tip for over a day with twelve outgoing connections, so the
+> outbound half — syncing from several peers, fluffy blocks, the peer store,
+> alternative blocks — has now been exercised for real. The rest has not:
+> inbound peers, IPv6, Dandelion++ relay, a real reorg, the admin and mining
+> RPC, HTTP Digest login, RPC over TLS, the ZMQ RPC and publisher, and the
+> miner have all only run between local daemons, mostly on regtest. The README's
+> Status table says the same thing and is the one to trust if these two ever
+> drift again.
 
 ## The failure that started it
 
