@@ -1017,11 +1017,6 @@ impl BlockchainDb for LmdbDb {
     // ------------------------------------------------------------- lifecycle
 
     fn batch_start(&self, _n_blocks: u64, _bytes: u64) -> Result<()> {
-        // `specs/10` §6.2 puts the write transaction in the writer task rather
-        // than in the database object, and `RwTxn` borrows the environment, so
-        // a batch cannot be stashed in `&self`. Use `LmdbDb::writer` and hold
-        // the `Writer` across the batch instead — same transaction, same
-        // atomicity, with the lifetime checked.
         Err(DbError::Backend(Box::new(BatchShape)))
     }
 
@@ -1045,7 +1040,47 @@ impl BlockchainDb for LmdbDb {
     }
 }
 
-/// Explains why `batch_start`/`batch_stop` are not the shape to use.
+/// Why a batch cannot be started yet, and what it would take.
+///
+/// **A known gap, not a design.** Every block is its own write transaction:
+/// [`BlockchainDb::add_block`] goes through [`LmdbDb::write`], which opens a
+/// transaction, writes one block and commits it. The C++ node wraps
+/// `blocks_per_sync` blocks in one transaction during a bulk sync, and
+/// `specs/10` §6.2 describes exactly that — "one `RwTxn` per block (or per
+/// batch during bulk sync)". Committing per block is the largest avoidable
+/// cost in applying a sync batch.
+///
+/// The obstacle is a lifetime. [`Writer`] holds an `RwTxn<'e>` borrowing the
+/// `Env`, and `LmdbDb` owns that `Env`, so a transaction cannot be stashed in
+/// `&self` without making the struct self-referential. Holding a `Writer`
+/// across the batch at the call site does not work either, because
+/// `wow_core`'s `Blockchain` reads from the same database between blocks.
+///
+/// # What would fix it
+///
+/// Give the transactions an owned handle rather than a borrow:
+/// `Env::write_txn(self: &Arc<Self>) -> RwTxn` with `RwTxn { env: Arc<Env> }`
+/// and no lifetime parameter. [`Writer`] becomes `'static`, `LmdbDb` can hold
+/// a `Mutex<Option<Writer>>`, and `batch_start`/`batch_stop` work as
+/// [`BlockchainDb`] already declares them. That is roughly 26 signatures
+/// across this file and `raw.rs`, and **nothing in `wow_core` changes**:
+/// `add_block` keeps calling `db.add_block`, [`LmdbDb::write`] routes into the
+/// open batch when there is one, and `NodeCore::apply_blocks` brackets the
+/// span.
+///
+/// Two things have to be right, and they are why this is not a change to make
+/// without running it against a real chain:
+///
+/// * **The map cannot grow while a transaction is open** — `grow_map` returns
+///   [`DbError::ResizeWhileOpen`]. `batch_start` has to grow it first, for the
+///   whole batch, which is what the C++ `batch_start` does with its `bytes`
+///   argument.
+/// * **An aborted batch rolls the database back and the chain's cached state
+///   does not roll back with it.** `Blockchain` keeps the weight window, the
+///   difficulty window and the generated coins in memory. Anything that
+///   abandons a batch has to call `Blockchain::reload_state` before the chain
+///   is used again, or the node carries on from a state the database does not
+///   have.
 #[derive(Debug)]
 struct BatchShape;
 
@@ -1053,8 +1088,9 @@ impl std::fmt::Display for BatchShape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "use LmdbDb::writer() and hold the Writer across the batch; a write \
-             transaction borrows the environment and cannot live in &self"
+            "batching several blocks into one write transaction is not built yet: a \
+             write transaction borrows the environment and cannot live in &self. See \
+             the BatchShape documentation for what it would take"
         )
     }
 }
