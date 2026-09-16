@@ -76,6 +76,25 @@ pub fn parse_amount(s: &str) -> Result<u64, String> {
 }
 
 /// `873,901`.
+/// `4m 52s`, `1h 07m`. The same shape `wownero-wallet-cli` prints beside its
+/// refresh progress, so the two wallets read alike.
+pub fn duration(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3_600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3_600, secs / 60 % 60),
+    }
+}
+
+/// Blocks per second, at a precision that does not jitter.
+pub fn rate(blocks_per_second: f64) -> String {
+    if blocks_per_second >= 10.0 {
+        format!("{blocks_per_second:.0} blocks/s")
+    } else {
+        format!("{blocks_per_second:.1} blocks/s")
+    }
+}
+
 pub fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);

@@ -371,6 +371,14 @@ struct WalletView {
     copy_wallet_password: String,
     copy_password: String,
     copy_password_again: String,
+    /// Recent `(seconds since the frame clock started, height scanned)`, for
+    /// the speed and the time left beside the progress bar.
+    ///
+    /// A window rather than an average since the start: blocks near the tip
+    /// carry far more transactions than the early chain, so an average over
+    /// the whole scan promises a finish the rest of it does not keep. The
+    /// command-line wallet measures the same way, over the same 30 seconds.
+    sync_samples: std::collections::VecDeque<(f64, u64)>,
 }
 
 impl WalletView {
@@ -409,6 +417,7 @@ impl WalletView {
             copy_wallet_password: String::new(),
             copy_password: String::new(),
             copy_password_again: String::new(),
+            sync_samples: std::collections::VecDeque::new(),
         }
     }
 }
@@ -739,7 +748,27 @@ impl WalletApp {
                 self.awaiting = None;
             }
             Event::Status(status) => {
+                // The frame clock, set at the top of `update`. Read before the
+                // wallet is borrowed.
+                let now = self.now;
                 if let Some(w) = &mut self.wallet {
+                    // Only when it has moved: a status that repeats the same
+                    // height says nothing about the speed, and a run of them
+                    // would drag the estimate down towards zero.
+                    if w.status.scanned != status.scanned || w.sync_samples.is_empty() {
+                        w.sync_samples.push_back((now, status.scanned));
+                    }
+                    while w.sync_samples.len() > 2
+                        && now - w.sync_samples[0].0 > SYNC_RATE_WINDOW_SECS
+                    {
+                        w.sync_samples.pop_front();
+                    }
+                    if status.scanned < w.status.scanned {
+                        // A reorganisation, or a scan started again: the
+                        // samples describe a scan that is no longer happening.
+                        w.sync_samples.clear();
+                        w.sync_samples.push_back((now, status.scanned));
+                    }
                     w.status = status;
                 }
             }
@@ -1810,7 +1839,7 @@ fn overview(
         }
     }
     ui.add_space(12.0);
-    sync_bar(ui, &w.status);
+    sync_bar(ui, &w.status, sync_rate(&w.sync_samples));
     if let Some(e) = &w.status.node_error {
         ui.colored_label(t.bad, e.as_str());
     }
@@ -3177,7 +3206,20 @@ fn node_chip(ui: &mut Ui, status: &Status) -> egui::Response {
     .on_hover_text(format!("{hover}\nClick for the node settings."))
 }
 
-fn sync_bar(ui: &mut Ui, s: &Status) {
+/// How far back the sync speed is measured, in seconds. As
+/// `wownero-wallet-cli`'s `RATE_WINDOW`.
+const SYNC_RATE_WINDOW_SECS: f64 = 30.0;
+
+/// Blocks per second over the samples held, once there is a second of them to
+/// measure.
+fn sync_rate(samples: &std::collections::VecDeque<(f64, u64)>) -> Option<f64> {
+    let (t0, h0) = *samples.front()?;
+    let (t1, h1) = *samples.back()?;
+    let secs = t1 - t0;
+    (secs >= 1.0 && h1 > h0).then(|| (h1 - h0) as f64 / secs)
+}
+
+fn sync_bar(ui: &mut Ui, s: &Status, rate: Option<f64>) {
     if s.chain == 0 {
         ui.label("Not synced with any node yet.");
         return;
@@ -3186,11 +3228,23 @@ fn sync_bar(ui: &mut Ui, s: &Status) {
     let text = if s.scanned >= s.chain {
         format!("Synced at height {}", format::grouped(s.scanned))
     } else {
-        format!(
+        let mut text = format!(
             "Height {} of {}",
             format::grouped(s.scanned),
             format::grouped(s.chain)
-        )
+        );
+        // The speed and what is left of the wait. On a first scan this is the
+        // difference between a bar that creeps and a bar that says how long to
+        // go and make a cup of tea.
+        if let Some(rate) = rate {
+            let left = ((s.chain - s.scanned) as f64 / rate).round() as u64;
+            text.push_str(&format!(
+                " — {}, {} left",
+                format::rate(rate),
+                format::duration(left)
+            ));
+        }
+        text
     };
     ui.add(egui::ProgressBar::new(fraction).text(text));
 }
