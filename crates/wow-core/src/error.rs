@@ -100,6 +100,17 @@ pub enum BlockError {
         index: usize,
         error: TxError,
     },
+    /// A transaction's ring signatures, range proof, commitment sum or ring
+    /// members did not check out (`specs/06` §5.11, §5.4).
+    ///
+    /// Separate from [`BlockError::Tx`] because the rules there are decided by
+    /// reading the transaction, and these by doing arithmetic over a ring
+    /// fetched from the store. The two fail for different reasons and an
+    /// operator wants to tell them apart.
+    TxSignature {
+        index: usize,
+        error: crate::txcheck::TxCheckError,
+    },
 
     // -- §2 step 10 --
     /// `validate_miner_transaction`.
@@ -158,6 +169,9 @@ impl std::fmt::Display for BlockError {
             MissingTx { .. } => write!(f, "a transaction named by the block is missing"),
             DoubleSpend { .. } => write!(f, "double spend"),
             Tx { index, error } => write!(f, "transaction {index}: {error:?}"),
+            TxSignature { index, error } => {
+                write!(f, "transaction {index} does not verify: {error}")
+            }
             MinerReward(e) => write!(f, "miner reward: {e:?}"),
             BlockTooBig { weight, limit } => {
                 write!(f, "block weight {weight} exceeds the limit {limit}")

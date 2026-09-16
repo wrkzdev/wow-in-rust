@@ -6,7 +6,7 @@
 //! and a layer that conflated them would blame the peer for our own bug or
 //! the other way round.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -172,6 +172,128 @@ impl wow_core::pow::PowVerifier for ChainPow {
     }
 }
 
+/// One transaction of a sync batch, ready to be verified: its id, itself, and
+/// the major version of the block carrying it.
+pub(crate) type PendingTx = (Hash256, Transaction, u8);
+
+/// The transaction checks `specs/06` §5.11 and §5.4 ask for, over this node's
+/// store: every ring signature, the range proof, the commitment sum, and each
+/// ring member's lock and age.
+///
+/// The work itself is [`crate::mempool::verify`] -- the same function that
+/// guards the pool, deliberately. A transaction inside a block and the same
+/// transaction in the pool must be judged identically, or this node disagrees
+/// with itself about the same bytes.
+///
+/// What this adds is *when*. A CLSAG over a ring of 22 is the most expensive
+/// thing in the block path, and running one under the chain lock would stop
+/// the rest of the node for the length of a sync batch. So a batch is verified
+/// side by side beforehand and the chain finds the answers waiting -- exactly
+/// the arrangement [`ChainPow::prehash`] uses for proofs of work, and correct
+/// for the same reason: nothing here decides validity that the chain would
+/// decide differently.
+///
+/// The one thing that *is* height-dependent -- whether a ring member is
+/// unlocked and old enough -- is checked ahead at a **lower** height than the
+/// block lands at, because the batch has not been applied yet. Both rules are
+/// monotone in the height, so a pass there is a pass here; see
+/// [`wow_core::txcheck`]. A transaction that does not pass ahead of time is
+/// simply not cached, and the chain verifies it in full.
+pub(crate) struct ChainTxs {
+    db: Arc<LmdbDb>,
+    /// Ids of transactions already verified, waiting for the chain to ask.
+    ready: Mutex<HashSet<Hash256>>,
+}
+
+impl ChainTxs {
+    fn new(db: Arc<LmdbDb>) -> ChainTxs {
+        ChainTxs {
+            db,
+            ready: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Verify a batch's transactions on every core, without the chain lock.
+    ///
+    /// Failures are dropped rather than recorded. A ring member created
+    /// earlier in this same batch is not in the store yet, so its transaction
+    /// cannot verify here and resolves by the time the chain reaches it --
+    /// and a transaction that is genuinely bad is refused there, with the
+    /// height and the index this cannot know.
+    pub(crate) fn prevalidate(&self, work: &[PendingTx], now: u64) {
+        let todo: Vec<&PendingTx> = {
+            let ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+            work.iter().filter(|w| !ready.contains(&w.0)).collect()
+        };
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(todo.len());
+        let height = self.db.height();
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while let Some((id, tx, version)) =
+                        todo.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        if crate::mempool::verify(&self.db, tx, *version, height, now).is_ok() {
+                            self.ready
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(*id);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Drop whatever [`ChainTxs::prevalidate`] verified for `work` that the
+    /// chain did not use.
+    pub(crate) fn forget(&self, work: &[PendingTx]) {
+        let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, _, _) in work {
+            ready.remove(id);
+        }
+    }
+}
+
+impl wow_core::txcheck::TxVerifier for ChainTxs {
+    fn verify(
+        &self,
+        hash: &Hash256,
+        tx: &Transaction,
+        hf_version: u8,
+        chain_height: u64,
+        now: u64,
+    ) -> Result<(), wow_core::txcheck::TxCheckError> {
+        use crate::mempool::Rejection;
+        use wow_core::txcheck::TxCheckError;
+
+        // Taken, not copied. A block whose transactions the chain refuses for
+        // some other reason may be offered again, and the second time it is
+        // verified again rather than waved through on a stale answer.
+        if self
+            .ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(hash)
+        {
+            return Ok(());
+        }
+        crate::mempool::verify(&self.db, tx, hf_version, chain_height, now).map_err(|r| {
+            let reason = r.reason();
+            // A shape this node has no verifier for is this node's gap, never
+            // the sender's fault.
+            if matches!(r, Rejection::UnsupportedRctType { .. }) {
+                TxCheckError::Unsupported(reason)
+            } else {
+                TxCheckError::Invalid(reason)
+            }
+        })
+    }
+}
+
 /// The local chain, as the sync loop sees it.
 pub struct LocalChain {
     chain: Blockchain<LmdbDb>,
@@ -185,6 +307,8 @@ pub struct LocalChain {
     /// The chain's verifier, shared so a batch's proofs can be computed before
     /// the chain lock is taken.
     pow: Arc<ChainPow>,
+    /// The chain's transaction verifier, shared for the same reason.
+    txs: Arc<ChainTxs>,
 }
 
 impl LocalChain {
@@ -203,15 +327,17 @@ impl LocalChain {
     /// the next checkpoint rather than immediately.
     ///
     /// Above the last checkpoint -- the range where a reorg is still possible
-    /// and where this node's answers actually matter -- the proof of work, the
-    /// difficulty, the timestamps, the coinbase and the transaction rules
-    /// `wow_consensus::tx_rules` covers are all enforced. **One thing is not
-    /// yet:** a transaction's ring signatures, its range proof and its
-    /// commitment sum are verified when it arrives at the pool
-    /// (`mempool::verify`), but not when it arrives *inside a block*. A block
-    /// carries its own transactions, and a peer's are used as given
-    /// (`Node::fill`), so for those three checks this node is still taking the
-    /// sender's word. `docs/daemon-review.md` tracks it.
+    /// and where this node's answers actually matter -- every rule is
+    /// enforced, transactions included: [`ChainTxs`] runs `specs/06` §5.11
+    /// and §5.4 over each one, which is the same [`crate::mempool::verify`]
+    /// the pool is guarded by.
+    ///
+    /// The one remaining gap is narrow and explicit: a RingCT shape this node
+    /// has no verifier for is **refused**, not waved through
+    /// (`Rejection::UnsupportedRctType`). Everything on mainnet above the last
+    /// checkpoint is Bulletproofs+, so it does not arise there; on a chain
+    /// replayed from genesis it stops the sync, as the missing CryptoNight
+    /// variants already do.
     pub fn new(db: Arc<LmdbDb>, network: Network) -> Result<LocalChain, String> {
         let checkpoints = wow_consensus::checkpoints::Checkpoints::new(network);
         // `last_height` is the last checkpointed block, and it is itself
@@ -220,9 +346,14 @@ impl LocalChain {
         let trusted_below = checkpoints.last_height().map(|h| h + 1).unwrap_or(0);
 
         let pow = Arc::new(ChainPow::new(trusted_below));
+        let txs = Arc::new(ChainTxs::new(db.clone()));
         let mut chain = Blockchain::new(db.clone(), pow.clone(), network)
             .map_err(|e| format!("cannot open the chain: {e:?}"))?;
         chain.trust_below(trusted_below);
+        // `specs/06` §2 step 9. Above `trusted_below` only: the chain below
+        // contains transactions today's rules reject, which is the whole
+        // reason that boundary exists.
+        chain.verify_transactions_with(txs.clone());
 
         let height = db.height();
         let mut hashes = Vec::with_capacity(height as usize);
@@ -238,6 +369,7 @@ impl LocalChain {
             db,
             hashes,
             pow,
+            txs,
         })
     }
 
@@ -250,6 +382,11 @@ impl LocalChain {
     /// The chain's proof-of-work verifier, for hashing ahead of it.
     pub(crate) fn pow(&self) -> Arc<ChainPow> {
         self.pow.clone()
+    }
+
+    /// The chain's transaction verifier, for checking a batch ahead of it.
+    pub(crate) fn txs(&self) -> Arc<ChainTxs> {
+        self.txs.clone()
     }
 
     /// Validate and add a block from outside, returning what it became.
@@ -484,10 +621,9 @@ pub fn run(db: LmdbDb, network: Network, address: &str, max_batches: usize) -> R
         println!(
             "Blocks below {trusted} are covered by hard-coded checkpoints: their proof of work
              and transaction rules are not re-checked, which is what the C++ node also does
-             (docs/spec-deltas.md §23). From {trusted} up the proof of work, the difficulty,
-             the coinbase and the transaction rules are checked -- but not, yet, a
-             transaction's ring signatures, range proof or commitment sum, which are verified
-             only when a transaction arrives at the pool."
+             (docs/spec-deltas.md §23). Everything from {trusted} up is fully verified: the
+             proof of work, the difficulty, the coinbase, and every transaction's ring
+             signatures, range proof, commitment sum and ring members."
         );
     }
     println!("Connecting to {address}...");
@@ -568,9 +704,8 @@ mod tests {
     /// *past* the last checkpoint, because that checkpoint is itself verified.
     ///
     /// Mainnet's last checkpoint is height 838,800, so everything from 838,801
-    /// up is validated -- which is the range where a reorg is still possible
-    /// and where this node's answers matter. What "validated" does not cover
-    /// yet is on [`LocalChain::new`].
+    /// up is fully validated -- which is the range where a reorg is still
+    /// possible and where this node's answers matter.
     #[test]
     fn the_trusted_boundary_follows_the_last_checkpoint() {
         for network in [Network::Mainnet, Network::Testnet, Network::Stagenet] {

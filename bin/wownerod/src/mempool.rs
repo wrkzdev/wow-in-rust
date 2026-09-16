@@ -90,6 +90,18 @@ pub enum Rejection {
         count: usize,
     },
     NotParseable(String),
+    /// A RingCT shape this node has no verifier for.
+    ///
+    /// Its own variant, not an [`Rejection::InvalidInput`], because the two
+    /// mean opposite things about whoever sent it: an invalid input is the
+    /// sender's fault, and this is **ours**. A block carrying one is refused
+    /// either way, but the peer that sent it is not banned for this node's
+    /// gap -- the same distinction `PowError::CryptoNightNotImplemented`
+    /// makes for proofs of work, and the one that stops a missing rule
+    /// costing this node every peer it has.
+    UnsupportedRctType {
+        ty: wow_types::rct::RctType,
+    },
 }
 
 impl Rejection {
@@ -132,6 +144,9 @@ impl Rejection {
                 format!("{count} output(s); at least two are required")
             }
             Rejection::NotParseable(w) => format!("the transaction does not parse: {w}"),
+            Rejection::UnsupportedRctType { ty } => format!(
+                "RCT type {ty:?} is not one this node can verify yet, so the transaction is                  refused rather than taken on trust"
+            ),
         }
     }
 
@@ -415,7 +430,7 @@ impl TxPool {
         }
 
         // 7. Full verification. Not policy: skipping it relays forgeries.
-        verify(db, &tx, fee_context.version, now)?;
+        verify(db, &tx, fee_context.version, db.height(), now)?;
 
         // The pool has no clock of its own, so a stale entry goes when something
         // else arrives. That is enough: a pool nobody is adding to is a pool
@@ -464,7 +479,7 @@ impl TxPool {
                 self.check_unspent(db, k_image)?;
             }
         }
-        verify(db, tx, hf_version, now)?;
+        verify(db, tx, hf_version, db.height(), now)?;
         self.insert(
             id,
             tx,
@@ -726,7 +741,24 @@ fn fee_rate(e: &PoolEntry) -> f64 {
 /// This is what makes a pool worth having. A node that admits without verifying
 /// is a node that relays forgeries, and the wallet on the other end cannot tell
 /// the difference until the transaction fails to confirm.
-fn verify(db: &LmdbDb, tx: &Transaction, hf_version: u8, now: u64) -> Result<(), Rejection> {
+///
+/// It is also what a *block's* transactions are checked with
+/// (`netsync::ChainTxs`), and deliberately the same function: a transaction in
+/// a block and the same transaction in the pool have to be judged identically,
+/// or this node disagrees with itself about the same bytes.
+///
+/// `chain_height` is the height the checks are made at -- `db.height()` for
+/// the pool, and for a block the height the chain stands at before it is
+/// added, which is what the C++ `check_tx_inputs` sees. It is a parameter
+/// rather than a call to `db.height()` because the block path verifies a whole
+/// batch ahead of applying it, at a height below the one each block lands at.
+pub(crate) fn verify(
+    db: &LmdbDb,
+    tx: &Transaction,
+    hf_version: u8,
+    chain_height: u64,
+    now: u64,
+) -> Result<(), Rejection> {
     use wow_crypto::bulletproofs_plus as bpp;
     use wow_crypto::clsag;
 
@@ -735,10 +767,7 @@ fn verify(db: &LmdbDb, tx: &Transaction, hf_version: u8, now: u64) -> Result<(),
     // Only the shapes this chain currently produces are verified here. A type
     // this node cannot check is refused rather than waved through.
     if !rct.ty.is_bulletproof_plus() {
-        return Err(Rejection::InvalidInput(format!(
-            "RCT type {:?} is not one this node verifies yet",
-            rct.ty
-        )));
+        return Err(Rejection::UnsupportedRctType { ty: rct.ty });
     }
     if tx.prefix.vout.len() < 2 {
         return Err(Rejection::TooFewOutputs {
@@ -813,7 +842,7 @@ fn verify(db: &LmdbDb, tx: &Transaction, hf_version: u8, now: u64) -> Result<(),
                 "a ring member is unknown to this node".into(),
             ));
         }
-        check_ring_members(&keys, slot, db.height(), hf_version, now)?;
+        check_ring_members(&keys, slot, chain_height, hf_version, now)?;
 
         let ring: Vec<clsag::RingMember> = keys
             .iter()

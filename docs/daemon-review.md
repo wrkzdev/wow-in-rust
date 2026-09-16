@@ -52,6 +52,7 @@ Statuses:
 | Real `synchronized`, `target_height` and connection counts in `get_info`; `sync_info` | Done | `untrusted` also follows the sync state |
 | `--no-sync`, `--offline`, clean Ctrl-C/SIGTERM | Done | Shutdown order: miner, peers, pool saved, database synced last |
 | *(found along the way)* proof of work for a sync batch on every core | Done | Before taking the chain lock, `apply_blocks` computes the RandomWOW hash of each block in the batch in parallel; the chain then takes each hash instead of computing it. A hash depends only on its seed and hashing blob, so a stored one is exactly what the chain would compute, and unused ones are dropped after the batch (`ChainPow::prehash` in [`netsync.rs`](../bin/wownerod/src/netsync.rs)) |
+| *(found along the way)* a block's transactions verified, not trusted | Done | `check_tx_inputs`' cryptographic half (`specs/06` §5.11, §5.4) ran only for the pool; the block path checked shapes and double spends and took the ring signatures, the range proof and the commitment sum on the sending peer's word. `wow_core::txcheck::TxVerifier` is the seam, `netsync::ChainTxs` the implementation, and the work is the same `mempool::verify` — a transaction in a block and the same transaction in the pool are now judged by one function. A batch is verified on every core before the chain lock is taken, as its proofs of work already were. A shape this node cannot verify is refused **and does not ban the peer**, the distinction `PowError::CryptoNightNotImplemented` already made |
 | *(found along the way)* syncing from several peers at once | Done | Spans of block ids are reserved per connection and filled by different peers, as in the C++ `block_queue` ([`queue.rs`](../crates/wow-p2p/src/queue.rs), [`node.rs`](../crates/wow-p2p/src/node.rs)). One `p2p-apply` thread applies filled spans in height order. The C++ thresholds hold: at most 10 filled spans and 100 MB queued, with download forced within 1000 blocks of the tip. A stale next span is re-requested from another peer after 30 s (5 s in standby). A peer that disconnects has its unfilled spans flushed; a peer whose blocks are rejected loses its spans and is banned, or has its connection closed when the rejection does not warrant a ban. `sync_info` now reports `spans` and `overview` ([`tests/node.rs`](../crates/wow-p2p/tests/node.rs)) |
 
 ## B. P2P listener
@@ -144,17 +145,10 @@ Statuses:
 * The hard-coded 1000-batch cap and `WOW_P2P_TRACE` in `--sync-from`.
 * The RPC does not check the `Host` header.
 * The writer lock cannot detect a C++ node using the same data directory.
-* **A block's transactions are not cryptographically verified.**
-  `mempool::verify` checks every ring signature, the range proof, the
-  commitment sum and each ring member's lock and age before a transaction
-  enters the pool, but the block path (`wow_core::chain::check_transactions`)
-  does none of those: it checks duplicate hashes, `tx_exists`, the semantic
-  and ring-size rules, and key-image double spends, and nothing else. Blocks
-  from `RESPONSE_GET_OBJECTS` carry their transactions inline, and
-  `Node::fill` prefers a peer's blob over a pool entry, so on both the sync
-  and the relay path those checks never run. The node therefore accepts
-  blocks a C++ node rejects. `specs/06` §2 step 9 requires `check_tx_inputs`,
-  whose §5.11 is exactly these checks.
+* A RingCT shape with no verifier here — anything but Bulletproofs+ — is
+  refused rather than waved through, so a chain replayed from genesis stops at
+  the first pre-HF-18 transaction, as it already does at the first CryptoNight
+  v2 block. Mainnet above the last checkpoint is all Bulletproofs+.
 * CryptoNight variants 2 and 4 (versions 9–12). A mainnet sync does not need
   them, because checkpoints cover those heights. A chain replayed without
   checkpoints still stops at the version 9 fork, and the miner cannot mine

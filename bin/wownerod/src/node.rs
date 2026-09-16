@@ -38,7 +38,7 @@ use wow_types::tx::{Transaction, TxIn};
 use wow_types::Network;
 
 use crate::mempool::{Rejection as PoolRejection, TxPool};
-use crate::netsync::{ChainPow, LocalChain, Refusal, Submitted};
+use crate::netsync::{ChainPow, ChainTxs, LocalChain, PendingTx, Refusal, Submitted};
 use crate::template::{ExtraNonce, NextBlock, Template, TemplateError};
 
 const LOG: &str = "blockchain";
@@ -106,6 +106,8 @@ pub struct NodeCore {
     chain: Mutex<LocalChain>,
     /// The chain's proof-of-work verifier, reachable without the chain lock.
     pow: Arc<ChainPow>,
+    /// The chain's transaction verifier, reachable for the same reason.
+    txs: Arc<ChainTxs>,
     pool: Arc<Mutex<TxPool>>,
     /// A snapshot of what fee checks read, refreshed after every block, so an
     /// RPC fee estimate does not wait on a sync holding the chain.
@@ -124,11 +126,13 @@ impl NodeCore {
         let chain = LocalChain::new(db.clone(), network)?;
         let fee = fee_context_of(&chain);
         let pow = chain.pow();
+        let txs = chain.txs();
         Ok(Arc::new(NodeCore {
             db,
             hardfork: HardFork::new(network),
             chain: Mutex::new(chain),
             pow,
+            txs,
             pool,
             fee: Mutex::new(fee),
             listener: OnceLock::new(),
@@ -555,6 +559,13 @@ fn verdict(r: Rejection) -> BlockVerdict {
             false
         }
         BlockError::Storage(_) | BlockError::MissingTx { .. } => false,
+        // A transaction shape this node has no verifier for is this node's
+        // gap. The block is still refused; the peer that sent it is not
+        // blamed for a rule nobody here has written.
+        BlockError::TxSignature {
+            error: wow_core::TxCheckError::Unsupported(_),
+            ..
+        } => false,
         BlockError::Timestamp(wow_consensus::timestamp::TimestampError::TooFarInTheFuture {
             ..
         }) => false,
@@ -675,9 +686,13 @@ impl Core for NodeCore {
     }
 
     fn apply_blocks(&self, blocks: &[BlockEntry]) -> (usize, Option<BlockVerdict>) {
-        // The proofs first, on every core and without the chain lock.
+        // The proofs and the ring signatures first, on every core and without
+        // the chain lock. Between them they are nearly all of the cost of
+        // applying a batch, and neither needs the chain to be still.
         let work = self.pow_work(blocks);
         self.pow.prehash(&work);
+        let tx_work = self.tx_work(blocks);
+        self.txs.prevalidate(&tx_work, unix_now());
         let taken = {
             let mut chain = lock(&self.chain);
             blocks
@@ -692,6 +707,7 @@ impl Core for NodeCore {
                 .unwrap_or((blocks.len(), None))
         };
         self.pow.forget(&work);
+        self.txs.forget(&tx_work);
         taken
     }
 
@@ -806,6 +822,41 @@ impl NodeCore {
         work
     }
 
+    /// Every transaction of a batch that the chain will actually check, with
+    /// the major version of the block carrying it.
+    ///
+    /// The same shape as [`NodeCore::pow_work`], and the same boundary: below
+    /// `trusted_below` the chain does not run these rules, so hashing rings
+    /// there would be work for nothing. A blob that does not parse is left
+    /// out rather than reported -- the chain refuses it, with the height and
+    /// the index this cannot know.
+    fn tx_work(&self, blocks: &[BlockEntry]) -> Vec<PendingTx> {
+        let from = self.db.height().max(self.pow.trusted_below());
+        let mut work = Vec::new();
+        for entry in blocks {
+            let Ok(block) = Block::from_blob(&entry.block) else {
+                break;
+            };
+            let height = match block.miner_tx.prefix.vin.as_slice() {
+                [TxIn::Gen { height }] => *height,
+                _ => break,
+            };
+            if height < from {
+                continue;
+            }
+            for blob in &entry.txs {
+                let Ok(tx) = Transaction::from_blob(blob) else {
+                    continue;
+                };
+                let Some(id) = wow_types::hashes::transaction_hash_from_blob(&tx, blob) else {
+                    continue;
+                };
+                work.push((id, tx, block.major_version));
+            }
+        }
+        work
+    }
+
     /// Transactions from a peer, into the pool.
     fn admit_txs(&self, txs: &[Vec<u8>]) -> Vec<TxVerdict> {
         let ctx = self.fee_context();
@@ -878,6 +929,22 @@ mod tests {
                 BlockError::Timestamp(
                     wow_consensus::timestamp::TimestampError::TooFarInTheFuture { limit: 1 },
                 ),
+                false,
+            ),
+            // A ring signature that does not verify is the sender's fault.
+            (
+                BlockError::TxSignature {
+                    index: 0,
+                    error: wow_core::TxCheckError::Invalid("input 0: bad CLSAG".into()),
+                },
+                true,
+            ),
+            // A shape this node has no verifier for is not.
+            (
+                BlockError::TxSignature {
+                    index: 0,
+                    error: wow_core::TxCheckError::Unsupported("RCT type Null".into()),
+                },
                 false,
             ),
         ] {

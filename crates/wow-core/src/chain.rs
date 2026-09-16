@@ -43,6 +43,7 @@ use wow_types::{check_hash, Block, Difficulty, Network, Transaction};
 
 use crate::error::{Added, BlockError};
 use crate::pow::PowVerifier;
+use crate::txcheck::TxVerifier;
 
 /// Which of `specs/06` §2's twelve steps a block reached.
 ///
@@ -168,6 +169,14 @@ pub struct Blockchain<D: BlockchainDb> {
     /// `--fixed-difficulty` (`specs/07` §5): regtest's difficulty for every
     /// block after genesis, in place of the algorithm.
     fixed_difficulty: Option<Difficulty>,
+    /// `check_tx_inputs`' cryptographic half (`specs/06` §5.11): the ring
+    /// signatures, the range proof, the commitment sum and each ring member's
+    /// lock and age.
+    ///
+    /// `None` skips them, which is what every caller without a real store
+    /// wants and what the chain did before the seam existed. See
+    /// [`Blockchain::verify_transactions_with`] and [`crate::txcheck`].
+    tx_verifier: Option<Arc<dyn TxVerifier>>,
 }
 
 /// One block of an alternative chain, as the walk back to the main chain
@@ -206,6 +215,7 @@ impl<D: BlockchainDb> Blockchain<D> {
             alt_txs: HashMap::new(),
             orphaned_txs: Vec::new(),
             fixed_difficulty: None,
+            tx_verifier: None,
         };
         chain.reload_state()?;
         Ok(chain)
@@ -716,6 +726,26 @@ impl<D: BlockchainDb> Blockchain<D> {
     /// themselves, coinbase prevalidation and amount, the weight limit,
     /// duplicate transactions, and key-image double spends. What is not: the
     /// per-transaction rules in `specs/06` §9.
+    /// Check every transaction's ring signatures, range proof, commitment sum
+    /// and ring members with `verifier` (`specs/06` §5.11, §5.4).
+    ///
+    /// Without this the chain runs only the rules it can decide by reading a
+    /// transaction -- shapes, ring sizes, versions, double spends -- and takes
+    /// the arithmetic on the sender's word. That is fine for a test double and
+    /// wrong for a node: `check_tx_inputs` is step 9 of `specs/06` §2, not an
+    /// optimisation.
+    ///
+    /// It applies above [`Blockchain::trust_below`] only, for the reason that
+    /// method gives: the chain below contains blocks today's rules reject.
+    pub fn verify_transactions_with(&mut self, verifier: Arc<dyn TxVerifier>) {
+        self.tx_verifier = Some(verifier);
+    }
+
+    /// Whether a verifier for `specs/06` §5.11 is set.
+    pub fn verifies_transactions(&self) -> bool {
+        self.tx_verifier.is_some()
+    }
+
     pub fn trust_below(&mut self, height: u64) {
         self.trusted_below = height;
     }
@@ -996,7 +1026,7 @@ impl<D: BlockchainDb> Blockchain<D> {
 
         // 9. Transactions.
         let fees = self
-            .check_transactions(blk, txs, height)
+            .check_transactions(blk, txs, height, now)
             .map_err(|(step, e)| reject(step, e))?;
 
         // 10 & 11. Coinbase amount and the weight limit.
@@ -1091,6 +1121,7 @@ impl<D: BlockchainDb> Blockchain<D> {
         blk: &Block,
         txs: &[(Transaction, Vec<u8>)],
         height: u64,
+        now: u64,
     ) -> Result<u64, (Step, BlockError)> {
         use std::collections::BTreeSet;
 
@@ -1153,6 +1184,22 @@ impl<D: BlockchainDb> Blockchain<D> {
                     .map_err(|error| (Step::Transactions, BlockError::Tx { index: i, error }))?;
                 tx_rules::check_tx_version(tx.prefix.version, version, summary.n_unmixable)
                     .map_err(|error| (Step::Transactions, BlockError::Tx { index: i, error }))?;
+
+                // `specs/06` §5.11 and §5.4: the ring signatures, the range
+                // proof, the commitment sum, and each ring member's lock and
+                // age. `height` is the chain's height before this block is
+                // added, which is the height the C++ `check_tx_inputs` sees.
+                if let Some(verifier) = self.tx_verifier.as_deref() {
+                    verifier
+                        .verify(hash, tx, version, height, now)
+                        .map_err(|error| {
+                            (
+                                Step::Transactions,
+                                BlockError::TxSignature { index: i, error },
+                            )
+                        })?;
+                }
+
                 semantic_fee
             };
 
