@@ -123,6 +123,16 @@ impl ChainPow {
     }
 }
 
+thread_local! {
+    /// One light-mode VM per thread, for [`ChainPow::pow_hash`]'s miss path.
+    ///
+    /// Not shared: a `Vm` is mutated by hashing, and a lock around one would
+    /// serialise the very thing `ChainPow::prehash` spreads over every core.
+    /// A thread that never verifies a proof never builds one.
+    static VM: std::cell::RefCell<Option<wow_randomwow::vm::Vm>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl wow_core::pow::PowVerifier for ChainPow {
     /// `specs/06` §2 step 6 allows the proof to be skipped "unless a
     /// precomputed hash covers this height". Below the last checkpoint, one
@@ -156,9 +166,29 @@ impl wow_core::pow::PowVerifier for ChainPow {
             // Light mode: a cache rather than the 2 GiB dataset. Verification
             // is one hash per block, where mining is millions, so the dataset's
             // build cost would dwarf what it saves.
-            let mut vm = wow_randomwow::vm::Vm::light(wow_randomwow::vm::verify_flags(), cache)
-                .map_err(|e| wow_core::pow::PowError::RandomWow(e.to_string()))?;
-            return Ok(vm.hash(hashing_blob));
+            //
+            // Kept per thread rather than built per call. A VM carries a 2 MiB
+            // scratchpad and its program buffers, and this path runs once for
+            // every block that arrives outside a sync batch -- a new block
+            // every few minutes, forever, each one allocating and freeing all
+            // of it. `set_cache` is a pointer swap when the seed has not
+            // changed, and the seed changes once an epoch.
+            return VM.with(|held| {
+                let mut held = held.borrow_mut();
+                if held.is_none() {
+                    *held = Some(
+                        wow_randomwow::vm::Vm::light(wow_randomwow::vm::verify_flags(), cache)
+                            .map_err(|e| wow_core::pow::PowError::RandomWow(e.to_string()))?,
+                    );
+                } else {
+                    let vm = held.as_mut().expect("present");
+                    if vm.seed() != seed_hash {
+                        vm.set_cache(cache);
+                    }
+                }
+                let vm = held.as_mut().expect("present");
+                Ok(vm.hash(hashing_blob))
+            });
         }
 
         match major_version {
