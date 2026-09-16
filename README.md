@@ -260,8 +260,11 @@ so the gate stays open until v2 and v4 land.
 
 ## Layout
 
-Per [`specs/00-overview.md`](specs/00-overview.md) §4.1. Crates not yet
-implemented exist as documented placeholders so the layout is stable.
+Mostly [`specs/00-overview.md`](specs/00-overview.md) §4.1. Three crates the
+spec does not name were added as the work went on — `wow-log`, `wow-zmq` and
+`wow-tls`, each replacing something that would otherwise have been a
+dependency. Two the spec *does* name are still empty, and what they were meant
+to hold went elsewhere; the note under the listing says where.
 
 ```
 crates/
@@ -275,18 +278,28 @@ crates/
   wow-p2p/           levin, peer lists, multi-peer sync, the node, Dandelion++
   wow-zmq/           ZMTP 3.1 without libzmq: REP/PUB servers, REQ/SUB clients
   wow-log/           C++-style log levels and categories, file rotation
-  wow-rpc-types/     shared RPC request/response types                [M3]
-  wow-rpc-server/    daemon HTTP server                               [M3]
-  wow-wallet/        wallet core                                      [M4]
-  wow-daemon-client/ wallet-side daemon RPC client                    [M4]
+  wow-tls/           a rustls CryptoProvider of pure-Rust crates; no ring
+  wow-rpc-types/     empty; see below
+  wow-rpc-server/    empty; see below
+  wow-wallet/        wallet core: keys, scanning, selection, building, files
+  wow-daemon-client/ wallet-side daemon RPC client, with TLS and a login
 bin/
   wownerod/  wownero-wallet-cli/  wownero-wallet-rpc/
 extras/              a Cargo workspace of its own; see extras/README.md
   wallet-gui/        the desktop wallet on egui: Linux, Windows, macOS
   wallet-web/        the same interface as wasm: static files, no server
 tests/corpus/        test vectors and blobs; see tests/corpus/README.md
-scripts/             corpus generation (blocks, difficulty windows, weights, unlock ids)
+scripts/             corpus generation, and scripts/check-no-c.sh
+docker/              release builds: linux, windows, macos, android
 ```
+
+`wow-rpc-types` and `wow-rpc-server` are still the placeholders `specs/00` §4.1
+asks for, and the daemon's RPC did not land in them: it is
+[`bin/wownerod/src/rpc/`](bin/wownerod/src/rpc/), because nothing else needs to
+serve it and splitting it out would have meant a crate whose only caller is one
+binary. The wallet side's types live with the client that uses them, in
+`wow-daemon-client`. The two crates are kept rather than deleted so the
+difference from the spec is visible instead of silent.
 
 ## Building and testing
 
@@ -327,11 +340,10 @@ Three rules, in order of importance.
 
 **1. The C++ tree is the specification where the two disagree.** The spec
 documents cite `src/...` paths in the reference tree, not this repository. Keep
-a checkout to hand. Seventeen places where the spec's summary turned out to be
-imprecise are collected in [`docs/spec-deltas.md`](docs/spec-deltas.md) —
-twenty-five of them so far — each
-with the C++ that settles it; they are also flagged at the code that depends on
-them.
+a checkout to hand. **Twenty-seven** places where the spec's summary turned out
+to be imprecise are collected in [`docs/spec-deltas.md`](docs/spec-deltas.md),
+each with the C++ that settles it; they are also flagged at the code that
+depends on them.
 
 Findings in the C++ *itself* — as opposed to in the spec's description of it —
 go in [`docs/cpp-findings.md`](docs/cpp-findings.md), each with the C++ test
