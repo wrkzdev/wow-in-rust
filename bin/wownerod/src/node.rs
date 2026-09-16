@@ -115,7 +115,17 @@ pub struct NodeCore {
     listener: OnceLock<Arc<dyn Listener>>,
     /// When the pool is next walked for transactions due to go out again.
     next_relay_check: AtomicU64,
+    /// Recent `(when, height)` pairs, for the sync speed `status` reports.
+    ///
+    /// A window rather than an average since start-up, for the reason the
+    /// wallets measure the same way: blocks near the tip carry far more
+    /// transactions than the early chain, so an average over a whole sync
+    /// promises a finish the rest of it does not keep.
+    progress: Mutex<std::collections::VecDeque<(std::time::Instant, u64)>>,
 }
+
+/// How far back the sync speed is measured.
+const RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl NodeCore {
     pub fn new(
@@ -137,6 +147,7 @@ impl NodeCore {
             fee: Mutex::new(fee),
             listener: OnceLock::new(),
             next_relay_check: AtomicU64::new(0),
+            progress: Mutex::new(std::collections::VecDeque::new()),
         }))
     }
 
@@ -708,7 +719,42 @@ impl Core for NodeCore {
         };
         self.pow.forget(&work);
         self.txs.forget(&tx_work);
+        self.note_progress();
         taken
+    }
+
+    /// Note where the chain has reached, for [`NodeCore::blocks_per_second`].
+    ///
+    /// Called after blocks are applied rather than on a timer: a sample that
+    /// repeats the same height says nothing about the speed, and a run of them
+    /// during a stall would drag the estimate towards zero when the right
+    /// answer is "no idea".
+    fn note_progress(&self) {
+        let now = std::time::Instant::now();
+        let height = self.db.height();
+        let mut held = lock(&self.progress);
+        if held.back().is_some_and(|(_, h)| *h == height) {
+            return;
+        }
+        held.push_back((now, height));
+        while held.len() > 2 && now.duration_since(held[0].0) > RATE_WINDOW {
+            held.pop_front();
+        }
+    }
+
+    /// Blocks per second over the last [`RATE_WINDOW`], once there is a second
+    /// of it to measure.
+    pub fn blocks_per_second(&self) -> Option<f64> {
+        let held = lock(&self.progress);
+        let (t0, h0) = *held.front()?;
+        let (t1, h1) = *held.back()?;
+        let secs = t1.duration_since(t0).as_secs_f64();
+        // And nothing at all if the last sample is stale: a speed measured
+        // over blocks that stopped arriving a minute ago is not a speed.
+        if t1.elapsed() > RATE_WINDOW {
+            return None;
+        }
+        (secs >= 1.0 && h1 > h0).then(|| (h1 - h0) as f64 / secs)
     }
 
     fn new_block(&self, entry: &BlockEntry) -> BlockVerdict {

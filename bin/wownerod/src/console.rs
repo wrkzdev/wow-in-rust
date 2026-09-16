@@ -430,10 +430,23 @@ fn status(server: &Server) -> Result<String, String> {
         _ => "No".into(),
     };
 
-    Ok(table(&[
+    // The speed and what is left of the wait, while there is a wait. An
+    // operator watching a sync wants to know whether to come back in ten
+    // minutes or tomorrow, and the height alone does not say.
+    let rate = (height < target)
+        .then(|| server.core().and_then(crate::node::NodeCore::blocks_per_second))
+        .flatten();
+    let mut rows: Vec<(&str, String)> = vec![
         ("Local Height", height.to_string()),
         ("Network Height", target.to_string()),
         ("Percentage Synced", percent_synced(height, target)),
+    ];
+    if let Some(rate) = rate {
+        rows.push(("Sync Speed", format!("{rate:.1} blocks/s")));
+        let left = ((target - height) as f64 / rate).round() as u64;
+        rows.push(("Time Left", uptime_text(left)));
+    }
+    rows.extend([
         (
             "Sync Status",
             if i["offline"] == true {
@@ -481,7 +494,8 @@ fn status(server: &Server) -> Result<String, String> {
         ("Pruned Node", "No".into()),
         ("Mining", mining),
         ("wownero-rs Version", env!("CARGO_PKG_VERSION").into()),
-    ]))
+    ]);
+    Ok(table(&rows))
 }
 
 /// Rows as a two-column table, each column as wide as its widest cell.
@@ -539,6 +553,7 @@ fn bytes(n: u64) -> String {
     }
 }
 
+/// `1d 4h 12m 30s`. Used for the uptime and for how much of a sync is left.
 fn uptime_text(secs: u64) -> String {
     format!(
         "{}d {}h {}m {}s",
