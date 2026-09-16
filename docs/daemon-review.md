@@ -144,6 +144,17 @@ Statuses:
 * The hard-coded 1000-batch cap and `WOW_P2P_TRACE` in `--sync-from`.
 * The RPC does not check the `Host` header.
 * The writer lock cannot detect a C++ node using the same data directory.
+* **A block's transactions are not cryptographically verified.**
+  `mempool::verify` checks every ring signature, the range proof, the
+  commitment sum and each ring member's lock and age before a transaction
+  enters the pool, but the block path (`wow_core::chain::check_transactions`)
+  does none of those: it checks duplicate hashes, `tx_exists`, the semantic
+  and ring-size rules, and key-image double spends, and nothing else. Blocks
+  from `RESPONSE_GET_OBJECTS` carry their transactions inline, and
+  `Node::fill` prefers a peer's blob over a pool entry, so on both the sync
+  and the relay path those checks never run. The node therefore accepts
+  blocks a C++ node rejects. `specs/06` §2 step 9 requires `check_tx_inputs`,
+  whose §5.11 is exactly these checks.
 * CryptoNight variants 2 and 4 (versions 9–12). A mainnet sync does not need
   them, because checkpoints cover those heights. A chain replayed without
   checkpoints still stops at the version 9 fork, and the miner cannot mine

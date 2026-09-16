@@ -200,9 +200,18 @@ impl LocalChain {
     ///
     /// This node has 39 checkpoints rather than a hash per block, so between
     /// two of them it is trusting the `prev_id` chain and finds a forgery at
-    /// the next checkpoint rather than immediately. Above the last checkpoint
-    /// -- the range where a reorg is still possible and where this node's
-    /// answers actually matter -- every rule is enforced.
+    /// the next checkpoint rather than immediately.
+    ///
+    /// Above the last checkpoint -- the range where a reorg is still possible
+    /// and where this node's answers actually matter -- the proof of work, the
+    /// difficulty, the timestamps, the coinbase and the transaction rules
+    /// `wow_consensus::tx_rules` covers are all enforced. **One thing is not
+    /// yet:** a transaction's ring signatures, its range proof and its
+    /// commitment sum are verified when it arrives at the pool
+    /// (`mempool::verify`), but not when it arrives *inside a block*. A block
+    /// carries its own transactions, and a peer's are used as given
+    /// (`Node::fill`), so for those three checks this node is still taking the
+    /// sender's word. `docs/daemon-review.md` tracks it.
     pub fn new(db: Arc<LmdbDb>, network: Network) -> Result<LocalChain, String> {
         let checkpoints = wow_consensus::checkpoints::Checkpoints::new(network);
         // `last_height` is the last checkpointed block, and it is itself
@@ -475,7 +484,10 @@ pub fn run(db: LmdbDb, network: Network, address: &str, max_batches: usize) -> R
         println!(
             "Blocks below {trusted} are covered by hard-coded checkpoints: their proof of work
              and transaction rules are not re-checked, which is what the C++ node also does
-             (docs/spec-deltas.md §23). Everything from {trusted} up is fully verified."
+             (docs/spec-deltas.md §23). From {trusted} up the proof of work, the difficulty,
+             the coinbase and the transaction rules are checked -- but not, yet, a
+             transaction's ring signatures, range proof or commitment sum, which are verified
+             only when a transaction arrives at the pool."
         );
     }
     println!("Connecting to {address}...");
@@ -556,8 +568,9 @@ mod tests {
     /// *past* the last checkpoint, because that checkpoint is itself verified.
     ///
     /// Mainnet's last checkpoint is height 838,800, so everything from 838,801
-    /// up is fully validated -- which is the range where a reorg is still
-    /// possible and where this node's answers matter.
+    /// up is validated -- which is the range where a reorg is still possible
+    /// and where this node's answers matter. What "validated" does not cover
+    /// yet is on [`LocalChain::new`].
     #[test]
     fn the_trusted_boundary_follows_the_last_checkpoint() {
         for network in [Network::Mainnet, Network::Testnet, Network::Stagenet] {

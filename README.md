@@ -96,7 +96,11 @@ Against public nodes — `https://wow-node.0z.network:443`,
 * **Node sync** — `wownerod` handshakes with C++ peers, applies blocks
   continuously, and has reached and held the network's tip: a full mainnet
   chain of its own in LMDB, 6.64 GiB at height 874,341. Proofs of work are
-  checked above the last checkpoint only, until CryptoNight v2 and v4 land.
+  checked above the last checkpoint only, until CryptoNight v2 and v4 land —
+  and a transaction's ring signatures, range proof and commitment sum are
+  verified when it reaches the pool but **not** when it arrives inside a block,
+  so a block's transactions are still taken on the sending peer's word. See
+  [`docs/daemon-review.md`](docs/daemon-review.md).
   A sync from scratch is many hours — roughly 11 blocks/s, ~78% of it waiting
   on the peer — so point a wallet at a public node unless you specifically want
   your own chain.
