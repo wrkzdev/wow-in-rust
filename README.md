@@ -344,7 +344,7 @@ Three rules, in order of importance.
 
 **1. The C++ tree is the specification where the two disagree.** The spec
 documents cite `src/...` paths in the reference tree, not this repository. Keep
-a checkout to hand. **Twenty-seven** places where the spec's summary turned out
+a checkout to hand. **Twenty-eight** places where the spec's summary turned out
 to be imprecise are collected in [`docs/spec-deltas.md`](docs/spec-deltas.md),
 each with the C++ that settles it; they are also flagged at the code that
 depends on them.
