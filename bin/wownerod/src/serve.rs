@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wow_p2p::addressbook::{parse_ban_list, STATE_FILENAME};
-use wow_p2p::node::{Core, Node};
+use wow_p2p::node::{Core, Node, SyncStatus};
 use wow_storage::db::BlockchainDb;
 use wow_storage::lmdb::LmdbDb;
 
@@ -31,6 +31,11 @@ use crate::node::NodeCore;
 use crate::{netsync, rpc, signal};
 
 const LOG: &str = "global";
+
+/// How often the node looks at how its sync is going.
+const STATUS_EVERY: Duration = Duration::from_secs(5);
+/// How often a node that is behind says how far.
+const PROGRESS_EVERY: Duration = Duration::from_secs(30);
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -183,9 +188,9 @@ pub fn run(db: LmdbDb, cfg: &Config) -> Result<(), String> {
     let zmq = zmq_bound
         .map(|b| crate::zmq::start(b, server.clone(), core.as_deref(), cfg.restricted_zmq_rpc))
         .transpose()?;
-    if !cfg.non_interactive && std::io::stdin().is_terminal() {
-        crate::console::spawn(server.clone());
-    }
+    // Dropped as `run` returns, which puts the terminal back.
+    let _terminal = (!cfg.non_interactive && std::io::stdin().is_terminal())
+        .then(|| crate::console::spawn(server.clone()));
 
     // A miner that cannot start stops the node, the way a bad option would --
     // but through the shutdown below, so peers and the pool are still saved.
@@ -210,7 +215,8 @@ pub fn run(db: LmdbDb, cfg: &Config) -> Result<(), String> {
     );
 
     let mut last_expire = Instant::now();
-    let mut last_report = Instant::now();
+    let mut last_status = Instant::now();
+    let mut progress = Progress::new(db.height(), last_status);
     while !signal::stop_requested() && !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(200));
 
@@ -225,19 +231,11 @@ pub fn run(db: LmdbDb, cfg: &Config) -> Result<(), String> {
             }
         }
 
-        if last_report.elapsed() >= Duration::from_secs(30) {
-            last_report = Instant::now();
+        if last_status.elapsed() >= STATUS_EVERY {
+            last_status = Instant::now();
             if let Some(p) = &p2p {
-                let s = p.sync_status();
-                if s.busy_syncing || !s.synchronized {
-                    wow_log::info!(
-                        LOG,
-                        "height {} of {} ({} out, {} in)",
-                        s.height,
-                        s.target_height,
-                        s.outgoing,
-                        s.incoming
-                    );
+                if let Some(line) = progress.observe(&p.sync_status(), last_status) {
+                    wow_log::info!(LOG, "{line}");
                 }
             }
         }
@@ -269,6 +267,86 @@ pub fn run(db: LmdbDb, cfg: &Config) -> Result<(), String> {
     match failure {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// What the node says about its sync as it goes.
+struct Progress {
+    /// The height at the last progress line, and when, for the rate.
+    last: Option<(u64, Instant)>,
+    /// Whether the node was synchronised when last looked at.
+    synchronized: bool,
+}
+
+impl Progress {
+    fn new(height: u64, now: Instant) -> Progress {
+        Progress {
+            last: Some((height, now)),
+            synchronized: false,
+        }
+    }
+
+    /// The line to log for `s`, when one is due: once on catching up with the
+    /// network, and every [`PROGRESS_EVERY`] while behind it.
+    fn observe(&mut self, s: &SyncStatus, now: Instant) -> Option<String> {
+        if s.synchronized {
+            self.last = None;
+            let caught_up = !std::mem::replace(&mut self.synchronized, true);
+            return caught_up
+                .then(|| format!("synchronised with the network at height {}", s.height));
+        }
+        self.synchronized = false;
+        let added = match self.last {
+            Some((_, at)) if now.duration_since(at) < PROGRESS_EVERY => return None,
+            Some((height, at)) => Some((s.height.saturating_sub(height), now.duration_since(at))),
+            None => None,
+        };
+        self.last = Some((s.height, now));
+        Some(progress_line(s, added))
+    }
+}
+
+/// Where the chain stands against its peers, how fast it is closing the gap,
+/// and with how many peers. `added` is the blocks added since the last line
+/// and how long that took.
+///
+/// ```text
+/// syncing: height 63300 of 873597 (7.2%), 810297 to go at 45.0 blocks/s, about 5 h 00 min left; 8 out, 0 in
+/// ```
+fn progress_line(s: &SyncStatus, added: Option<(u64, Duration)>) -> String {
+    if s.outgoing + s.incoming == 0 {
+        return format!("height {}, waiting for peers", s.height);
+    }
+    let peers = format!("{} out, {} in", s.outgoing, s.incoming);
+    if s.target_height <= s.height {
+        return format!("height {}; {peers}", s.height);
+    }
+    let left = s.target_height - s.height;
+    let percent = s.height as f64 * 100.0 / s.target_height as f64;
+    let pace = match added {
+        None => String::new(),
+        Some((0, took)) => format!(", no blocks added in {}", approx(took.as_secs())),
+        Some((n, took)) => {
+            let rate = n as f64 / took.as_secs_f64().max(0.001);
+            format!(
+                " at {rate:.1} blocks/s, about {} left",
+                approx((left as f64 / rate) as u64)
+            )
+        }
+    };
+    format!(
+        "syncing: height {} of {} ({percent:.1}%), {left} to go{pace}; {peers}",
+        s.height, s.target_height
+    )
+}
+
+/// A duration in its largest units: `45 s`, `12 min`, `3 h 05 min`, `2 d 7 h`.
+fn approx(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs} s"),
+        60..3_600 => format!("{} min", secs / 60),
+        3_600..86_400 => format!("{} h {:02} min", secs / 3_600, secs % 3_600 / 60),
+        _ => format!("{} d {} h", secs / 86_400, secs % 86_400 / 3_600),
     }
 }
 
@@ -366,6 +444,88 @@ fn start_p2p(cfg: &Config, core: Arc<NodeCore>) -> Result<Node, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status(height: u64, target_height: u64, outgoing: usize) -> SyncStatus {
+        SyncStatus {
+            height,
+            target_height,
+            synchronized: false,
+            busy_syncing: true,
+            outgoing,
+            incoming: 0,
+        }
+    }
+
+    #[test]
+    fn a_progress_line_says_how_far_how_fast_and_how_long() {
+        let s = status(63_300, 873_597, 8);
+        assert_eq!(
+            progress_line(&s, None),
+            "syncing: height 63300 of 873597 (7.2%), 810297 to go; 8 out, 0 in"
+        );
+        assert_eq!(
+            progress_line(&s, Some((1_350, Duration::from_secs(30)))),
+            "syncing: height 63300 of 873597 (7.2%), 810297 to go at 45.0 blocks/s, \
+             about 5 h 00 min left; 8 out, 0 in"
+        );
+        assert_eq!(
+            progress_line(&s, Some((0, Duration::from_secs(30)))),
+            "syncing: height 63300 of 873597 (7.2%), 810297 to go, no blocks added in 30 s; \
+             8 out, 0 in"
+        );
+        assert_eq!(
+            progress_line(&status(5, 0, 0), None),
+            "height 5, waiting for peers"
+        );
+        assert_eq!(
+            progress_line(&status(5, 5, 2), None),
+            "height 5; 2 out, 0 in"
+        );
+    }
+
+    #[test]
+    fn durations_read_in_their_largest_units() {
+        assert_eq!(approx(45), "45 s");
+        assert_eq!(approx(720), "12 min");
+        assert_eq!(approx(3 * 3_600 + 5 * 60 + 9), "3 h 05 min");
+        assert_eq!(approx(2 * 86_400 + 7 * 3_600), "2 d 7 h");
+    }
+
+    /// Behind, a line every thirty seconds with the rate since the last one;
+    /// caught up, one line, once.
+    #[test]
+    fn progress_is_reported_while_behind_and_catching_up_is_said_once() {
+        let t0 = Instant::now();
+        let mut p = Progress::new(100, t0);
+        assert_eq!(
+            p.observe(&status(100, 1_000, 3), t0 + STATUS_EVERY),
+            None,
+            "not due yet"
+        );
+        let line = p
+            .observe(&status(400, 1_000, 3), t0 + PROGRESS_EVERY)
+            .expect("due");
+        assert!(line.contains(" at 10.0 blocks/s"), "{line}");
+        assert_eq!(
+            p.observe(&status(450, 1_000, 3), t0 + PROGRESS_EVERY + STATUS_EVERY),
+            None
+        );
+
+        let mut synced = status(1_000, 1_000, 3);
+        synced.synchronized = true;
+        synced.busy_syncing = false;
+        let later = t0 + 2 * PROGRESS_EVERY;
+        assert_eq!(
+            p.observe(&synced, later).as_deref(),
+            Some("synchronised with the network at height 1000")
+        );
+        assert_eq!(p.observe(&synced, later + STATUS_EVERY), None, "said once");
+
+        // Falling behind again is reported straight away.
+        assert!(p
+            .observe(&status(1_000, 1_200, 3), later + 2 * STATUS_EVERY)
+            .is_some());
+    }
 
     #[test]
     fn an_address_without_a_port_gets_the_networks() {

@@ -25,7 +25,7 @@
 //! that index second, and an output can match on either.
 
 use wow_crypto::types::{
-    AccountPublicAddress, KeyDerivation, KeyImage, PublicKey, SecretKey, SubaddressIndex,
+    AccountPublicAddress, Hash8, KeyDerivation, KeyImage, PublicKey, SecretKey, SubaddressIndex,
 };
 use wow_types::tx::{Transaction, TxOutTarget};
 
@@ -149,6 +149,28 @@ pub fn scan_transaction(tx: &Transaction, keys: &ScanKeys<'_>) -> Result<Vec<Rec
         }
     }
     Ok(found)
+}
+
+/// The payment id a transaction carries, decrypted: `process_new_transaction`.
+///
+/// Read as the C++ reads it: the first nonce in `extra`, if that is an
+/// encrypted id, under the derivation of the transaction's public key -- the
+/// main key, also for a payment to a subaddress. Zeros are the dummy a
+/// transaction without an id carries, and are none. A plain 32-byte id is not
+/// read; the C++ ignores one from block version 12.
+pub fn payment_id(tx: &Transaction, view_secret_key: &SecretKey) -> Option<Hash8> {
+    let extra = wow_types::tx_extra::parse_tx_extra(&tx.prefix.extra);
+    let nonce = extra.fields.iter().find_map(|f| match f {
+        wow_types::tx_extra::TxExtraField::Nonce(n) => Some(n),
+        _ => None,
+    })?;
+    let encrypted: Hash8 = match nonce.as_slice() {
+        [0x01, id @ ..] => id.try_into().ok()?,
+        _ => return None,
+    };
+    let derivation = wow_crypto::generate_key_derivation(&extra.tx_pubkey()?, view_secret_key)?;
+    let id = wow_crypto::keys::encrypt_payment_id(&encrypted, &derivation);
+    (id != [0u8; 8]).then_some(id)
 }
 
 /// The amount, and the blinding factor needed to spend the output.

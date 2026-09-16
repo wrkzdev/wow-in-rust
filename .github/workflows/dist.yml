@@ -1,7 +1,7 @@
 # Release archives for every platform, built with docker/build-dist.sh.
 #
-# Manual and on version tags only: four Docker cross-builds take far longer
-# than ci.yml's budget, and nothing about an ordinary push needs them.
+# Manual and on version tags only: the Docker cross-builds take far longer than
+# ci.yml's budget, and nothing about an ordinary push needs them.
 #
 # Each platform builds in its own job; a final job collects the archives and
 # writes SHA256SUMS over all of them, so the published hashes describe exactly
@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [linux, windows, macos, android]
+        platform: [linux, windows, macos, android, web, gui-linux, gui-windows]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -32,9 +32,27 @@ jobs:
           path: dist/${{ matrix.platform }}/
           if-no-files-found: error
 
+  # The macOS GUI wallet needs Apple's SDK, so it builds on a macOS runner
+  # rather than in a container.
+  gui-macos:
+    name: gui-macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - run: bash docker/build-dist.sh gui-macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-gui-macos
+          path: dist/gui-macos/
+          if-no-files-found: error
+
   sha256sums:
     name: SHA256SUMS
-    needs: build
+    needs: [build, gui-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

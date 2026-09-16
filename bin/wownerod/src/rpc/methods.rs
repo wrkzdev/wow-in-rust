@@ -667,18 +667,20 @@ pub fn send_raw_transaction(server: &super::Server, body: &[u8]) -> String {
         .add(db, &blob, &fee_context, now, do_not_relay);
     match added {
         Ok(id) => {
-            // Accepted is not the same as sent. It goes out only when the
-            // caller allows it and there is a peer to send it to.
             // Announced as the C++ announces it: accepted, and allowed out.
             if let Some(core) = server.core().filter(|_| !do_not_relay) {
                 core.announce_pool_txs(&[id]);
             }
-            let relayed = !do_not_relay && server.relays();
-            if relayed {
+            // Handed to the peer-to-peer layer whenever the caller allows it,
+            // whether or not a peer can take it this moment. One that reaches
+            // nobody stays unrelayed in the pool, which offers it again until
+            // one does; `not_relayed` still says whether it went out now.
+            if !do_not_relay {
                 if let Some(p) = server.p2p() {
                     p.relay_transaction(id, blob.clone());
                 }
             }
+            let relayed = !do_not_relay && server.relays();
             let mut m = relay_flags(None);
             m.insert("status".into(), json!("OK"));
             m.insert("reason".into(), json!(""));

@@ -11,6 +11,7 @@ wow-serialize.workspace = true
 wow-types.workspace = true
 wow-consensus.workspace = true
 wow-daemon-client.workspace = true
+wow-log.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 

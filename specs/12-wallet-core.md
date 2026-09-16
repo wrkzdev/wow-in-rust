@@ -350,9 +350,25 @@ fee          = round_up(weight * fee_per_byte, quantization_mask = 1000)
 The wallet must iterate: adding the fee changes the change amount, which can
 change the number of outputs, which changes the weight. `FEE_CALCULATION_MAX_RETRIES = 10`.
 
+The fee a transaction pays is its **built** weight's, not the estimate's.
+`create_transactions_2` estimates, builds, recomputes the fee from the blob, and
+builds again at that fee (the difference moves the change, or a sweep's amount),
+repeating while the blob needs more than it pays. The estimate only chooses
+inputs; the estimator runs a few bytes over, so a fee charged on it is a little
+too high.
+
 Priorities map to the four tiers returned by `get_fee_estimate`
-(1 = low … 4 = high). `default_priority` and `auto_low_priority` are persisted
-settings.
+(1 = low … 4 = high), asked for with `grace_blocks = FEE_ESTIMATE_GRACE_BLOCKS (10)`.
+
+**Priority 0 is not normal.** `adjust_priority(0)`, with `default_priority == 0`
+and `auto_low_priority` on (the default), returns **1** unless the pool holds at
+least a full reward zone (`block_weight_limit / 2`) of transactions paying the low
+rate or more, or the ten blocks below the wallet's height fill more than 80% of
+ten zones; then **2**. When it cannot tell (a failed call, fewer than ten blocks)
+it returns 0, and `get_base_fee` maps a 0 that reaches it to the low tier too.
+`simple_wallet::transfer` starts from `default_priority`; `sweep_all` and the
+wallet RPC start from 0, so a default priority set there leaves them at the low
+tier. `default_priority` and `auto_low_priority` are persisted settings.
 
 ### 4.6 Building the transaction
 

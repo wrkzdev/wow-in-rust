@@ -325,17 +325,8 @@ fn parsers_never_panic() {
     }
 }
 
-/// A truncated blob must never be mistaken for the whole one.
-///
-/// Note it may still *parse*: the reference's `serialize_uvarint` treats
-/// running out of input as a successful read of the partial value
-/// (`wow_serialize::varint::read_varint_bits`), so e.g. the single byte `0x02`
-/// decodes as a complete v2 transaction with no inputs and no outputs. That
-/// quirk is reproduced deliberately, so the invariant to pin is the one that
-/// matters — a truncated blob never yields the original transaction, and never
-/// re-serializes to itself.
-#[test]
-fn truncation_at_every_offset() {
+/// A BulletproofPlus transaction with its prunable half in place, as a blob.
+fn bp_plus_blob() -> Vec<u8> {
     let prefix = TransactionPrefix {
         version: 2,
         unlock_time: 0,
@@ -369,7 +360,21 @@ fn truncation_at_every_offset() {
     };
     let mut w = Writer::new();
     tx.write(&mut w);
-    let blob = w.into_vec();
+    w.into_vec()
+}
+
+/// A truncated blob must never be mistaken for the whole one.
+///
+/// Note it may still *parse*: the reference's `serialize_uvarint` treats
+/// running out of input as a successful read of the partial value
+/// (`wow_serialize::varint::read_varint_bits`), so e.g. the single byte `0x02`
+/// decodes as a complete v2 transaction with no inputs and no outputs. That
+/// quirk is reproduced deliberately, so the invariant to pin is the one that
+/// matters — a truncated blob never yields the original transaction, and never
+/// re-serializes to itself.
+#[test]
+fn truncation_at_every_offset() {
+    let blob = bp_plus_blob();
 
     // The whole blob parses, and round-trips.
     let parsed = Transaction::from_blob(&blob).unwrap();
@@ -404,4 +409,36 @@ fn truncation_at_every_offset() {
         accepted <= 8,
         "{accepted} truncated blobs parsed; expected only the varint-run cuts"
     );
+}
+
+/// `parse_and_validate_tx_base_from_blob`: a pruned transaction is its prefix
+/// and RingCT base, and parses as that, though as a whole transaction it is
+/// cut short. A daemon asked for pruned blocks sends exactly this.
+#[test]
+fn a_pruned_blob_parses_base_only() {
+    let blob = bp_plus_blob();
+    let whole = Transaction::from_blob(&blob).unwrap();
+    let pruned = &blob[..whole.unprunable_size];
+
+    assert!(
+        Transaction::from_blob(pruned).is_err(),
+        "not a whole transaction"
+    );
+    let base = Transaction::from_blob_base_only(pruned).expect("a pruned transaction parses");
+    assert_eq!(base.prefix, whole.prefix);
+    assert_eq!(base.rct_signatures.ty, whole.rct_signatures.ty);
+    assert_eq!(base.rct_signatures.txn_fee, whole.rct_signatures.txn_fee);
+    assert_eq!(
+        base.rct_signatures.ecdh_info,
+        whole.rct_signatures.ecdh_info
+    );
+    assert_eq!(base.rct_signatures.out_pk, whole.rct_signatures.out_pk);
+    assert_eq!(base.unprunable_size, whole.unprunable_size);
+    assert!(
+        base.rct_signatures.clsags.is_empty(),
+        "nothing prunable was read"
+    );
+
+    // A whole blob reads to the same fields, and the rest is left unread.
+    assert_eq!(Transaction::from_blob_base_only(&blob).unwrap(), base);
 }

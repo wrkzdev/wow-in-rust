@@ -7,6 +7,9 @@
 //! A handler only sets a flag. The shutdown itself -- closing peers, saving the
 //! pool, syncing the store -- happens on the main thread when it next looks,
 //! because almost nothing is safe to do inside a signal handler.
+//!
+//! The last thing a clean stop does is put the terminal back as the console
+//! found it ([`TerminalMode`]).
 
 #![allow(unsafe_code)]
 
@@ -90,4 +93,87 @@ pub fn install() -> Result<(), String> {
 #[cfg(not(any(unix, windows)))]
 pub fn install() -> Result<(), String> {
     Err("stopping on a signal is not supported on this platform".into())
+}
+
+/// The mode standard input's terminal was in, put back when this is dropped.
+///
+/// The console's line editor holds the terminal in raw mode while it waits for
+/// a line. A node stopped by `stop_daemon` or a signal exits with it still
+/// waiting, and a shell handed a terminal in raw mode shows nothing typed at
+/// it. So the mode is read before the console starts, and put back on the way
+/// out.
+pub struct TerminalMode {
+    #[cfg(unix)]
+    saved: Option<libc::termios>,
+    #[cfg(windows)]
+    saved: Option<u32>,
+}
+
+#[cfg(unix)]
+impl TerminalMode {
+    pub fn save() -> TerminalMode {
+        // SAFETY: a zeroed `termios` is a valid buffer for `tcgetattr` to fill.
+        // It returns non-zero, and the buffer is not used, when standard input
+        // is not a terminal.
+        let mut mode: libc::termios = unsafe { std::mem::zeroed() };
+        let read = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut mode) } == 0;
+        TerminalMode {
+            saved: read.then_some(mode),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalMode {
+    fn drop(&mut self) {
+        if let Some(mode) = &self.saved {
+            // SAFETY: putting back exactly the `termios` that `save` read.
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, mode) };
+        }
+    }
+}
+
+#[cfg(windows)]
+mod console {
+    pub const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GetStdHandle(n_std_handle: u32) -> *mut core::ffi::c_void;
+        pub fn GetConsoleMode(h: *mut core::ffi::c_void, mode: *mut u32) -> i32;
+        pub fn SetConsoleMode(h: *mut core::ffi::c_void, mode: u32) -> i32;
+    }
+}
+
+#[cfg(windows)]
+impl TerminalMode {
+    pub fn save() -> TerminalMode {
+        use console::*;
+        let mut mode = 0u32;
+        // SAFETY: `GetStdHandle` returns a borrowed handle that needs no
+        // closing. `GetConsoleMode` writes one `u32`, and returns zero when
+        // standard input is not a console.
+        let read = unsafe { GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut mode) } != 0;
+        TerminalMode {
+            saved: read.then_some(mode),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TerminalMode {
+    fn drop(&mut self) {
+        use console::*;
+        if let Some(mode) = self.saved {
+            // SAFETY: putting back exactly the mode that `save` read.
+            unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode) };
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl TerminalMode {
+    pub fn save() -> TerminalMode {
+        TerminalMode {}
+    }
 }

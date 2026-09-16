@@ -447,6 +447,31 @@ fn an_integrated_address_round_trips() {
     assert_eq!(v["error"]["code"], -2, "{v}");
 }
 
+/// `get_payments` and `get_bulk_payments` answer, where they were refused as
+/// not built, and an id that is not one is `-5 WRONG_PAYMENT_ID`.
+#[test]
+fn payments_are_listed_by_payment_id() {
+    let s = start("payments", false);
+    create_wallet(&s, "w");
+
+    let v = call(
+        &s,
+        "get_payments",
+        json!({ "payment_id": "0102030405060708" }),
+    );
+    assert_eq!(v["result"]["payments"], json!([]), "{v}");
+
+    let v = call(
+        &s,
+        "get_bulk_payments",
+        json!({ "payment_ids": ["0102030405060708"], "min_block_height": 0 }),
+    );
+    assert_eq!(v["result"]["payments"], json!([]), "{v}");
+
+    let v = call(&s, "get_payments", json!({ "payment_id": "0102" }));
+    assert_eq!(v["error"]["code"], -5, "{v}");
+}
+
 /// `-50 NONZERO_UNLOCK_TIME` exists because of Wownero's relay rule, and is
 /// returned here rather than letting the transfer fail opaquely later.
 #[test]

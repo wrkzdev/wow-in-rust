@@ -191,6 +191,9 @@ impl State {
             .to_string();
 
         let paths = self.path_for(name)?;
+        // The wallet already open here holds its own keys file, and opening it
+        // again would find it locked by this server. So that one closes first.
+        self.close_if_open(&paths)?;
         let mut session = Session::open(paths, password, self.kdf_rounds, Some(self.network))
             .map_err(|e| Error::new(errors::INVALID_PASSWORD, e))?;
         self.attach_daemon(&mut session);
@@ -200,7 +203,7 @@ impl State {
 
     pub fn close_wallet(&self) -> methods::MethodResult {
         let mut guard = self.wallet();
-        if let Some(session) = guard.as_ref() {
+        if let Some(session) = guard.as_mut() {
             // An unflushed cache is a long rescan next time (`specs/14` §5).
             session
                 .save()
@@ -208,6 +211,23 @@ impl State {
         }
         *guard = None;
         Ok(json!({}))
+    }
+
+    /// Save and close the open wallet if it is the one at `paths`.
+    fn close_if_open(&self, paths: &Paths) -> Result<(), Error> {
+        let mut guard = self.wallet();
+        let Some(session) = guard.as_mut() else {
+            return Ok(());
+        };
+        // A wallet opened from files is where its keys file is.
+        if session.location() != paths.keys().display().to_string() {
+            return Ok(());
+        }
+        session
+            .save()
+            .map_err(|e| Error::new(errors::UNKNOWN_ERROR, e))?;
+        *guard = None;
+        Ok(())
     }
 
     pub fn create_wallet(&self, params: &Value) -> methods::MethodResult {

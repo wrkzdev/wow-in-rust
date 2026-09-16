@@ -57,6 +57,29 @@ fn os_random(out: &mut [u8]) -> bool {
     status == 0
 }
 
+/// Where this crate knows no entropy call, as in a browser, the program
+/// supplies one ([`set_random_source`]). Without it there is no entropy, and
+/// [`seeded_rng`] refuses.
+#[cfg(not(any(unix, windows)))]
+fn os_random(out: &mut [u8]) -> bool {
+    match RANDOM_SOURCE.get() {
+        Some(fill) => fill(out),
+        None => false,
+    }
+}
+
+static RANDOM_SOURCE: std::sync::OnceLock<fn(&mut [u8]) -> bool> = std::sync::OnceLock::new();
+
+/// Supply the CSPRNG on a platform where this crate cannot reach one itself.
+///
+/// A browser build passes a function over `crypto.getRandomValues`, which must
+/// fill the whole slice or return `false`. Only the first call takes effect,
+/// so nothing later can swap the source out. On Unix and Windows the
+/// operating system's own is used, and this is ignored.
+pub fn set_random_source(fill: fn(&mut [u8]) -> bool) -> bool {
+    RANDOM_SOURCE.set(fill).is_ok()
+}
+
 /// A random number generator seeded from the operating system.
 ///
 /// The state is the reference's 200-byte Keccak state (`src/crypto/random.c`),

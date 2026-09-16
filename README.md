@@ -1,7 +1,8 @@
 # wownero-rs
 
-A Rust reimplementation of the Wownero suite — daemon, wallet CLI, wallet RPC —
-drop-in compatible with the C++ tree at version `0.11.4.0` "Kunty Karen".
+A Rust reimplementation of the Wownero suite — daemon, wallet CLI, wallet RPC,
+and a desktop and a web wallet — drop-in compatible with the C++ tree at version
+`0.11.4.0` "Kunty Karen".
 
 > [!WARNING]
 > **Unofficial, AI-assisted and experimental. Use it at your own risk.**
@@ -28,32 +29,77 @@ The normative specification is vendored in [`specs/`](specs/). Start with
 > mainnet and reach the same chain tip as the C++ node, byte-for-byte, without a
 > fork. Everything else is an implementation choice. Consensus is not.
 
+## What it looks like
+
+**`wownerod` on mainnet.** The requirement above, in practice: the Rust node on
+the real chain, at the same height as the C++ peers it follows, and staying
+there. A day and a bit of uptime, twelve outgoing peers, 1,682 addresses
+learned, and 6.64 GiB of LMDB written in the C++ daemon's own format. The
+`help` under it is the command set the interactive prompt takes.
+
+![wownerod's status table: synced at height 874,341 on mainnet, 12 outgoing connections, 1d 4h uptime, 6.64 GiB LMDB](images/daemon-rs-01.png)
+
+**The desktop wallet** — `extras/wallet-gui`, written with egui, over the same
+wallet library `wownero-wallet-cli` uses. A balance on mainnet, and a payment
+out that this wallet code built, signed and relayed, confirmed 167 blocks deep.
+
+![The desktop wallet's overview: a balance of 148.9755202 WOW, synced at height 874,341, an address, and recent transfers in and out](images/desktop-gui-02.png)
+
+Both wallets choose a node the same way: the default over TLS, then the public
+nodes monero.fail lists, each one asked what it is — height, network, latency —
+before anything trusts it.
+
+![The desktop wallet's node settings, testing the default node and the public node list](images/desktop-gui-01.png)
+
+**The web wallet** — `extras/wallet-web`, the same interface compiled to wasm.
+Static files and nothing else: no server code and no proxy, the browser talking
+straight to a node. Wallets live in the browser's IndexedDB, which the browser
+may clear, so it says so until they have been exported. Here it is watching a
+receive land.
+
+![The web wallet's overview in a browser: 12.4567 WOW locked, when it unlocks, a QR code, and an incoming transfer with 2 confirmations](images/web-wallet-01.png)
+
+In a browser a node must also allow requests from web pages, so the node list
+grows a Browser column and says in full why each one could not be reached.
+
+![The web wallet's node settings, with a Browser column and CORS failures explained underneath](images/web-wallet-02.png)
+
+Both are in [`extras/`](extras/README.md), a Cargo workspace of its own, so the
+node and the command-line wallets never build egui or wasm-bindgen.
+
 ## Status
 
 | Milestone | Scope | State |
 |---|---|---|
 | **M1** | Wire parity: crypto primitives, serialization, block/tx types, hashes, RandomWOW | **complete; gate met** |
-| **M2** | Verifying sync on mainnet (PoW, difficulty, LMDB store) | **syncs from live C++ peers**; CryptoNight v2/v4 missing |
-| **M3** | Serving node (daemon RPC, mempool, P2P) | **built**: inbound and outbound P2P, sync from several peers at once, IPv6, Dandelion++ relay, reorgs, admin RPC and login, RPC over TLS; exercised between local daemons, not yet as a long-running node on mainnet |
-| **M4** | Wallet (CLI + RPC) | **built and working against public nodes**; sending untested for want of funds |
+| **M2** | Verifying sync on mainnet (PoW, difficulty, LMDB store) | **synced to the mainnet tip** from live C++ peers, into LMDB; CryptoNight v2/v4 missing, so blocks below the last checkpoint are taken on its word |
+| **M3** | Serving node (daemon RPC, mempool, P2P) | **built, and now running on mainnet**: inbound and outbound P2P, sync from several peers at once, IPv6, Dandelion++ relay, reorgs, admin RPC and login, RPC over TLS. Over a day at the tip with twelve outgoing peers; inbound peers and the rest still only between local daemons |
+| **M4** | Wallet (CLI, RPC, desktop GUI, web) | **built, and it has moved real money**: a payment signed, relayed and confirmed on mainnet, and a receive watched land |
 | M5 | Mining and the long tail | **mining built** (templates, the HF 18 signing miner, `generateblocks`), exercised on regtest only; of the long tail, only the ZMQ RPC and publisher are built |
 
 ### Verified against the live network
 
-Against `node2.monerodevs.org:34568` and the mainnet seed nodes, with no local
-chain:
+Against public nodes — `https://wow-node.0z.network:443`,
+`node2.monerodevs.org:34568` — and the mainnet seed nodes:
 
 * **Wallet** — create, restore from seed (same address reproduced), refresh,
-  balance, address, and `transfer` refusing correctly for want of funds. Both
-  `wownero-wallet-cli` and `wownero-wallet-rpc`.
+  balance, address, subaddresses and history, in all four front ends:
+  `wownero-wallet-cli`, `wownero-wallet-rpc`, the desktop GUI and the web
+  wallet.
+* **Sending real money** — a payment built, signed, relayed and confirmed on
+  mainnet, and a receive watched land in another wallet. The screenshots above
+  are of that.
 * **Ring construction** — the output distribution (2.9 M RingCT outputs) and
   ring members fetched and well formed. This is what a *send* depends on.
 * **Relay** — `/send_raw_transaction` answers, and refuses a malformed
   transaction as a structured value rather than a transport error.
-* **Node sync** — `wownerod --sync-from <host:port>` handshakes with C++ peers
-  and applies blocks continuously. Roughly 11 blocks/s, ~78% of it waiting on
-  the peer, so a full sync is many hours; point the wallet at a public node
-  instead unless you specifically want your own chain.
+* **Node sync** — `wownerod` handshakes with C++ peers, applies blocks
+  continuously, and has reached and held the network's tip: a full mainnet
+  chain of its own in LMDB, 6.64 GiB at height 874,341. Proofs of work are
+  checked above the last checkpoint only, until CryptoNight v2 and v4 land.
+  A sync from scratch is many hours — roughly 11 blocks/s, ~78% of it waiting
+  on the peer — so point a wallet at a public node unless you specifically want
+  your own chain.
 
 Run the live checks yourself:
 
@@ -61,14 +107,16 @@ Run the live checks yourself:
 WOW_LIVE_NODE=node2.monerodevs.org:34568   cargo test -p wow-daemon-client --test live_node -- --ignored --nocapture
 ```
 
-**Not verified, and it needs coins:** signing and confirming a real payment,
-sweep, and watching a receive land. Everything up to the signature is checked.
+**Not verified:** sweeps — `sweep_all`, and sweeping a single output. Both are
+built; neither has been run against mainnet.
 
-**Built, but only exercised between local daemons:** `wownerod --serve` as a
-long-running node — inbound peers, syncing from several peers at once, IPv6,
-Dandelion++ relay, fluffy blocks, reorgs, the admin and mining RPC, HTTP Digest
-login, RPC over TLS, the ZMQ RPC and publisher — and the miner, on regtest.
-None of it has yet run for long against live C++ peers.
+**Built, and run on mainnet:** `wownerod --serve` as a long-running node —
+outbound peers, syncing from several at once, fluffy blocks, the peer store, and
+at least one alternative block filed off the main chain.
+
+**Built, but still only exercised between local daemons:** inbound peers, IPv6,
+Dandelion++ relay, reorgs, the admin and mining RPC, HTTP Digest login, RPC over
+TLS, the ZMQ RPC and publisher — and the miner, on regtest.
 
 **Not built:** in the wallets, transaction proofs, key-image import/export and
 multiple accounts; in the daemon, proxies and i2p/Tor, rate limits, pruning,
@@ -153,14 +201,12 @@ most Wownero-specific rule is covered without generating anything.
     bounds, sorted inputs, minimum age, RingCT type gating, and the HF 16–17
     dynamic coinbase unlock **checked against real blocks**.
 
-### What M2 still needs
-
 * **`wow-storage`** — the LMDB layer, byte-compatible with the C++ `data.mdb`
-  ([`specs/10`](specs/10-storage-lmdb.md)). The file format is **done**: all
-  nineteen sub-databases open with their exact flags and comparators, every
-  record type in §4 encodes and decodes byte-for-byte, and the environment
-  reproduces `BlockchainLMDB::open` — paths, `--db-sync-mode` flags, map-size
-  arithmetic, the `hf_starting_heights` drop, and the schema-version check.
+  ([`specs/10`](specs/10-storage-lmdb.md)). All nineteen sub-databases open with
+  their exact flags and comparators, every record type in §4 encodes and decodes
+  byte-for-byte, and the environment reproduces `BlockchainLMDB::open` — paths,
+  `--db-sync-mode` flags, map-size arithmetic, the `hf_starting_heights` drop,
+  and the schema-version check.
 
   Built in the order [`specs/15`](specs/15-testing-and-conformance.md) §3.3
   insists on, comparators first. A wrong `compare_hash32` corrupts nothing and
@@ -169,33 +215,43 @@ most Wownero-specific rule is covered without generating anything.
   that proves the ordering differs from bytewise in the direction the C++
   requires.
 
-  The `BlockchainDb` trait (§9) is defined — the seam the spec asks for, kept
-  object-safe so `wow-core` can hold an `Arc<dyn BlockchainDb>` and a test
-  double can stand in for LMDB. The §5 semantics the format *cannot* enforce
-  are implemented and tested: the coinbase-first id assignment order, ids as
-  table entry counts rather than stored counters, and the commitment rules —
-  including that a v2 coinbase output is filed under **amount zero** with an
-  identity-mask commitment, and that an RCT type 8 commitment is multiplied by
-  eight on the way in because the wire form is `C/8`.
-
-  What remains is the LMDB implementation of the trait's methods, which lands
-  alongside `wow-core` since the two are written against each other.
+  The `BlockchainDb` trait (§9) is the seam the spec asks for, kept object-safe
+  so `wow-core` can hold an `Arc<dyn BlockchainDb>` and a test double can stand
+  in for LMDB. The §5 semantics the format *cannot* enforce are implemented and
+  tested: the coinbase-first id assignment order, ids as table entry counts
+  rather than stored counters, and the commitment rules — including that a v2
+  coinbase output is filed under **amount zero** with an identity-mask
+  commitment, and that an RCT type 8 commitment is multiplied by eight on the
+  way in because the wire form is `C/8`. The LMDB implementation of the trait
+  landed with `wow-core`; the 6.64 GiB of mainnet chain in the screenshot above
+  is it.
 * **`wow-p2p`** — the Levin codec, peer list and block sync
-  ([`specs/08`](specs/08-p2p.md)).
-* **`wow-core`** — the `Blockchain` state machine that drives all of the above.
-* **CryptoNight v1/v2/v4**, to verify pre-HF-13 proofs of work from genesis.
+  ([`specs/08`](specs/08-p2p.md)), which grew into the whole node under M3.
+* **`wow-core`** — the `Blockchain` state machine that drives all of the above:
+  validation, alternative chains and reorgs.
+
+### What M2 still needs
+
+* **CryptoNight v2 and v4**, to verify pre-HF-13 proofs of work from genesis.
   [`specs/03`](specs/03-pow.md) §2 allows deferring it this far, and a node that
-  syncs from a checkpoint never needs it.
+  syncs from a checkpoint never needs it — which is how the node in the
+  screenshot reached the tip. The gap is explicit rather than silent: a
+  pre-HF-13 proof that is not skipped returns
+  `PowError::CryptoNightNotImplemented` instead of being waved through, since a
+  node that quietly skipped those would sync a chain nobody else agrees with.
 
-  **v0 is done** — it is a different job from the other three. Wownero's genesis
-  is already major version 7, so v0 never mined a block; what it does is derive
-  the wallet-file key ([`specs/02`](specs/02-crypto.md) §7), which is the first
-  thing standing between a Rust wallet and a `.keys` file the C++ wallet wrote.
-  It passes the reference tree's four `tests-slow.txt` vectors, and each of
-  BLAKE-256, Grøstl-256, JH-256 and Skein-256 passes its own 321.
+  **v0 and v1 are done.** v0 never mined a block — Wownero's genesis is already
+  major version 7 — but it derives the wallet-file key
+  ([`specs/02`](specs/02-crypto.md) §7), which is the first thing standing
+  between a Rust wallet and a `.keys` file the C++ wallet wrote. v1 is the
+  chain's own, for HF 7–8. They pass the reference tree's four `tests-slow.txt`
+  vectors and the five in `tests-slow-1.txt`, and each of BLAKE-256, Grøstl-256,
+  JH-256 and Skein-256 passes its own 321. `tests-slow-2.txt` and
+  `tests-slow-4.txt` are vendored and waiting.
 
-The M2 gate is a full mainnet sync from genesis with zero differ mismatches, so
-it cannot close until those land.
+The M2 gate is a full mainnet sync **from genesis** with zero differ mismatches.
+The node reaches the tip today by taking the checkpoints below HF 13 on trust,
+so the gate stays open until v2 and v4 land.
 
 ## Layout
 
@@ -220,6 +276,9 @@ crates/
   wow-daemon-client/ wallet-side daemon RPC client                    [M4]
 bin/
   wownerod/  wownero-wallet-cli/  wownero-wallet-rpc/
+extras/              a Cargo workspace of its own; see extras/README.md
+  wallet-gui/        the desktop wallet on egui: Linux, Windows, macOS
+  wallet-web/        the same interface as wasm: static files, no server
 tests/corpus/        test vectors and blobs; see tests/corpus/README.md
 scripts/             corpus generation (blocks, difficulty windows, weights, unlock ids)
 ```
@@ -235,6 +294,9 @@ cargo fmt --all --check
 # Slow checks, excluded from the default run:
 cargo test -p wow-randomwow --release -- --ignored   # ~2.3 GiB dataset build
 ```
+
+The desktop and web wallets are built separately, in Docker or by hand:
+[`extras/README.md`](extras/README.md) has both.
 
 A Rust toolchain and a C compiler are all it needs. LMDB, built by
 `lmdb-master-sys`, is the only code that is not Rust; RandomWOW, which used to
@@ -286,6 +348,13 @@ git clone https://github.com/wownero-project/wownero.git reference/wownero
 git -C reference/wownero checkout 9f4f22c72
 git -C reference/wownero submodule update --init external/randomwow
 ```
+
+## Donate
+
+If any of this was useful to you:
+
+* **Wownero** — `So1e4FFiHd6aizfQRyYBm4Dj3nUgP78Y2Re6iN8HYBSLh2qZTfnJQ6sBnnTJtaPqQFA1z9sKeTJnQ7ZwMzaSzMMRJv1NiHmoB522xXvtS8MQ`
+* **Monero** — `4Hh8CAoojaYFZPjA9R7ndGMV6kjLMg1dqKAceg6eJxSp9QUtUpY4Do6QF3931WYSSMVVCY6u6BtCjKMEAzbnZgsmJKJQvfUazBDRK9j4AM`
 
 ## Licence
 

@@ -113,7 +113,8 @@ pub const fn quantize_up(v: u64) -> u64 {
 /// The ambient blockchain state `check_fee` reads (`specs/06` §6.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FeeContext {
-    /// `get_current_hard_fork_version()` — the **tip's** version.
+    /// `get_current_hard_fork_version()` — the version the **next** block must
+    /// carry, not the tip block's.
     pub version: u8,
     /// `m_current_block_cumul_weight_limit`. `check_fee` uses `limit / 2`.
     pub cumulative_weight_limit: u64,

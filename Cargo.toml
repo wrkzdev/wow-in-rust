@@ -15,10 +15,14 @@ members = [
     "crates/wow-rpc-server",
     "crates/wow-wallet",
     "crates/wow-daemon-client",
+    "crates/wow-tls",
     "bin/wownerod",
     "bin/wownero-wallet-cli",
     "bin/wownero-wallet-rpc",
 ]
+# The GUI and web wallets are a workspace of their own (extras/Cargo.toml), so
+# nothing here builds egui or wasm-bindgen.
+exclude = ["extras"]
 
 [workspace.package]
 version = "0.11.4"
@@ -41,6 +45,7 @@ wow-zmq = { path = "crates/wow-zmq" }
 wow-rpc-types = { path = "crates/wow-rpc-types" }
 wow-daemon-client = { path = "crates/wow-daemon-client" }
 wow-wallet = { path = "crates/wow-wallet" }
+wow-tls = { path = "crates/wow-tls" }
 
 curve25519-dalek = { version = "4.1.3", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 subtle = { version = "2.5", default-features = false }
@@ -49,12 +54,16 @@ lmdb-master-sys = "0.2"
 libc = "0.2"
 # IPv6-only listeners, so IPv4 and IPv6 can share a port (`wow-p2p::net`).
 socket2 = "0.6"
-# RPC over TLS (`wownerod`'s `rpc::tls`), on a rustls CryptoProvider made of
-# pure-Rust RustCrypto crates (`rpc::tls::provider`): no C, C++ or assembly,
-# so neither ring nor aws-lc-rs. All of one generation (digest 0.10,
-# signature 2, rand_core 0.6): the one `rsa` 0.9, its stable release, uses.
+# RPC over TLS (`wownerod`'s `rpc::tls`), and a wallet's TLS to a node
+# (`wow-daemon-client`), on a rustls CryptoProvider made of pure-Rust
+# RustCrypto crates (`wow-tls`): no C, C++ or assembly, so neither ring nor
+# aws-lc-rs. All of one generation (digest 0.10, signature 2, rand_core 0.6):
+# the one `rsa` 0.9, its stable release, uses.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem"] }
+# The roots a wallet checks an https:// node's certificate against: Mozilla's,
+# as data, so the check is the same on every system.
+webpki-roots = "1.0"
 sha2 = { version = "0.10", default-features = false, features = ["oid"] }
 hmac = "0.12"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
@@ -64,13 +73,18 @@ p384 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "pkcs8", "zeroize"] }
 x25519-dalek = { version = "2.0", default-features = false, features = ["precomputed-tables", "zeroize"] }
 # Signing with RSA keys, which the C++ generates and users bring. Blinded, but
-# not constant-time: RUSTSEC-2023-0071. See `rpc::tls::provider`.
+# not constant-time: RUSTSEC-2023-0071. See `wow-tls`'s provider.
 rsa = { version = "0.9.10", default-features = false, features = ["pem", "std", "u64_digit"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 time = "0.3"
 serde_json = "1.0"
 thiserror = "1.0"
 hex = "0.4"
+# The node's console and the wallet's prompt: line editing, and up and down
+# through the commands typed before. Without its default features: no history
+# file (nothing typed at a wallet is written to disk), no custom key bindings,
+# no home-directory lookup.
+rustyline = { version = "18.0", default-features = false }
 
 [profile.release]
 opt-level = 3

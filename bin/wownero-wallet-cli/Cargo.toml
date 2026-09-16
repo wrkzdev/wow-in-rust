@@ -15,9 +15,11 @@ wow-crypto.workspace = true
 wow-types.workspace = true
 wow-wallet.workspace = true
 wow-daemon-client.workspace = true
+wow-log.workspace = true
 wow-serialize.workspace = true
 serde_json.workspace = true
 curve25519-dalek.workspace = true
+rustyline.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "wownero-wallet-web"
+description = "The Wownero web wallet: the GUI wallet's interface on a canvas, and its wallet in a web worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# For wasm32-unknown-unknown only. On any other target the crate is empty, so a
+# plain `cargo check` of the workspace passes over it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wownero-wallet-gui = { path = "../wallet-gui" }
+wow-daemon-client = { path = "../../crates/wow-daemon-client" }
+wow-wallet = { path = "../../crates/wow-wallet" }
+wow-log = { path = "../../crates/wow-log" }
+
+eframe = { version = "0.31", features = ["persistence"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3.70", features = ["HtmlCanvasElement"] }

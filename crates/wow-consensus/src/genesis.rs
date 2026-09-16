@@ -14,7 +14,9 @@
 //! schema matches, the tip reads back, and the chain simply disagrees with
 //! everyone.
 
-use wow_types::{Block, Network};
+use wow_types::{Block, Difficulty, Network};
+
+use crate::emission::{get_block_reward, validate_miner_reward};
 
 /// `GENESIS_TX` — the coinbase blob, as hex, for each network.
 const MAINNET_GENESIS_TX: &str = "013c01ff0001ffffffffff1f029b2e4c0281c0b02e7c53291a94d1d0cbff8883f8024f5142ee494ffbbd08807121012a1a936be5d91c01ee876e38c13fab0ee11cbe86011a2bf7740fb5ebd39d267d";
@@ -87,6 +89,58 @@ pub fn genesis_id(network: Network) -> wow_crypto::types::Hash256 {
         .expect("the genesis block hashes")
 }
 
+/// The genesis block's `block_info` record — see [`genesis_record`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenesisRecord {
+    pub weight: u64,
+    pub long_term_weight: u64,
+    pub cumulative_difficulty: Difficulty,
+    pub already_generated_coins: u64,
+}
+
+/// What the C++ stores for height 0.
+///
+/// `Blockchain::init` adds the genesis block with `add_new_block`, the same
+/// path as every other block, so the record holds what
+/// `handle_block_to_main_chain` computes for it:
+///
+/// * `weight` — `get_transaction_weight(miner_tx)`, the **coinbase's** size,
+///   not the block's: 79 bytes on mainnet, where the block is 119.
+/// * `long_term_weight` — the same, since version 7 predates
+///   `HF_VERSION_LONG_TERM_BLOCK_WEIGHT`.
+/// * `cumulative_difficulty` — 1, the first block's difficulty.
+/// * `already_generated_coins` — what the genesis coinbase pays: `2^40 - 1`
+///   on mainnet.
+///
+/// # Why the coins matter
+///
+/// Block 1's reward is `(MONEY_SUPPLY - already_generated_coins) >> 20`, and
+/// every later total builds on this one. Recording 0 makes every reward about
+/// `2^20` atomic units too large. HF 7–15 accept a coinbase that claims less
+/// than the reward, which hides the error for 253,998 blocks; HF 16 requires
+/// the exact amount and refuses the real block at 253,999.
+pub fn genesis_record(network: Network) -> GenesisRecord {
+    let (tx_hex, _) = parts(network);
+    let weight = (tx_hex.len() / 2) as u64;
+    let block = genesis_block(network);
+    let version = block.header.major_version;
+    let claimed = block.miner_tx.prefix.vout.iter().map(|o| o.amount).sum();
+
+    // The same arithmetic as any other block: the reward on an empty chain,
+    // then the part of it the coinbase claimed.
+    let base = get_block_reward(0, weight, 0, version)
+        .expect("the genesis coinbase is far below the weight limit");
+    let reward = validate_miner_reward(version, base, 0, claimed)
+        .expect("the genesis coinbase claims no more than the reward");
+
+    GenesisRecord {
+        weight,
+        long_term_weight: weight,
+        cumulative_difficulty: 1,
+        already_generated_coins: reward.adjusted_base_reward,
+    }
+}
+
 /// Which network a `data.mdb` belongs to, from its `blocks[0]` hash.
 ///
 /// `None` when the hash matches no network, which is the case worth refusing
@@ -116,6 +170,52 @@ mod tests {
     #[test]
     fn the_mainnet_genesis_id_matches_the_chain() {
         assert_eq!(hex::encode(&genesis_id(Network::Mainnet)), MAINNET_ID);
+    }
+
+    /// What a synced C++ node reports for height 0:
+    /// `get_block_header_by_height(0)` gives `block_weight` 79,
+    /// `long_term_weight` 79, `cumulative_difficulty` 1 and `reward`
+    /// 1,099,511,627,775.
+    #[test]
+    fn the_mainnet_genesis_record_matches_the_chain() {
+        assert_eq!(
+            genesis_record(Network::Mainnet),
+            GenesisRecord {
+                weight: 79,
+                long_term_weight: 79,
+                cumulative_difficulty: 1,
+                already_generated_coins: (1 << 40) - 1,
+            }
+        );
+
+        // Every network records what its coinbase pays, and weighs the
+        // coinbase rather than the block.
+        for n in [Network::Mainnet, Network::Testnet, Network::Stagenet] {
+            let record = genesis_record(n);
+            let paid: u64 = genesis_block(n)
+                .miner_tx
+                .prefix
+                .vout
+                .iter()
+                .map(|o| o.amount)
+                .sum();
+            assert_eq!(record.already_generated_coins, paid, "{n:?}");
+            assert_eq!(record.weight, genesis_blob(n).len() as u64 - 40, "{n:?}");
+        }
+    }
+
+    /// Block 1 (81 bytes) pays 17,592,184,995,840 on the chain: exactly the
+    /// reward the genesis record leaves. A record of 0 coins makes it 1,048,575
+    /// more, which HF 7 passes as an under-claim and HF 16 refuses — the bug
+    /// that stopped a sync at height 253,999.
+    #[test]
+    fn block_one_pays_what_the_genesis_record_leaves() {
+        let coins = genesis_record(Network::Mainnet).already_generated_coins;
+        assert_eq!(get_block_reward(0, 81, coins, 7), Ok(17_592_184_995_840));
+        assert_eq!(
+            get_block_reward(0, 81, 0, 7),
+            Ok(17_592_184_995_840 + 1_048_575)
+        );
     }
 
     /// Genesis carries version **7**, not 1 — the fact

@@ -8,14 +8,23 @@
 //!
 //! A wallet does not ask for a height. It sends a **short chain history** —
 //! its last ten block hashes, then exponentially spaced ones, then genesis —
-//! and this endpoint answers from the first hash it recognises. A wallet on a
-//! chain that no longer exists gets blocks from before the split without ever
-//! having to ask whether there was one.
+//! and this endpoint answers from the newest of those hashes it has. A wallet
+//! on a chain that no longer exists gets blocks from before the split without
+//! ever having to ask whether there was one.
 //!
-//! `start_height` in the request is a fallback for a wallet with no history
-//! yet. When the history matches nothing, the reference restarts from genesis
-//! rather than honouring `start_height`, and so does this: honouring it would
-//! let a wallet skip blocks it has never seen, which is how money goes missing.
+//! The answer starts **at** that block, not after it, so its first block is
+//! one the wallet already holds. The reference sends it "just to make other
+//! side be sure", and a wallet compares it rather than scanning it again. A
+//! history that does not end at genesis is refused, and one whose newest hash
+//! is the top block gets no blocks at all.
+//!
+//! `start_height` overrides all of that when it is above zero: the reference
+//! then answers from that height and never looks at the history
+//! (`Blockchain::find_blockchain_supplement`). This answered one block later
+//! and ignored `start_height`, and a wallet that only ever met this daemon
+//! treated every batch from a real one as a reorg. Refusing a gap is the
+//! wallet's job; a daemon that differs from the reference only hides a
+//! wallet's bugs until it meets one.
 //!
 //! # Two ways a `Vec<u64>` reaches the wire
 //!
@@ -32,6 +41,7 @@
 //! because a mismatch here does not look like an error — it looks like a
 //! wallet that decided to rescan.
 
+use wow_crypto::types::Hash256;
 use wow_serialize::epee::{self, Array, Section, Value};
 use wow_storage::db::BlockchainDb;
 use wow_storage::lmdb::LmdbDb;
@@ -82,61 +92,93 @@ fn db_error(e: impl std::fmt::Display) -> RpcError {
     RpcError::new(error::INTERNAL_ERROR, e.to_string())
 }
 
-/// Where the wallet's history and our chain agree, as a height to resume from.
-///
-/// Returns one past the highest hash we recognise, or 0 when we recognise
-/// none — which means "start from genesis", not "start from wherever the
-/// request suggested".
-fn split_height(db: &LmdbDb, block_ids: &[u8]) -> Result<u64, RpcError> {
-    if !block_ids.len().is_multiple_of(32) {
+/// A request's `block_ids`, refusing a blob no wallet would send.
+fn block_ids(request: &Section) -> Result<Vec<Hash256>, RpcError> {
+    let blob = request
+        .get("block_ids")
+        .and_then(Value::as_bytes)
+        .unwrap_or(&[]);
+    if !blob.len().is_multiple_of(32) {
         return Err(RpcError::new(
             error::WRONG_PARAM,
             "block_ids is not a whole number of hashes",
         ));
     }
-    let count = block_ids.len() / 32;
+    let count = blob.len() / 32;
     if count > MAX_BLOCK_IDS {
         return Err(RpcError::new(
             error::WRONG_PARAM,
             format!("block_ids has {count} entries, more than {MAX_BLOCK_IDS}"),
         ));
     }
+    Ok(blob.as_chunks::<32>().0.to_vec())
+}
 
-    // Newest first, so the first match is the deepest agreement.
-    for hash in block_ids.as_chunks::<32>().0 {
-        if let Ok(h) = db.get_block_height(hash) {
-            return Ok(h + 1);
-        }
+/// Where an answer to a short chain history starts:
+/// `Blockchain::find_blockchain_supplement`.
+///
+/// The history must end at this chain's genesis, and the answer starts at the
+/// newest hash in it this chain has, **including** that block:
+///
+/// ```cpp
+/// //we start to put block ids INCLUDING last known id, just to make other side be sure
+/// starter_offset = split_height;
+/// ```
+///
+/// `None` is the reference's `return false`, which its endpoints answer with
+/// `status: "Failed"`.
+pub(crate) fn supplement_start(db: &LmdbDb, ids: &[Hash256]) -> Option<u64> {
+    let genesis = db.get_block_hash(0).ok()?;
+    if ids.last() != Some(&genesis) {
+        return None;
     }
-    Ok(0)
+    ids.iter().find_map(|id| db.get_block_height(id).ok())
+}
+
+/// The reference's answer when there is no supplement to give, in its words.
+fn failed() -> RpcError {
+    RpcError::new(error::WRONG_PARAM, "Failed")
 }
 
 /// `/get_blocks.bin` (`specs/11` §5.1).
 fn get_blocks(db: &LmdbDb, request: &Section) -> BinaryResult {
-    let block_ids = request
-        .get("block_ids")
-        .and_then(Value::as_bytes)
-        .unwrap_or(&[]);
+    let ids = block_ids(request)?;
+    let start_height = request
+        .get("start_height")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let no_miner_tx = request
         .get("no_miner_tx")
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
     let height = db.height();
-    let mut from = split_height(db, block_ids)?;
-    // A wallet with no history at all may name a starting height.
-    if block_ids.is_empty() {
-        from = request
-            .get("start_height")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+
+    // `on_get_blocks`' "quick check for noop": the wallet already has the top
+    // block, so there is nothing to send.
+    if let Some(newest) = ids.first() {
+        if height > 0 && db.get_block_hash(height - 1).ok().as_ref() == Some(newest) {
+            let mut res = base_response();
+            res.insert("start_height".into(), Value::U64(0));
+            res.insert("current_height".into(), Value::U64(height));
+            res.insert("daemon_time".into(), Value::U64(now()));
+            res.insert("pool_info_extent".into(), Value::U8(0));
+            return Ok(res);
+        }
     }
-    if from > height {
-        return Err(RpcError::new(
-            error::TOO_BIG_HEIGHT,
-            format!("asked to start at {from}, past the tip at {height}"),
-        ));
-    }
+
+    let from = if start_height > 0 {
+        // `find_blockchain_supplement` refuses a height it does not have yet.
+        if start_height >= height {
+            return Err(RpcError::new(
+                error::TOO_BIG_HEIGHT,
+                format!("asked to start at {start_height}, past the tip at {height}"),
+            ));
+        }
+        start_height
+    } else {
+        supplement_start(db, &ids).ok_or_else(failed)?
+    };
 
     let mut blocks = Vec::new();
     let mut output_indices = Vec::new();
@@ -266,12 +308,13 @@ fn tx_output_indices(db: &LmdbDb, txid: &[u8; 32]) -> Result<Vec<u64>, RpcError>
 }
 
 /// `/get_hashes.bin` — block hashes from a short history, for a fast sync.
+///
+/// From the same split as `get_blocks.bin`, the block both sides have
+/// included. `start_height` in the request is not read: `on_get_hashes` passes
+/// it in, and the split search overwrites it.
 fn get_hashes(db: &LmdbDb, request: &Section) -> BinaryResult {
-    let block_ids = request
-        .get("block_ids")
-        .and_then(Value::as_bytes)
-        .unwrap_or(&[]);
-    let from = split_height(db, block_ids)?;
+    let ids = block_ids(request)?;
+    let from = supplement_start(db, &ids).ok_or_else(failed)?;
     let height = db.height();
 
     let mut packed = Vec::new();

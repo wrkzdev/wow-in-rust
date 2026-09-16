@@ -31,6 +31,7 @@
 //!   detected and reported rather than guessed at.
 //! * Background-sync keys files, which are keyed differently.
 //! * Multisig, which needs the `multisig_signers` blobs.
+//! * Hardware wallets (`key_on_device`), whose spend key is on the device.
 
 use serde_json::{Map, Value as Json};
 use wow_serialize::binary::{Reader, Writer};
@@ -56,8 +57,20 @@ pub enum KeysFileError {
     Account(#[from] AccountError),
     #[error("the keys file is multisig, which is not implemented")]
     Multisig,
+    /// `key_on_device`, a `hw::device::device_type` other than 0.
+    #[error("the keys file belongs to a hardware wallet ({}), which is not implemented", device_name(.0))]
+    OnDevice(u64),
     #[error("`{0}` has the wrong JSON type")]
     BadField(&'static str),
+}
+
+/// `hw::device::device_type`, in which 0 is a software wallet.
+fn device_name(device: &u64) -> &'static str {
+    match device {
+        1 => "Ledger",
+        2 => "Trezor",
+        _ => "an unknown device",
+    }
 }
 
 type Result<T> = std::result::Result<T, KeysFileError>;
@@ -115,6 +128,12 @@ impl KeysFile {
 
         if bool_member(&settings, "multisig").unwrap_or(false) {
             return Err(KeysFileError::Multisig);
+        }
+        // A device wallet's spend key never leaves the device, and key images
+        // and signatures need it. This build cannot talk to one.
+        let device = u64_member(&settings, "key_on_device").unwrap_or(0);
+        if device != 0 {
+            return Err(KeysFileError::OnDevice(device));
         }
 
         let mut account = AccountBase::from_key_data(&key_data)?;
@@ -212,6 +231,45 @@ impl KeysFile {
 
     pub fn seed_language(&self) -> Option<&str> {
         self.settings.get("seed_language")?.as_str()
+    }
+
+    /// `store_tx_info`: whether a sent transaction's destinations and payment
+    /// id are written down. On unless turned off; keys files from before it
+    /// had that name say `store_tx_keys`.
+    pub fn store_tx_info(&self) -> bool {
+        bool_member(&self.settings, "store_tx_info")
+            .or_else(|| bool_member(&self.settings, "store_tx_keys"))
+            .unwrap_or(true)
+    }
+
+    pub fn set_store_tx_info(&mut self, on: bool) {
+        self.settings
+            .insert("store_tx_info".into(), Json::from(u64::from(on)));
+    }
+
+    /// `default_priority`, 0 to 4, where 0 lets the wallet choose. A keys file
+    /// from before the field existed may carry `default_fee_multiplier`, which
+    /// the reference reads in its place.
+    pub fn default_priority(&self) -> u32 {
+        u64_member(&self.settings, "default_priority")
+            .or_else(|| u64_member(&self.settings, "default_fee_multiplier"))
+            .unwrap_or(0) as u32
+    }
+
+    pub fn set_default_priority(&mut self, priority: u32) {
+        self.settings
+            .insert("default_priority".into(), Json::from(priority));
+    }
+
+    /// `auto_low_priority`: whether a transfer with no priority may pay the
+    /// lowest tier when the network is quiet. On unless turned off.
+    pub fn auto_low_priority(&self) -> bool {
+        bool_member(&self.settings, "auto_low_priority").unwrap_or(true)
+    }
+
+    pub fn set_auto_low_priority(&mut self, on: bool) {
+        self.settings
+            .insert("auto_low_priority".into(), Json::from(u64::from(on)));
     }
 
     /// `(major, minor)` lookahead — how many unused subaddresses to precompute.
@@ -429,5 +487,29 @@ mod tests {
             cache,
             chacha::derive_cache_key(&keys_key, chacha::HASH_KEY_WALLET_CACHE)
         );
+    }
+
+    /// A hardware wallet's keys file is refused, as a multisig one is: its
+    /// spend key is on the device, which this build cannot drive.
+    #[test]
+    fn a_hardware_wallet_is_refused() {
+        for (device, name) in [(1u64, "Ledger"), (2, "Trezor"), (7, "unknown")] {
+            let mut kf = KeysFile::new(account(), Network::Mainnet, "English");
+            kf.settings
+                .insert("key_on_device".into(), Json::from(device));
+            let blob = kf.to_blob(b"pw", 1, [1; 8], [2; 8]).expect("write");
+
+            let err = KeysFile::open(&blob, b"pw", 1).expect_err("refused");
+            assert!(
+                matches!(err, KeysFileError::OnDevice(d) if d == device),
+                "got {err:?}"
+            );
+            assert!(err.to_string().contains(name), "{err}");
+        }
+
+        // A software wallet writes 0, and opens.
+        let kf = KeysFile::new(account(), Network::Mainnet, "English");
+        let blob = kf.to_blob(b"pw", 1, [1; 8], [2; 8]).expect("write");
+        KeysFile::open(&blob, b"pw", 1).expect("opens");
     }
 }

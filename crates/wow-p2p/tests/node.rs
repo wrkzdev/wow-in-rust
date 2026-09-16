@@ -68,6 +68,8 @@ fn tx_id(blob: &[u8]) -> Hash256 {
 struct MemCore {
     chain: Mutex<Vec<(Hash256, Vec<u8>)>>,
     pool: Mutex<HashMap<Hash256, Vec<u8>>>,
+    /// Pool transactions that went out to a peer.
+    relayed: Mutex<HashSet<Hash256>>,
     /// Blocks handed to peers that asked for them.
     served: AtomicUsize,
 }
@@ -77,6 +79,7 @@ impl MemCore {
         Arc::new(MemCore {
             chain: Mutex::new(vec![genesis.clone()]),
             pool: Mutex::new(HashMap::new()),
+            relayed: Mutex::new(HashSet::new()),
             served: AtomicUsize::new(0),
         })
     }
@@ -86,6 +89,7 @@ impl MemCore {
         Arc::new(MemCore {
             chain: Mutex::new(other.chain.lock().unwrap().clone()),
             pool: Mutex::new(HashMap::new()),
+            relayed: Mutex::new(HashSet::new()),
             served: AtomicUsize::new(0),
         })
     }
@@ -256,7 +260,21 @@ impl Core for MemCore {
         self.pool.lock().unwrap().keys().copied().collect()
     }
 
-    fn tx_relayed(&self, _ids: &[Hash256]) {}
+    fn tx_relayed(&self, ids: &[Hash256]) {
+        self.relayed.lock().unwrap().extend(ids);
+    }
+
+    /// Everything in the pool that has not gone out yet.
+    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>)> {
+        let relayed = self.relayed.lock().unwrap();
+        self.pool
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| !relayed.contains(*id))
+            .map(|(id, blob)| (*id, blob.clone()))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +399,29 @@ fn a_transaction_reaches_the_peer() {
     b.relay_transaction(id, blob);
 
     wait_until("the transaction at the peer", 60, || a_core.has_tx(&id));
+}
+
+/// A transaction handed over before any peer is synchronised still reaches
+/// one. It went to nobody, so it is not marked relayed, and the pool offers it
+/// again once a peer can take it. It used to be marked relayed all the same,
+/// and stay in the pool for good.
+#[test]
+fn a_transaction_sent_before_any_peer_is_ready_still_goes_out() {
+    let (_a, a_core, b, b_core, _) = pair(3);
+    // Straight after starting, before a handshake could finish.
+    assert_eq!(b.normal_connection_count(), 0);
+
+    let blob = b"a transaction sent before anyone could hear it".to_vec();
+    let id = tx_id(&blob);
+    b_core.pool.lock().unwrap().insert(id, blob.clone());
+    b.relay_transaction(id, blob);
+    assert!(
+        !b_core.relayed.lock().unwrap().contains(&id),
+        "nobody could take it, so it is not relayed"
+    );
+
+    wait_until("the transaction at the peer", 60, || a_core.has_tx(&id));
+    assert!(b_core.relayed.lock().unwrap().contains(&id));
 }
 
 /// The network id is the fork guard: a testnet node gets no connection to a

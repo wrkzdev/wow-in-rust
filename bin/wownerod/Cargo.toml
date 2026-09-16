@@ -22,6 +22,7 @@ wow-p2p.workspace = true
 wow-zmq.workspace = true
 wow-randomwow.workspace = true
 wow-wallet.workspace = true
+wow-tls.workspace = true
 curve25519-dalek.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
@@ -36,8 +37,9 @@ x25519-dalek.workspace = true
 rsa.workspace = true
 rand_core.workspace = true
 time.workspace = true
+rustyline.workspace = true
 
-# `src/signal.rs`: the SIGINT/SIGTERM handler.
+# `src/signal.rs`: the SIGINT/SIGTERM handler, and the terminal's mode.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

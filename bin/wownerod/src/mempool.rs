@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use wow_crypto::types::{Hash256, KeyImage};
-use wow_storage::db::BlockchainDb;
+use wow_storage::db::{BlockchainDb, OutputData};
 use wow_storage::lmdb::LmdbDb;
 use wow_types::tx::{Transaction, TxIn};
 
@@ -49,6 +49,12 @@ const TX_FROM_ALT_BLOCK_LIVETIME: u64 = 7 * 86_400;
 /// so one still in its Dandelion++ stem phase (embargo mean 39 s) is not
 /// handed to a peer that did not get it through the stem.
 const COMPLEMENT_QUIET_SECS: u64 = 120;
+/// `MIN_RELAY_TIME`: a transaction sent to peers is not sent again sooner.
+pub const MIN_RELAY_SECS: u64 = 5 * 60;
+/// `MAX_RELAY_TIME`: nor later than this after the last time.
+pub const MAX_RELAY_SECS: u64 = 4 * 3_600;
+/// `max_relayable_check`: how often the pool is walked for what is due.
+pub const RELAY_CHECK_SECS: u64 = 2 * 60;
 
 /// Why a transaction was not admitted.
 ///
@@ -57,16 +63,32 @@ const COMPLEMENT_QUIET_SECS: u64 = 120;
 /// rather than only that something was wrong.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rejection {
-    TooBig { weight: u64 },
-    FeeTooLow { got: u64, needed: u64 },
-    TxExtraTooBig { len: usize },
-    NonZeroUnlockTime { unlock_time: u64 },
-    DoubleSpend { key_image: KeyImage },
+    TooBig {
+        weight: u64,
+    },
+    FeeTooLow {
+        got: u64,
+        needed: u64,
+    },
+    TxExtraTooBig {
+        len: usize,
+    },
+    NonZeroUnlockTime {
+        unlock_time: u64,
+    },
+    /// `in_pool` is the pooled transaction spending it; `None` means a block
+    /// did.
+    DoubleSpend {
+        key_image: KeyImage,
+        in_pool: Option<Hash256>,
+    },
     AlreadyInPool,
     InvalidInput(String),
     InvalidOutput(String),
     Overspend,
-    TooFewOutputs { count: usize },
+    TooFewOutputs {
+        count: usize,
+    },
     NotParseable(String),
 }
 
@@ -87,9 +109,20 @@ impl Rejection {
                 "the unlock time is {unlock_time}; Wownero does not relay a transaction with a \
                  non-zero unlock time, though one is valid inside a block"
             ),
-            Rejection::DoubleSpend { key_image } => format!(
-                "the output with key image {} has already been spent",
+            Rejection::DoubleSpend {
+                key_image,
+                in_pool: None,
+            } => format!(
+                "the output with key image {} has already been spent in a block",
                 wow_crypto::hex::encode(&key_image.0)
+            ),
+            Rejection::DoubleSpend {
+                key_image,
+                in_pool: Some(tx),
+            } => format!(
+                "the output with key image {} is already being spent by transaction {} in the pool",
+                wow_crypto::hex::encode(&key_image.0),
+                wow_crypto::hex::encode(tx)
             ),
             Rejection::AlreadyInPool => "the transaction is already in the pool".into(),
             Rejection::InvalidInput(w) => format!("an input is not valid: {w}"),
@@ -165,6 +198,10 @@ pub struct TxPool {
     weight: u64,
     /// `--max-txpool-weight`.
     max_weight: u64,
+    /// When each transaction last went out to peers from this process. Not
+    /// saved: a pool loaded at start has everything due to go out again,
+    /// which is what a restart should do.
+    relayed_at: HashMap<Hash256, u64>,
 }
 
 impl Default for TxPool {
@@ -180,6 +217,7 @@ impl TxPool {
             spent: HashMap::new(),
             weight: 0,
             max_weight: MAX_POOL_WEIGHT,
+            relayed_at: HashMap::new(),
         }
     }
 
@@ -231,6 +269,7 @@ impl TxPool {
 
     pub fn remove(&mut self, id: &Hash256) -> Option<PoolEntry> {
         let entry = self.by_id.remove(id)?;
+        self.relayed_at.remove(id);
         self.weight = self.weight.saturating_sub(entry.weight);
         self.spent.retain(|_, owner| owner != id);
         Some(entry)
@@ -282,6 +321,24 @@ impl TxPool {
             dropped += 1;
         }
         dropped
+    }
+
+    /// Refuse a key image a block or a pooled transaction has spent, saying
+    /// which.
+    fn check_unspent(&self, db: &LmdbDb, k_image: &KeyImage) -> Result<(), Rejection> {
+        if db.has_key_image(k_image).unwrap_or(false) {
+            return Err(Rejection::DoubleSpend {
+                key_image: *k_image,
+                in_pool: None,
+            });
+        }
+        match self.spent.get(k_image) {
+            Some(owner) => Err(Rejection::DoubleSpend {
+                key_image: *k_image,
+                in_pool: Some(*owner),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Add a transaction that has already been checked.
@@ -348,11 +405,7 @@ impl TxPool {
         // 5. Key images unspent, on chain and in the pool.
         for input in &tx.prefix.vin {
             if let TxIn::ToKey { k_image, .. } = input {
-                if db.has_key_image(k_image).unwrap_or(false) || self.spent.contains_key(k_image) {
-                    return Err(Rejection::DoubleSpend {
-                        key_image: *k_image,
-                    });
-                }
+                self.check_unspent(db, k_image)?;
             }
         }
 
@@ -362,7 +415,7 @@ impl TxPool {
         }
 
         // 7. Full verification. Not policy: skipping it relays forgeries.
-        verify(db, &tx)?;
+        verify(db, &tx, fee_context.version, now)?;
 
         // The pool has no clock of its own, so a stale entry goes when something
         // else arrives. That is enough: a pool nobody is adding to is a pool
@@ -398,6 +451,7 @@ impl TxPool {
         db: &LmdbDb,
         tx: &Transaction,
         blob: &[u8],
+        hf_version: u8,
         now: u64,
     ) -> Result<Hash256, Rejection> {
         let id = wow_types::hashes::transaction_hash_from_blob(tx, blob)
@@ -407,14 +461,10 @@ impl TxPool {
         }
         for input in &tx.prefix.vin {
             if let TxIn::ToKey { k_image, .. } = input {
-                if db.has_key_image(k_image).unwrap_or(false) || self.spent.contains_key(k_image) {
-                    return Err(Rejection::DoubleSpend {
-                        key_image: *k_image,
-                    });
-                }
+                self.check_unspent(db, k_image)?;
             }
         }
-        verify(db, tx)?;
+        verify(db, tx, hf_version, now)?;
         self.insert(
             id,
             tx,
@@ -502,12 +552,46 @@ impl TxPool {
             .collect()
     }
 
-    pub fn mark_relayed(&mut self, ids: &[Hash256]) {
+    /// These went out to peers at `now`.
+    pub fn mark_relayed(&mut self, ids: &[Hash256], now: u64) {
         for id in ids {
             if let Some(e) = self.by_id.get_mut(id) {
                 e.relayed = true;
+                self.relayed_at.insert(*id, now);
             }
         }
+    }
+
+    /// `get_relayable_transactions`: what is due to go out to peers again.
+    ///
+    /// One never sent from this process goes at once. One sent goes again
+    /// after [`relay_delay`], since a single send can reach no one: a peer
+    /// that drops it, a connection that closes, no peer synchronised at the
+    /// time. One older than half its lifetime is left to expire rather than
+    /// spread again, where a node about to drop it would take it back.
+    pub fn due_for_relay(&self, now: u64) -> Vec<(Hash256, Vec<u8>)> {
+        self.by_id
+            .iter()
+            .filter(|(id, e)| {
+                // A transaction paying no fee is never relayed.
+                if e.do_not_relay || e.fee == 0 {
+                    return false;
+                }
+                let life = if e.kept_by_block {
+                    TX_FROM_ALT_BLOCK_LIVETIME
+                } else {
+                    TX_LIVETIME
+                };
+                if now.saturating_sub(e.receive_time) > life / 2 {
+                    return false;
+                }
+                match self.relayed_at.get(*id) {
+                    None => true,
+                    Some(&last) => now.saturating_sub(last) > relay_delay(last, e.receive_time),
+                }
+            })
+            .map(|(id, e)| (*id, e.blob.clone()))
+            .collect()
     }
 
     /// `flush_txpool`: drop the named transactions, or every one when none are
@@ -517,6 +601,7 @@ impl TxPool {
             let n = self.by_id.len();
             self.by_id.clear();
             self.spent.clear();
+            self.relayed_at.clear();
             self.weight = 0;
             return n;
         }
@@ -620,6 +705,14 @@ impl TxPool {
     }
 }
 
+/// `get_relay_delay`: the wait before sending a transaction again, five minutes
+/// more for every five minutes it had been in the pool when last sent, and at
+/// most four hours.
+fn relay_delay(last_relayed: u64, received: u64) -> u64 {
+    let age = last_relayed.saturating_sub(received);
+    ((age + MIN_RELAY_SECS) / MIN_RELAY_SECS * MIN_RELAY_SECS).min(MAX_RELAY_SECS)
+}
+
 fn fee_rate(e: &PoolEntry) -> f64 {
     if e.weight == 0 {
         0.0
@@ -633,7 +726,7 @@ fn fee_rate(e: &PoolEntry) -> f64 {
 /// This is what makes a pool worth having. A node that admits without verifying
 /// is a node that relays forgeries, and the wallet on the other end cannot tell
 /// the difference until the transaction fails to confirm.
-fn verify(db: &LmdbDb, tx: &Transaction) -> Result<(), Rejection> {
+fn verify(db: &LmdbDb, tx: &Transaction, hf_version: u8, now: u64) -> Result<(), Rejection> {
     use wow_crypto::bulletproofs_plus as bpp;
     use wow_crypto::clsag;
 
@@ -720,6 +813,7 @@ fn verify(db: &LmdbDb, tx: &Transaction) -> Result<(), Rejection> {
                 "a ring member is unknown to this node".into(),
             ));
         }
+        check_ring_members(&keys, slot, db.height(), hf_version, now)?;
 
         let ring: Vec<clsag::RingMember> = keys
             .iter()
@@ -741,6 +835,37 @@ fn verify(db: &LmdbDb, tx: &Transaction) -> Result<(), Rejection> {
     }
 
     Ok(())
+}
+
+/// The outputs one input's ring names, against the chain as it stands: each
+/// one unlocked (`outputs_visitor::handle_output`), and from HF 15 none younger
+/// than `CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE` blocks (`check_tx_inputs`).
+///
+/// A signature over a locked output verifies perfectly, which is why this is a
+/// check of its own -- and why a node that checked only the signature admitted,
+/// and relayed, transactions every C++ node refuses.
+fn check_ring_members(
+    members: &[OutputData],
+    slot: usize,
+    chain_height: u64,
+    hf_version: u8,
+    now: u64,
+) -> Result<(), Rejection> {
+    for m in members {
+        if !wow_consensus::is_tx_spendtime_unlocked(m.unlock_time, chain_height, now) {
+            return Err(Rejection::InvalidInput(format!(
+                "input {slot}: a ring member from block {} is locked (unlock time {})",
+                m.height, m.unlock_time
+            )));
+        }
+    }
+    let newest = members.iter().map(|m| m.height).max().unwrap_or(0);
+    wow_consensus::tx_rules::check_min_output_age(hf_version, newest, chain_height).map_err(|_| {
+        Rejection::InvalidInput(format!(
+            "input {slot}: a ring member from block {newest} is younger than {} blocks",
+            wow_consensus::constants::CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE
+        ))
+    })
 }
 
 /// `sum(pseudoOuts) == sum(outPk) + fee*H`.
@@ -796,6 +921,45 @@ mod tests {
             double_spend_seen: false,
             kept_by_block: false,
         }
+    }
+
+    /// Never sent goes now; sent goes again on a delay that grows with its
+    /// age; kept private or past half its lifetime, it never goes.
+    #[test]
+    fn a_transaction_goes_out_again_on_a_growing_delay() {
+        let t0 = 10_000_000;
+        let mut pool = TxPool::new();
+        pool.by_id.insert(id(1), entry(100, 10, t0));
+        let mut private = entry(100, 10, t0);
+        private.do_not_relay = true;
+        pool.by_id.insert(id(2), private);
+        pool.by_id
+            .insert(id(3), entry(100, 10, t0 - TX_LIVETIME / 2 - 1));
+
+        let due = |pool: &TxPool, now: u64| -> Vec<u8> {
+            let mut ids: Vec<u8> = pool
+                .due_for_relay(now)
+                .iter()
+                .map(|(id, _)| id[0])
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(due(&pool, t0), vec![1], "never sent: at once");
+
+        pool.mark_relayed(&[id(1)], t0);
+        assert!(due(&pool, t0 + MIN_RELAY_SECS).is_empty(), "just sent");
+        assert_eq!(due(&pool, t0 + MIN_RELAY_SECS + 1), vec![1]);
+
+        // Sent again an hour after it arrived: it waits an hour and five
+        // minutes before the next time.
+        pool.mark_relayed(&[id(1)], t0 + 3_600);
+        assert!(due(&pool, t0 + 7_200).is_empty());
+        assert_eq!(relay_delay(t0 + 3_600, t0), 3_600 + MIN_RELAY_SECS);
+        assert_eq!(relay_delay(t0 + 86_400, t0), MAX_RELAY_SECS, "capped");
+
+        pool.remove(&id(1));
+        assert!(pool.relayed_at.is_empty(), "forgotten with the transaction");
     }
 
     /// A transaction mined in a block leaves the pool, and so does one that
@@ -878,6 +1042,39 @@ mod tests {
     }
 
     /// Relative offsets accumulate; the first is absolute.
+    /// A ring member still locked, or too young, is refused however good the
+    /// signature over it, as `handle_output` and `check_tx_inputs` refuse it.
+    /// Checking only the signature let this node admit and relay transactions
+    /// every C++ node turned away.
+    #[test]
+    fn locked_or_young_ring_members_are_refused() {
+        const HEIGHT: u64 = 1_000;
+        const NOW: u64 = 1_700_000_000;
+        let member = |height, unlock_time| OutputData {
+            pubkey: [0; 32],
+            unlock_time,
+            height,
+            commitment: None,
+        };
+
+        // Unlocked, including a coinbase whose unlock height has passed.
+        let fine = [member(900, 0), member(10, 0), member(700, 988)];
+        assert!(check_ring_members(&fine, 0, HEIGHT, 20, NOW).is_ok());
+
+        // A coinbase still inside its 288 blocks.
+        let locked = [member(900, 0), member(950, 950 + 288)];
+        let e = check_ring_members(&locked, 1, HEIGHT, 20, NOW).expect_err("locked");
+        assert!(
+            matches!(&e, Rejection::InvalidInput(why) if why.contains("input 1") && why.contains("locked")),
+            "{e:?}"
+        );
+
+        // Four blocks old is old enough and three is not, from HF 15.
+        assert!(check_ring_members(&[member(HEIGHT - 4, 0)], 0, HEIGHT, 20, NOW).is_ok());
+        assert!(check_ring_members(&[member(HEIGHT - 3, 0)], 0, HEIGHT, 20, NOW).is_err());
+        assert!(check_ring_members(&[member(HEIGHT - 3, 0)], 0, HEIGHT, 14, NOW).is_ok());
+    }
+
     #[test]
     fn key_offsets_are_relative() {
         assert_eq!(to_absolute(&[5]), Some(vec![5]));
@@ -957,6 +1154,7 @@ mod tests {
             Rejection::NonZeroUnlockTime { unlock_time: 5 },
             Rejection::DoubleSpend {
                 key_image: KeyImage([1u8; 32]),
+                in_pool: None,
             },
             Rejection::AlreadyInPool,
             Rejection::Overspend,
@@ -970,6 +1168,7 @@ mod tests {
         // Each one sets its own flag and no other.
         let d = Rejection::DoubleSpend {
             key_image: KeyImage([1u8; 32]),
+            in_pool: None,
         };
         let set: Vec<&str> = d
             .flags()
@@ -978,6 +1177,21 @@ mod tests {
             .map(|(n, _)| *n)
             .collect();
         assert_eq!(set, vec!["double_spend"]);
+
+        // A double spend says where the first spend is, so a wallet that did
+        // not send it can be told which transaction to look for.
+        assert!(d.reason().contains("in a block"), "{}", d.reason());
+        let pooled = Rejection::DoubleSpend {
+            key_image: KeyImage([1u8; 32]),
+            in_pool: Some([0x3a; 32]),
+        };
+        assert!(
+            pooled
+                .reason()
+                .contains(&format!("by transaction {} in the pool", "3a".repeat(32))),
+            "{}",
+            pooled.reason()
+        );
 
         // `tx_extra_too_big` is separate because it is not in the flag array.
         assert!(Rejection::TxExtraTooBig { len: 2_000 }.tx_extra_too_big());

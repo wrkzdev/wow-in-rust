@@ -67,12 +67,14 @@ The DB stores the applied version per height (`hf_versions`) so that a restart o
 a reorg reproduces the same versions; see [10 §4.11](10-storage-lmdb.md).
 
 > **Caveat that matters for validation order.** Several places in the C++ call
-> `get_current_hard_fork_version()` — the version at the *current tip* — where a
-> reader would expect the version at the block being validated. This affects
-> `get_difficulty_for_next_block` (which picks the difficulty algorithm by the
-> tip's version, see [07 §3](07-difficulty.md)) and `check_fee` /
-> `check_block_timestamp`. Reproduce the C++ call sites exactly; do not
-> "correct" them to use the candidate block's height.
+> `get_current_hard_fork_version()`, which reads as "the version at the current
+> tip" but is not. `HardFork::add` advances it to the version of the *next*
+> height as each block is stored, so while the block at height `H` is validated
+> it returns the version at `H`. This affects `get_difficulty_for_next_block`
+> (which picks the difficulty algorithm by it, see [07 §3](07-difficulty.md)),
+> `check_fee` and `check_block_timestamp`. Reading the tip block's version
+> instead picks the wrong difficulty algorithm on the first block of six
+> mainnet forks (6969, 53,666, 63,469, 81,769, 331,170, 514,000).
 
 ---
 
@@ -122,7 +124,8 @@ window = if version >= 10 { 11 }  else { 60 }           # blocks
 - If `chain_height >= window`: `block.timestamp >= median(last `window`
   timestamps)`.
 
-`version` here is `get_current_hard_fork_version()` (the tip's version).
+`version` here is `get_current_hard_fork_version()` — the version at the height
+being validated (§1).
 
 ### 2.2 Adjusted time
 
@@ -745,9 +748,16 @@ original `tree_hash_cnt`). Full analysis and its interaction with fast-sync:
 HF 7–15 allowed under-claiming the coinbase; `already_generated_coins` recorded
 the claimed amount. §3.3.
 
-### 9.4 `get_current_hard_fork_version()` used where the block's own version is expected
+### 9.4 `get_current_hard_fork_version()` is the next block's version, not the tip's
 
-Affects difficulty algorithm selection, `check_fee`, timestamp windows. §1.
+`BlockchainDB::add_block` ends with `m_hardfork->add(blk, height)`, and
+`HardFork::add` moves to `get_voted_fork_index(height + 1)`. So while the block
+at height `H` is validated, the "current" version is the one at `H`. It selects
+the difficulty algorithm and window, the timestamp window and future limit, and
+`check_fee`. Reading the tip block's version (`H - 1`) instead picks the wrong
+difficulty algorithm on the first block of six mainnet forks: 6969, 53,666,
+63,469, 81,769, 331,170 and 514,000. `tests/corpus/difficulty` pins all six.
+§1.
 
 ### 9.5 `get_ideal_version` skips table index 0
 

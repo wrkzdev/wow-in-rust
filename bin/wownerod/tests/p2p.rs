@@ -148,13 +148,14 @@ fn build_chain(data_dir: &Path, n: u64) -> Hash256 {
 
     let genesis = wow_consensus::genesis::genesis_blob(NET);
     let g = Block::from_blob(&genesis).unwrap();
+    let record = wow_consensus::genesis::genesis_record(NET);
     db.add_block(
         &g,
         &genesis,
-        genesis.len() as u64,
-        genesis.len() as u64,
-        1,
-        0,
+        record.weight,
+        record.long_term_weight,
+        record.cumulative_difficulty,
+        record.already_generated_coins,
         &[],
     )
     .unwrap();

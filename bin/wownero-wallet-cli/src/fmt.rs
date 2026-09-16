@@ -25,6 +25,40 @@ pub fn amount(atomic: u64) -> String {
     format!("{whole}.{frac:0width$}", width = DECIMALS as usize)
 }
 
+/// A time the way `get_human_readable_timestamp` prints it:
+/// `YYYY-MM-DD HH:MM:SS` in UTC, or `<unknown>` for one before 2009.
+pub fn timestamp(ts: u64) -> String {
+    if ts < 1_234_567_890 {
+        return "<unknown>".into();
+    }
+    let secs = ts % 86_400;
+    // `civil_from_days`, from Howard Hinnant's date algorithms.
+    let z = (ts / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        secs / 3_600,
+        secs / 60 % 60,
+        secs % 60
+    )
+}
+
+/// A span of seconds: `45s`, `4m 52s`, `2h 05m`.
+pub fn duration(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3_600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3_600, secs / 60 % 60),
+    }
+}
+
 /// Parse an amount as a user types it.
 ///
 /// Accepts a bare integer (`5`), a decimal (`5.25`), and a leading point
@@ -172,5 +206,26 @@ mod tests {
         assert!(parse_amount("999999999999").is_err());
         // And the exact supply round-trips.
         assert_eq!(parse_amount("184467440.73709551615").expect("ok"), u64::MAX);
+    }
+
+    #[test]
+    fn timestamps_print_in_utc() {
+        assert_eq!(timestamp(1_600_000_000), "2020-09-13 12:26:40");
+        assert_eq!(timestamp(1_234_567_890), "2009-02-13 23:31:30");
+        assert_eq!(
+            timestamp(1_709_164_800),
+            "2024-02-29 00:00:00",
+            "a leap day"
+        );
+        assert_eq!(timestamp(0), "<unknown>");
+    }
+
+    #[test]
+    fn durations_read_at_a_glance() {
+        assert_eq!(duration(0), "0s");
+        assert_eq!(duration(59), "59s");
+        assert_eq!(duration(292), "4m 52s");
+        assert_eq!(duration(3_600), "1h 00m");
+        assert_eq!(duration(7_500), "2h 05m");
     }
 }

@@ -43,6 +43,8 @@ use wow_types::rct::{EcdhInfo, RctSignatures, RctType};
 use wow_types::tx::{Transaction, TransactionPrefix, TxIn, TxOut, TxOutTarget};
 use wow_types::tx_extra::{serialize_tx_extra, TxExtraField};
 
+use crate::spend::{fee_from_weight, SpendError, SpendPlan, FEE_CALCULATION_MAX_RETRIES};
+
 /// An output this wallet owns and is about to spend.
 pub struct SpendableOutput {
     /// The one-time public key on chain.
@@ -253,9 +255,24 @@ pub fn construct(
     if any_subaddress {
         extra.push(TxExtraField::AdditionalPubkeys(additional_publics));
     }
-    if let Some(pid) = payment_id {
-        // An integrated address encrypts the id under the first output's
-        // derivation, which is why it has to be computed above first.
+    // `construct_tx_with_tx_key` gives every transaction of one destination
+    // plus change an encrypted payment id -- zeros when there is no real one --
+    // so a transaction with an id looks like one without. Past two outputs it
+    // adds no dummy.
+    //
+    // Nor when a subaddress is paid, where this builder parts from the C++: it
+    // gives such a transaction per-output keys, while the C++ makes the
+    // transaction key `r*D` for a single subaddress. The payee decrypts with
+    // that key, so under this layout a dummy would come out as eight random
+    // bytes -- a payment id the sender never gave.
+    let encrypted_id = match payment_id {
+        Some(pid) => Some(pid),
+        None if destinations.len() == 2 && !any_subaddress => Some([0u8; 8]),
+        None => None,
+    };
+    if let Some(pid) = encrypted_id {
+        // Encrypted under the first output's derivation, the payee's, which is
+        // why it has to be computed above first.
         let d = first_derivation.ok_or(TransferError::BadKey)?;
         let enc = wow_crypto::keys::encrypt_payment_id(&pid, &d);
         let mut nonce = Vec::with_capacity(9);
@@ -364,6 +381,81 @@ pub fn construct(
         tx_secret_key: SecretKey(tx_secret.to_bytes()),
         additional_tx_secret_keys: additional_secrets,
     })
+}
+
+/// A transaction built at the fee its own blob needs.
+#[derive(Debug)]
+pub struct Settled {
+    pub built: BuiltTransaction,
+    /// The transaction, serialized for relay.
+    pub blob: Vec<u8>,
+    /// The plan as built: its fee, the change or swept amount that fee moved,
+    /// and the built weight in `estimated_weight`.
+    pub plan: SpendPlan,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SettleError {
+    #[error(transparent)]
+    Build(#[from] TransferError),
+    #[error(transparent)]
+    Plan(#[from] SpendError),
+}
+
+/// Build a plan at the fee the built transaction needs, as
+/// `wallet2::create_transactions_2` does before it hands a transaction over.
+///
+/// The plan's fee comes from [`crate::spend::estimate_tx_weight`], which runs a
+/// few bytes over. The C++ builds at it, reads the weight off the blob, builds
+/// again at that weight's fee, and repeats while a rebuild needs more than it
+/// pays. So the fee on chain is the real weight's, which a fee charged on the
+/// estimate is not. The C++ rebuilds once even when the estimate was exact;
+/// this skips that, since it would only draw fresh randomness.
+///
+/// `destinations` makes the outputs for a plan, so that a changed fee reaches
+/// the change output, or a sweep's amount.
+pub fn construct_settled(
+    inputs: &[SpendableOutput],
+    plan: &SpendPlan,
+    fee_per_byte: u64,
+    payment_id: Option<Hash8>,
+    destinations: &dyn Fn(&SpendPlan) -> Vec<Destination>,
+    rng: &mut dyn Rng,
+) -> std::result::Result<Settled, SettleError> {
+    let mut plan = plan.clone();
+    let (mut built, mut blob, mut weight) =
+        build_measured(inputs, &plan, payment_id, destinations, rng)?;
+    let mut needed = fee_from_weight(fee_per_byte, weight);
+
+    let mut rebuilds = 0;
+    while needed > plan.fee || (rebuilds == 0 && needed != plan.fee) {
+        if rebuilds == FEE_CALCULATION_MAX_RETRIES {
+            return Err(SpendError::FeeDidNotSettle(FEE_CALCULATION_MAX_RETRIES).into());
+        }
+        plan = plan.with_fee(needed)?;
+        (built, blob, weight) = build_measured(inputs, &plan, payment_id, destinations, rng)?;
+        needed = fee_from_weight(fee_per_byte, weight);
+        rebuilds += 1;
+    }
+
+    plan.estimated_weight = weight;
+    Ok(Settled { built, blob, plan })
+}
+
+/// Build, serialize, and weigh.
+fn build_measured(
+    inputs: &[SpendableOutput],
+    plan: &SpendPlan,
+    payment_id: Option<Hash8>,
+    destinations: &dyn Fn(&SpendPlan) -> Vec<Destination>,
+    rng: &mut dyn Rng,
+) -> Result<(BuiltTransaction, Vec<u8>, u64)> {
+    let built = construct(inputs, &destinations(plan), plan.fee, payment_id, rng)?;
+    let mut w = wow_serialize::binary::Writer::with_capacity(8192);
+    built.tx.write(&mut w);
+    let blob = w.into_vec();
+    let weight = wow_types::weight::get_transaction_weight(&built.tx, blob.len());
+    Ok((built, blob, weight))
 }
 
 /// A pseudo-output commitment per input, with masks summing to the outputs'.
@@ -868,6 +960,11 @@ mod tests {
         let enc: wow_crypto::types::Hash8 = nonce[1..].try_into().expect("8 bytes");
         let dec = wow_crypto::keys::encrypt_payment_id(&enc, &got[0].derivation);
         assert_eq!(dec, pid, "the recipient recovers the payment id");
+        assert_eq!(
+            crate::scan::payment_id(&built.tx, &them.view),
+            Some(pid),
+            "and a refresh reads it"
+        );
     }
 
     /// The balance check is not advisory. An unbalanced request is refused
@@ -1001,5 +1098,253 @@ mod tests {
             wow_types::hashes::transaction_hash_from_blob(&back, &blob),
             Some(transaction_hash(&built.tx))
         );
+    }
+
+    /// The payment id a transaction carries, still encrypted.
+    fn encrypted_payment_id(tx: &Transaction) -> Option<Hash8> {
+        wow_types::tx_extra::parse_tx_extra(&tx.prefix.extra)
+            .fields
+            .iter()
+            .find_map(|f| match f {
+                TxExtraField::Nonce(n) if n.len() == 9 && n[0] == 0x01 => n[1..].try_into().ok(),
+                _ => None,
+            })
+    }
+
+    /// Without a payment id, one destination plus change still carries one: a
+    /// dummy the payee decrypts to zeros, which is how the C++ writes "none".
+    #[test]
+    fn a_transaction_without_a_payment_id_carries_a_dummy() {
+        let me = wallet(67);
+        let them = wallet(71);
+        let input = spendable(6_000_000_000, 22, 3, 91);
+        let fee = 15_000_000u64;
+        let send = 2_000_000_000u64;
+
+        let destinations = vec![
+            Destination {
+                address: them.address,
+                is_subaddress: false,
+                amount: send,
+            },
+            Destination {
+                address: me.address,
+                is_subaddress: false,
+                amount: input.amount - send - fee,
+            },
+        ];
+        let built = construct(
+            std::slice::from_ref(&input),
+            &destinations,
+            fee,
+            None,
+            &mut Counter(11),
+        )
+        .expect("construct");
+        verify_as_a_node(&built.tx, &[&input]);
+
+        let enc = encrypted_payment_id(&built.tx).expect("a dummy payment id");
+        let got = scan_transaction(&built.tx, &them.keys()).expect("scan");
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            wow_crypto::keys::encrypt_payment_id(&enc, &got[0].derivation),
+            [0u8; 8],
+            "the payee reads it as no payment id"
+        );
+        assert_eq!(crate::scan::payment_id(&built.tx, &them.view), None);
+        assert_eq!(
+            built.tx.prefix.extra.len(),
+            crate::spend::extra_size(2, false, false),
+            "the size the estimate assumes"
+        );
+    }
+
+    /// No dummy past two outputs, nor when a subaddress is paid.
+    #[test]
+    fn no_dummy_past_two_outputs_or_to_a_subaddress() {
+        let me = wallet(73);
+        let them = wallet(79);
+        let input = spendable(9_000_000_000, 11, 0, 93);
+        let fee = 10_000_000u64;
+
+        let three = vec![
+            Destination {
+                address: them.address,
+                is_subaddress: false,
+                amount: 1_000_000_000,
+            },
+            Destination {
+                address: them.address,
+                is_subaddress: false,
+                amount: 2_000_000_000,
+            },
+            Destination {
+                address: me.address,
+                is_subaddress: false,
+                amount: input.amount - 3_000_000_000 - fee,
+            },
+        ];
+        let built = construct(
+            std::slice::from_ref(&input),
+            &three,
+            fee,
+            None,
+            &mut Counter(12),
+        )
+        .expect("construct");
+        assert_eq!(encrypted_payment_id(&built.tx), None);
+        assert_eq!(
+            built.tx.prefix.extra.len(),
+            crate::spend::extra_size(3, false, false)
+        );
+
+        let sub = wow_crypto::get_subaddress(&them.address, &them.view, SubaddressIndex::new(0, 1))
+            .expect("derivable");
+        let to_sub = vec![
+            Destination {
+                address: sub,
+                is_subaddress: true,
+                amount: 1_000_000_000,
+            },
+            Destination {
+                address: me.address,
+                is_subaddress: false,
+                amount: input.amount - 1_000_000_000 - fee,
+            },
+        ];
+        let built = construct(
+            std::slice::from_ref(&input),
+            &to_sub,
+            fee,
+            None,
+            &mut Counter(13),
+        )
+        .expect("construct");
+        assert_eq!(encrypted_payment_id(&built.tx), None);
+        assert_eq!(
+            built.tx.prefix.extra.len(),
+            crate::spend::extra_size(2, false, true)
+        );
+    }
+
+    /// Outputs for a plan: the payee, then change back to `me`.
+    fn pay(
+        them: AccountPublicAddress,
+        me: AccountPublicAddress,
+    ) -> impl Fn(&SpendPlan) -> Vec<Destination> {
+        move |p: &SpendPlan| {
+            vec![
+                Destination {
+                    address: them,
+                    is_subaddress: false,
+                    amount: p.amounts[0],
+                },
+                Destination {
+                    address: me,
+                    is_subaddress: false,
+                    amount: p.change,
+                },
+            ]
+        }
+    }
+
+    /// The fee a built transaction pays is its own weight's, not the
+    /// estimate's, and the change takes up the difference.
+    #[test]
+    fn the_fee_settles_on_the_built_weight() {
+        let me = wallet(83);
+        let them = wallet(89);
+        let input = spendable(10_000_000_000, 22, 6, 95);
+        let rate = 260_000u64;
+        let send = 1_234_000_000u64;
+
+        let estimate =
+            crate::spend::estimate_tx_weight(1, 22, 2, crate::spend::extra_size(2, false, false));
+        let fee = fee_from_weight(rate, estimate);
+        let plan = SpendPlan {
+            inputs: vec![0],
+            amounts: vec![send],
+            change: input.amount - send - fee,
+            fee,
+            estimated_weight: estimate,
+            sweep: false,
+        };
+
+        let settled = construct_settled(
+            std::slice::from_ref(&input),
+            &plan,
+            rate,
+            None,
+            &pay(them.address, me.address),
+            &mut Counter(14),
+        )
+        .expect("settles");
+        verify_as_a_node(&settled.built.tx, &[&input]);
+
+        let built =
+            wow_types::weight::get_transaction_weight(&settled.built.tx, settled.blob.len());
+        assert!(built < estimate, "estimated {estimate}, built {built}");
+        assert_eq!(settled.plan.estimated_weight, built);
+        assert_eq!(settled.plan.fee, fee_from_weight(rate, built));
+        assert!(settled.plan.fee < fee);
+        assert_eq!(settled.built.tx.rct_signatures.txn_fee, settled.plan.fee);
+
+        assert_eq!(
+            settled.plan.amounts[0], send,
+            "the payee gets what was asked"
+        );
+        assert_eq!(settled.plan.change, input.amount - send - settled.plan.fee);
+        let mine = scan_transaction(&settled.built.tx, &me.keys()).expect("scan");
+        assert_eq!(
+            mine[0].amount, settled.plan.change,
+            "the change holds the difference"
+        );
+
+        let back = Transaction::from_blob(&settled.blob).expect("the blob is the transaction");
+        assert_eq!(back.rct_signatures.txn_fee, settled.plan.fee);
+    }
+
+    /// A sweep settles the same way, out of the amount sent.
+    #[test]
+    fn a_sweep_settles_out_of_the_amount() {
+        let me = wallet(97);
+        let them = wallet(101);
+        let input = spendable(10_000_000_000, 22, 1, 97);
+        let rate = 260_000u64;
+
+        let estimate =
+            crate::spend::estimate_tx_weight(1, 22, 2, crate::spend::extra_size(2, false, false));
+        let fee = fee_from_weight(rate, estimate);
+        let plan = SpendPlan {
+            inputs: vec![0],
+            amounts: vec![input.amount - fee],
+            change: 0,
+            fee,
+            estimated_weight: estimate,
+            sweep: true,
+        };
+
+        let settled = construct_settled(
+            std::slice::from_ref(&input),
+            &plan,
+            rate,
+            None,
+            &pay(them.address, me.address),
+            &mut Counter(15),
+        )
+        .expect("settles");
+        verify_as_a_node(&settled.built.tx, &[&input]);
+
+        let built =
+            wow_types::weight::get_transaction_weight(&settled.built.tx, settled.blob.len());
+        assert_eq!(settled.plan.fee, fee_from_weight(rate, built));
+        assert_eq!(settled.plan.change, 0);
+        assert_eq!(
+            settled.plan.amounts[0] + settled.plan.fee,
+            input.amount,
+            "the fee comes out of the amount"
+        );
+        let got = scan_transaction(&settled.built.tx, &them.keys()).expect("scan");
+        assert_eq!(got[0].amount, settled.plan.amounts[0]);
     }
 }

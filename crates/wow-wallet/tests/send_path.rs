@@ -134,6 +134,8 @@ fn owned(chain: &mut Chain, amount: u64, index: u64, rng: &mut Lcg) -> (Transfer
             spent_height: 0,
             unlock_time: 0,
             is_coinbase: false,
+            timestamp: 0,
+            payment_id: None,
         },
         x,
         mask,

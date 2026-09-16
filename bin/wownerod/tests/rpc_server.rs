@@ -77,8 +77,17 @@ fn start(tag: &str, extra: usize) -> Daemon {
         let blob = wow_consensus::genesis::genesis_blob(Network::Mainnet);
         let blk = Block::from_blob(&blob).unwrap();
         let mut prev = blk.block_id().unwrap();
-        db.add_block(&blk, &blob, blob.len() as u64, blob.len() as u64, 1, 0, &[])
-            .unwrap();
+        let record = wow_consensus::genesis::genesis_record(Network::Mainnet);
+        db.add_block(
+            &blk,
+            &blob,
+            record.weight,
+            record.long_term_weight,
+            record.cumulative_difficulty,
+            record.already_generated_coins,
+            &[],
+        )
+        .unwrap();
 
         let mut cum = 1u128;
         for (i, fixture) in fixture_blocks().into_iter().take(extra).enumerate() {

@@ -97,8 +97,17 @@ fn start(tag: &str, extra: usize) -> Daemon {
         let blob = wow_consensus::genesis::genesis_blob(Network::Mainnet);
         let blk = Block::from_blob(&blob).unwrap();
         let mut prev = blk.block_id().unwrap();
-        db.add_block(&blk, &blob, blob.len() as u64, blob.len() as u64, 1, 0, &[])
-            .unwrap();
+        let record = wow_consensus::genesis::genesis_record(Network::Mainnet);
+        db.add_block(
+            &blk,
+            &blob,
+            record.weight,
+            record.long_term_weight,
+            record.cumulative_difficulty,
+            record.already_generated_coins,
+            &[],
+        )
+        .unwrap();
 
         let mut cum = 1u128;
         for (i, fixture) in fixture_blocks().into_iter().take(extra).enumerate() {
@@ -292,9 +301,10 @@ fn get_transactions_separates_found_from_missing() {
     let d = start("gettx", 4);
     let c = client(d.port);
 
-    // A coinbase that is definitely on the chain.
-    let blocks = c.get_blocks(&[], 0, false, false).expect("blocks");
-    let block = Block::from_blob(&blocks.blocks[2].block).expect("parses");
+    // A coinbase that is definitely on the chain. From a height, since the
+    // reference refuses an empty history at zero.
+    let blocks = c.get_blocks(&[], 2, false, false, 0).expect("blocks");
+    let block = Block::from_blob(&blocks.blocks[0].block).expect("parses");
     let txid = wow_types::hashes::transaction_hash(&block.miner_tx).expect("a hash");
 
     let body = serde_json::json!({

@@ -1,0 +1,35 @@
+# The wallet front ends: a desktop GUI, and the same interface in a browser.
+#
+# A workspace of its own, apart from the one at the repository root, so the
+# node, the command-line wallets and their CI never build egui, winit or
+# wasm-bindgen. The wallet crates come in by path.
+
+[workspace]
+resolver = "2"
+members = ["wallet-gui", "wallet-web"]
+
+[workspace.package]
+# Kept equal to the root workspace's version.
+version = "0.11.4"
+edition = "2021"
+rust-version = "1.89"
+license = "BSD-3-Clause"
+repository = "https://github.com/wrkzdev/wow-in-rust"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Opening a wallet runs CryptoNight and scanning is curve arithmetic: both are
+# far too slow unoptimised, even in a debug build of the GUI. As at the root.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.wow-crypto]
+opt-level = 3
+[profile.dev.package.wow-randomwow]
+opt-level = 3
+[profile.test.package.curve25519-dalek]
+opt-level = 3
+[profile.test.package.wow-crypto]
+opt-level = 3

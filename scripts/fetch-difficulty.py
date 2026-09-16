@@ -7,7 +7,7 @@ the six algorithms, compared against
 `get_block_header_by_height(h).difficulty`.
 
 Each row is the input `get_difficulty_for_next_block` assembles at `height`:
-`difficulty_blocks_count(tip_version)` headers ending at `height - 1`, per
+`difficulty_blocks_count(version)` headers ending at `height - 1`, per
 `specs/07` §1 --
 
     offset = H - min(H, difficulty_blocks_count)
@@ -15,9 +15,12 @@ Each row is the input `get_difficulty_for_next_block` assembles at `height`:
     timestamps   = [ timestamp(i)             for i in offset..H ]
     difficulties = [ cumulative_difficulty(i) for i in offset..H ]
 
+`version` is `get_current_hard_fork_version()` while the block at `H` is
+validated, which is the version at `H` -- not the tip block's.
+
 Output: `tests/corpus/difficulty/index.tsv`
 
-    name  height  tip_version  expected_difficulty  timestamps_csv  cumulative_csv
+    name  height  version  expected_difficulty  timestamps_csv  cumulative_csv
 
 Usage:
     python scripts/fetch-difficulty.py --daemon 127.0.0.1:34568
@@ -32,7 +35,7 @@ import sys
 import time
 import urllib.request
 
-# (name, height, tip hard-fork version, difficulty_blocks_count for it)
+# (name, height, hard-fork version at that height, difficulty_blocks_count for it)
 CASES = [
     ("v1_hf7", 3_000, 7, 735),
     ("v2_hf8", 30_000, 8, 61),
@@ -44,6 +47,15 @@ CASES = [
     ("v1_hf19", 400_000, 19, 735),
     ("v6_hf20", 600_000, 20, 147),
     ("v6_tip", 870_000, 20, 147),
+    # The first block of each fork that changes the algorithm. It takes the new
+    # fork's algorithm; the parent block's version gives a different answer at
+    # every one of these heights.
+    ("first_hf8", 6_969, 8, 61),
+    ("first_hf9", 53_666, 9, 61),
+    ("first_hf10", 63_469, 10, 61),
+    ("first_hf11", 81_769, 11, 145),
+    ("first_hf18", 331_170, 18, 735),
+    ("first_hf20", 514_000, 20, 147),
 ]
 
 
@@ -113,7 +125,7 @@ def main() -> int:
     path = os.path.join(args.out, "index.tsv")
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(
-            "# name\theight\ttip_version\texpected_difficulty\ttimestamps_csv\tcumulative_difficulties_csv\n"
+            "# name\theight\tversion\texpected_difficulty\ttimestamps_csv\tcumulative_difficulties_csv\n"
         )
         fh.write("\n".join(rows) + "\n")
     print(f"wrote {path}")

@@ -73,6 +73,9 @@ pub struct Info {
     pub nettype: String,
     pub synchronized: bool,
     pub top_block_hash: String,
+    /// Twice the median the fee tiers come from; half of it is the full
+    /// reward zone. 0 when the daemon does not say.
+    pub block_weight_limit: u64,
 }
 
 /// The outcome of a relay attempt.
@@ -94,6 +97,27 @@ impl SendResult {
     pub fn accepted(&self) -> bool {
         self.status == "OK"
     }
+}
+
+/// One transaction in the daemon's pool, as `/get_transaction_pool` lists it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PoolTx {
+    pub id: Hash256,
+    pub blob: Vec<u8>,
+    /// When the daemon received it.
+    pub receive_time: u64,
+    pub relayed: bool,
+    pub double_spend_seen: bool,
+}
+
+/// `COMMAND_RPC_IS_KEY_IMAGE_SPENT::STATUS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyImageStatus {
+    Unspent,
+    /// In a block.
+    SpentInChain,
+    /// By a transaction in the pool.
+    SpentInPool,
 }
 
 impl DaemonClient {
@@ -135,6 +159,13 @@ impl DaemonClient {
                 .and_then(Json::as_str)
                 .unwrap_or("")
                 .to_string(),
+            // `NodeRPCProxy::get_block_weight_limit` falls back to the name
+            // from before weights replaced sizes.
+            block_weight_limit: v
+                .get("block_weight_limit")
+                .or_else(|| v.get("block_size_limit"))
+                .and_then(Json::as_u64)
+                .unwrap_or(0),
         })
     }
 
@@ -180,19 +211,39 @@ impl DaemonClient {
         Ok(vec![u64_of(&v, "fee")?])
     }
 
+    /// `getblockheadersrange`, down to the one field a wallet reads from it:
+    /// the weight of each block from `start_height` to `end_height` inclusive.
+    pub fn get_block_weights(&self, start_height: u64, end_height: u64) -> Result<Vec<u64>> {
+        let v = self.json_rpc(
+            "getblockheadersrange",
+            json!({ "start_height": start_height, "end_height": end_height }),
+        )?;
+        v.get("headers")
+            .and_then(Json::as_array)
+            .ok_or(DaemonError::Missing("headers"))?
+            .iter()
+            .map(|h| u64_of(h, "block_weight"))
+            .collect()
+    }
+
     // -- binary -------------------------------------------------------------
 
     /// `/get_blocks.bin` — the refresh workhorse (`specs/11` §5.1).
     ///
     /// `block_ids` is the wallet's short chain history, newest first, genesis
-    /// last. The daemon answers from the first hash it recognises, which is how
-    /// a reorg is detected without the wallet asking.
+    /// last. The daemon answers from the newest block in it that it has, that
+    /// block included, which is how a reorg is detected without the wallet
+    /// asking.
+    ///
+    /// `max_block_count` caps the reply below the daemon's own limit of 1000,
+    /// and 0 leaves it there. A daemon that predates the field ignores it.
     pub fn get_blocks(
         &self,
         block_ids: &[Hash256],
         start_height: u64,
         prune: bool,
         no_miner_tx: bool,
+        max_block_count: u64,
     ) -> Result<GetBlocks> {
         let mut req = Section::new();
         // CONTAINER_POD_AS_BLOB: one string, not an array.
@@ -203,6 +254,9 @@ impl DaemonClient {
         req.insert("start_height".into(), Value::U64(start_height));
         req.insert("prune".into(), Value::Bool(prune));
         req.insert("no_miner_tx".into(), Value::Bool(no_miner_tx));
+        if max_block_count > 0 {
+            req.insert("max_block_count".into(), Value::U64(max_block_count));
+        }
 
         let res = self.binary("/get_blocks.bin", &req)?;
         parse_get_blocks(&res)
@@ -331,6 +385,41 @@ impl DaemonClient {
         Ok(blob.as_chunks::<32>().0.to_vec())
     }
 
+    /// `/get_transaction_pool`: every transaction in the pool, with its blob.
+    ///
+    /// A restricted C++ node leaves out what was submitted with
+    /// `do_not_relay`, which is nothing a wallet on another machine could
+    /// have sent.
+    pub fn get_transaction_pool(&self) -> Result<Vec<PoolTx>> {
+        let v = self.direct("/get_transaction_pool", json!({}))?;
+        parse_transaction_pool(&v)
+    }
+
+    /// `/is_key_image_spent`, one status per key image, in order.
+    pub fn is_key_image_spent(&self, key_images: &[[u8; 32]]) -> Result<Vec<KeyImageStatus>> {
+        let hex: Vec<String> = key_images
+            .iter()
+            .map(|k| wow_crypto::hex::encode(k))
+            .collect();
+        let v = self.direct("/is_key_image_spent", json!({ "key_images": hex }))?;
+        let status = v
+            .get("spent_status")
+            .and_then(Json::as_array)
+            .ok_or(DaemonError::Missing("spent_status"))?;
+        if status.len() != key_images.len() {
+            return Err(DaemonError::BadField("spent_status"));
+        }
+        status
+            .iter()
+            .map(|s| match s.as_u64() {
+                Some(0) => Ok(KeyImageStatus::Unspent),
+                Some(1) => Ok(KeyImageStatus::SpentInChain),
+                Some(2) => Ok(KeyImageStatus::SpentInPool),
+                _ => Err(DaemonError::BadField("spent_status")),
+            })
+            .collect()
+    }
+
     /// A `POST` that returns the raw body regardless of the `status` field.
     fn endpoint_post(&self, path: &str, body: &[u8]) -> Result<Vec<u8>> {
         Ok(self.raw_post(path, "application/json", body)?)
@@ -449,6 +538,36 @@ fn u64_list(v: Option<&Value>) -> Vec<u64> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Pull a `/get_transaction_pool` response apart.
+///
+/// An empty pool comes back with no `transactions` field at all: epee omits an
+/// empty container, in JSON as in binary.
+fn parse_transaction_pool(v: &Json) -> Result<Vec<PoolTx>> {
+    let Some(txs) = v.get("transactions") else {
+        return Ok(Vec::new());
+    };
+    let txs = txs
+        .as_array()
+        .ok_or(DaemonError::BadField("transactions"))?;
+    txs.iter()
+        .map(|t| {
+            let id = wow_crypto::hex::decode(&str_of(t, "id_hash"))
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .ok_or(DaemonError::BadField("id_hash"))?;
+            let blob = wow_crypto::hex::decode(&str_of(t, "tx_blob"))
+                .filter(|b| !b.is_empty())
+                .ok_or(DaemonError::BadField("tx_blob"))?;
+            Ok(PoolTx {
+                id,
+                blob,
+                receive_time: t.get("receive_time").and_then(Json::as_u64).unwrap_or(0),
+                relayed: bool_of(t, "relayed"),
+                double_spend_seen: bool_of(t, "double_spend_seen"),
+            })
+        })
+        .collect()
 }
 
 fn fixed32(s: &Section, field: &'static str) -> Result<[u8; 32]> {
@@ -682,5 +801,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(info.target_height, 500_000);
+    }
+
+    /// A pool listing is read with its blobs, and an empty pool -- which epee
+    /// sends with no `transactions` field -- is an empty list, not an error.
+    #[test]
+    fn a_pool_listing_parses_and_an_empty_one_is_empty() {
+        let id = "3a".repeat(32);
+        let v = json!({
+            "status": "OK",
+            "transactions": [{
+                "id_hash": id,
+                "tx_blob": "0201ff",
+                "receive_time": 1_700_000_000u64,
+                "relayed": true,
+                "double_spend_seen": false,
+            }],
+        });
+        let pool = parse_transaction_pool(&v).expect("parses");
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].id, [0x3a; 32]);
+        assert_eq!(pool[0].blob, vec![0x02, 0x01, 0xff]);
+        assert_eq!(pool[0].receive_time, 1_700_000_000);
+        assert!(pool[0].relayed);
+
+        assert!(parse_transaction_pool(&json!({"status": "OK"}))
+            .expect("parses")
+            .is_empty());
+        assert!(matches!(
+            parse_transaction_pool(&json!({"transactions": [{"id_hash": "zz", "tx_blob": "00"}]})),
+            Err(DaemonError::BadField("id_hash"))
+        ));
     }
 }

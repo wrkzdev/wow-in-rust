@@ -1,0 +1,39 @@
+[package]
+name = "wownero-wallet-gui"
+description = "A Wownero wallet with a GUI: the desktop application, and the interface the web wallet shares"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "wownero-wallet-gui"
+path = "src/main.rs"
+
+[dependencies]
+wow-crypto = { path = "../../crates/wow-crypto" }
+wow-daemon-client = { path = "../../crates/wow-daemon-client" }
+wow-types = { path = "../../crates/wow-types" }
+wow-wallet = { path = "../../crates/wow-wallet" }
+wow-log = { path = "../../crates/wow-log" }
+
+egui = "0.31"
+# With its defaults: OpenGL through glow, and winit's X11 and Wayland, which are
+# loaded at run time rather than linked, so a Linux build (a cross-build
+# included) needs no system development packages. "persistence" keeps the
+# settings: the node, the network, the folder. Never a password.
+eframe = { version = "0.31", features = ["persistence"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# An address as a QR code, drawn as rectangles: no image crates.
+qrcodegen = "1.8"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Times in the history as the local clock reads them, from the system's time
+# zone. A browser gives its own.
+chrono = { version = "0.4.38", default-features = false, features = ["clock", "std"] }
+# Choosing the wallets folder, and where a saved file goes. On Linux through
+# the XDG desktop portal, over D-Bus, with no GTK or Wayland library to link,
+# so a cross-build still needs no system packages.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }

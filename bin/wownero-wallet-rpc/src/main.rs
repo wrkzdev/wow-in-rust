@@ -39,10 +39,17 @@ wownero-wallet-rpc — the Wownero wallet RPC (specs/14)
   --rpc-login <user:pass>           HTTP Basic
   --disable-rpc-login               explicitly run without authentication
 
-  --daemon-address <host:port>      default 127.0.0.1:34568
+  --daemon-address <address>        host:port, or https://host:port for TLS;
+                                    default 127.0.0.1:34568
   --testnet / --stagenet
   --kdf-rounds <n>                  default 1
   --no-initial-sync
+  --log-file <path>                 also log here
+  --log-level <0-4 | category:LEVEL,...>
+                                    default 0; given alone, also logs to
+                                    wownero-wallet-rpc.log beside the program
+  --max-log-file-size <bytes>       default 104850000
+  --max-log-files <n>               rotated files to keep, default 50
   --help
 
 Either --rpc-login or --disable-rpc-login must be given. There is no default:
@@ -62,6 +69,11 @@ struct Options {
     network: Network,
     kdf_rounds: u64,
     no_initial_sync: bool,
+    /// `--log-level`, as given.
+    log_level: Option<String>,
+    log_file: Option<PathBuf>,
+    max_log_file_size: u64,
+    max_log_files: usize,
 }
 
 /// Written by hand rather than derived: this struct holds a wallet password
@@ -85,6 +97,10 @@ impl std::fmt::Debug for Options {
             .field("network", &self.network)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("no_initial_sync", &self.no_initial_sync)
+            .field("log_level", &self.log_level)
+            .field("log_file", &self.log_file)
+            .field("max_log_file_size", &self.max_log_file_size)
+            .field("max_log_files", &self.max_log_files)
             .finish()
     }
 }
@@ -104,6 +120,10 @@ impl Default for Options {
             network: Network::Mainnet,
             kdf_rounds: 1,
             no_initial_sync: false,
+            log_level: None,
+            log_file: None,
+            max_log_file_size: 104_850_000,
+            max_log_files: 50,
         }
     }
 }
@@ -155,6 +175,18 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
                 }
             }
             "--no-initial-sync" => o.no_initial_sync = true,
+            "--log-level" => o.log_level = Some(next("--log-level")?),
+            "--log-file" => o.log_file = Some(PathBuf::from(next("--log-file")?)),
+            "--max-log-file-size" => {
+                o.max_log_file_size = next("--max-log-file-size")?
+                    .parse()
+                    .map_err(|_| "--max-log-file-size needs a number".to_string())?;
+            }
+            "--max-log-files" => {
+                o.max_log_files = next("--max-log-files")?
+                    .parse()
+                    .map_err(|_| "--max-log-files needs a number".to_string())?;
+            }
             other => return Err(format!("unknown option `{other}`. Try --help.")),
         }
     }
@@ -218,7 +250,30 @@ fn main() {
     }
 }
 
+/// Where the log goes (`wallet_args::main`): to stderr, as a server's does, and
+/// to `--log-file` as well. When only `--log-level` is given, the file is
+/// `wownero-wallet-rpc.log` beside the program, where the C++ writes it.
+fn start_logging(o: &Options) -> Result<(), String> {
+    if let Some(spec) = &o.log_level {
+        wow_log::configure(spec).map_err(|e| format!("--log-level: {e}"))?;
+    }
+    if o.log_level.is_none() && o.log_file.is_none() {
+        return Ok(());
+    }
+    let path = o
+        .log_file
+        .clone()
+        .unwrap_or_else(|| wow_log::beside_program("wownero-wallet-rpc.log"));
+    wow_log::set_file(path.clone(), o.max_log_file_size, o.max_log_files, false)?;
+    eprintln!("Logging to {}", path.display());
+    wow_log::info!("global", "wownero-wallet-rpc {}", env!("CARGO_PKG_VERSION"));
+    // Safe to log only because `Options`' `Debug` redacts every secret.
+    wow_log::debug!("global", "{o:?}");
+    Ok(())
+}
+
 fn run(options: Options) -> Result<(), String> {
+    start_logging(&options)?;
     let source = match (&options.wallet_file, &options.wallet_dir) {
         (Some(f), None) => WalletSource::File {
             paths: Paths::new(f.clone()),
@@ -392,5 +447,30 @@ mod tests {
         args.push("--mine-please");
         let e = opts(&args).expect_err("rejected");
         assert!(e.contains("--mine-please"), "{e}");
+    }
+
+    /// The log options, with the C++'s rotation defaults.
+    #[test]
+    fn the_log_options_parse() {
+        let o = opts(MINIMUM).expect("parses");
+        assert!(o.log_level.is_none() && o.log_file.is_none());
+        assert_eq!((o.max_log_file_size, o.max_log_files), (104_850_000, 50));
+
+        let mut args = MINIMUM.to_vec();
+        args.extend_from_slice(&[
+            "--log-level",
+            "2",
+            "--log-file",
+            "rpc.log",
+            "--max-log-files",
+            "7",
+        ]);
+        let o = opts(&args).expect("parses");
+        assert_eq!(o.log_level.as_deref(), Some("2"));
+        assert_eq!(o.log_file, Some(PathBuf::from("rpc.log")));
+        assert_eq!(o.max_log_files, 7);
+
+        args.push("--max-log-file-size");
+        assert!(opts(&args).is_err(), "a missing value");
     }
 }

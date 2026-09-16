@@ -1096,3 +1096,57 @@ C++ runtime.
 `jit::tests::running::*`, which holds the compiled SuperscalarHash to the
 interpreter over generated programs and over every instruction with every
 register pair.
+
+---
+
+## 26. `get_blocks.bin` answers from the block both sides have, and a start height beats the history
+
+**Spec:** `specs/11` §5.1 lists `block_ids` and `start_height` in the request
+without saying how they combine, and `specs/12` §3.1 has the daemon answer
+from the short chain history. Neither says which block the answer starts at.
+
+**Reality:** `Blockchain::find_blockchain_supplement` does two things a wallet
+has to know:
+
+```cpp
+// src/cryptonote_core/blockchain.cpp
+if(req_start_block > 0)
+{
+  if (req_start_block >= m_db->height())
+    return false;
+  start_height = req_start_block;
+}
+else
+{
+  if(!find_blockchain_supplement(qblock_ids, start_height))
+    return false;
+}
+...
+//we start to put block ids INCLUDING last known id, just to make other side be sure
+starter_offset = split_height;
+```
+
+* A start height above zero wins, and the history is not read at all.
+* Otherwise the history must end at genesis, and the answer starts **at** the
+  newest block in it the daemon has: a block the wallet already holds.
+  `wallet2::process_parsed_blocks` compares that block's hash and passes over
+  it.
+
+`on_get_blocks` answers a history whose newest hash is the top block with no
+blocks at all, and `get_hashes.bin` uses the same split.
+
+**Why it matters:** this node's `get_blocks.bin` answered one block past the
+split and ignored `start_height` when there was a history, and `wow-wallet` was
+written against it. Pointed at a C++ node, the wallet read the repeated block
+as a reorg on every batch, detaching it and scanning it again. A wallet
+restored above zero kept naming its restore height, so every call was answered
+from there: the same blocks, forever. Neither showed against this node, which
+agreed with the wallet.
+
+**Pinned by:** `refresh::tests::the_block_a_daemon_repeats_is_not_a_reorg`,
+`refresh::tests::a_restored_wallet_names_its_height_only_until_it_has_a_history`,
+`wallet_sync::the_daemon_answers_from_the_short_chain_history`,
+`wallet_sync::a_start_height_above_zero_is_taken_as_given`,
+`wallet_sync::a_wallet_restored_above_zero_syncs_and_stays_synced`, and
+`wow-daemon-client`'s
+`live_node::a_second_batch_starts_at_the_last_block_of_the_first`.

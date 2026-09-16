@@ -20,6 +20,7 @@
 //! miner data and blocks as they happen, in the C++'s order.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use wow_consensus::fee::FeeContext;
@@ -110,6 +111,8 @@ pub struct NodeCore {
     /// RPC fee estimate does not wait on a sync holding the chain.
     fee: Mutex<FeeContext>,
     listener: OnceLock<Arc<dyn Listener>>,
+    /// When the pool is next walked for transactions due to go out again.
+    next_relay_check: AtomicU64,
 }
 
 impl NodeCore {
@@ -129,6 +132,7 @@ impl NodeCore {
             pool,
             fee: Mutex::new(fee),
             listener: OnceLock::new(),
+            next_relay_check: AtomicU64::new(0),
         }))
     }
 
@@ -284,6 +288,18 @@ impl NodeCore {
             }
             Err(Refusal::Malformed(reason)) => BlockVerdict::Rejected { reason, ban: true },
             Err(Refusal::Rejected(r)) => verdict(r),
+            // The sender is not at fault for a block the checkpoints name, so
+            // the sync stalls and retries rather than banning it.
+            Err(Refusal::Checkpointed(r)) => match verdict(r) {
+                BlockVerdict::Rejected { reason, .. } => BlockVerdict::Rejected {
+                    reason: format!(
+                        "{reason}; the block is the checkpointed one, so this node's rules \
+                         are wrong, not the peer"
+                    ),
+                    ban: false,
+                },
+                other => other,
+            },
         }
     }
 
@@ -417,12 +433,16 @@ impl NodeCore {
     /// and refresh the fee snapshot.
     fn settle(&self, chain: &mut LocalChain) {
         let orphaned = chain.blockchain_mut().take_orphaned_txs();
+        let fee = fee_context_of(chain);
         if !orphaned.is_empty() {
             let now = unix_now();
             let mut pool = lock(&self.pool);
             let back = orphaned
                 .iter()
-                .filter(|(tx, blob)| pool.add_kept_by_block(&self.db, tx, blob, now).is_ok())
+                .filter(|(tx, blob)| {
+                    pool.add_kept_by_block(&self.db, tx, blob, fee.version, now)
+                        .is_ok()
+                })
                 .count();
             wow_log::info!(
                 "txpool",
@@ -430,7 +450,7 @@ impl NodeCore {
                 orphaned.len()
             );
         }
-        *lock(&self.fee) = fee_context_of(chain);
+        *lock(&self.fee) = fee;
     }
 
     /// A block's transactions, from the message by hash and then from the
@@ -499,7 +519,7 @@ fn fee_context_of(chain: &LocalChain) -> FeeContext {
     let bc = chain.blockchain();
     let state = bc.state();
     FeeContext {
-        version: bc.tip_version(),
+        version: bc.current_version(),
         cumulative_weight_limit: state.weights.limit,
         long_term_effective_median: state
             .weights
@@ -518,7 +538,6 @@ fn next_block_of(bc: &Blockchain<LmdbDb>) -> Result<NextBlock, String> {
         difficulty: bc.next_difficulty().map_err(|e| e.to_string())?,
         median_weight: state.weights.median,
         already_generated_coins: state.already_generated_coins,
-        tip_version: bc.tip_version(),
     })
 }
 
@@ -730,7 +749,19 @@ impl Core for NodeCore {
     }
 
     fn tx_relayed(&self, ids: &[Hash256]) {
-        lock(&self.pool).mark_relayed(ids);
+        lock(&self.pool).mark_relayed(ids, unix_now());
+    }
+
+    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Asked every tick; the pool is walked every two minutes.
+        let now = unix_now();
+        if now < self.next_relay_check.load(Relaxed) {
+            return Vec::new();
+        }
+        self.next_relay_check
+            .store(now + crate::mempool::RELAY_CHECK_SECS, Relaxed);
+        lock(&self.pool).due_for_relay(now)
     }
 }
 

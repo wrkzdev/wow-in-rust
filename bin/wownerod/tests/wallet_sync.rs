@@ -94,8 +94,17 @@ fn start(tag: &str, extra: usize) -> (Daemon, Vec<[u8; 32]>) {
         let blk = Block::from_blob(&blob).unwrap();
         let mut prev = blk.block_id().unwrap();
         hashes.push(prev);
-        db.add_block(&blk, &blob, blob.len() as u64, blob.len() as u64, 1, 0, &[])
-            .unwrap();
+        let record = wow_consensus::genesis::genesis_record(Network::Mainnet);
+        db.add_block(
+            &blk,
+            &blob,
+            record.weight,
+            record.long_term_weight,
+            record.cumulative_difficulty,
+            record.already_generated_coins,
+            &[],
+        )
+        .unwrap();
 
         let mut cum = 1u128;
         for (i, fixture) in fixture_blocks().into_iter().take(extra).enumerate() {
@@ -184,6 +193,9 @@ fn a_wallet_syncs_to_the_daemon_tip() {
     let summary = w.refresh(&c, 20).expect("refresh");
 
     assert!(summary.caught_up, "the wallet caught up");
+    // The daemon's first block is genesis, which the wallet holds from the
+    // start. It is compared, not taken for a split.
+    assert_eq!(summary.reorg_to, None);
     assert_eq!(w.scan_height(), hashes.len() as u64);
     assert_eq!(
         w.hashes, hashes,
@@ -212,8 +224,30 @@ fn refreshing_again_does_nothing() {
     assert_eq!(w.hashes.len(), hashes.len());
 }
 
+/// A wallet restored above zero names its height once, then goes by its
+/// history: synced, it asks again and gets nothing. Naming the height every
+/// time would be answered from that height every time.
+#[test]
+fn a_wallet_restored_above_zero_syncs_and_stays_synced() {
+    let (d, hashes) = start("restored", 12);
+    let c = client(d.port);
+
+    let mut w = wallet(5);
+    let summary = w.refresh(&c, 20).expect("refresh");
+    assert!(summary.caught_up);
+    assert_eq!(summary.reorg_to, None);
+    assert_eq!(w.hashes, hashes[5..]);
+
+    let again = w.refresh_once(&c).expect("refresh again");
+    assert!(again.caught_up);
+    assert_eq!(again.blocks_scanned, 0);
+    assert_eq!(w.hashes, hashes[5..]);
+}
+
 /// `get_blocks.bin` answers from the wallet's history, not from a height it was
-/// told. A wallet that has already seen some blocks gets only the rest.
+/// told. A wallet that has already seen some blocks gets the rest, starting at
+/// the newest one it has: sent again, as the reference sends it, for the
+/// wallet to compare.
 #[test]
 fn the_daemon_answers_from_the_short_chain_history() {
     let (d, hashes) = start("history", 10);
@@ -223,36 +257,64 @@ fn the_daemon_answers_from_the_short_chain_history() {
     let mut w = wallet(0);
     w.hashes = hashes[..4].to_vec();
 
-    let batch = wow_wallet::refresh::BlockSource::get_blocks(&c, &w.short_chain_history(), 0)
-        .expect("get_blocks");
-    assert_eq!(batch.start_height, 4, "resumed just past what we had");
-    assert_eq!(batch.blocks.len(), hashes.len() - 4);
+    let batch = wow_wallet::refresh::BlockSource::get_blocks(
+        &c,
+        &w.short_chain_history(),
+        0,
+        wow_wallet::refresh::MAX_BLOCKS_PER_CALL,
+    )
+    .expect("get_blocks");
+    assert_eq!(batch.start_height, 3, "from the newest block both have");
+    assert_eq!(batch.blocks.len(), hashes.len() - 3);
     assert_eq!(batch.current_height, hashes.len() as u64);
 }
 
-/// An empty history means "start from genesis", whatever `start_height` says.
-///
-/// Honouring a `start_height` a wallet cannot justify with a hash is how a
-/// wallet skips blocks it has never seen.
+/// A start height above zero is taken as given, and the history is not read:
+/// `find_blockchain_supplement` answers from `req_start_block` when there is
+/// one. What stops a wallet skipping blocks it has never seen is the wallet
+/// refusing a gap, not the daemon second-guessing the height.
 #[test]
-fn an_unrecognised_history_restarts_from_genesis() {
-    let (d, hashes) = start("restart", 8);
+fn a_start_height_above_zero_is_taken_as_given() {
+    let (d, hashes) = start("given", 8);
     let c = client(d.port);
 
     let nonsense = vec![[0xabu8; 32], [0xcdu8; 32]];
-    let batch = wow_wallet::refresh::BlockSource::get_blocks(&c, &nonsense, 5).expect("get_blocks");
-    assert_eq!(batch.start_height, 0, "back to genesis");
-    assert_eq!(batch.blocks.len(), hashes.len());
+    let batch = wow_wallet::refresh::BlockSource::get_blocks(
+        &c,
+        &nonsense,
+        5,
+        wow_wallet::refresh::MAX_BLOCKS_PER_CALL,
+    )
+    .expect("get_blocks");
+    assert_eq!(batch.start_height, 5, "the height, whatever the history");
+    assert_eq!(batch.blocks.len(), hashes.len() - 5);
+}
+
+/// At zero, a history that does not end at this chain's genesis is refused, in
+/// the reference's word for it.
+#[test]
+fn a_history_not_ending_at_genesis_is_refused() {
+    let (d, _) = start("nogenesis", 8);
+    let c = client(d.port);
+
+    let nonsense = vec![[0xabu8; 32], [0xcdu8; 32]];
+    let e = c
+        .get_blocks(&nonsense, 0, false, false, 0)
+        .expect_err("refused");
+    assert!(e.to_string().contains("Failed"), "{e}");
 }
 
 /// `get_blocks.bin` carries one output-index list per transaction, coinbase
 /// first, and it lines up with the blocks.
 #[test]
 fn output_indices_line_up_with_the_blocks() {
-    let (d, _) = start("indices", 5);
+    let (d, hashes) = start("indices", 5);
     let c = client(d.port);
 
-    let res = c.get_blocks(&[], 0, false, false).expect("get_blocks");
+    // A history of genesis alone. The reference refuses an empty one.
+    let res = c
+        .get_blocks(&hashes[..1], 0, false, false, 0)
+        .expect("get_blocks");
     assert_eq!(res.blocks.len(), 6, "genesis plus five");
 
     for (h, b) in res.blocks.iter().enumerate() {
@@ -280,10 +342,12 @@ fn output_indices_line_up_with_the_blocks() {
 /// `/get_o_indexes.bin` agrees with what `get_blocks.bin` already said.
 #[test]
 fn get_o_indexes_matches_get_blocks() {
-    let (d, _) = start("oindexes", 4);
+    let (d, hashes) = start("oindexes", 4);
     let c = client(d.port);
 
-    let res = c.get_blocks(&[], 0, false, false).expect("get_blocks");
+    let res = c
+        .get_blocks(&hashes[..1], 0, false, false, 0)
+        .expect("get_blocks");
     let block = Block::from_blob(&res.blocks[2].block).expect("parses");
     let txid = wow_types::hashes::transaction_hash(&block.miner_tx).expect("a hash");
 
@@ -297,10 +361,12 @@ fn get_o_indexes_matches_get_blocks() {
 /// `/get_outs.bin` returns the key and commitment a ring member needs.
 #[test]
 fn get_outs_returns_ring_members() {
-    let (d, _) = start("outs", 6);
+    let (d, hashes) = start("outs", 6);
     let c = client(d.port);
 
-    let res = c.get_blocks(&[], 0, false, false).expect("get_blocks");
+    let res = c
+        .get_blocks(&hashes[..1], 0, false, false, 0)
+        .expect("get_blocks");
     // A RingCT output is filed under amount zero (`specs/10` §5.1).
     let indices: Vec<u64> = res
         .blocks
@@ -364,7 +430,7 @@ fn a_start_height_past_the_tip_is_refused() {
     let c = client(d.port);
 
     let e = c
-        .get_blocks(&[], hashes.len() as u64 + 100, false, false)
+        .get_blocks(&[], hashes.len() as u64 + 100, false, false, 0)
         .expect_err("past the tip");
     assert!(e.to_string().contains("past the tip"), "{e}");
 }

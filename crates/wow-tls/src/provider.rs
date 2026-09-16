@@ -1,6 +1,6 @@
 //! The rustls [`CryptoProvider`] under the RPC server's TLS (`specs/11` §1.2),
-//! built from pure-Rust RustCrypto crates: no C, C++ or assembly, so neither
-//! ring nor aws-lc-rs.
+//! and under a wallet's TLS to a node, built from pure-Rust RustCrypto crates:
+//! no C, C++ or assembly, so neither ring nor aws-lc-rs.
 //!
 //! It is narrow on purpose: what the C++'s `ssl_options_t` negotiates, and
 //! what a client of it may bring.

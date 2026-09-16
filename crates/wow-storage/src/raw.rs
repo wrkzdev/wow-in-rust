@@ -42,10 +42,13 @@
     reason = "this module is the FFI boundary; every block carries a SAFETY note"
 )]
 
+use std::cell::RefCell;
 use std::ffi::{c_uint, c_void, CString};
 use std::marker::PhantomData;
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 use lmdb_master_sys as ffi;
 
@@ -197,6 +200,8 @@ fn comparator_ptr(c: crate::tables::Cmp) -> ffi::MDB_cmp_func {
 /// dropped on one thread — and the writer is serialised by LMDB itself.
 pub struct Env {
     ptr: *mut ffi::MDB_env,
+    /// Keeps a map resize away from open transactions.
+    gate: Gate,
 }
 
 // SAFETY: `MDB_env` is documented as safe to share between threads; LMDB does
@@ -224,7 +229,10 @@ impl Env {
         // pointer and touches nothing else.
         check(unsafe { ffi::mdb_env_create(&mut ptr) }, "mdb_env_create")?;
 
-        let env = Env { ptr };
+        let env = Env {
+            ptr,
+            gate: Gate::new(),
+        };
 
         // SAFETY: `env.ptr` is a valid handle from `mdb_env_create`, and none
         // of these may be called after `mdb_env_open`, which is why they are
@@ -262,34 +270,87 @@ impl Env {
 
     /// Begin a read transaction.
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
-        let mut txn: *mut ffi::MDB_txn = ptr::null_mut();
-        // SAFETY: a null parent and `MDB_RDONLY` start a top-level read txn.
-        check(
-            unsafe { ffi::mdb_txn_begin(self.ptr, ptr::null_mut(), ffi::MDB_RDONLY, &mut txn) },
-            "mdb_txn_begin(read)",
-        )?;
-        Ok(RoTxn {
-            ptr: txn,
-            _env: PhantomData,
-        })
+        self.begin(ffi::MDB_RDONLY, "mdb_txn_begin(read)")
     }
 
     /// Begin the write transaction. LMDB permits only one at a time
     /// environment-wide and will block until the previous one finishes
     /// (`specs/10` §6.1).
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
-        let mut txn: *mut ffi::MDB_txn = ptr::null_mut();
-        // SAFETY: a null parent and no flags start a top-level write txn.
-        check(
-            unsafe { ffi::mdb_txn_begin(self.ptr, ptr::null_mut(), 0, &mut txn) },
-            "mdb_txn_begin(write)",
-        )?;
         Ok(RwTxn {
-            inner: RoTxn {
-                ptr: txn,
-                _env: PhantomData,
-            },
+            inner: self.begin(0, "mdb_txn_begin(write)")?,
         })
+    }
+
+    /// `mdb_txn_begin`, counted by the [`Gate`].
+    ///
+    /// `MDB_MAP_RESIZED` means another process grew the map past what this one
+    /// has mapped. LMDB's remedy is to adopt the size recorded in the file and
+    /// begin again, which is what the C++'s `lmdb_txn_begin` does too.
+    fn begin(&self, flags: c_uint, op: &'static str) -> Result<RoTxn<'_>> {
+        let mut adopted = false;
+        loop {
+            self.gate.enter();
+            let mut txn: *mut ffi::MDB_txn = ptr::null_mut();
+            // SAFETY: a null parent starts a top-level transaction: a read
+            // transaction with `MDB_RDONLY`, the write transaction without.
+            let rc = unsafe { ffi::mdb_txn_begin(self.ptr, ptr::null_mut(), flags, &mut txn) };
+            if rc == ffi::MDB_SUCCESS {
+                return Ok(RoTxn {
+                    ptr: txn,
+                    env: self,
+                });
+            }
+            self.gate.leave();
+            if rc == ffi::MDB_MAP_RESIZED && !adopted && !self.holds_txn() {
+                adopted = true;
+                // A size of zero adopts the one in the file.
+                self.resize(|_| Some(0))?;
+                continue;
+            }
+            return Err(LmdbError { code: rc, op });
+        }
+    }
+
+    /// Whether this thread has a transaction open on this environment.
+    ///
+    /// A resize waits for every transaction to end, so one asked for by a
+    /// thread holding a transaction would wait for itself forever.
+    /// [`Env::resize`] refuses it instead.
+    pub fn holds_txn(&self) -> bool {
+        held(self.gate.id) > 0
+    }
+
+    /// `mdb_env_set_mapsize` on an open, shared environment (`specs/10` §2.2).
+    ///
+    /// Waits for every transaction in the process to end, holding new ones
+    /// back meanwhile -- the C++'s `prevent_new_txns` and
+    /// `wait_no_active_txns` -- and then asks `new_size` what to set, given the
+    /// map as it is *now*: another thread may have grown it while this one
+    /// waited. `None` leaves it alone. Returns the map as it is afterwards.
+    ///
+    /// Fails with `EINVAL` from a thread that holds a transaction here (see
+    /// [`Env::holds_txn`]).
+    pub fn resize(&self, new_size: impl FnOnce(&MapInfo) -> Option<usize>) -> Result<MapInfo> {
+        self.gate
+            .exclusive(|| {
+                let now = self.size_info()?;
+                if let Some(size) = new_size(&now) {
+                    // SAFETY: the gate has seen every transaction in the
+                    // process end and holds new ones back until this returns,
+                    // so no pointer into the old map survives -- the
+                    // precondition LMDB documents.
+                    check(
+                        unsafe { ffi::mdb_env_set_mapsize(self.ptr, size) },
+                        "mdb_env_set_mapsize",
+                    )?;
+                }
+                self.size_info()
+            })
+            .unwrap_or(Err(LmdbError {
+                code: libc::EINVAL,
+                op: "mdb_env_set_mapsize with a transaction open on this thread",
+            }))
     }
 
     /// `mdb_env_sync(force)`.
@@ -361,6 +422,138 @@ pub struct MapInfo {
     pub page_size: u64,
 }
 
+impl MapInfo {
+    /// Bytes up to the last page in use: `need_resize`'s `size_used`.
+    pub fn used(&self) -> u64 {
+        self.page_size.saturating_mul(self.last_pgno)
+    }
+}
+
+/// Keeps a map resize and open transactions apart (`specs/10` §2.2).
+///
+/// Changing the map size invalidates every pointer into the map, so nothing
+/// may be reading it when that happens. The C++ counts its transactions and
+/// holds new ones at a gate while a resize waits for the count to fall to
+/// zero. This does the same, with one difference a Rust node needs: every
+/// `BlockchainDb` read opens its own snapshot, so a thread already holding one
+/// routinely opens another. Holding that second one at the gate would
+/// deadlock -- the resize waits for the first to end, and the first waits on
+/// its own thread -- so a thread already inside goes straight through. It
+/// cannot slip in under a resize that is under way, since the count is not
+/// zero while it holds anything.
+struct Gate {
+    /// This environment among any others in the process, for [`HELD`].
+    id: u64,
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    /// Transactions open in this process.
+    open: usize,
+    /// A resize is waiting for `open` to reach zero, or running.
+    resizing: bool,
+}
+
+thread_local! {
+    /// Transactions this thread holds, by [`Gate::id`]. A transaction is not
+    /// `Send`, so it ends on the thread that counted it.
+    static HELD: RefCell<Vec<(u64, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn held(gate: u64) -> usize {
+    HELD.try_with(|h| {
+        h.borrow()
+            .iter()
+            .find(|(g, _)| *g == gate)
+            .map_or(0, |(_, n)| *n)
+    })
+    .unwrap_or(0)
+}
+
+fn note_held(gate: u64, began: bool) {
+    let _ = HELD.try_with(|h| {
+        let mut h = h.borrow_mut();
+        match h.iter().position(|(g, _)| *g == gate) {
+            Some(i) if began => h[i].1 += 1,
+            Some(i) => {
+                h[i].1 -= 1;
+                if h[i].1 == 0 {
+                    h.swap_remove(i);
+                }
+            }
+            None if began => h.push((gate, 1)),
+            None => {}
+        }
+    });
+}
+
+impl Gate {
+    fn new() -> Gate {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Gate {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            state: Mutex::new(GateState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, GateState> {
+        // Nothing panics while holding this lock, and a count is still right
+        // after a panic elsewhere.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait<'a>(&self, s: MutexGuard<'a, GateState>) -> MutexGuard<'a, GateState> {
+        self.changed.wait(s).unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Count a transaction this thread is about to begin, waiting out a
+    /// resize unless the thread is already inside.
+    fn enter(&self) {
+        let inside = held(self.id) > 0;
+        let mut s = self.state();
+        while s.resizing && !inside {
+            s = self.wait(s);
+        }
+        s.open += 1;
+        drop(s);
+        note_held(self.id, true);
+    }
+
+    /// A transaction this thread counted has ended, or never began.
+    fn leave(&self) {
+        note_held(self.id, false);
+        let mut s = self.state();
+        s.open -= 1;
+        if s.open == 0 {
+            self.changed.notify_all();
+        }
+    }
+
+    /// Run `f` with no transaction open anywhere in the process, or return
+    /// `None` from a thread that holds one.
+    fn exclusive<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        if held(self.id) > 0 {
+            return None;
+        }
+        let mut s = self.state();
+        while s.resizing {
+            s = self.wait(s);
+        }
+        s.resizing = true;
+        while s.open > 0 {
+            s = self.wait(s);
+        }
+        let out = f();
+        s.resizing = false;
+        drop(s);
+        self.changed.notify_all();
+        Some(out)
+    }
+}
+
 #[cfg(unix)]
 fn path_bytes(p: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
@@ -372,6 +565,61 @@ fn path_bytes(p: &Path) -> Vec<u8> {
     p.to_string_lossy().into_owned().into_bytes()
 }
 
+/// Bytes this process may still write on the filesystem holding `dir`, or
+/// `None` when the platform will not say.
+///
+/// `do_resize` checks it before growing the map (`specs/10` §2.2).
+#[cfg(unix)]
+#[allow(
+    clippy::useless_conversion,
+    reason = "`fsblkcnt_t` and `c_ulong` are 32 bits on some targets"
+)]
+pub fn available_space(dir: &Path) -> Option<u64> {
+    let c_path = CString::new(path_bytes(dir)).ok()?;
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is NUL-terminated and outlives the call, and `statvfs`
+    // fills the struct whenever it returns zero.
+    let st = unsafe {
+        if libc::statvfs(c_path.as_ptr(), st.as_mut_ptr()) != 0 {
+            return None;
+        }
+        st.assume_init()
+    };
+    Some(u64::from(st.f_bavail).saturating_mul(u64::from(st.f_frsize)))
+}
+
+/// Bytes this process may still write on the filesystem holding `dir`, or
+/// `None` when the platform will not say.
+///
+/// `do_resize` checks it before growing the map (`specs/10` §2.2).
+#[cfg(windows)]
+pub fn available_space(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is NUL-terminated and outlives the call, `free` is a
+    // writable `ULARGE_INTEGER`, and the other two out-parameters may be null.
+    let ok =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, ptr::null_mut(), ptr::null_mut()) };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn available_space(_dir: &Path) -> Option<u64> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // transactions
 // ---------------------------------------------------------------------------
@@ -379,11 +627,12 @@ fn path_bytes(p: &Path) -> Vec<u8> {
 /// A read transaction — a consistent snapshot for its whole life
 /// (`specs/10` §6.2).
 ///
-/// Not `Send`: LMDB ties a read transaction to the thread that created it
-/// unless `MDB_NOTLS` is set, and this wrapper does not set it.
+/// Not `Send`: the [`Gate`] counts transactions per thread, so one must end
+/// on the thread that began it.
 pub struct RoTxn<'e> {
     ptr: *mut ffi::MDB_txn,
-    _env: PhantomData<&'e Env>,
+    /// Counted in the environment's gate until the transaction ends.
+    env: &'e Env,
 }
 
 impl RoTxn<'_> {
@@ -400,11 +649,13 @@ impl RoTxn<'_> {
     /// become visible to the environment; dropping it instead leaves later
     /// transactions unable to use them.
     pub fn commit(self) -> Result<()> {
-        let ptr = self.ptr;
+        let (ptr, env) = (self.ptr, self.env);
         std::mem::forget(self);
         // SAFETY: the handle is live and is not used again — `forget` skips the
         // Drop that would abort it.
-        check(unsafe { ffi::mdb_txn_commit(ptr) }, "mdb_txn_commit(read)")
+        let rc = unsafe { ffi::mdb_txn_commit(ptr) };
+        env.gate.leave();
+        check(rc, "mdb_txn_commit(read)")
     }
 
     /// `mdb_get`.
@@ -437,9 +688,11 @@ impl RoTxn<'_> {
 
 impl Drop for RoTxn<'_> {
     fn drop(&mut self) {
-        // SAFETY: aborting a read transaction is always safe and is the
-        // cheapest way to end one.
+        // SAFETY: aborting a transaction is always safe and is the cheapest
+        // way to end one.
         unsafe { ffi::mdb_txn_abort(self.ptr) };
+        // Only now, with the transaction over, may a resize go ahead.
+        self.env.gate.leave();
     }
 }
 
@@ -514,11 +767,13 @@ impl RwTxn<'_> {
 
     /// Commit. This is the atomic unit (`specs/10` §6.3).
     pub fn commit(self) -> Result<()> {
-        let ptr = self.inner.ptr;
+        let (ptr, env) = (self.inner.ptr, self.inner.env);
         std::mem::forget(self);
         // SAFETY: the handle is live and not used again; `forget` skips the
         // Drop that would otherwise abort it.
-        check(unsafe { ffi::mdb_txn_commit(ptr) }, "mdb_txn_commit")
+        let rc = unsafe { ffi::mdb_txn_commit(ptr) };
+        env.gate.leave();
+        check(rc, "mdb_txn_commit")
     }
 
     /// Abort explicitly. Dropping does the same.
@@ -1001,6 +1256,54 @@ mod tests {
         assert_eq!(r.get(db, &1u64.to_ne_bytes()).unwrap(), Some(&b"one"[..]));
         assert_eq!(r.get(db, &2u64.to_ne_bytes()).unwrap(), None);
         assert_eq!(r.entries(db).unwrap(), 1);
+    }
+
+    /// A resize waits for open transactions and holds new ones back -- except
+    /// on a thread already inside, which would otherwise deadlock against it.
+    #[test]
+    fn a_resize_waits_for_transactions_and_lets_a_nested_one_through() {
+        let s = Scratch::new("resize");
+        // A second read transaction on one thread needs `MDB_NOTLS`, which
+        // every real open sets (`crate::env::NOTLS_NOTE`).
+        let e = Env::open(&s.0, ffi::MDB_NOTLS, 32, None, 16 << 20).expect("open");
+        let before = e.size_info().unwrap().map_size;
+
+        let outer = e.read_txn().unwrap();
+        std::thread::scope(|scope| {
+            let resizer = scope.spawn(|| e.resize(|m| Some(m.map_size as usize * 2)));
+            while !e.gate.state().resizing {
+                std::thread::yield_now();
+            }
+            let nested = e
+                .read_txn()
+                .expect("a thread already inside is not held back");
+            assert!(!resizer.is_finished(), "the resize waits for both");
+            drop(nested);
+            drop(outer);
+            let after = resizer.join().expect("resizer").expect("resize");
+            assert_eq!(after.map_size, before * 2);
+        });
+        assert_eq!(e.gate.state().open, 0);
+        assert!(!e.holds_txn());
+    }
+
+    /// A thread holding a transaction cannot resize, since it would wait for
+    /// itself. A commit ends the count as surely as a drop.
+    #[test]
+    fn a_thread_holding_a_transaction_cannot_resize() {
+        let s = Scratch::new("resize-held");
+        let e = env(&s);
+        let r = e.read_txn().unwrap();
+        assert!(e.holds_txn());
+        assert!(e.resize(|m| Some(m.map_size as usize * 2)).is_err());
+        drop(r);
+
+        let w = e.write_txn().unwrap();
+        assert!(e.holds_txn());
+        w.commit().unwrap();
+        assert!(!e.holds_txn());
+        let grown = e.resize(|m| Some(m.map_size as usize * 2)).unwrap();
+        assert!(grown.map_size >= 32 << 20, "{grown:?}");
     }
 
     /// Every table in the schema opens with its real flags and comparators.

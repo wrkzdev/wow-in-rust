@@ -398,6 +398,18 @@ impl core::ops::Deref for Transaction {
 
 impl Transaction {
     pub fn read(r: &mut Reader<'_>) -> Result<Transaction> {
+        Transaction::read_parts(r, false)
+    }
+
+    /// `transaction::serialize_base`: the prefix, and for v2 the RingCT base.
+    ///
+    /// What a pruned transaction keeps. v1 signatures and the v2 prunable half
+    /// are not read, so a blob that ends where they would begin parses.
+    pub fn read_base(r: &mut Reader<'_>) -> Result<Transaction> {
+        Transaction::read_parts(r, true)
+    }
+
+    fn read_parts(r: &mut Reader<'_>, base_only: bool) -> Result<Transaction> {
         let start = r.pos();
         let prefix = TransactionPrefix::read(r)?;
         let prefix_size = r.pos() - start;
@@ -413,14 +425,16 @@ impl Transaction {
             // resizes the outer vector to one row per input on load, so there
             // is always exactly one row per input even when a row is empty
             // (a `txin_gen` has `get_signature_size() == 0`).
-            signatures.reserve(prefix.vin.len());
-            for input in &prefix.vin {
-                let n = input.signature_size();
-                let mut row = Vec::with_capacity(n);
-                for _ in 0..n {
-                    row.push(Signature::from_bytes(&r.read_array::<64>()?));
+            if !base_only {
+                signatures.reserve(prefix.vin.len());
+                for input in &prefix.vin {
+                    let n = input.signature_size();
+                    let mut row = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        row.push(Signature::from_bytes(&r.read_array::<64>()?));
+                    }
+                    signatures.push(row);
                 }
-                signatures.push(row);
             }
         } else if !prefix.vin.is_empty() {
             let inputs = prefix.vin.len();
@@ -441,7 +455,7 @@ impl Transaction {
 
             rct_signatures = RctSignatures::read_base(r, inputs, outputs)?;
             unprunable_size = r.pos() - start;
-            if !rct_signatures.ty.is_null() {
+            if !base_only && !rct_signatures.ty.is_null() {
                 rct_signatures.read_prunable(r, inputs, outputs, mixin)?;
             }
         }
@@ -467,13 +481,16 @@ impl Transaction {
         Ok(tx)
     }
 
-    /// Parse without the [`Transaction::expand`] step.
+    /// `parse_and_validate_tx_base_from_blob`: the prefix, and for v2 the
+    /// RingCT base, without the [`Transaction::expand`] checks.
     ///
-    /// This is the `base_only` path, used for pruned transactions
-    /// (`specs/05` §2.5) where the prunable half is absent.
+    /// This is the `base_only` path for pruned transactions (`specs/05` §2.5),
+    /// where the prunable half is absent. Given a whole blob it reads the same
+    /// fields and ignores the rest. It used to read the whole transaction, so a
+    /// pruned blob, which ends where the proofs would begin, did not parse.
     pub fn from_blob_base_only(blob: &[u8]) -> Result<Transaction> {
         let mut r = Reader::new(blob);
-        Transaction::read(&mut r)
+        Transaction::read_base(&mut r)
     }
 
     /// `expand_transaction_1(tx, base_only = false)`, the checks only.

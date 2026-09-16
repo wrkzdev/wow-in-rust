@@ -5,12 +5,19 @@
 //! "unknown command" to `export_outputs` tells a user nothing about whether it
 //! will ever work.
 
-use wow_types::address::{Address, AddressKind};
-use wow_wallet::decoys::{self, GammaPicker};
-use wow_wallet::spend::{self, SpendOptions};
-use wow_wallet::transfer::{self, Destination, SpendableOutput};
+use std::time::Instant;
+
+use wow_daemon_client::KeyImageStatus;
+use wow_types::address::Address;
+use wow_wallet::decoys;
+use wow_wallet::history::{EntryKind, PROPAGATION_TIMEOUT};
+use wow_wallet::priority::{self, PrioritySettings};
+use wow_wallet::send::SendRequest;
+use wow_wallet::spend;
+use wow_wallet::{PoolCheck, RefreshEvent};
 
 use crate::fmt;
+use crate::progress::Progress;
 use crate::session::{balance_line, now, Session};
 use crate::term;
 
@@ -54,7 +61,6 @@ const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ),
     ("address_book", "the address book is not built yet"),
     ("account", "multiple accounts are not built yet"),
-    ("payments", "payment-id history is not built yet"),
     ("donate", "the donation address is not wired up"),
     ("show_qr_code", "QR rendering is not built yet"),
     (
@@ -92,6 +98,8 @@ pub fn run_one(session: &mut Session, line: &str) -> Result<Outcome, String> {
         return Ok(Outcome::Continue);
     };
     let args: Vec<&str> = parts.collect();
+    // The name only: an argument can be a password, a seed or a key.
+    wow_log::debug!("wallet.simplewallet", "command `{name}`");
 
     if let Some((_, why)) = NOT_IMPLEMENTED.iter().find(|(n, _)| *n == name) {
         println!("`{name}` is not available in this build: {why}.");
@@ -128,6 +136,7 @@ pub fn run_one(session: &mut Session, line: &str) -> Result<Outcome, String> {
         }
         "incoming_transfers" => incoming_transfers(session, &args),
         "show_transfers" => show_transfers(session, &args),
+        "payments" => payments(session, &args),
         "unspent_outputs" => unspent_outputs(session),
         "fee" => fee(session),
         "transfer" => transfer_cmd(session, &args),
@@ -153,7 +162,7 @@ Wallet
   save                          write the keys file and cache
 
 Chain
-  set_daemon <host:port>        point at a daemon
+  set_daemon <address>          point at a daemon: host:port, or https://host:port
   refresh                       scan up to the daemon's tip
   rescan_bc                     forget what was scanned and start over
   bc_height / status            where the wallet and the daemon are
@@ -161,7 +170,8 @@ Chain
 
 History
   incoming_transfers [available|unavailable]
-  show_transfers [in|out|all]
+  show_transfers [in|out|pending|failed|coinbase|all] [<min_height> [<max_height>]]
+  payments <payment_id> [<payment_id> ...]
   unspent_outputs
 
 Sending
@@ -273,7 +283,7 @@ fn spendkey(session: &mut Session) -> Result<(), String> {
 }
 
 fn wallet_info(session: &mut Session) -> Result<(), String> {
-    println!("file: {}", session.paths.keys().display());
+    println!("file: {}", session.location());
     println!("network: {}", session.network.name());
     println!("address: {}", session.primary_address());
     let keys = &session.keys_file.account.keys;
@@ -340,8 +350,10 @@ fn refresh(session: &mut Session) -> Result<(), String> {
         .ok_or("no daemon set; use `set_daemon <host:port>`")?;
 
     let start = session.state.scan_height();
-    let mut received = 0usize;
-    let mut spent = 0usize;
+    let started = Instant::now();
+    let mut progress = Progress::new();
+    let (mut received, mut received_amount) = (0usize, 0u64);
+    let (mut spent, mut spent_amount) = (0usize, 0u64);
 
     loop {
         let s = session
@@ -350,34 +362,140 @@ fn refresh(session: &mut Session) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         received += s.received;
         spent += s.spent;
+        // The daemon's height as it grows, so a long refresh aims at the tip
+        // it will reach rather than the one there was when it started.
+        if s.current_height > 0 {
+            session.daemon_height = s.current_height;
+        }
 
         if let Some(h) = s.reorg_to {
+            progress.clear();
             println!("Reorganisation: the chain changed below height {h}; rescanned from there.");
         }
+        for e in &s.events {
+            match *e {
+                RefreshEvent::Received { amount, burnt, .. } => received_amount += amount - burnt,
+                RefreshEvent::Spent { amount, .. } => spent_amount += amount,
+            }
+            progress.clear();
+            println!("{}", describe_event(e));
+        }
         if s.blocks_scanned > 0 {
-            println!("  {}", session.describe_progress());
+            progress.update(session.state.scan_height(), session.chain_height());
         }
         if s.caught_up {
             break;
         }
     }
+    progress.clear();
 
     if let Ok(info) = client.get_info() {
         session.daemon_height = info.height;
     }
     session.dirty = true;
+    println!("  {}", session.describe_progress());
+
+    // Caught up, so a sent transaction missing from both the chain and the
+    // pool really is missing.
+    match session.check_pending() {
+        Ok(check) => report_pool(session, &check),
+        Err(e) => eprintln!("{e}"),
+    }
 
     let scanned = session.state.scan_height().saturating_sub(start);
-    println!("Scanned {scanned} block(s).");
+    let elapsed = started.elapsed();
+    if elapsed.as_secs() > 0 && scanned > 0 {
+        println!(
+            "Scanned {scanned} block(s) in {} ({:.0} blocks/s).",
+            fmt::duration(elapsed.as_secs()),
+            scanned as f64 / elapsed.as_secs_f64()
+        );
+    } else {
+        println!("Scanned {scanned} block(s).");
+    }
     if received > 0 {
-        println!("Received {received} new output(s).");
+        println!(
+            "Received {received} new output(s), {} in all.",
+            fmt::amount(received_amount)
+        );
     }
     if spent > 0 {
-        println!("{spent} of this wallet's outputs were spent.");
+        println!(
+            "{spent} of this wallet's outputs were spent, {} in all.",
+            fmt::amount(spent_amount)
+        );
     }
     let (balance, unlocked) = session.balances();
     println!("{}", balance_line(balance, unlocked));
     Ok(())
+}
+
+/// A payment found or a spend of this wallet's, as
+/// `simple_wallet::on_money_received` and `on_money_spent` print them.
+fn describe_event(e: &RefreshEvent) -> String {
+    match *e {
+        RefreshEvent::Received {
+            height,
+            txid,
+            amount,
+            burnt,
+            subaddress,
+        } => {
+            let burn = if burnt > 0 {
+                format!(
+                    " ({} yet {} was burnt)",
+                    fmt::amount(amount),
+                    fmt::amount(burnt)
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "Height {height}, txid {}, {}{burn}, idx {}/{}",
+                wow_crypto::hex::encode(&txid),
+                fmt::amount(amount - burnt),
+                subaddress.major,
+                subaddress.minor
+            )
+        }
+        RefreshEvent::Spent {
+            height,
+            txid,
+            amount,
+            subaddress,
+        } => format!(
+            "Height {height}, txid {}, spent {}, idx {}/{}",
+            wow_crypto::hex::encode(&txid),
+            fmt::amount(amount),
+            subaddress.major,
+            subaddress.minor
+        ),
+    }
+}
+
+/// What the daemon's pool showed about this wallet's money.
+fn report_pool(session: &Session, check: &PoolCheck) {
+    for txid in &check.noted {
+        let Some(s) = session.state.sent.iter().find(|s| s.txid == *txid) else {
+            continue;
+        };
+        println!(
+            "Transaction {} in the daemon's pool spends {} of this wallet's outputs, {} in all. \
+             It was not sent from this wallet file; those outputs count as spent while it waits \
+             for a block.",
+            wow_crypto::hex::encode(txid),
+            s.key_images.len(),
+            fmt::amount(s.amount_in)
+        );
+    }
+    for txid in &check.failed {
+        println!(
+            "Transaction {} is in neither a block nor the daemon's pool {PROPAGATION_TIMEOUT} \
+             seconds after this wallet sent it or first saw it. Marked failed; its inputs can be \
+             spent again.",
+            wow_crypto::hex::encode(txid)
+        );
+    }
 }
 
 fn rescan(session: &mut Session) -> Result<(), String> {
@@ -386,10 +504,7 @@ fn rescan(session: &mut Session) -> Result<(), String> {
         return Ok(());
     }
     let from = session.keys_file.refresh_height();
-    session.state.hashes.clear();
-    session.state.transfers.clear();
-    session.state.by_key_image.clear();
-    session.state.start_height = from;
+    session.state.rescan_from(from);
     session.dirty = true;
     println!("Cleared. Run `refresh` to scan from height {from}.");
     Ok(())
@@ -442,32 +557,139 @@ fn incoming_transfers(session: &mut Session, args: &[&str]) -> Result<(), String
 }
 
 fn show_transfers(session: &mut Session, args: &[&str]) -> Result<(), String> {
-    let filter = args.first().copied().unwrap_or("all");
+    use EntryKind::*;
+    const ALL: &[EntryKind] = &[In, Coinbase, Out, Pending, Failed];
+
+    // `simple_wallet::get_transfers`: a word to narrow what is shown, then a
+    // height range.
+    let (kinds, rest): (&[EntryKind], &[&str]) = match args.first().copied() {
+        Some("in" | "incoming") => (&[In, Coinbase], &args[1..]),
+        Some("out" | "outgoing") => (&[Out, Pending, Failed], &args[1..]),
+        Some("pending") => (&[Pending], &args[1..]),
+        Some("failed") => (&[Failed], &args[1..]),
+        Some("coinbase") => (&[Coinbase], &args[1..]),
+        Some("pool") => {
+            println!("(this build does not track incoming transactions in the pool)");
+            return Ok(());
+        }
+        Some("all" | "both") => (ALL, &args[1..]),
+        _ => (ALL, args),
+    };
+    let height_arg = |i: usize, default: u64| match rest.get(i) {
+        Some(s) => s.parse().map_err(|_| format!("`{s}` is not a height")),
+        None => Ok(default),
+    };
+    let (min, max) = (height_arg(0, 0)?, height_arg(1, u64::MAX)?);
+
+    let chain_height = session.chain_height();
+    let now = now();
     let mut shown = 0usize;
-    for t in session.transfers() {
-        let direction = if t.spent { "out" } else { "in" };
-        if filter != "all" && filter != direction {
+    for e in session.state.history() {
+        if !kinds.contains(&e.kind) {
             continue;
         }
+        // Above the lower height and up to the upper, as the C++ has it.
+        if let Some(h) = e.height {
+            if (min > 0 && h <= min) || h > max {
+                continue;
+            }
+        }
         shown += 1;
+
+        let received = matches!(e.kind, In | Coinbase);
+        let block = match e.height {
+            Some(h) => format!("{h:08}"),
+            None => e.kind.name().to_string(),
+        };
+        let direction = match e.kind {
+            In => "in",
+            Coinbase => "block",
+            _ => "out",
+        };
+        let unlocked = if !received {
+            "-"
+        } else if e.unlocked(chain_height, now) {
+            "unlocked"
+        } else {
+            "locked"
+        };
+        let destinations = if received {
+            // The subaddress it came in on, cut short as the C++ cuts it.
+            let minor = e.minors.first().copied().unwrap_or(0);
+            let address = session.address_at(e.account, minor).unwrap_or_default();
+            format!(
+                "{}:{}",
+                &address[..address.len().min(6)],
+                fmt::amount(e.amount)
+            )
+        } else if e.destinations.is_empty() {
+            "-".to_string()
+        } else {
+            e.destinations
+                .iter()
+                .map(|d| format!("{}:{}", d.address, fmt::amount(d.amount)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let indices = e
+            .minors
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let payment_id = e
+            .payment_id
+            .map_or_else(|| "0".repeat(16), |p| wow_crypto::hex::encode(&p));
         println!(
-            "{:<4} {:<10} {:>20}  {}",
-            direction,
-            t.block_height,
-            fmt::amount(t.amount),
-            wow_crypto::hex::encode(&t.txid)
+            "{block:>8} {direction:>6} {unlocked:>8} {:>25.25} {:>20.20} {} {payment_id} {:>14.14} \
+             {destinations} {indices} -",
+            fmt::timestamp(e.timestamp),
+            fmt::amount(e.amount),
+            wow_crypto::hex::encode(&e.txid),
+            fmt::amount(e.fee),
         );
     }
     if shown == 0 {
         println!("(none)");
     }
-    // An outgoing transfer is inferred from an output being spent, which is
-    // not the same as a record of what was sent. Saying so beats letting a
-    // user believe the history is complete.
+    Ok(())
+}
+
+/// `simple_wallet::show_payments`: the payments received with each id given.
+fn payments(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("usage: payments <payment_id> [<payment_id> ...]".into());
+    }
+    let received = session.state.payments(0);
     println!(
-        "(outgoing entries are this wallet's own outputs being spent; a record of destinations \
-         needs store-tx-info, which is not built yet)"
+        "{:<16}  {:<64}  {:>8}  {:>20}  {:>11}  {:>10}",
+        "payment", "transaction", "height", "amount", "unlock time", "addr index"
     );
+    for arg in args {
+        let Some(key) = wow_wallet::history::parse_payment_key(arg) else {
+            println!("`{arg}` is not a payment id: 16 or 64 hex characters");
+            continue;
+        };
+        let mut found = false;
+        for e in received
+            .iter()
+            .filter(|e| wow_wallet::history::payment_key(e.payment_id) == key)
+        {
+            found = true;
+            println!(
+                "{:<16}  {}  {:>8}  {:>20}  {:>11}  {:>10}",
+                arg,
+                wow_crypto::hex::encode(&e.txid),
+                e.height.unwrap_or(0),
+                fmt::amount(e.amount),
+                e.unlock_time,
+                e.minors.first().copied().unwrap_or(0),
+            );
+        }
+        if !found {
+            println!("No payments with id {arg}");
+        }
+    }
     Ok(())
 }
 
@@ -501,38 +723,45 @@ fn fee(session: &mut Session) -> Result<(), String> {
         .as_ref()
         .ok_or("no daemon set; use `set_daemon <host:port>`")?;
     let tiers = client
-        .get_fee_estimate(0)
+        .get_fee_estimate(priority::FEE_ESTIMATE_GRACE_BLOCKS)
         .map_err(|e| format!("cannot get a fee estimate: {e}"))?;
 
     println!("Fee per byte, by priority:");
     for (i, t) in tiers.iter().enumerate() {
-        println!("  {}: {}", priority_name(i as u32 + 1), fmt::amount(*t));
+        println!("  {}: {}", tier_name(i as u32 + 1), fmt::amount(*t));
     }
-    // What that means for an ordinary transaction.
-    let weight = spend::estimate_tx_weight(1, decoys::RING_SIZE, 2, 44);
+
+    // What a transfer given no priority pays now, for an ordinary one.
+    let settings = PrioritySettings::from_keys_file(&session.keys_file);
+    let chosen = priority::adjust_priority(
+        client,
+        settings.default_priority,
+        settings,
+        session.state.scan_height(),
+        &tiers,
+    );
+    let weight =
+        spend::estimate_tx_weight(1, decoys::RING_SIZE, 2, spend::extra_size(2, false, false));
     println!(
-        "A one-input, two-output transaction weighs about {weight} bytes, so at normal priority \
-         it would cost {}.",
+        "A transfer given no priority pays the {} rate now. A one-input, two-output transaction \
+         weighs about {weight} bytes, so it would cost {}.",
+        tier_name(chosen),
         fmt::amount(spend::fee_from_weight(
-            tiers.get(1).copied().unwrap_or(tiers[0]),
+            priority::fee_per_byte(&tiers, chosen),
             weight
         ))
     );
     Ok(())
 }
 
-fn priority_name(p: u32) -> &'static str {
-    match p {
-        1 => "unimportant",
-        2 => "normal",
-        3 => "elevated",
-        _ => "priority",
-    }
+/// The name of the tier a priority pays. A 0 left unadjusted pays the lowest.
+fn tier_name(p: u32) -> &'static str {
+    priority::PRIORITY_NAMES[p.clamp(1, 4) as usize]
 }
 
 fn transfer_cmd(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let mut rest: Vec<&str> = args.to_vec();
-    let priority = take_priority(&mut rest);
+    let priority = take_priority(&mut rest, session.keys_file.default_priority());
     let ring_size = take_ring_size(&mut rest)?;
 
     let address = rest
@@ -554,7 +783,8 @@ fn transfer_cmd(session: &mut Session, args: &[&str]) -> Result<(), String> {
 
 fn sweep_all(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let mut rest: Vec<&str> = args.to_vec();
-    let priority = take_priority(&mut rest);
+    // `simple_wallet::sweep_main` starts from 0, not the default priority.
+    let priority = take_priority(&mut rest, 0);
     let ring_size = take_ring_size(&mut rest)?;
     let address = rest
         .first()
@@ -583,20 +813,11 @@ fn send(
     if session.is_view_only() {
         return Err("a view-only wallet cannot spend: it has no spend key".into());
     }
-    let client = session
-        .daemon
-        .clone()
-        .ok_or("no daemon set; use `set_daemon <host:port>`")?;
+    if session.daemon.is_none() {
+        return Err("no daemon set; use `set_daemon <host:port>`".into());
+    }
 
-    // The destination, decoded against this wallet's network.
     let (address_text, amount) = &destinations[0];
-    let decoded = Address::decode_for(address_text, session.network).map_err(|e| {
-        format!(
-            "that address is not valid for {}: {e}",
-            session.network.name()
-        )
-    })?;
-
     let explicit_pid: Option<[u8; 8]> = match payment_id {
         Some(hex) => Some(
             wow_crypto::hex::decode(hex)
@@ -606,112 +827,47 @@ fn send(
         ),
         None => None,
     };
-    // An integrated address carries its own payment id, and giving a second one
-    // is ambiguous rather than additive.
-    let pid = match (decoded.payment_id, explicit_pid) {
-        (Some(_), Some(_)) => {
-            return Err("that is an integrated address; it already carries a payment id".into())
-        }
-        (Some(p), None) => Some(p),
-        (None, other) => other,
-    };
 
-    // Fees, from the daemon.
-    let tiers = client
-        .get_fee_estimate(0)
-        .map_err(|e| format!("cannot get a fee estimate: {e}"))?;
-    let fee_per_byte = tiers
-        .get(priority.saturating_sub(1) as usize)
-        .or(tiers.first())
-        .copied()
-        .unwrap_or(0);
-
-    let options = SpendOptions {
+    let request = SendRequest {
+        address: address_text,
+        amount: (!sweep).then_some(*amount),
+        priority,
         ring_size,
-        fee_per_byte,
-        extra_size: if pid.is_some() { 44 + 11 } else { 44 },
-        chain_height: session.chain_height(),
-        now: now(),
-        ..Default::default()
+        payment_id: explicit_pid,
     };
+    let prepared = session.prepare_send(&request).map_err(|e| e.to_string())?;
 
-    let plan = if sweep {
-        spend::plan_sweep(session.transfers(), &options)
-    } else {
-        spend::plan(session.transfers(), &[*amount], &options)
+    // Spends of this wallet's outputs that preparing found in the pool.
+    if let Some(e) = &prepared.pool_unread {
+        eprintln!("{e}");
     }
-    .map_err(|e| e.to_string())?;
+    report_pool(
+        session,
+        &PoolCheck {
+            noted: prepared.noted_in_pool.clone(),
+            failed: Vec::new(),
+        },
+    );
 
-    // Rings, one per input.
-    let distribution = client
-        .get_output_distribution(0, 0, session.chain_height().saturating_sub(1))
-        .map_err(|e| format!("cannot get the output distribution: {e}"))?;
-    let picker = GammaPicker::new(&distribution).map_err(|e| e.to_string())?;
-    let mut rng = term::seeded_rng()?;
-
-    let mut inputs = Vec::with_capacity(plan.inputs.len());
-    for &i in &plan.inputs {
-        let t = &session.state.transfers[i];
-        let ring = decoys::select_ring(&picker, &mut rng, t.global_output_index, ring_size)
-            .map_err(|e| format!("cannot build a ring: {e}"))?;
-
-        let wanted: Vec<(u64, u64)> = ring.indices.iter().map(|i| (0u64, *i)).collect();
-        let outs = client
-            .get_outs(&wanted, false)
-            .map_err(|e| format!("cannot fetch ring members: {e}"))?;
-        let keys: Vec<([u8; 32], [u8; 32])> = outs.iter().map(|o| (o.key, o.mask)).collect();
-
-        let mask = wow_crypto::ops::decode_scalar(&t.mask)
-            .ok_or("this output's stored mask is not a valid scalar")?;
-        let assembled = decoys::assemble_ring(
-            &ring,
-            &keys,
-            &t.public_key,
-            &wow_crypto::rct::commit(t.amount, &mask),
-        )
-        .map_err(|e| format!("the daemon's ring members do not match ours: {e}"))?;
-
-        // The one-time secret key for this output.
-        let secret = one_time_secret(session, t)?;
-
-        inputs.push(SpendableOutput {
-            public_key: t.public_key,
-            secret_key: secret,
-            mask,
-            amount: t.amount,
-            key_image: t.key_image.ok_or("this output has no key image")?,
-            ring: assembled.members,
-            global_indices: assembled.indices,
-            real_index: assembled.real_index,
-        });
-    }
-
-    // Destinations: the payee, then change back to ourselves.
-    let change_to = session.keys_file.account.keys.account_address;
-    let mut dests = vec![Destination {
-        address: decoded.keys,
-        is_subaddress: decoded.kind == AddressKind::Subaddress,
-        amount: plan.amounts[0],
-    }];
-    dests.push(Destination {
-        address: change_to,
-        is_subaddress: false,
-        amount: plan.change,
-    });
-
+    let plan = &prepared.plan;
+    let txid = prepared.txid;
     println!();
     println!("Sending  {}", fmt::amount(plan.amounts[0]));
     println!("     to  {address_text}");
-    println!("    fee  {}", fmt::amount(plan.fee));
+    println!(
+        "    fee  {} ({})",
+        fmt::amount(plan.fee),
+        tier_name(prepared.priority)
+    );
     if plan.change > 0 {
         println!(" change  {}", fmt::amount(plan.change));
     }
     println!(
-        " inputs  {}, ring size {ring_size}, about {} bytes",
+        " inputs  {}, ring size {ring_size}, {} bytes",
         plan.inputs.len(),
         plan.estimated_weight
     );
-    if let Some(p) = pid {
+    if let Some(p) = prepared.payment_id {
         println!("payment id  {}", wow_crypto::hex::encode(&p));
     }
     if !term::confirm("Send?") {
@@ -719,30 +875,23 @@ fn send(
         return Ok(());
     }
 
-    let built = transfer::construct(&inputs, &dests, plan.fee, pid, &mut || {
-        use wow_wallet::decoys::RandomSource;
-        let mut b = [0u8; 32];
-        b[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
-        b[8..16].copy_from_slice(&rng.next_u64().to_le_bytes());
-        b[16..24].copy_from_slice(&rng.next_u64().to_le_bytes());
-        b[24..].copy_from_slice(&rng.next_u64().to_le_bytes());
-        curve25519_dalek::scalar::Scalar::from_bytes_mod_order(b)
-    })
-    .map_err(|e| format!("cannot build the transaction: {e}"))?;
-
-    let mut w = wow_serialize::binary::Writer::with_capacity(8192);
-    built.tx.write(&mut w);
-    let blob = w.into_vec();
-    let txid = transfer::transaction_hash(&built.tx);
-
-    let result = client
-        .send_raw_transaction(&blob, false)
-        .map_err(|e| format!("cannot reach the daemon to relay: {e}"))?;
+    let relayed = session
+        .commit_send(&prepared, false)
+        .map_err(|e| e.to_string())?;
+    let result = relayed.result;
 
     if result.accepted() {
+        // Saved at once: a wallet that forgot this send would offer the same
+        // inputs to the next one, and the daemon would refuse it.
+        match session.save() {
+            Ok(()) => session.dirty = false,
+            Err(e) => eprintln!("Sent, but the wallet could not be saved: {e}"),
+        }
         println!("Sent. Transaction {}", wow_crypto::hex::encode(&txid));
-        println!("(it will appear in the balance once it is mined and four blocks have passed)");
-        session.dirty = true;
+        println!(
+            "(the change is in the balance now, and can be spent once the transaction is mined \
+             and four blocks have passed)"
+        );
     } else {
         println!("The daemon rejected the transaction.");
         if !result.reason.is_empty() {
@@ -762,17 +911,67 @@ fn send(
             }
         }
         println!("  status: {}", result.status);
+        if result.double_spend {
+            explain_double_spend(session, &relayed.noted_in_pool, plan);
+        }
     }
     Ok(())
 }
 
-/// The one-time secret key for an output, recomputed rather than stored.
-fn one_time_secret(
+/// After a refusal as a double spend: say which input was spent, and where.
+/// Spends found in the pool are already held back by the time this runs.
+fn explain_double_spend(
     session: &Session,
-    t: &wow_wallet::refresh::Transfer,
-) -> Result<wow_crypto::types::SecretKey, String> {
-    wow_wallet::refresh::one_time_secret_key(&session.keys_file.account, t)
-        .ok_or_else(|| "a view-only wallet has no spend key".to_string())
+    noted: &[wow_crypto::types::Hash256],
+    plan: &spend::SpendPlan,
+) {
+    report_pool(
+        session,
+        &PoolCheck {
+            noted: noted.to_vec(),
+            failed: Vec::new(),
+        },
+    );
+    let Some(client) = session.daemon.clone() else {
+        return;
+    };
+
+    let inputs: Vec<(usize, [u8; 32])> = plan
+        .inputs
+        .iter()
+        .filter_map(|&i| Some((i, session.state.transfers[i].key_image?.0)))
+        .collect();
+    let images: Vec<[u8; 32]> = inputs.iter().map(|(_, k)| *k).collect();
+    let status = match client.is_key_image_spent(&images) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("  cannot ask the daemon which input was spent: {e}");
+            return;
+        }
+    };
+    for ((i, image), status) in inputs.iter().zip(status) {
+        let t = &session.state.transfers[*i];
+        let what = format!(
+            "  the {} output with key image {}",
+            fmt::amount(t.amount),
+            wow_crypto::hex::encode(image)
+        );
+        match status {
+            KeyImageStatus::SpentInPool if t.spent => println!(
+                "{what} is being spent by a transaction in the daemon's pool. It counts as spent \
+                 now; send again to use other outputs."
+            ),
+            KeyImageStatus::SpentInPool => println!(
+                "{what} is being spent by a transaction in the daemon's pool, which the daemon \
+                 does not list, so this wallet cannot hold the output back."
+            ),
+            KeyImageStatus::SpentInChain => println!(
+                "{what} was spent in a block, and this wallet's scan did not see it go. \
+                 `rescan_bc` scans again."
+            ),
+            KeyImageStatus::Unspent => {}
+        }
+    }
 }
 
 // -- settings --------------------------------------------------------------
@@ -780,7 +979,10 @@ fn one_time_secret(
 fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let Some(option) = args.first() else {
         println!("usage: set <option> <value>");
-        println!("known: refresh-from-block-height, subaddress-lookahead, seed-language");
+        println!(
+            "known: refresh-from-block-height, subaddress-lookahead, seed-language, store-tx-info, \
+             priority, auto-low-priority"
+        );
         return Ok(());
     };
     let value = args.get(1).ok_or("a value is required")?;
@@ -812,6 +1014,32 @@ fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
                 .settings
                 .insert("subaddress_lookahead_minor".into(), minor.into());
         }
+        "store-tx-info" => {
+            if session.is_view_only() {
+                return Err("a view-only wallet sends nothing, so it has nothing to record".into());
+            }
+            let on = match *value {
+                "1" | "true" | "on" => true,
+                "0" | "false" | "off" => false,
+                _ => return Err("store-tx-info is 0 or 1".into()),
+            };
+            session.keys_file.set_store_tx_info(on);
+        }
+        "priority" => {
+            let p = priority::parse_priority(value).ok_or(
+                "priority is 0, 1, 2, 3 or 4, or one of: default, unimportant, normal, elevated, \
+                 priority",
+            )?;
+            session.keys_file.set_default_priority(p);
+        }
+        "auto-low-priority" => {
+            let on = match *value {
+                "1" | "true" | "on" => true,
+                "0" | "false" | "off" => false,
+                _ => return Err("auto-low-priority is 0 or 1".into()),
+            };
+            session.keys_file.set_auto_low_priority(on);
+        }
         other => return Err(format!("`{other}` is not a setting this build knows")),
     }
 
@@ -829,25 +1057,17 @@ fn parse_index(arg: Option<&&str>, default: u32) -> Result<u32, String> {
     }
 }
 
-/// A leading priority word or digit, if present.
-fn take_priority(args: &mut Vec<&str>) -> u32 {
-    let Some(first) = args.first().copied() else {
-        return 2;
-    };
-    let p = match first {
-        "default" | "0" => Some(2),
-        "unimportant" | "1" => Some(1),
-        "normal" | "2" => Some(2),
-        "elevated" | "3" => Some(3),
-        "priority" | "4" => Some(4),
-        _ => None,
-    };
-    match p {
+/// A leading priority word or digit, if present; `default` otherwise.
+///
+/// `default` and `0` are 0, which `adjust_priority` turns into a tier later.
+/// They are not "normal".
+fn take_priority(args: &mut Vec<&str>, default: u32) -> u32 {
+    match args.first().and_then(|a| priority::parse_priority(a)) {
         Some(p) => {
             args.remove(0);
             p
         }
-        None => 2,
+        None => default,
     }
 }
 
@@ -883,15 +1103,22 @@ mod tests {
     #[test]
     fn priorities_parse_both_ways() {
         let mut a = vec!["elevated", "rest"];
-        assert_eq!(take_priority(&mut a), 3);
+        assert_eq!(take_priority(&mut a, 0), 3);
         assert_eq!(a, vec!["rest"]);
 
         let mut a = vec!["4", "rest"];
-        assert_eq!(take_priority(&mut a), 4);
+        assert_eq!(take_priority(&mut a, 0), 4);
 
-        // Not a priority: left alone, default returned.
+        // `default` is 0, for `adjust_priority` to settle, whatever the
+        // wallet's default priority.
+        let mut a = vec!["default", "rest"];
+        assert_eq!(take_priority(&mut a, 3), 0);
+        assert_eq!(a, vec!["rest"]);
+
+        // Not a priority: left alone, the default returned.
         let mut a = vec!["Wo1abc", "5"];
-        assert_eq!(take_priority(&mut a), 2);
+        assert_eq!(take_priority(&mut a, 0), 0);
+        assert_eq!(take_priority(&mut a, 3), 3);
         assert_eq!(a.len(), 2);
     }
 

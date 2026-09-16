@@ -9,6 +9,9 @@
 //! | [`keys_file`] | the `<name>.keys` file, read and written compatibly |
 //! | [`subaddress`] | the spend-key → `(major, minor)` table |
 //! | [`scan`] | deciding whether a transaction paid this wallet |
+//! | [`history`] | what this wallet sent, and its transfer history |
+//! | [`store`] | where an open wallet's files live: on disk, or in memory a program keeps |
+//! | [`send`] | a destination to a relayed transaction, prepared and then committed |
 //!
 //! # What is here and what is not
 //!
@@ -16,12 +19,9 @@
 //! keys file the C++ wallet writes, address and subaddress derivation, output
 //! scanning with view tags, RingCT amount decoding, and key images.
 //!
-//! **Spending is not here.** Building a transaction needs CLSAG signing and
-//! Bulletproofs+ proving, the two remaining "algorithm gaps" of
-//! `specs/README.md`, and neither is implemented in `wow-crypto` yet. Input
-//! selection, decoy selection and fee calculation (`specs/12` §4) wait on them,
-//! because there is no point selecting inputs for a transaction that cannot be
-//! signed.
+//! And spending: input selection and the fee ([`spend`]), decoys ([`decoys`]),
+//! building and signing ([`transfer`]), and the path from a destination to a
+//! relayed transaction that every wallet front end shares ([`send`]).
 //!
 //! The cache file (`specs/12` §2.2) is deliberately **not** the C++ format —
 //! that is a Boost portable binary archive, and §2.2 says so and says to detect
@@ -30,20 +30,28 @@
 
 pub mod account;
 pub mod chacha;
+pub mod clock;
 pub mod decoys;
 pub mod entropy;
 pub mod files;
+pub mod history;
 pub mod keys_file;
+pub mod lock;
+pub mod priority;
 pub mod refresh;
 pub mod scan;
+pub mod send;
 pub mod spend;
+pub mod store;
 pub mod subaddress;
 pub mod transfer;
 
 pub use account::{AccountBase, AccountError, AccountKeys};
 pub use decoys::{select_ring, GammaPicker, RandomSource, Ring};
+pub use files::PoolCheck;
+pub use history::{EntryKind, HistoryEntry, PooledTx, SentDestination, SentState, SentTx};
 pub use keys_file::{AskPassword, KeysFile, KeysFileError};
-pub use refresh::{BlockSource, RefreshError, Transfer, WalletState};
+pub use refresh::{BlockSource, RefreshError, RefreshEvent, RefreshSummary, Transfer, WalletState};
 pub use scan::{scan_transaction, Received, ScanError, ScanKeys};
 pub use spend::{plan, plan_sweep, SpendError, SpendOptions, SpendPlan};
 pub use subaddress::SubaddressTable;

@@ -5,8 +5,9 @@
 //! asks a Rust node to accept that syntax "for operator familiarity", so this
 //! does: [`set_level`] takes the five presets and [`set_categories`] the list.
 //!
-//! It is a crate of its own, with no dependencies, because both `wow-p2p` and
-//! the binaries log and neither should depend on the other for it.
+//! It is a crate of its own, with no dependencies, because the node's crates,
+//! the wallet's and the binaries all log, and none should depend on another for
+//! it.
 //!
 //! ```
 //! wow_log::info!("global", "listening on {}", 34567);
@@ -18,13 +19,21 @@
 //! Rules are applied in order and the **last** one that matches a category
 //! decides its level, so `*:WARNING,net.p2p:DEBUG` quietens everything except
 //! the peer-to-peer layer.
+//!
+//! # Where lines go
+//!
+//! To stderr unless told otherwise ([`set_stderr`]), to a rotating file
+//! ([`set_file`]), and to memory, for a program that shows its own log
+//! ([`set_memory`], [`recent`]).
 
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 /// Severity, most severe first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,6 +81,10 @@ pub const PRESETS: [&str; 5] = [
     "*:TRACE",
 ];
 
+/// The longest line kept in memory, in bytes; a longer one is cut. A dump
+/// category can put a whole block's bytes on one line.
+const MAX_KEPT_LINE: usize = 1_000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Rule {
     pattern: String,
@@ -102,6 +115,12 @@ struct Config {
     also_stderr: bool,
 }
 
+/// The last lines written, for a program to show.
+struct Memory {
+    lines: VecDeque<String>,
+    cap: usize,
+}
+
 fn config() -> &'static RwLock<Config> {
     static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
     CONFIG.get_or_init(|| {
@@ -115,6 +134,16 @@ fn config() -> &'static RwLock<Config> {
 fn sink() -> &'static Mutex<Option<FileSink>> {
     static SINK: OnceLock<Mutex<Option<FileSink>>> = OnceLock::new();
     SINK.get_or_init(|| Mutex::new(None))
+}
+
+fn memory() -> &'static Mutex<Memory> {
+    static MEMORY: OnceLock<Mutex<Memory>> = OnceLock::new();
+    MEMORY.get_or_init(|| {
+        Mutex::new(Memory {
+            lines: VecDeque::new(),
+            cap: 0,
+        })
+    })
 }
 
 fn parse_rules(spec: &str) -> Result<Vec<Rule>, String> {
@@ -203,6 +232,68 @@ pub fn set_file(path: PathBuf, max_size: u64, max_files: usize, quiet: bool) -> 
     Ok(())
 }
 
+/// Stop writing to the log file [`set_file`] opened, if any.
+pub fn close_file() {
+    *sink().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The file [`set_file`] opened, while it is open.
+pub fn file() -> Option<PathBuf> {
+    sink()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|s| s.path.clone())
+}
+
+/// Stop or start writing lines to stderr. A program whose terminal is its
+/// interface, like the wallet's prompt, keeps its log off it.
+pub fn set_stderr(on: bool) {
+    config()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .also_stderr = on;
+}
+
+/// Keep the last `lines` lines in memory as well, for a program that shows its
+/// own log: a GUI's log window. Zero keeps none, and forgets those kept.
+pub fn set_memory(lines: usize) {
+    let mut m = memory().lock().unwrap_or_else(|e| e.into_inner());
+    m.cap = lines;
+    while m.lines.len() > lines {
+        m.lines.pop_front();
+    }
+}
+
+/// The lines kept in memory, oldest first, without their line breaks.
+pub fn recent() -> Vec<String> {
+    memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .lines
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// Forget the lines kept in memory, and go on keeping new ones.
+pub fn clear_recent() {
+    memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .lines
+        .clear();
+}
+
+/// `mlog_get_default_log_path`: a log file named `name` in the program's own
+/// directory, or in the current one when that cannot be found.
+pub fn beside_program(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
 /// Whether a line at `level` in `category` would be written. The macros check
 /// this first so a disabled line costs no formatting.
 pub fn enabled(category: &str, level: Level) -> bool {
@@ -221,7 +312,7 @@ pub fn enabled(category: &str, level: Level) -> bool {
 pub fn log(category: &str, level: Level, args: fmt::Arguments<'_>) {
     let line = format!(
         "{}\t{}\t{}\t{}\n",
-        timestamp(std::time::SystemTime::now()),
+        timestamp(now()),
         level.tag(),
         category,
         args
@@ -230,6 +321,8 @@ pub fn log(category: &str, level: Level, args: fmt::Arguments<'_>) {
     if also_stderr {
         let _ = std::io::stderr().write_all(line.as_bytes());
     }
+
+    keep(&line);
 
     let mut guard = sink().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = guard.as_mut() {
@@ -242,12 +335,31 @@ pub fn log(category: &str, level: Level, args: fmt::Arguments<'_>) {
     }
 }
 
+/// Keep a line in memory, when lines are kept.
+fn keep(line: &str) {
+    let mut m = memory().lock().unwrap_or_else(|e| e.into_inner());
+    if m.cap == 0 {
+        return;
+    }
+    let mut kept = line.trim_end_matches('\n').to_string();
+    if kept.len() > MAX_KEPT_LINE {
+        let mut cut = MAX_KEPT_LINE;
+        while !kept.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        kept.truncate(cut);
+        kept.push('…');
+    }
+    if m.lines.len() >= m.cap {
+        m.lines.pop_front();
+    }
+    m.lines.push_back(kept);
+}
+
 /// Rename the current file aside with a timestamp, start a new one, and drop
 /// the oldest rotated files past the limit.
 fn rotate(s: &mut FileSink) {
-    let stamp = timestamp(std::time::SystemTime::now())
-        .replace([' ', ':'], "-")
-        .replace('.', "-");
+    let stamp = timestamp(now()).replace([' ', ':'], "-").replace('.', "-");
     let mut aside = s.path.clone().into_os_string();
     aside.push(format!("-{stamp}"));
     let _ = std::fs::rename(&s.path, &aside);
@@ -286,6 +398,33 @@ fn rotate(s: &mut FileSink) {
     while old.len() > s.max_files {
         let _ = std::fs::remove_file(old.remove(0));
     }
+}
+
+/// The clock a program gave, for where std has none ([`set_clock`]).
+static CLOCK: OnceLock<fn() -> Duration> = OnceLock::new();
+
+/// Give the log a clock, as the time since 1970, where std has none to read:
+/// a bare wasm target, in a browser, where every line would otherwise say
+/// 1970. The first clock given stays. Everywhere else std's clock is read and
+/// this changes nothing.
+pub fn set_clock(clock: fn() -> Duration) {
+    let _ = CLOCK.set(clock);
+}
+
+/// The time a line is stamped with.
+///
+/// A bare wasm target has no clock std can read -- `SystemTime::now` panics
+/// there -- and a wallet built for a browser links this crate, so its lines
+/// carry the clock the program gave, or the epoch rather than bring the wallet
+/// down.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn now() -> std::time::SystemTime {
+    std::time::SystemTime::now()
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn now() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + CLOCK.get().map_or(Duration::ZERO, |clock| clock())
 }
 
 /// `YYYY-MM-DD hh:mm:ss.mmm`, UTC.
@@ -388,6 +527,54 @@ mod tests {
         assert!(set_categories("net.p2p").is_err());
         assert!(set_categories("net.p2p:LOUD").is_err());
         configure("0").unwrap();
+    }
+
+    /// The only test that writes lines, so what memory holds is its own.
+    #[test]
+    fn the_last_lines_are_kept_in_memory() {
+        set_stderr(false);
+        set_memory(3);
+        clear_recent();
+        for i in 0..5 {
+            log("test.memory", Level::Info, format_args!("line {i}"));
+        }
+        let kept = recent();
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        assert!(kept[0].ends_with("\tINFO\ttest.memory\tline 2"), "{kept:?}");
+        assert!(kept[2].ends_with("line 4"), "{kept:?}");
+
+        // A line past the limit is cut on a character, and says so.
+        log(
+            "test.memory",
+            Level::Info,
+            format_args!("{}", "é".repeat(800)),
+        );
+        let long = recent().pop().expect("a line");
+        assert!(long.ends_with('…'), "{long}");
+        assert!(
+            long.len() <= MAX_KEPT_LINE + '…'.len_utf8(),
+            "{}",
+            long.len()
+        );
+
+        clear_recent();
+        assert!(recent().is_empty());
+        set_memory(0);
+        log("test.memory", Level::Info, format_args!("not kept"));
+        assert!(recent().is_empty());
+        set_stderr(true);
+    }
+
+    #[test]
+    fn a_default_log_file_sits_beside_the_program() {
+        let p = beside_program("wownero-wallet-cli.log");
+        assert_eq!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some("wownero-wallet-cli.log")
+        );
+        if let Ok(exe) = std::env::current_exe() {
+            assert_eq!(p.parent(), exe.parent());
+        }
     }
 
     #[test]

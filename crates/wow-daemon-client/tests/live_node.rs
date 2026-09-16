@@ -10,10 +10,11 @@
 //! ```
 //!
 //! They exist because the bugs that matter here are interoperation bugs. Our
-//! own daemon is lenient in several places the reference is not -- it accepts
-//! an empty `block_ids`, and it writes fields the reference omits -- so a test
-//! suite that only ever talks to our daemon agrees with itself and says
-//! nothing about whether a wallet can reach the network.
+//! own daemon has differed from the reference where no test of it could see --
+//! it answered a wallet's history one block later than the reference does, and
+//! it writes fields the reference omits -- so a test suite that only ever talks
+//! to our daemon agrees with itself and says nothing about whether a wallet can
+//! reach the network.
 
 use wow_daemon_client::DaemonClient;
 
@@ -97,6 +98,44 @@ fn the_decoy_endpoints_answer() {
     eprintln!("fetched {} ring members, all well formed", outs.len());
 }
 
+/// What `adjust_priority` asks before it picks a fee tier. If any of these
+/// fails, a transfer given no priority still pays the low tier, but by the
+/// fallback rather than by looking -- so a broken call would go unnoticed.
+#[test]
+#[ignore = "needs a live node; set WOW_LIVE_NODE"]
+fn the_fee_priority_inputs_answer() {
+    let Some(c) = client() else {
+        eprintln!("set WOW_LIVE_NODE to run this");
+        return;
+    };
+    let tiers = c.get_fee_estimate(10).expect("get_fee_estimate");
+    assert_eq!(
+        tiers.len(),
+        4,
+        "four tiers from the 2021 scaling: {tiers:?}"
+    );
+    assert!(tiers.windows(2).all(|w| w[0] <= w[1]), "ordered: {tiers:?}");
+
+    let info = c.get_info().expect("get_info");
+    assert!(
+        info.block_weight_limit >= 600_000,
+        "twice a median floored at 300,000: {}",
+        info.block_weight_limit
+    );
+
+    let weights = c
+        .get_block_weights(info.height - 10, info.height - 1)
+        .expect("getblockheadersrange");
+    assert_eq!(weights.len(), 10, "one weight per block asked for");
+    assert!(weights.iter().all(|w| *w > 0), "every block has a coinbase");
+
+    c.get_transaction_pool().expect("get_transaction_pool");
+    eprintln!(
+        "tiers {tiers:?}, limit {}, recent weights {weights:?}",
+        info.block_weight_limit
+    );
+}
+
 /// A wallet's refresh call, against the real thing.
 #[test]
 #[ignore = "needs a live node; set WOW_LIVE_NODE"]
@@ -112,7 +151,7 @@ fn a_refresh_from_the_tip_returns_blocks() {
     // a history holding only genesis.
     let genesis = wow_consensus::genesis::genesis_id(wow_types::Network::Mainnet);
     let got = c
-        .get_blocks(&[genesis], from, false, false)
+        .get_blocks(&[genesis], from, false, false, 0)
         .expect("get_blocks");
     assert!(!got.blocks.is_empty(), "the tip block comes back");
     assert_eq!(got.start_height, from);
@@ -121,6 +160,53 @@ fn a_refresh_from_the_tip_returns_blocks() {
         got.blocks.len(),
         got.start_height,
         got.current_height
+    );
+}
+
+/// The second call of a refresh, which the first cannot show: a history ending
+/// at a block the wallet has is answered **from** that block, not after it.
+///
+/// A wallet that expects the block after reads the repeated one as a reorg, on
+/// every batch. The two batches of early blocks are tens of megabytes.
+#[test]
+#[ignore = "needs a live node; set WOW_LIVE_NODE"]
+fn a_second_batch_starts_at_the_last_block_of_the_first() {
+    let Some(c) = client() else {
+        eprintln!("set WOW_LIVE_NODE to run this");
+        return;
+    };
+    let genesis = wow_consensus::genesis::genesis_id(wow_types::Network::Mainnet);
+
+    let first = c
+        .get_blocks(&[genesis], 0, false, false, 0)
+        .expect("first batch");
+    assert_eq!(
+        first.start_height, 0,
+        "a history of genesis alone starts at it"
+    );
+    let last = first.blocks.last().expect("blocks");
+    let last_id = wow_types::block::Block::from_blob(&last.block)
+        .expect("parses")
+        .block_id()
+        .expect("an id");
+    let last_height = first.start_height + first.blocks.len() as u64 - 1;
+
+    let second = c
+        .get_blocks(&[last_id, genesis], 0, false, false, 0)
+        .expect("second batch");
+    assert_eq!(
+        second.start_height, last_height,
+        "the block both have, again"
+    );
+    assert_eq!(
+        second.blocks.first().map(|b| &b.block),
+        Some(&last.block),
+        "and it is that very block"
+    );
+    eprintln!(
+        "first {} block(s) from 0; second from {}",
+        first.blocks.len(),
+        second.start_height
     );
 }
 
