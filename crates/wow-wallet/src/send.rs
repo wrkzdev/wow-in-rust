@@ -32,6 +32,11 @@ pub struct SendRequest<'a> {
     /// A payment id given apart from the address. An integrated address
     /// carries its own, and giving both is refused.
     pub payment_id: Option<[u8; 8]>,
+    /// Sweep exactly this one output and nothing else (`sweep_single`).
+    ///
+    /// Only read when `amount` is `None`; an amount says what to send, and
+    /// which outputs pay for it is the wallet's business.
+    pub sweep_output: Option<wow_crypto::types::KeyImage>,
 }
 
 /// A transaction built and signed, and not yet relayed.
@@ -165,9 +170,10 @@ impl Session {
             now: now(),
             ..Default::default()
         };
-        let plan = match request.amount {
-            Some(amount) => spend::plan(&self.state.transfers, &[amount], &options),
-            None => spend::plan_sweep(&self.state.transfers, &options),
+        let plan = match (request.amount, &request.sweep_output) {
+            (Some(amount), _) => spend::plan(&self.state.transfers, &[amount], &options),
+            (None, Some(k)) => spend::plan_sweep_single(&self.state.transfers, k, &options),
+            (None, None) => spend::plan_sweep(&self.state.transfers, &options),
         }?;
 
         // A ring for each input, of members the chain has unlocked, or no node
@@ -366,6 +372,7 @@ mod tests {
             priority: 0,
             ring_size: decoys::RING_SIZE,
             payment_id: None,
+            sweep_output: None,
         }
     }
 

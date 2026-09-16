@@ -25,7 +25,7 @@
 
 use wow_consensus::constants;
 use wow_consensus::fee::{quantize_up, FEE_QUANTIZATION_MASK};
-use wow_crypto::types::SubaddressIndex;
+use wow_crypto::types::{KeyImage, SubaddressIndex};
 
 use crate::refresh::Transfer;
 
@@ -315,6 +315,12 @@ pub enum SpendError {
          send a smaller amount, or sweep, which splits by weight"
     )]
     TooHeavy { weight: u64, limit: u64 },
+    #[error("this wallet has no output with that key image")]
+    NoSuchOutput,
+    #[error("that output has already been spent")]
+    OutputSpent,
+    #[error("that output is not spendable yet: it is locked, or too new")]
+    OutputLocked,
 }
 
 /// Which transfers are eligible to spend.
@@ -514,6 +520,54 @@ pub fn plan_sweep(transfers: &[Transfer], options: &SpendOptions) -> Result<Spen
     })
 }
 
+/// Plan a sweep of **one** output: `sweep_single`.
+///
+/// The one case where a wallet's own choice of input is the point rather than
+/// an implementation detail. Somebody sweeping a single output is usually
+/// separating it from the rest of the wallet on purpose — an output with a
+/// history they do not want mixed into a later transaction, or one a payer
+/// can already link to them.
+///
+/// `key_image` names it, because that is what `unspent_outputs` prints and
+/// what the reference's `sweep_single` takes.
+pub fn plan_sweep_single(
+    transfers: &[Transfer],
+    key_image: &KeyImage,
+    options: &SpendOptions,
+) -> Result<SpendPlan, SpendError> {
+    let (index, transfer) = transfers
+        .iter()
+        .enumerate()
+        .find(|(_, t)| t.key_image.as_ref() == Some(key_image))
+        .ok_or(SpendError::NoSuchOutput)?;
+    if transfer.spent {
+        return Err(SpendError::OutputSpent);
+    }
+    if spendable(std::slice::from_ref(transfer), options).is_empty() {
+        return Err(SpendError::OutputLocked);
+    }
+
+    let weight = estimate_tx_weight(1, options.ring_size, MIN_OUTPUTS, options.extra_size);
+    let fee = fee_from_weight(options.fee_per_byte, weight);
+    if fee >= transfer.amount {
+        return Err(SpendError::NotEnough {
+            available: transfer.amount,
+            needed: fee,
+            fee,
+        });
+    }
+
+    Ok(SpendPlan {
+        inputs: vec![index],
+        amounts: vec![transfer.amount - fee],
+        change: 0,
+        fee,
+        estimated_weight: weight,
+        sweep: true,
+        left_behind: 0,
+    })
+}
+
 /// The subaddress account an output belongs to, for change.
 pub fn change_index(plan: &SpendPlan, transfers: &[Transfer]) -> SubaddressIndex {
     plan.inputs
@@ -532,7 +586,7 @@ pub const fn quantization() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wow_crypto::types::{KeyImage, PublicKey};
+    use wow_crypto::types::PublicKey;
 
     fn transfer(amount: u64, height: u64, seed: u8) -> Transfer {
         Transfer {
@@ -636,6 +690,57 @@ mod tests {
         let taken: u64 = p.inputs.iter().map(|&i| transfers[i].amount).sum();
         let everything: u64 = transfers.iter().map(|t| t.amount).sum();
         assert!(taken > everything / 2, "the money goes, not the dust");
+    }
+
+    /// `sweep_single` takes the output named and no other, whatever else the
+    /// wallet holds.
+    #[test]
+    fn sweeping_one_output_takes_that_one_and_no_other() {
+        let transfers = vec![
+            transfer(9_000_000, 1, 1),
+            transfer(5_000_000, 1, 2),
+            transfer(7_000_000, 1, 3),
+        ];
+        let wanted = transfers[1].key_image.expect("an image");
+
+        let p = plan_sweep_single(&transfers, &wanted, &options(3)).expect("a sweep");
+        assert_eq!(p.inputs, vec![1], "not the largest, the one asked for");
+        assert!(p.sweep);
+        assert_eq!(p.change, 0);
+        assert_eq!(p.left_behind, 0, "nothing was left behind; one was chosen");
+        assert_eq!(p.amounts[0] + p.fee, 5_000_000);
+    }
+
+    /// An output that is not this wallet's, or is already spent, is refused by
+    /// name rather than quietly swept from somewhere else.
+    #[test]
+    fn sweeping_an_output_the_wallet_cannot_spend_says_which_problem() {
+        let mut transfers = vec![transfer(9_000_000, 1, 1)];
+        let mine = transfers[0].key_image.expect("an image");
+
+        let e = plan_sweep_single(&transfers, &KeyImage([0xaa; 32]), &options(3))
+            .expect_err("not ours");
+        assert!(matches!(e, SpendError::NoSuchOutput), "{e}");
+
+        transfers[0].spent = true;
+        let e = plan_sweep_single(&transfers, &mine, &options(3)).expect_err("spent");
+        assert!(matches!(e, SpendError::OutputSpent), "{e}");
+    }
+
+    /// An output worth less than the fee to move it cannot be swept, and says
+    /// so with the numbers rather than as a generic failure.
+    #[test]
+    fn sweeping_an_output_that_cannot_pay_its_own_fee_is_refused() {
+        let transfers = vec![transfer(1_000, 1, 1)];
+        let wanted = transfers[0].key_image.expect("an image");
+        let e = plan_sweep_single(&transfers, &wanted, &options(1_000)).expect_err("too small");
+        match e {
+            SpendError::NotEnough { available, fee, .. } => {
+                assert_eq!(available, 1_000);
+                assert!(fee >= 1_000);
+            }
+            other => panic!("expected NotEnough, got {other}"),
+        }
     }
 
     /// A sweep that fits takes everything and leaves nothing to report.

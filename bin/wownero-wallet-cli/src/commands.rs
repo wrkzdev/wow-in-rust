@@ -141,6 +141,7 @@ pub fn run_one(session: &mut Session, line: &str) -> Result<Outcome, String> {
         "fee" => fee(session),
         "transfer" => transfer_cmd(session, &args),
         "sweep_all" => sweep_all(session, &args),
+        "sweep_single" => sweep_single(session, &args),
         "set" => set(session, &args),
 
         other => Err(format!("unknown command `{other}`. Try `help`.")),
@@ -180,6 +181,9 @@ Sending
   fee                           the current fee estimate
   transfer <address> <amount> [<payment_id>]
   sweep_all <address>           send everything
+  sweep_single <key_image> <address>
+                                send one output, by the key image
+                                unspent_outputs prints
 
 Settings
   set <option> <value>          persisted to the keys file
@@ -790,6 +794,7 @@ fn transfer_cmd(session: &mut Session, args: &[&str]) -> Result<(), String> {
         ring_size,
         payment_id,
         false,
+        None,
     )
 }
 
@@ -810,6 +815,41 @@ fn sweep_all(session: &mut Session, args: &[&str]) -> Result<(), String> {
         ring_size,
         payment_id,
         true,
+        None,
+    )
+}
+
+/// `sweep_single [<priority>] [<ring_size>] <key_image> <address> [<payment_id>]`
+///
+/// Sends exactly one output, named by its key image, which is what
+/// `unspent_outputs` prints in its last column. Somebody doing this is usually
+/// separating that output from the rest of the wallet on purpose.
+fn sweep_single(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    const USAGE: &str =
+        "usage: sweep_single [<priority>] [<ring_size>] <key_image> <address> [<payment_id>]";
+    let mut rest: Vec<&str> = args.to_vec();
+    // As `sweep_all` does, and for the same reason: `simple_wallet::sweep_main`
+    // starts from 0 rather than the wallet's default priority.
+    let priority = take_priority(&mut rest, 0);
+    let ring_size = take_ring_size(&mut rest)?;
+
+    let image_text = rest.first().ok_or(USAGE)?;
+    let bytes = wow_crypto::hex::decode(image_text)
+        .ok_or("a key image is 64 hex characters; `unspent_outputs` prints them")?;
+    let image: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "a key image is 64 hex characters".to_string())?;
+    let address = rest.get(1).ok_or(USAGE)?;
+    let payment_id = rest.get(2).copied();
+
+    send(
+        session,
+        &[(address.to_string(), 0)],
+        priority,
+        ring_size,
+        payment_id,
+        true,
+        Some(wow_crypto::types::KeyImage(image)),
     )
 }
 
@@ -821,6 +861,7 @@ fn send(
     ring_size: usize,
     payment_id: Option<&str>,
     sweep: bool,
+    sweep_output: Option<wow_crypto::types::KeyImage>,
 ) -> Result<(), String> {
     if session.is_view_only() {
         return Err("a view-only wallet cannot spend: it has no spend key".into());
@@ -846,6 +887,7 @@ fn send(
         priority,
         ring_size,
         payment_id: explicit_pid,
+        sweep_output,
     };
     let prepared = session.prepare_send(&request).map_err(|e| e.to_string())?;
 

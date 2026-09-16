@@ -110,8 +110,10 @@ Run the live checks yourself:
 WOW_LIVE_NODE=node2.monerodevs.org:34568   cargo test -p wow-daemon-client --test live_node -- --ignored --nocapture
 ```
 
-**Not verified:** sweeps — `sweep_all`, and sweeping a single output. Both are
-built; neither has been run against mainnet.
+**Not verified:** sweeps — `sweep_all`, and `sweep_single`, which sends one
+output named by the key image `unspent_outputs` prints. Both are built, in
+`wownero-wallet-cli` and `wownero-wallet-rpc`; neither has been run against
+mainnet. The GUI sweeps the whole wallet only.
 
 **Built, and run on mainnet:** `wownerod --serve` as a long-running node —
 outbound peers, syncing from several at once, fluffy blocks, the peer store, and

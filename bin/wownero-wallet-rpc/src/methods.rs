@@ -158,6 +158,7 @@ pub fn dispatch(state: &State, method: &str, params: &Value) -> MethodResult {
         "transfer" => transfer_method(session, params, false),
         "transfer_split" => transfer_method(session, params, true),
         "sweep_all" => sweep_all(session, params),
+        "sweep_single" => sweep_single(session, params),
         "relay_tx" => relay_tx(session, params),
         "get_default_fee_priority" => get_default_fee_priority(session),
         "stop_wallet" => {
@@ -896,12 +897,45 @@ fn transfer_method(session: &mut Session, params: &Value, split: bool) -> Method
     })
 }
 
+/// `sweep_single`: one output, named by its key image.
+fn sweep_single(session: &mut Session, params: &Value) -> MethodResult {
+    let address = params
+        .get("address")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new(errors::WRONG_ADDRESS, "address is missing"))?;
+    let image_text = params
+        .get("key_image")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new(errors::WRONG_PARAM, "key_image is missing"))?;
+    let image: [u8; 32] = wow_crypto::hex::decode(image_text)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| Error::new(errors::WRONG_PARAM, "key_image is 64 hex characters"))?;
+
+    let outcome = build_and_send_output(
+        session,
+        address,
+        Some(wow_crypto::types::KeyImage(image)),
+        params,
+    )?;
+    Ok(json!({
+        "tx_hash_list": [outcome["tx_hash"]],
+        "tx_key_list": [],
+        "amount_list": [outcome["amount"]],
+        "fee_list": [outcome["fee"]],
+        "weight_list": [outcome["weight"]],
+        "tx_blob_list": [outcome["tx_blob"]],
+        "multisig_txset": "",
+        "unsigned_txset": "",
+        "spent_key_images_list": [outcome["spent_key_images"].clone()],
+    }))
+}
+
 fn sweep_all(session: &mut Session, params: &Value) -> MethodResult {
     let address = params
         .get("address")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::new(errors::WRONG_ADDRESS, "address is missing"))?;
-    let outcome = build_and_send(session, address, None, params)?;
+    let outcome = build_and_send_output(session, address, None, params)?;
     Ok(json!({
         "tx_hash_list": [outcome["tx_hash"]],
         "tx_key_list": [],
@@ -924,6 +958,26 @@ fn build_and_send(
     session: &mut Session,
     address: &str,
     amount: Option<u64>,
+    params: &Value,
+) -> MethodResult {
+    build_and_send_inner(session, address, amount, None, params)
+}
+
+/// [`build_and_send`] for a sweep of one named output.
+fn build_and_send_output(
+    session: &mut Session,
+    address: &str,
+    sweep_output: Option<wow_crypto::types::KeyImage>,
+    params: &Value,
+) -> MethodResult {
+    build_and_send_inner(session, address, None, sweep_output, params)
+}
+
+fn build_and_send_inner(
+    session: &mut Session,
+    address: &str,
+    amount: Option<u64>,
+    sweep_output: Option<wow_crypto::types::KeyImage>,
     params: &Value,
 ) -> MethodResult {
     if session.keys_file.is_watch_only() {
@@ -969,6 +1023,7 @@ fn build_and_send(
         priority: u32_param(params, "priority", 0),
         ring_size,
         payment_id: None,
+        sweep_output,
     };
     let prepared = session.prepare_send(&request).map_err(send_error)?;
 
@@ -1057,6 +1112,16 @@ fn spend_error(e: spend::SpendError) -> Error {
             Error::new(errors::TX_NOT_POSSIBLE, e.to_string())
         }
         spend::SpendError::FeeDidNotSettle(_) => Error::new(errors::TX_NOT_POSSIBLE, e.to_string()),
+        // A transaction no node would relay, and a sweep_single naming an
+        // output this wallet cannot spend: all of them are "not possible"
+        // rather than a bad parameter, because the request was well formed and
+        // the wallet is what cannot satisfy it.
+        spend::SpendError::TooHeavy { .. }
+        | spend::SpendError::NoSuchOutput
+        | spend::SpendError::OutputSpent
+        | spend::SpendError::OutputLocked => {
+            Error::new(errors::TX_NOT_POSSIBLE, e.to_string())
+        }
     }
 }
 

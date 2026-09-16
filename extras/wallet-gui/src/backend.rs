@@ -660,6 +660,9 @@ impl<P: Platform> Backend<P> {
             priority: form.priority,
             ring_size: wow_wallet::decoys::RING_SIZE,
             payment_id,
+            // The GUI has no way to pick one output yet; sweeping there means
+            // the whole wallet.
+            sweep_output: None,
         };
         let prepared = w
             .session
