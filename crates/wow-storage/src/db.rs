@@ -142,6 +142,16 @@ pub trait BlockchainDb: Send + Sync {
 
     fn block_exists(&self, h: &Hash256) -> Result<bool>;
     fn get_block_hash(&self, height: u64) -> Result<Hash256>;
+
+    /// Block hashes for heights `from..to`, in order.
+    ///
+    /// The default asks one at a time, which is what a store double wants and
+    /// what any implementation can fall back to. An implementation that can do
+    /// better should: a node reads every hash from genesis at start-up, and on
+    /// this chain that is nearly a million of them.
+    fn block_hashes(&self, from: u64, to: u64) -> Result<Vec<Hash256>> {
+        (from..to).map(|h| self.get_block_hash(h)).collect()
+    }
     fn get_block_height(&self, h: &Hash256) -> Result<u64>;
     fn get_block_blob(&self, height: u64) -> Result<Vec<u8>>;
     fn get_block_info(&self, height: u64) -> Result<BlockInfo>;

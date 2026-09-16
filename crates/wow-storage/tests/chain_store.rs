@@ -252,6 +252,37 @@ fn repeated_add_and_pop_cycles_are_stable() {
 }
 
 /// `specs/15` §3.3: the invariants that must hold after every step.
+/// `block_hashes` is a cursor walk rather than a lookup per height, so it has
+/// to agree with `get_block_hash` exactly — including at the edges, where an
+/// off-by-one would return the right *number* of hashes for the wrong heights.
+#[test]
+fn a_bulk_read_of_block_hashes_matches_reading_them_one_at_a_time() {
+    let s = Scratch::new("bulk-hashes");
+    let db = open(&s.db_dir());
+    let blocks = fixture_blocks();
+    assert!(blocks.len() >= 5, "the fixture is too small for this test");
+
+    for (_, _, blob) in blocks.iter().take(5) {
+        add_fixture_block(&db, blob);
+    }
+    let height = db.height();
+    let one_by_one: Vec<[u8; 32]> = (0..height).map(|h| db.get_block_hash(h).unwrap()).collect();
+
+    assert_eq!(db.block_hashes(0, height).unwrap(), one_by_one);
+    assert_eq!(db.block_hashes(2, 4).unwrap(), one_by_one[2..4]);
+    assert_eq!(db.block_hashes(height - 1, height).unwrap(), &one_by_one[4..]);
+
+    // An empty range is empty, not an error and not the whole chain.
+    assert!(db.block_hashes(0, 0).unwrap().is_empty());
+    assert!(db.block_hashes(3, 3).unwrap().is_empty());
+    assert!(db.block_hashes(4, 2).unwrap().is_empty());
+
+    // Past the end is a failure, not a short answer: a caller sizing a vector
+    // from it would otherwise carry on with the wrong heights.
+    assert!(db.block_hashes(0, height + 1).is_err());
+    assert!(db.block_hashes(height, height + 1).is_err());
+}
+
 #[test]
 fn the_entry_count_invariants_hold() {
     let s = Scratch::new("invariants");

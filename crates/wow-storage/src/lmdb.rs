@@ -605,6 +605,48 @@ impl BlockchainDb for LmdbDb {
         Ok(self.block_info_in(&rtxn, height)?.hash)
     }
 
+    /// One read transaction and one cursor walk, rather than a transaction
+    /// and a lookup per height.
+    ///
+    /// `get_block_hash` opens a read transaction of its own, so reading every
+    /// hash from genesis one at a time is a million `mdb_txn_begin` and
+    /// `mdb_txn_abort` pairs, and the environment's gate taken and released a
+    /// million times. That is the cost, not the lookups. `block_info` is
+    /// DUPSORT under a single zero key with the height inside the value, so
+    /// the whole range is one positioned cursor and `next_dup` from there.
+    fn block_hashes(&self, from: u64, to: u64) -> Result<Vec<Hash256>> {
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        let rtxn = self.read_txn()?;
+        let mut cursor = rtxn.cursor(self.dbs.block_info)?;
+        let mut out = Vec::with_capacity((to - from) as usize);
+
+        // Positioned at the first record at or after `from`. The comparator
+        // orders duplicates by the height they start with, so "at or after"
+        // is what `get_both_range` means here.
+        let Some(raw) = cursor.get_both_range(&ZEROKEY, &from.to_ne_bytes())? else {
+            return Err(DbError::NotFound);
+        };
+        let mut info = BlockInfo::decode(raw)?;
+        loop {
+            if info.height != from + out.len() as u64 {
+                // A gap, or the walk overshot. Neither should happen on a
+                // chain this node wrote, and carrying on would silently
+                // return hashes for the wrong heights.
+                return Err(DbError::NotFound);
+            }
+            out.push(info.hash);
+            if out.len() as u64 == to - from {
+                return Ok(out);
+            }
+            let Some((_, raw)) = cursor.next_dup()? else {
+                return Err(DbError::NotFound);
+            };
+            info = BlockInfo::decode(raw)?;
+        }
+    }
+
     fn get_block_height(&self, h: &Hash256) -> Result<u64> {
         let rtxn = self.read_txn()?;
         self.block_height_in(&rtxn, h)

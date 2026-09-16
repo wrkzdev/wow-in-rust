@@ -355,14 +355,12 @@ impl LocalChain {
         // reason that boundary exists.
         chain.verify_transactions_with(txs.clone());
 
+        // One cursor walk, not one read transaction per block: on a chain of
+        // this length the difference is seconds of start-up.
         let height = db.height();
-        let mut hashes = Vec::with_capacity(height as usize);
-        for h in 0..height {
-            hashes.push(
-                db.get_block_hash(h)
-                    .map_err(|e| format!("cannot read the block at height {h}: {e}"))?,
-            );
-        }
+        let hashes = db
+            .block_hashes(0, height)
+            .map_err(|e| format!("cannot read the chain's block hashes: {e}"))?;
 
         Ok(LocalChain {
             chain,
@@ -483,13 +481,12 @@ impl LocalChain {
                 }
             }
         }
-        for h in self.hashes.len() as u64..height {
-            self.hashes.push(
-                self.db
-                    .get_block_hash(h)
-                    .map_err(|e| format!("cannot read the block at height {h}: {e}"))?,
-            );
-        }
+        let from = self.hashes.len() as u64;
+        self.hashes.extend(
+            self.db
+                .block_hashes(from, height)
+                .map_err(|e| format!("cannot read block hashes from {from}: {e}"))?,
+        );
         Ok(())
     }
 
