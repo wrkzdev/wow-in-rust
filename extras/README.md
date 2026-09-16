@@ -42,9 +42,16 @@ bash extras/wallet-web/build.sh
 python3 -m http.server -d extras/wallet-web/dist 8080   # then open http://localhost:8080
 ```
 
-The first build writes `extras/Cargo.lock`. A Docker build leaves a copy in
-`dist/<platform>/extras-Cargo.lock`. Commit it, so later builds resolve the
-same dependency versions.
+`extras/Cargo.lock` is committed, and every build command above passes
+`--locked`, so a build here resolves the same dependency versions as the one
+that was reviewed rather than whatever is newest that day. A Docker build also
+leaves a copy in `dist/<platform>/extras-Cargo.lock`, so a release archive can
+be matched against what actually went into it.
+
+To move a dependency, change it deliberately — `cargo update -p <crate>
+--manifest-path extras/Cargo.toml` — and commit the result. Then run
+`bash scripts/check-no-c.sh`, which is what notices if the new version drags
+in a C toolchain.
 
 ## Nodes
 

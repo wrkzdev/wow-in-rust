@@ -70,9 +70,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: extras
-      - run: cargo check --manifest-path extras/Cargo.toml -p wownero-wallet-gui
-      - run: cargo test --manifest-path extras/Cargo.toml -p wownero-wallet-gui --lib
-      - run: cargo check --manifest-path extras/Cargo.toml --target wasm32-unknown-unknown -p wownero-wallet-web
+      # --locked: extras/Cargo.lock is committed, and CI is where a build that
+      # ignored it would otherwise go unnoticed.
+      - run: cargo check --locked --manifest-path extras/Cargo.toml -p wownero-wallet-gui
+      - run: cargo test --locked --manifest-path extras/Cargo.toml -p wownero-wallet-gui --lib
+      - run: cargo check --locked --manifest-path extras/Cargo.toml --target wasm32-unknown-unknown -p wownero-wallet-web
 
   # What is not Rust here, and is it still only what we chose? LMDB is
   # compiled on purpose -- data.mdb must stay byte-compatible with the C++
