@@ -38,6 +38,14 @@ use wow_wallet::AccountBase;
 /// Deterministic randomness, so a failure is reproducible.
 struct Lcg(u64);
 
+/// So the same source can choose the inputs and the ring members, as a wallet's
+/// does.
+impl wow_wallet::decoys::RandomSource for Lcg {
+    fn next_u64(&mut self) -> u64 {
+        self.next()
+    }
+}
+
 impl Lcg {
     fn next(&mut self) -> u64 {
         self.0 = self
@@ -205,7 +213,7 @@ fn the_whole_send_path() {
         now: 1_700_000_000,
         ..Default::default()
     };
-    let plan = spend::plan(&transfers, &[4_000_000_000], &options).expect("a plan");
+    let plan = spend::plan(&transfers, &[4_000_000_000], &options, &mut Lcg(7)).expect("a plan");
     assert_eq!(plan.inputs, vec![0]);
     assert!(plan.fee > 0);
 

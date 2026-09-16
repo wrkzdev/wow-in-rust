@@ -804,8 +804,11 @@ impl<P: Platform> Backend<P> {
             ..Default::default()
         };
         let transfers = w.session.transfers();
+        // An estimate, not the transaction: its own source, so asking what a
+        // send would cost does not consume the one the send itself will use.
+        let mut rng = wow_wallet::entropy::seeded_rng().map_err(|e| e.to_string())?;
         let plan = match form.amount {
-            Some(amount) => spend::plan(transfers, &[amount], &options),
+            Some(amount) => spend::plan(transfers, &[amount], &options, &mut rng),
             None => spend::plan_sweep(transfers, &options),
         }
         .map_err(|e| e.to_string())?;

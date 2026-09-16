@@ -170,8 +170,15 @@ impl Session {
             now: now(),
             ..Default::default()
         };
+        // One source for the whole transaction: which of this wallet's outputs
+        // pay, and which of the chain's outputs hide them. Both are choices an
+        // observer must not be able to make for us.
+        let mut rng = crate::entropy::seeded_rng().map_err(SendError::Entropy)?;
+
         let plan = match (request.amount, &request.sweep_output) {
-            (Some(amount), _) => spend::plan(&self.state.transfers, &[amount], &options),
+            (Some(amount), _) => {
+                spend::plan(&self.state.transfers, &[amount], &options, &mut rng)
+            }
             (None, Some(k)) => spend::plan_sweep_single(&self.state.transfers, k, &options),
             (None, None) => spend::plan_sweep(&self.state.transfers, &options),
         }?;
@@ -189,7 +196,6 @@ impl Session {
             .get(&client, to_height)
             .map_err(SendError::Distribution)?;
         let picker = GammaPicker::new(distribution.as_slice()).map_err(SendError::Ring)?;
-        let mut rng = crate::entropy::seeded_rng().map_err(SendError::Entropy)?;
 
         let mut inputs = Vec::with_capacity(plan.inputs.len());
         let mut key_images = Vec::with_capacity(plan.inputs.len());

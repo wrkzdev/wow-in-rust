@@ -354,6 +354,7 @@ pub fn plan(
     transfers: &[Transfer],
     destinations: &[u64],
     options: &SpendOptions,
+    rng: &mut dyn crate::decoys::RandomSource,
 ) -> Result<SpendPlan, SpendError> {
     if destinations.is_empty() {
         return Err(SpendError::NoDestinations);
@@ -368,11 +369,7 @@ pub fn plan(
 
     let sending: u64 = destinations.iter().copied().sum();
 
-    // Largest first. `wallet2` has a more careful policy — it prefers dust and
-    // avoids leaving unspendable remainders — but largest-first uses the fewest
-    // inputs, and each input costs both weight and a ring to fetch.
     let mut candidates = spendable(transfers, options);
-    candidates.sort_by_key(|(_, t)| std::cmp::Reverse(t.amount));
     let available: u64 = candidates.iter().map(|(_, t)| t.amount).sum();
 
     let mut chosen: Vec<usize> = Vec::new();
@@ -382,17 +379,21 @@ pub fn plan(
 
     for _ in 0..FEE_CALCULATION_MAX_RETRIES {
         // Take inputs until they cover the send plus the fee we currently
-        // believe in.
+        // believe in. Inputs already taken are kept: the loop only ever raises
+        // the fee, so a second pass appends rather than starting over, and the
+        // choice does not wobble as the fee settles.
         let target = sending.saturating_add(fee);
         while in_total < target {
-            let Some((i, t)) = candidates.get(chosen.len()) else {
+            let need = target - in_total;
+            let Some(pick) = choose_input(&candidates, need, rng) else {
                 return Err(SpendError::NotEnough {
                     available,
                     needed: target,
                     fee,
                 });
             };
-            chosen.push(*i);
+            let (i, t) = candidates.swap_remove(pick);
+            chosen.push(i);
             in_total += t.amount;
         }
 
@@ -442,6 +443,55 @@ pub fn plan(
         let _ = weight;
         SpendError::FeeDidNotSettle(FEE_CALCULATION_MAX_RETRIES)
     })
+}
+
+/// Which output pays next.
+///
+/// # Why this is not simply the largest
+///
+/// Largest-first is the obvious policy and it is a fingerprint. Every wallet
+/// that uses it produces transactions whose inputs, seen from outside, are
+/// exactly the outputs an observer would have guessed — which is a signature
+/// that says *this* software built *this* transaction, and one more fact to
+/// hang on whoever sent it. `decoys.rs` makes this argument at length about
+/// ring members; it applies just as much to the real spend.
+///
+/// So: among the outputs that could finish the job on their own, one is taken
+/// **at random**. That keeps the input count as low as largest-first would --
+/// each input costs weight, a fee and a ring to fetch -- while making which
+/// output pays unpredictable from the amounts alone. Only when nothing left
+/// can cover what remains does it fall back to taking the largest, because at
+/// that point every remaining output will be needed anyway and the order
+/// stops mattering.
+///
+/// `wallet2` reaches for the same two ideas from a different direction:
+/// `pick_preferred_rct_inputs` looks for a single output that covers the
+/// amount, and `select_transfers` picks at random among what is left.
+fn choose_input(
+    candidates: &[(usize, &Transfer)],
+    need: u64,
+    rng: &mut dyn crate::decoys::RandomSource,
+) -> Option<usize> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let finishers: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, t))| t.amount >= need)
+        .map(|(pos, _)| pos)
+        .collect();
+    if !finishers.is_empty() {
+        let pick = rng.below(finishers.len() as u64) as usize;
+        return Some(finishers[pick]);
+    }
+    // Nothing covers the rest by itself, so every remaining output is going to
+    // be needed. Take the largest to get there in the fewest.
+    candidates
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, t))| t.amount)
+        .map(|(pos, _)| pos)
 }
 
 /// Plan a sweep: send **everything** eligible to one destination.
@@ -609,6 +659,24 @@ mod tests {
         }
     }
 
+    /// A deterministic source, so a plan can be reproduced exactly. Not a
+    /// CSPRNG, and not what a wallet passes.
+    struct Seq(u64);
+
+    impl crate::decoys::RandomSource for Seq {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+    }
+
+    fn seq() -> Seq {
+        Seq(0x5eed)
+    }
+
     fn options(fee_per_byte: u64) -> SpendOptions {
         SpendOptions {
             fee_per_byte,
@@ -692,6 +760,73 @@ mod tests {
         assert!(taken > everything / 2, "the money goes, not the dust");
     }
 
+    /// Which output pays is not a function of the amounts.
+    ///
+    /// Largest-first was a fingerprint: an observer who knew the wallet's
+    /// outputs could name the inputs before seeing the transaction. Two
+    /// different sources must be able to reach two different plans over the
+    /// same wallet.
+    #[test]
+    fn which_output_pays_is_not_decided_by_its_size() {
+        // Ten outputs, any one of which covers the amount on its own.
+        let transfers: Vec<Transfer> = (0..10u8)
+            .map(|i| transfer(1_000_000_000 + u64::from(i) * 1_000, 1, i))
+            .collect();
+
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..40u64 {
+            let mut rng = Seq(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let p = plan(&transfers, &[500_000_000], &options(3), &mut rng).expect("a plan");
+            assert_eq!(p.inputs.len(), 1, "one output covers it, so one is taken");
+            seen.insert(p.inputs[0]);
+        }
+        assert!(
+            seen.len() > 1,
+            "every source chose the same output: selection is still deterministic"
+        );
+
+        // And in particular it is not always the largest, which is what the
+        // old policy did every single time.
+        let largest = transfers.len() - 1;
+        assert!(
+            seen.iter().any(|&i| i != largest),
+            "still always the largest"
+        );
+    }
+
+    /// Randomness must not cost inputs. An output that finishes the job is
+    /// always preferred to two that do.
+    #[test]
+    fn a_single_output_that_covers_it_is_always_enough() {
+        let transfers = vec![
+            transfer(1_000, 1, 1),
+            transfer(2_000, 1, 2),
+            transfer(9_000_000_000, 1, 3),
+            transfer(3_000, 1, 4),
+        ];
+        for seed in 0..20u64 {
+            let mut rng = Seq(seed.wrapping_mul(0x2545_f491_4f6c_dd1d));
+            let p = plan(&transfers, &[1_000_000_000], &options(3), &mut rng).expect("a plan");
+            assert_eq!(
+                p.inputs,
+                vec![2],
+                "only the third output can cover it alone"
+            );
+        }
+    }
+
+    /// When nothing left covers what remains, every remaining output is going
+    /// to be needed, so it takes the largest and gets there in the fewest.
+    #[test]
+    fn what_cannot_be_covered_alone_is_taken_largest_first() {
+        let transfers: Vec<Transfer> = (0..6u8)
+            .map(|i| transfer(1_000_000 * (u64::from(i) + 1), 1, i))
+            .collect();
+        // 21,000,000 in all; asking for nearly that takes everything.
+        let p = plan(&transfers, &[20_000_000], &options(0), &mut seq()).expect("a plan");
+        assert_eq!(p.inputs.len(), 6);
+    }
+
     /// `sweep_single` takes the output named and no other, whatever else the
     /// wallet holds.
     #[test]
@@ -761,7 +896,7 @@ mod tests {
         let transfers: Vec<Transfer> = (0..255u16)
             .map(|i| transfer(1_000, 1, i as u8))
             .collect();
-        let e = plan(&transfers, &[250_000], &options(3)).expect_err("too heavy");
+        let e = plan(&transfers, &[250_000], &options(3), &mut seq()).expect_err("too heavy");
         match e {
             SpendError::TooHeavy { weight, limit } => {
                 assert!(weight > limit);
@@ -802,7 +937,7 @@ mod tests {
     #[test]
     fn a_plan_balances() {
         let transfers = vec![transfer(10_000_000_000, 100, 1)];
-        let p = plan(&transfers, &[4_000_000_000], &options(3)).expect("a plan");
+        let p = plan(&transfers, &[4_000_000_000], &options(3), &mut seq()).expect("a plan");
 
         assert_eq!(p.inputs, vec![0]);
         assert_eq!(p.amounts, vec![4_000_000_000]);
@@ -820,7 +955,7 @@ mod tests {
     #[test]
     fn a_zero_fee_rate_plans() {
         let transfers = vec![transfer(5_000, 100, 1)];
-        let p = plan(&transfers, &[3_000], &options(0)).expect("a plan");
+        let p = plan(&transfers, &[3_000], &options(0), &mut seq()).expect("a plan");
         assert_eq!(p.fee, 0);
         assert_eq!(p.change, 2_000);
     }
@@ -833,10 +968,10 @@ mod tests {
             transfer(9_000_000_000, 100, 2),
             transfer(3_000_000_000, 100, 3),
         ];
-        let p = plan(&transfers, &[8_000_000_000], &options(3)).expect("a plan");
+        let p = plan(&transfers, &[8_000_000_000], &options(3), &mut seq()).expect("a plan");
         assert_eq!(p.inputs, vec![1], "the 9 WOW output alone covers it");
 
-        let p = plan(&transfers, &[11_000_000_000], &options(3)).expect("a plan");
+        let p = plan(&transfers, &[11_000_000_000], &options(3), &mut seq()).expect("a plan");
         assert_eq!(p.inputs, vec![1, 2], "largest first");
     }
 
@@ -844,7 +979,7 @@ mod tests {
     #[test]
     fn not_enough_is_reported_with_the_numbers() {
         let transfers = vec![transfer(1_000, 100, 1)];
-        let e = plan(&transfers, &[5_000], &options(3)).expect_err("too little");
+        let e = plan(&transfers, &[5_000], &options(3), &mut seq()).expect_err("too little");
         match e {
             SpendError::NotEnough {
                 available, needed, ..
@@ -905,7 +1040,7 @@ mod tests {
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].0, 3, "only the last one");
 
-        let p = plan(&transfers, &[1_000_000], &options(3)).expect("a plan");
+        let p = plan(&transfers, &[1_000_000], &options(3), &mut seq()).expect("a plan");
         assert_eq!(p.inputs, vec![3]);
     }
 
@@ -966,7 +1101,7 @@ mod tests {
             transfer(3_000_000_000, 100, 2),
             transfer(3_000_000_000, 100, 3),
         ];
-        let p = plan(&transfers, &[7_000_000_000], &options(11)).expect("a plan");
+        let p = plan(&transfers, &[7_000_000_000], &options(11), &mut seq()).expect("a plan");
 
         let recomputed = fee_from_weight(
             11,
@@ -985,13 +1120,13 @@ mod tests {
         let transfers = vec![transfer(u64::MAX / 2, 100, 1)];
         let many: Vec<u64> = (0..MAX_OUTPUTS as u64).map(|i| i + 1).collect();
         assert_eq!(
-            plan(&transfers, &many, &options(3)),
+            plan(&transfers, &many, &options(3), &mut seq()),
             Err(SpendError::TooManyDestinations(MAX_OUTPUTS))
         );
 
         // One fewer leaves room for change.
         let ok: Vec<u64> = (0..MAX_OUTPUTS as u64 - 1).map(|i| i + 1).collect();
-        assert!(plan(&transfers, &ok, &options(3)).is_ok());
+        assert!(plan(&transfers, &ok, &options(3), &mut seq()).is_ok());
     }
 
     /// Degenerate requests are refused rather than planned.
@@ -999,11 +1134,11 @@ mod tests {
     fn degenerate_requests_are_refused() {
         let transfers = vec![transfer(1_000_000, 100, 1)];
         assert_eq!(
-            plan(&transfers, &[], &options(3)),
+            plan(&transfers, &[], &options(3), &mut seq()),
             Err(SpendError::NoDestinations)
         );
         assert_eq!(
-            plan(&transfers, &[100, 0], &options(3)),
+            plan(&transfers, &[100, 0], &options(3), &mut seq()),
             Err(SpendError::ZeroAmount)
         );
     }
@@ -1049,7 +1184,7 @@ mod tests {
 
         let mut o = options(3);
         o.from_account = Some(2);
-        let p = plan(&transfers, &[1_000_000], &o).expect("a plan");
+        let p = plan(&transfers, &[1_000_000], &o, &mut seq()).expect("a plan");
         assert_eq!(change_index(&p, &transfers), SubaddressIndex::new(2, 0));
     }
 
@@ -1057,7 +1192,7 @@ mod tests {
     #[test]
     fn a_new_fee_moves_the_change() {
         let transfers = vec![transfer(10_000_000_000, 100, 1)];
-        let p = plan(&transfers, &[4_000_000_000], &options(3)).expect("a plan");
+        let p = plan(&transfers, &[4_000_000_000], &options(3), &mut seq()).expect("a plan");
         assert!(!p.sweep);
 
         let lower = p.with_fee(p.fee - 1_000).expect("a lower fee");
