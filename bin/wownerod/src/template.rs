@@ -124,12 +124,20 @@ fn chain(e: impl std::fmt::Display) -> TemplateError {
 /// Public ones only. A block is as public as it gets, and mining a transaction
 /// still in its stem, or submitted here and not out yet, would announce it
 /// from this node -- the very link Dandelion++ is there to break. The C++ also
-/// mines ones kept from relay; they stay out here, as they always have. On a
-/// fake chain stem transactions are mined as well, as the C++ mines them there
-/// (`m_mine_stem_txes`), so a test network with a single node still confirms
-/// what it relays.
+/// mines ones kept from relay; they stay out here, as they always have.
+///
+/// A fake chain is a test network, where the C++ mines stem transactions too
+/// (`m_mine_stem_txes`). It mines a lone node's own as well, in effect: with
+/// no peer to stem to, `dandelionpp_notify` fluffs it and so makes it public.
+/// Here a transaction sent to nobody stays unrelayed, to go out once a peer
+/// can take it, so on a fake chain one submitted here is minable as it stands
+/// -- or a single regtest node would never confirm a payment made to it.
 fn minable(entry: &PoolEntry, network: Network) -> bool {
-    entry.is_public() || (network == Network::Fakechain && entry.relay == RelayMethod::Stem)
+    match entry.relay {
+        RelayMethod::Fluff | RelayMethod::Block => true,
+        RelayMethod::Stem | RelayMethod::Local => network == Network::Fakechain,
+        RelayMethod::None | RelayMethod::Forward => false,
+    }
 }
 
 /// `add_tx_pub_key_to_extra`, then `add_extra_nonce_to_tx_extra` when there
@@ -400,7 +408,8 @@ mod tests {
     }
 
     /// Only what the network already has goes into a block; a stem
-    /// transaction only on a fake chain, and one kept from relay never.
+    /// transaction, or this node's own, only on a fake chain; and one kept
+    /// from relay never.
     #[test]
     fn a_template_takes_public_transactions_only() {
         let entry = |relay| PoolEntry {
@@ -414,7 +423,7 @@ mod tests {
         };
         for (relay, mainnet, fake) in [
             (RelayMethod::None, false, false),
-            (RelayMethod::Local, false, false),
+            (RelayMethod::Local, false, true),
             (RelayMethod::Stem, false, true),
             (RelayMethod::Fluff, true, true),
             (RelayMethod::Block, true, true),
