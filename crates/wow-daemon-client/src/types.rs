@@ -346,6 +346,12 @@ impl DaemonClient {
     }
 
     /// `/get_outs.bin` — the ring members for a set of `(amount, index)` pairs.
+    ///
+    /// Written as epee writes `wallet2`'s request: `client` always, and
+    /// `get_txid` only when it is false, since `KV_SERIALIZE_OPT(get_txid,
+    /// true)` leaves out a field that holds its default. A wallet asks with it
+    /// false: which transaction a ring member came from is not the node's to
+    /// be told that anyone wants to know.
     pub fn get_outs(&self, wanted: &[(u64, u64)], get_txid: bool) -> Result<Vec<OutKey>> {
         let items: Vec<Value> = wanted
             .iter()
@@ -358,6 +364,7 @@ impl DaemonClient {
             .collect();
 
         let mut req = Section::new();
+        req.insert("client".into(), Value::String(Vec::new()));
         req.insert(
             "outputs".into(),
             Value::Array(Array {
@@ -365,7 +372,9 @@ impl DaemonClient {
                 items,
             }),
         );
-        req.insert("get_txid".into(), Value::Bool(get_txid));
+        if !get_txid {
+            req.insert("get_txid".into(), Value::Bool(false));
+        }
 
         let res = self.binary("/get_outs.bin", &req)?;
         let outs = res

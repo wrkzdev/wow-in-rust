@@ -200,24 +200,42 @@ impl Session {
             .map_err(SendError::Distribution)?;
         let picker = GammaPicker::new(&distribution.offsets).map_err(SendError::Ring)?;
 
-        let mut inputs = Vec::with_capacity(plan.inputs.len());
-        let mut key_images = Vec::with_capacity(plan.inputs.len());
+        // Every input's ring in one request of the reference's shape, checked
+        // member by member and then as a whole (`decoys::select_rings`).
+        let mut masks = Vec::with_capacity(plan.inputs.len());
+        let mut reals = Vec::with_capacity(plan.inputs.len());
         for &i in &plan.inputs {
             let t = &self.state.transfers[i];
-            let (ring, keys) = decoys::select_unlocked_ring(
-                &picker,
-                &mut rng,
-                t.global_output_index,
-                request.ring_size,
-                |indices| decoys::fetch_members(&client, indices),
-            )
-            .map_err(SendError::Ring)?;
-
             let mask = wow_crypto::ops::decode_scalar(&t.mask)
                 .ok_or(SendError::Damaged("its stored mask is not a scalar"))?;
+            reals.push(decoys::RealOutput {
+                global_index: t.global_output_index,
+                public_key: t.public_key.0,
+                commitment: wow_crypto::rct::commit(t.amount, &mask).0,
+            });
+            masks.push(mask);
+        }
+        let rings = decoys::select_rings(
+            &distribution.offsets,
+            &picker,
+            &mut rng,
+            &reals,
+            request.ring_size,
+            None,
+            |indices| decoys::fetch_members(&client, indices),
+        )
+        .map_err(|e| match e {
+            DecoyError::RealOutputNotReturned(_) => SendError::RingMismatch(e),
+            other => SendError::Ring(other),
+        })?;
+
+        let mut inputs = Vec::with_capacity(plan.inputs.len());
+        let mut key_images = Vec::with_capacity(plan.inputs.len());
+        for ((&i, (ring, keys)), mask) in plan.inputs.iter().zip(&rings).zip(masks) {
+            let t = &self.state.transfers[i];
             let assembled = decoys::assemble_ring(
-                &ring,
-                &keys,
+                ring,
+                keys,
                 &t.public_key,
                 &wow_crypto::rct::commit(t.amount, &mask),
             )
