@@ -81,7 +81,7 @@ pub fn dispatch(server: &Server, path: &str, body: &[u8], restricted: bool) -> B
                     "Restricted RPC can only get output distribution for rct outputs. Use your own node.",
                 ));
             }
-            get_output_distribution(db, &request)
+            get_output_distribution(db, server.config().network, &request)
         }
         "/get_transaction_pool_hashes.bin" => get_pool_hashes(server, restricted),
         other => Err(RpcError::unsupported(other)),
@@ -438,90 +438,157 @@ fn get_outs(db: &LmdbDb, request: &Section) -> BinaryResult {
 }
 
 /// `/get_output_distribution.bin` — what decoy selection is built on
-/// (`specs/12` §4.3).
-fn get_output_distribution(db: &LmdbDb, request: &Section) -> BinaryResult {
-    // The reference refuses this endpoint without `binary: true`:
+/// (`specs/12` §4.3): `core_rpc_server::on_get_output_distribution_bin`, with
+/// `Blockchain::get_output_distribution` and `RpcHandler`'s
+/// `process_distribution` behind it.
+///
+/// The answer has the reference's shape, because the reference wallet reads
+/// it: a distribution starts no lower than the first block RingCT outputs
+/// could be in, `base` counts what is below that, and the counts are running
+/// totals only when `cumulative` asks for them. Otherwise each block has its
+/// own count, `base` taken out of the first. This once sent running totals
+/// whatever was asked, starting at `from_height`, as an epee array where a
+/// binary request is answered with a packed blob -- and the Rust wallet, which
+/// asked for running totals and added `base` to each, agreed with it and with
+/// nothing else.
+fn get_output_distribution(
+    db: &LmdbDb,
+    network: wow_types::Network,
+    request: &Section,
+) -> BinaryResult {
+    // `KV_SERIALIZE_OPT(binary, true)`: absent is true, and that is how the
+    // reference wallet asks, never writing a field that holds its default.
+    // Sent false, it is refused:
     //
     // ```cpp
-    // if (!req.binary) { res.status = "Binary only call"; return false; }
+    // if (!req.binary) { res.status = "Binary only call"; return true; }
     // ```
     //
-    // Accepting it anyway is the more forgiving thing to do and the wrong one.
-    // This node's own client sent `binary: false` for months; every test passed
-    // because this handler did not mind, and the first real daemon it met
-    // answered "Binary only call" and broke decoy selection -- which is to say,
-    // broke sending. A daemon that is lenient where the reference is strict
-    // does not make clients work, it makes their bugs invisible until they meet
-    // something else.
-    let binary = request
-        .get("binary")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !binary {
+    // This node's own client once sent `binary: false`, which a lenient
+    // handler here hid until a real daemon refused it and sending broke.
+    // Refusing an absent flag was the opposite mistake: it refused `wallet2`.
+    let flag = |name: &str, default: bool| {
+        request
+            .get(name)
+            .and_then(Value::as_bool)
+            .unwrap_or(default)
+    };
+    if !flag("binary", true) {
         return Err(RpcError::new(error::WRONG_PARAM, "Binary only call"));
     }
+    let cumulative = flag("cumulative", false);
+    let compress = flag("compress", false);
 
+    // A plain `KV_SERIALIZE`: absent is empty, and an empty request gets an
+    // empty answer.
     let amounts = request
         .get("amounts")
         .and_then(Value::as_array)
         .map(|a| a.items.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
-        .unwrap_or_else(|| vec![0]);
-    let from = request
-        .get("from_height")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let number = |name: &str| request.get(name).and_then(Value::as_u64).unwrap_or(0);
+    let from = number("from_height");
     let height = db.height();
-    let to = request
-        .get("to_height")
-        .and_then(Value::as_u64)
-        .filter(|t| *t != 0)
-        .unwrap_or(height.saturating_sub(1))
-        .min(height.saturating_sub(1));
+    // "0 is placeholder for the whole chain".
+    let to = match number("to_height") {
+        0 => height.saturating_sub(1),
+        t => t,
+    };
+    let failed = || RpcError::new(error::INTERNAL_ERROR, "Failed to get output distribution");
 
     let mut entries = Vec::with_capacity(amounts.len());
     for amount in amounts {
-        let d = db
-            .get_output_distribution(amount, from, to)
+        // "rct outputs don't exist before v4": the height
+        // `get_earliest_ideal_height_for_version` gives, walking the fork
+        // table down from the top while each fork is at least that version.
+        // Height 1 on mainnet, where every fork is.
+        let earliest = if amount == 0 && network != wow_types::Network::Fakechain {
+            let mut earliest = u64::MAX;
+            for fork in wow_consensus::hardfork::HardFork::new(network)
+                .forks()
+                .iter()
+                .rev()
+            {
+                if fork.version < wow_consensus::hardfork::gates::HF_VERSION_DYNAMIC_FEE {
+                    break;
+                }
+                earliest = fork.height;
+            }
+            earliest
+        } else {
+            0
+        };
+        if to > 0 && to < from {
+            return Err(failed());
+        }
+        let start = earliest.max(from);
+        // Only amount 0 is kept as a running total, and no wallet asks for the
+        // others.
+        if height == 0 || start >= height || to >= height || amount != 0 {
+            return Err(failed());
+        }
+        // One block below the start as well, which becomes `base`.
+        let heights: Vec<u64> = (start.saturating_sub(1)..=to).collect();
+        let mut d = db
+            .get_block_cumulative_rct_outputs(&heights)
             .map_err(db_error)?;
-        // The cumulative count below the window, which is what turns a
-        // per-block distribution into global indices.
-        let base = if from > 0 {
-            db.get_output_distribution(amount, 0, from.saturating_sub(1))
-                .map_err(db_error)?
-                .last()
-                .copied()
-                .unwrap_or(0)
+        let base = if start > 0 {
+            if d.is_empty() {
+                return Err(failed());
+            }
+            d.remove(0)
         } else {
             0
         };
 
+        // `RpcHandler::get_output_distribution` trims to the range asked for,
+        // which matters to its cache and is a no-op here.
+        if to >= from {
+            let offset = from.max(start);
+            if offset <= to && ((to - offset + 1) as usize) < d.len() {
+                d.truncate((to - offset + 1) as usize);
+            }
+        }
+        // `process_distribution`.
+        if !cumulative && !d.is_empty() {
+            for n in (1..d.len()).rev() {
+                d[n] = d[n].wrapping_sub(d[n - 1]);
+            }
+            d[0] = d[0].wrapping_sub(base);
+        }
+
         let mut s = Section::new();
         s.insert("amount".into(), Value::U64(amount));
-        s.insert("start_height".into(), Value::U64(from));
-        s.insert("base".into(), Value::U64(base));
-        // Uncompressed. The reference can send a compressed form; a wallet
-        // reads whichever it is given, and the compressed encoding buys
-        // bandwidth this node does not need yet.
-        s.insert(
-            "distribution".into(),
-            Value::Array(Array {
-                elem_type: epee::ty::UINT64,
-                items: d.into_iter().map(Value::U64).collect(),
-            }),
-        );
+        s.insert("start_height".into(), Value::U64(start));
         s.insert("binary".into(), Value::Bool(true));
-        s.insert("compress".into(), Value::Bool(false));
+        s.insert("compress".into(), Value::Bool(compress));
+        if compress {
+            // `compress_integer_array`: base-128 varints back to back.
+            let mut packed = Vec::with_capacity(d.len());
+            for v in &d {
+                wow_serialize::varint::write_varint(&mut packed, *v);
+            }
+            s.insert("compressed_data".into(), Value::String(packed));
+        } else if !d.is_empty() {
+            // `KV_SERIALIZE_CONTAINER_POD_AS_BLOB_N(data.distribution, ...)`,
+            // left out when empty as epee leaves out an empty container.
+            let packed: Vec<u8> = d.iter().flat_map(|v| v.to_le_bytes()).collect();
+            s.insert("distribution".into(), Value::String(packed));
+        }
+        s.insert("base".into(), Value::U64(base));
         entries.push(Value::Object(s));
     }
 
     let mut res = base_response();
-    res.insert(
-        "distributions".into(),
-        Value::Array(Array {
-            elem_type: epee::ty::OBJECT,
-            items: entries,
-        }),
-    );
+    if !entries.is_empty() {
+        res.insert(
+            "distributions".into(),
+            Value::Array(Array {
+                elem_type: epee::ty::OBJECT,
+                items: entries,
+            }),
+        );
+    }
     Ok(res)
 }
 

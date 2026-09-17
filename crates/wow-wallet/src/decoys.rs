@@ -170,6 +170,8 @@ pub enum DecoyError {
     RealOutputLocked(u64),
     #[error("found only {found} unlocked decoys of the {wanted} a ring needs")]
     TooFewUnlocked { wanted: usize, found: usize },
+    #[error("the output distribution cannot be used: {0}")]
+    Distribution(String),
 }
 
 impl<'a> GammaPicker<'a> {
@@ -561,93 +563,98 @@ pub fn fetch_members(
         .collect())
 }
 
-/// The RingCT output distribution, kept between sends.
-///
-/// `get_output_distribution` is the largest thing a wallet asks a node for:
-/// one cumulative count per block since genesis, which on mainnet is about
-/// 875,000 of them. Fetching the whole array before every transaction meant
-/// several megabytes and several seconds each time, on a node that is usually
-/// somebody else's and usually public.
-///
-/// It is also almost entirely the same array as last time. `wallet2` keeps it
-/// (`m_rct_offsets`) and asks only for the blocks since, and so does this.
-///
-/// # Why appending is sound
-///
-/// A cumulative answer for `from_height..=to_height` already has `base` --
-/// the count of everything below `from_height` -- added into every element by
-/// [`wow_daemon_client::DaemonClient::get_output_distribution`], so the tail
-/// continues the array rather than restarting it.
-///
-/// Outputs are append-only, so a block's cumulative count never changes...
-/// except across a reorganisation, where blocks are replaced and the counts
-/// below the tip can move. Two guards for that: a tip below what is already
-/// held throws the cache away, and a tail whose first element is *below* the
-/// last one held means the chain was rewritten under us, which also throws it
-/// away. Both are cheap, and getting this wrong picks decoys from a
-/// distribution nobody else has, which is the one failure in decoy selection
-/// that is invisible and permanent.
-#[derive(Debug, Default)]
-pub struct DistributionCache {
-    /// `offsets[i]` is the number of RingCT outputs in blocks `0..=i`.
+/// The RingCT output distribution a transaction's rings are picked from:
+/// what `wallet2::get_rct_distribution` hands `get_outs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RctDistribution {
+    /// The height `offsets[0]` is for, as the node said.
     ///
-    /// Shared rather than lent out, so holding the distribution does not hold
-    /// a borrow of the wallet for the length of a send.
-    offsets: std::sync::Arc<Vec<u64>>,
+    /// `wallet2` reads it and uses it for nothing, and neither does this: the
+    /// offsets go to the picker as they are. A C++ node starts them at height
+    /// 1, where RingCT outputs begin on mainnet, so `offsets[i]` is the block
+    /// `i + 1`. That shifts no pick: the picker finds a block by its running
+    /// total and takes the output within it from the totals alone, and the
+    /// only thing a block's position feeds is how many blocks a young chain
+    /// spans, which mainnet is long past. Lining the array up by prepending
+    /// the missing blocks would make this wallet's picker the one that
+    /// differs.
+    pub start_height: u64,
+    /// Running totals of RingCT outputs, one per block from `start_height`.
+    pub offsets: Vec<u64>,
 }
 
-impl DistributionCache {
-    /// The cumulative distribution through `to_height`, fetching only the part
-    /// not already held.
-    pub fn get(
-        &mut self,
-        client: &wow_daemon_client::DaemonClient,
-        to_height: u64,
-    ) -> Result<std::sync::Arc<Vec<u64>>, wow_daemon_client::DaemonError> {
-        use std::sync::Arc;
-        let want = to_height as usize + 1;
+/// `wallet2::get_rct_distribution`: the whole RingCT distribution, asked for
+/// exactly as the reference wallet asks.
+///
+/// Amount 0 only, from height 0, per-block counts rather than running totals,
+/// compressed, and to the node's own tip -- not the height this wallet has
+/// scanned to, which may be behind it. The node sees the same request from
+/// this wallet as from the C++ one, every transaction.
+///
+/// Nothing is kept between sends. A cache that asked only for the blocks since
+/// the last send would be a request no other wallet makes; the one this
+/// replaces also counted every output below the window twice once it had
+/// something to append to.
+pub fn rct_distribution(
+    client: &wow_daemon_client::DaemonClient,
+) -> Result<RctDistribution, DecoyError> {
+    let answer = client
+        .get_output_distribution(&[0], 0, 0, false, true)
+        .map_err(|e| DecoyError::Fetch(e.to_string()))?;
+    rct_distribution_from(answer)
+}
 
-        // The chain is shorter than what is held: a reorganisation, or a
-        // different node. Nothing cached can be trusted to line up.
-        if self.offsets.len() > want {
-            self.offsets = Arc::new(Vec::new());
-        }
-
-        if self.offsets.len() < want {
-            let from = self.offsets.len() as u64;
-            let tail = client.get_output_distribution(0, from, to_height)?;
-            let continues = from > 0
-                && tail.len() == want - from as usize
-                && tail.first() >= self.offsets.last();
-            if continues {
-                Arc::make_mut(&mut self.offsets).extend_from_slice(&tail);
-            } else if from == 0 && tail.len() == want {
-                self.offsets = Arc::new(tail);
-            } else {
-                // Either the chain moved under us or the node answered with a
-                // range nobody asked for. Start again rather than splice two
-                // distributions together.
-                self.offsets = Arc::new(client.get_output_distribution(0, 0, to_height)?);
-            }
-        }
-
-        Ok(Arc::clone(&self.offsets))
+/// The checks and the sum in `wallet2::get_rct_distribution`, on an answer
+/// already fetched.
+///
+/// The answer must be exactly one distribution, for amount 0; anything else
+/// is refused rather than guessed at. The per-block counts are then summed in
+/// place into running totals. `base` is not added: the reference does not add
+/// it, and a node counts no RingCT outputs below where it starts.
+pub fn rct_distribution_from(
+    mut answer: Vec<wow_daemon_client::OutputDistribution>,
+) -> Result<RctDistribution, DecoyError> {
+    if answer.len() != 1 {
+        return Err(DecoyError::Distribution(format!(
+            "not the expected single result, but {}",
+            answer.len()
+        )));
     }
-
-    /// Forget everything held, for a wallet that has changed node or rescanned.
-    pub fn clear(&mut self) {
-        self.offsets = std::sync::Arc::new(Vec::new());
+    let d = answer.remove(0);
+    if d.amount != 0 {
+        return Err(DecoyError::Distribution(
+            "the result is not for amount 0".into(),
+        ));
     }
-
-    /// How many blocks are held. For tests, and for saying why a send that
-    /// used to take seconds did not.
-    pub fn len(&self) -> usize {
-        self.offsets.len()
+    let mut offsets = d.distribution;
+    for i in 1..offsets.len() {
+        offsets[i] = offsets[i].wrapping_add(offsets[i - 1]);
     }
+    Ok(RctDistribution {
+        start_height: d.start_height,
+        offsets,
+    })
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+/// The checks `wallet2::get_outs` makes of a distribution before picking from
+/// it.
+///
+/// Too few blocks to leave the spendable age out of is "Not enough rct
+/// outputs". And a chain whose last running total does not reach past every
+/// output being spent cannot be the chain those outputs are on: "Daemon
+/// reports suspicious number of rct outputs". A node that answered short would
+/// otherwise have every ring picked from the part of the chain it chose to
+/// show.
+pub fn check_distribution(offsets: &[u64], max_real_index: u64) -> Result<(), DecoyError> {
+    if offsets.len() <= SPENDABLE_AGE as usize {
+        return Err(DecoyError::Distribution("not enough rct outputs".into()));
     }
+    if offsets.last().is_none_or(|last| *last <= max_real_index) {
+        return Err(DecoyError::Distribution(
+            "the daemon reports a suspicious number of rct outputs".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1042,5 +1049,68 @@ mod tests {
             }
         );
         assert_eq!(rounds, MAX_FETCH_ROUNDS);
+    }
+
+    fn answer(
+        amount: u64,
+        start_height: u64,
+        counts: &[u64],
+    ) -> wow_daemon_client::OutputDistribution {
+        wow_daemon_client::OutputDistribution {
+            amount,
+            start_height,
+            base: 0,
+            distribution: counts.to_vec(),
+        }
+    }
+
+    /// Per-block counts are summed into running totals, as
+    /// `wallet2::get_rct_distribution` sums them, and nothing else is added:
+    /// not `base`, and not the start height. Asking twice gives the same
+    /// array, which is what the cache this replaced got wrong from the second
+    /// send on.
+    #[test]
+    fn a_distribution_is_summed_as_wallet2_sums_it() {
+        let got = rct_distribution_from(vec![answer(0, 1, &[2, 0, 3, 5])]).expect("one answer");
+        assert_eq!(got.offsets, vec![2, 2, 5, 10]);
+        assert_eq!(got.start_height, 1, "kept, and not used to shift anything");
+        assert_eq!(
+            rct_distribution_from(vec![answer(0, 1, &[2, 0, 3, 5])]),
+            Ok(got),
+            "the same every time"
+        );
+    }
+
+    /// Anything but exactly one distribution, for amount 0, is refused.
+    #[test]
+    fn a_distribution_answer_must_be_one_for_amount_zero() {
+        assert!(matches!(
+            rct_distribution_from(Vec::new()),
+            Err(DecoyError::Distribution(_))
+        ));
+        assert!(matches!(
+            rct_distribution_from(vec![answer(0, 1, &[1]), answer(0, 1, &[1])]),
+            Err(DecoyError::Distribution(_))
+        ));
+        assert!(matches!(
+            rct_distribution_from(vec![answer(5, 1, &[1])]),
+            Err(DecoyError::Distribution(_))
+        ));
+    }
+
+    /// The distribution has to leave something past the spendable age, and
+    /// reach past every output being spent.
+    #[test]
+    fn a_distribution_short_of_the_real_outputs_is_refused() {
+        let o = offsets(10, 5);
+        assert_eq!(check_distribution(&o, 49), Ok(()));
+        assert!(matches!(
+            check_distribution(&o, 50),
+            Err(DecoyError::Distribution(_))
+        ));
+        assert!(matches!(
+            check_distribution(&o[..4], 0),
+            Err(DecoyError::Distribution(_))
+        ));
     }
 }

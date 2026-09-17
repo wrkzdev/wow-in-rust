@@ -86,6 +86,22 @@ pub struct OutKey {
     pub txid: Hash256,
 }
 
+/// One amount's distribution, as `/get_output_distribution.bin` answers it:
+/// `COMMAND_RPC_GET_OUTPUT_DISTRIBUTION::distribution`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputDistribution {
+    pub amount: u64,
+    /// The height `distribution[0]` is for. A C++ node never answers below the
+    /// first block RingCT outputs could be in, which on mainnet is height 1,
+    /// so this can be above the `from_height` asked for.
+    pub start_height: u64,
+    /// How many outputs there are below `start_height`.
+    pub base: u64,
+    /// One entry per block from `start_height`: running totals if the request
+    /// asked for `cumulative`, and each block's own count if it did not.
+    pub distribution: Vec<u64>,
+}
+
 /// What `get_info` says that a wallet cares about.
 #[derive(Clone, Debug, Default)]
 pub struct Info {
@@ -371,63 +387,63 @@ impl DaemonClient {
         Ok(v)
     }
 
-    /// `/get_output_distribution.bin` — the per-block RingCT output counts
-    /// decoy selection is built on (`specs/12` §4.3).
+    /// `/get_output_distribution.bin` — the per-block output counts decoy
+    /// selection is built on (`specs/12` §4.3), exactly as the node sends
+    /// them.
     ///
-    /// Returns the **cumulative** count per block from `from_height`, plus the
-    /// `base` count below the window. The gamma picker wants a single
-    /// cumulative series, so the base is added back here rather than left for
-    /// the caller to forget.
+    /// Nothing is added up or shifted here. A `cumulative` answer is already
+    /// running totals from genesis, `base` included, and a per-block one has
+    /// `base` taken out of its first entry (`rpc_handler.cpp`,
+    /// `process_distribution`); adding `base` to every entry, as this once did,
+    /// counted it twice. What a wallet does with the answer is
+    /// `wallet2::get_rct_distribution`'s business, in `wow_wallet::decoys`.
+    ///
+    /// # The request is written as `wallet2` writes it
+    ///
+    /// epee leaves out a `KV_SERIALIZE_OPT` field that holds its default:
+    /// `from_height` and `to_height` of 0, `cumulative` and `compress` false.
+    /// And `binary`, whose default is **true**
+    /// (`KV_SERIALIZE_OPT(binary, true)`), so the reference wallet never sends
+    /// it and a C++ node reads its absence as true. Sent explicitly false it
+    /// is refused with `Binary only call`. `client` is a plain `KV_SERIALIZE`
+    /// and always goes, empty unless RPC payment is set up, which it is not
+    /// here.
+    ///
+    /// A `to_height` of 0 means the node's own tip, which is what a wallet
+    /// should ask for: the distribution a ring is picked from is the chain's,
+    /// not what this wallet has scanned.
     pub fn get_output_distribution(
         &self,
-        amount: u64,
+        amounts: &[u64],
         from_height: u64,
         to_height: u64,
-    ) -> Result<Vec<u64>> {
+        cumulative: bool,
+        compress: bool,
+    ) -> Result<Vec<OutputDistribution>> {
         let mut req = Section::new();
+        req.insert("client".into(), Value::String(Vec::new()));
         req.insert(
             "amounts".into(),
             Value::Array(Array {
                 elem_type: epee::ty::UINT64,
-                items: vec![Value::U64(amount)],
+                items: amounts.iter().map(|a| Value::U64(*a)).collect(),
             }),
         );
-        req.insert("from_height".into(), Value::U64(from_height));
-        req.insert("to_height".into(), Value::U64(to_height));
-        req.insert("cumulative".into(), Value::Bool(true));
-        // `binary: true` is **required** on the `.bin` endpoint --
-        // `on_get_output_distribution_bin` answers `status: "Binary only call"`
-        // and nothing else without it:
-        //
-        // ```cpp
-        // if (!req.binary) { res.status = "Binary only call"; return false; }
-        // ```
-        //
-        // It also changes the answer's shape: `distribution` comes back as
-        // `CONTAINER_POD_AS_BLOB`, one string of little-endian u64s, rather
-        // than an epee array. `u64_list` reads either.
-        req.insert("binary".into(), Value::Bool(true));
-        // `compress` would pack it with the reference's own varint scheme
-        // (`compress_integer_array`), which is a second format to implement for
-        // a saving that does not matter on one call per transaction.
-        req.insert("compress".into(), Value::Bool(false));
+        if from_height != 0 {
+            req.insert("from_height".into(), Value::U64(from_height));
+        }
+        if to_height != 0 {
+            req.insert("to_height".into(), Value::U64(to_height));
+        }
+        if cumulative {
+            req.insert("cumulative".into(), Value::Bool(true));
+        }
+        if compress {
+            req.insert("compress".into(), Value::Bool(true));
+        }
 
         let res = self.binary("/get_output_distribution.bin", &req)?;
-        let first = res
-            .get("distributions")
-            .and_then(Value::as_array)
-            .and_then(|a| a.items.first())
-            .and_then(Value::as_object)
-            .ok_or(DaemonError::Missing("distributions"))?;
-
-        let base = first.get("base").and_then(Value::as_u64).unwrap_or(0);
-        let mut d = u64_list(first.get("distribution"));
-        if base > 0 {
-            for x in d.iter_mut() {
-                *x += base;
-            }
-        }
-        Ok(d)
+        parse_output_distributions(&res)
     }
 
     /// `/get_transaction_pool_hashes.bin`.
@@ -746,6 +762,67 @@ fn u64_list(v: Option<&Value>) -> Vec<u64> {
     }
 }
 
+/// Pull a `/get_output_distribution.bin` response apart.
+///
+/// Each entry is read as `COMMAND_RPC_GET_OUTPUT_DISTRIBUTION::distribution`
+/// loads one: with `binary` and `compress` both set the counts are in
+/// `compressed_data`, and otherwise in `distribution`, as a packed blob or an
+/// array, which [`u64_list`] reads either way. No `distributions` at all is
+/// an empty list, as epee writes one, and what to make of that is the
+/// caller's.
+fn parse_output_distributions(res: &Section) -> Result<Vec<OutputDistribution>> {
+    let Some(list) = res.get("distributions") else {
+        return Ok(Vec::new());
+    };
+    let list = list
+        .as_array()
+        .ok_or(DaemonError::BadField("distributions"))?;
+    list.items
+        .iter()
+        .map(|item| {
+            let d = item
+                .as_object()
+                .ok_or(DaemonError::BadField("distributions"))?;
+            let number = |name: &str| d.get(name).and_then(Value::as_u64).unwrap_or(0);
+            let flag = |name: &str| d.get(name).and_then(Value::as_bool).unwrap_or(false);
+            let distribution = if flag("binary") && flag("compress") {
+                decompress_integer_array(
+                    d.get("compressed_data")
+                        .and_then(Value::as_bytes)
+                        .unwrap_or(&[]),
+                )?
+            } else {
+                u64_list(d.get("distribution"))
+            };
+            Ok(OutputDistribution {
+                amount: number("amount"),
+                start_height: number("start_height"),
+                base: number("base"),
+                distribution,
+            })
+        })
+        .collect()
+}
+
+/// `decompress_integer_array`: base-128 varints back to back, as
+/// `compress_integer_array` in `core_rpc_server_commands_defs.h` packs them.
+///
+/// Read with the consensus varint reader, which is `tools::read_varint`
+/// quirks included: an over-long or overflowing encoding is refused, and one
+/// cut off by the end of the data is taken as far as it goes, as the C++
+/// takes it.
+fn decompress_integer_array(bytes: &[u8]) -> Result<Vec<u64>> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let read = wow_serialize::varint::read_varint_bits(rest, 64)
+            .map_err(|_| DaemonError::BadField("compressed_data"))?;
+        out.push(read.value);
+        rest = &rest[read.len..];
+    }
+    Ok(out)
+}
+
 /// Pull a `/get_transaction_pool` response apart.
 ///
 /// An empty pool comes back with no `transactions` field at all: epee omits an
@@ -973,6 +1050,77 @@ mod tests {
 
         assert!(u64_list(None).is_empty());
         assert!(u64_list(Some(&Value::Bool(true))).is_empty());
+    }
+
+    /// A distribution is read in each shape a node sends it: compressed, as a
+    /// packed blob, and as an array. Nothing is added to the counts: `base`
+    /// is reported beside them, never folded in.
+    #[test]
+    fn an_output_distribution_parses_in_every_shape() {
+        let counts = [3u64, 0, 127, 128, 300, 1 << 40];
+
+        let mut compressed = Vec::new();
+        for c in counts {
+            wow_serialize::varint::write_varint(&mut compressed, c);
+        }
+        let mut packed = Vec::new();
+        for c in counts {
+            packed.extend_from_slice(&c.to_le_bytes());
+        }
+        let array = Value::Array(Array {
+            elem_type: epee::ty::UINT64,
+            items: counts.iter().map(|c| Value::U64(*c)).collect(),
+        });
+
+        let entry = |binary: bool, compress: bool, field: &str, value: Value| {
+            let mut s = Section::new();
+            s.insert("amount".into(), Value::U64(0));
+            s.insert("start_height".into(), Value::U64(1));
+            s.insert("binary".into(), Value::Bool(binary));
+            s.insert("compress".into(), Value::Bool(compress));
+            s.insert(field.into(), value);
+            s.insert("base".into(), Value::U64(9));
+            Value::Object(s)
+        };
+        let mut res = Section::new();
+        res.insert(
+            "distributions".into(),
+            Value::Array(Array {
+                elem_type: epee::ty::OBJECT,
+                items: vec![
+                    entry(true, true, "compressed_data", Value::String(compressed)),
+                    entry(true, false, "distribution", Value::String(packed)),
+                    entry(false, false, "distribution", array),
+                ],
+            }),
+        );
+
+        let got = parse_output_distributions(&res).expect("parses");
+        assert_eq!(got.len(), 3);
+        for d in got {
+            assert_eq!(d.distribution, counts, "the counts as sent");
+            assert_eq!((d.amount, d.start_height, d.base), (0, 1, 9));
+        }
+
+        // epee leaves an empty list out, and that is not a malformed answer.
+        assert!(parse_output_distributions(&Section::new())
+            .expect("parses")
+            .is_empty());
+    }
+
+    /// Compressed data is read as `tools::read_varint` reads it: an over-long
+    /// encoding is refused, not taken as a count.
+    #[test]
+    fn compressed_counts_refuse_an_over_long_varint() {
+        assert_eq!(
+            decompress_integer_array(&[0x01, 0xac, 0x02]).expect("valid"),
+            vec![1, 300]
+        );
+        assert!(matches!(
+            decompress_integer_array(&[0x80, 0x00]),
+            Err(DaemonError::BadField("compressed_data"))
+        ));
+        assert!(decompress_integer_array(&[]).expect("empty").is_empty());
     }
 
     /// A missing block blob is an error rather than an empty block.

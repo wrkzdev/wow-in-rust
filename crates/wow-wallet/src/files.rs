@@ -105,10 +105,6 @@ pub struct Session {
     /// The key the cache is sealed under, derived from the password once
     /// rather than by a CryptoNight on every save.
     cache_key: crate::chacha::Key,
-    /// The RingCT output distribution, so a second send does not fetch the
-    /// whole of it again. Not saved with the wallet: it is the chain's, not
-    /// this wallet's, and a node answers for the part that is missing.
-    pub(crate) distribution: crate::decoys::DistributionCache,
 }
 
 impl Session {
@@ -181,7 +177,6 @@ impl Session {
             dirty: true,
             store,
             cache_key,
-            distribution: Default::default(),
         };
         s.save()?;
         let address = s.primary_address();
@@ -274,7 +269,6 @@ impl Session {
             dirty: false,
             store,
             cache_key,
-            distribution: Default::default(),
         })
     }
 

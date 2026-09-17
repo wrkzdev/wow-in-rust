@@ -438,16 +438,17 @@ fn a_start_height_past_the_tip_is_refused() {
     assert!(e.to_string().contains("past the tip"), "{e}");
 }
 
-/// `/get_output_distribution.bin` refuses a request without `binary: true`,
-/// exactly as `on_get_output_distribution_bin` does.
+/// `/get_output_distribution.bin` refuses `binary: false`, exactly as
+/// `on_get_output_distribution_bin` does, and answers a request that leaves
+/// the flag out, because `KV_SERIALIZE_OPT(binary, true)` reads that as true.
 ///
-/// This node's own client sent `binary: false` for months. Every test passed,
+/// This node's own client once sent `binary: false`. Every test passed,
 /// because this daemon did not mind -- and the first real C++ daemon it met
 /// answered `Binary only call`, which broke decoy selection and so broke
-/// sending. Being lenient where the reference is strict does not make clients
-/// work; it hides their bugs until they meet something else.
+/// sending. Refusing an absent flag was the opposite mistake: `wallet2` never
+/// writes a field that holds its default, so it refused the reference wallet.
 #[test]
-fn the_output_distribution_needs_the_binary_flag() {
+fn the_output_distribution_is_binary_only() {
     use wow_serialize::epee::{self, Array, Section, Value};
 
     let (d, _) = start("distflag", 3);
@@ -461,26 +462,25 @@ fn the_output_distribution_needs_the_binary_flag() {
             items: vec![Value::U64(0)],
         }),
     );
-    req.insert("from_height".into(), Value::U64(0));
     req.insert("cumulative".into(), Value::Bool(true));
 
-    // Missing entirely.
+    // Missing entirely, as `wallet2` sends it: answered.
+    let res = c
+        .binary("/get_output_distribution.bin", &req)
+        .expect("answered without the flag");
+    assert!(res.contains_key("distributions"), "{res:?}");
+
+    // Present and false is refused.
+    req.insert("binary".into(), Value::Bool(false));
     let e = c
         .binary("/get_output_distribution.bin", &req)
-        .expect_err("refused without the flag");
+        .expect_err("refused with the flag false");
     assert!(
         e.to_string().contains("Binary only call"),
         "the reference's own wording: {e}"
     );
 
-    // Present and false is the same refusal.
-    req.insert("binary".into(), Value::Bool(false));
-    let e = c
-        .binary("/get_output_distribution.bin", &req)
-        .expect_err("refused with the flag false");
-    assert!(e.to_string().contains("Binary only call"), "{e}");
-
-    // And with it, an answer.
+    // And present and true, an answer.
     req.insert("binary".into(), Value::Bool(true));
     let res = c
         .binary("/get_output_distribution.bin", &req)
@@ -488,20 +488,48 @@ fn the_output_distribution_needs_the_binary_flag() {
     assert!(res.contains_key("distributions"), "{res:?}");
 }
 
-/// The typed client asks the way the reference requires, so the round trip
-/// works against this daemon and against a real one alike.
+/// The three shapes a node answers in agree with each other, as the
+/// reference's do: running totals, per-block counts that add up to them less
+/// `base`, and the same per-block counts compressed. A mainnet distribution
+/// starts at height 1, the first block RingCT outputs could be in.
 #[test]
 fn the_client_gets_a_distribution_from_this_daemon() {
     let (d, _) = start("distclient", 3);
     let c = client(d.port);
 
-    let dist = c
-        .get_output_distribution(0, 0, 2)
-        .expect("the client sends binary: true");
-    // Cumulative, so it never decreases.
-    let mut prev = 0u64;
-    for v in &dist {
-        assert!(*v >= prev, "the distribution went backwards: {dist:?}");
+    let totals = c
+        .get_output_distribution(&[0], 0, 0, true, false)
+        .expect("running totals");
+    assert_eq!(totals.len(), 1, "one distribution per amount asked for");
+    let totals = &totals[0];
+    assert_eq!(totals.amount, 0);
+    assert_eq!(totals.start_height, 1, "no RingCT outputs before version 4");
+    assert_eq!(totals.distribution.len(), 3, "heights 1 to the tip");
+    let mut prev = totals.base;
+    for v in &totals.distribution {
+        assert!(*v >= prev, "the running totals went backwards: {totals:?}");
         prev = *v;
+    }
+
+    for compress in [false, true] {
+        let per_block = c
+            .get_output_distribution(&[0], 0, 0, false, compress)
+            .expect("per-block counts");
+        let per_block = &per_block[0];
+        assert_eq!(per_block.start_height, totals.start_height);
+        assert_eq!(per_block.base, totals.base);
+        let mut sum = per_block.base;
+        let summed: Vec<u64> = per_block
+            .distribution
+            .iter()
+            .map(|n| {
+                sum += n;
+                sum
+            })
+            .collect();
+        assert_eq!(
+            summed, totals.distribution,
+            "per-block counts add up to the totals (compressed: {compress})"
+        );
     }
 }

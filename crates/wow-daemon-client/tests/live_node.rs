@@ -59,24 +59,27 @@ fn the_decoy_endpoints_answer() {
     let tip = info.height - 1;
 
     // Amount zero is the RingCT pool, which is the only one a modern wallet
-    // draws from.
-    let dist = c
-        .get_output_distribution(0, 0, tip)
+    // draws from. Asked for as `wallet2` asks: per-block counts, compressed,
+    // to the node's own tip.
+    let answer = c
+        .get_output_distribution(&[0], 0, 0, false, true)
         .expect("get_output_distribution");
+    assert_eq!(answer.len(), 1, "one distribution for the one amount");
+    let answer = &answer[0];
+    assert_eq!(answer.amount, 0);
     assert!(
-        dist.len() > 1000,
-        "the distribution covers the chain: {} entries",
-        dist.len()
+        answer.distribution.len() > 1000,
+        "the distribution covers the chain: {} entries from height {}",
+        answer.distribution.len(),
+        answer.start_height
     );
 
-    // It is cumulative, so it never decreases, and its last entry is the total
-    // number of RingCT outputs ever made.
-    let mut prev = 0u64;
-    for (i, v) in dist.iter().enumerate() {
-        assert!(*v >= prev, "the distribution went backwards at {i}");
-        prev = *v;
+    // Added up, the counts are running totals, and the last is the number of
+    // RingCT outputs ever made.
+    let mut total = answer.base;
+    for n in &answer.distribution {
+        total = total.checked_add(*n).expect("the counts do not overflow");
     }
-    let total = *dist.last().expect("non-empty");
     eprintln!("{} RingCT outputs over {} entries", total, dist.len());
     assert!(total > 1_000_000, "a chain this old has millions");
 

@@ -93,7 +93,7 @@ pub enum SendError {
     #[error("cannot get a fee estimate: {0}")]
     FeeEstimate(DaemonError),
     #[error("cannot get the output distribution: {0}")]
-    Distribution(DaemonError),
+    Distribution(DecoyError),
     #[error(transparent)]
     Plan(#[from] SpendError),
     #[error("cannot build a ring: {0}")]
@@ -186,16 +186,19 @@ impl Session {
         // A ring for each input, of members the chain has unlocked, or no node
         // will take the transaction.
         //
-        // The distribution is one cumulative count per block since genesis --
-        // the largest thing this wallet asks a node for. It is kept between
-        // sends and only the blocks since the last one are fetched, which is
-        // what `wallet2` does with `m_rct_offsets`.
-        let to_height = self.chain_height().saturating_sub(1);
-        let distribution = self
-            .distribution
-            .get(&client, to_height)
+        // The distribution is asked for whole, to the node's tip, as
+        // `wallet2::get_rct_distribution` asks for it before every
+        // transaction, and checked as `get_outs` checks it.
+        let distribution = decoys::rct_distribution(&client).map_err(SendError::Distribution)?;
+        let max_real_index = plan
+            .inputs
+            .iter()
+            .map(|&i| self.state.transfers[i].global_output_index)
+            .max()
+            .unwrap_or(0);
+        decoys::check_distribution(&distribution.offsets, max_real_index)
             .map_err(SendError::Distribution)?;
-        let picker = GammaPicker::new(distribution.as_slice()).map_err(SendError::Ring)?;
+        let picker = GammaPicker::new(&distribution.offsets).map_err(SendError::Ring)?;
 
         let mut inputs = Vec::with_capacity(plan.inputs.len());
         let mut key_images = Vec::with_capacity(plan.inputs.len());
