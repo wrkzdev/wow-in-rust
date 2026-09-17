@@ -23,6 +23,8 @@
 //! — a transaction that comes out lighter than estimated pays slightly over the
 //! odds, which is fine, where one that comes out heavier would be rejected.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use wow_consensus::constants;
 use wow_consensus::fee::{quantize_up, FEE_QUANTIZATION_MASK};
 use wow_crypto::types::{KeyImage, SubaddressIndex};
@@ -168,12 +170,33 @@ pub struct SpendOptions {
     pub fee_per_byte: u64,
     /// Bytes `tx_extra` will take. A transaction with a payment id is larger.
     pub extra_size: usize,
-    /// Prefer outputs from this account, as `wallet2` does. `None` spends from
-    /// anywhere.
-    pub from_account: Option<u32>,
-    /// `ignore_outputs_above` / `ignore_outputs_below`.
+    /// The subaddress account to spend from. A transaction spends from one
+    /// account only, as `wallet2` does: funds from two would tie the two
+    /// together on chain.
+    pub account: u32,
+    /// The minor indices within `account` to spend from. Empty is every one
+    /// that holds anything, or for a sweep one of them at random.
+    pub subaddr_indices: Vec<u32>,
+    /// `ignore_outputs_above` / `ignore_outputs_below`: outputs outside the
+    /// range are not picked to pay a transfer.
     pub ignore_above: u64,
     pub ignore_below: u64,
+    /// `ignore_fractional_outputs`: leave out outputs worth less than the fee
+    /// one more input costs. On by default, as in `wallet2`.
+    pub ignore_fractional_outputs: bool,
+    /// `min_output_count` / `min_output_value`: a second input that is not
+    /// needed is not added when fewer than this many outputs of at least this
+    /// value would be left. Both zero means `wallet2`'s defaults, five of 2
+    /// WOW.
+    pub min_output_count: u32,
+    pub min_output_value: u64,
+    /// Change still to come back to `account` from transactions not yet in a
+    /// block, which counts toward its balance as `balance_per_subaddress`
+    /// counts it.
+    pub pending_change: u64,
+    /// A sweep's `below_amount`: only outputs worth less than this. Zero is
+    /// every output.
+    pub sweep_below: u64,
     /// The chain height, for the unlock check.
     pub chain_height: u64,
     pub now: u64,
@@ -187,9 +210,15 @@ impl Default for SpendOptions {
             ring_size: crate::decoys::RING_SIZE,
             fee_per_byte: 0,
             extra_size: 44, // the tx public key and an encrypted payment id
-            from_account: None,
-            ignore_above: u64::MAX,
+            account: 0,
+            subaddr_indices: Vec::new(),
+            ignore_above: constants::MONEY_SUPPLY,
             ignore_below: 0,
+            ignore_fractional_outputs: true,
+            min_output_count: 0,
+            min_output_value: 0,
+            pending_change: 0,
+            sweep_below: 0,
             chain_height: 0,
             now: 0,
             weight_limit: default_weight_limit(),
@@ -200,12 +229,12 @@ impl Default for SpendOptions {
 /// What to build, once the arithmetic has settled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpendPlan {
-    /// Indices into the transfer list.
+    /// Indices into the transfer list, in the order they were picked.
     pub inputs: Vec<usize>,
     /// The amount going to each destination, in the order given.
     pub amounts: Vec<u64>,
-    /// The change, which the caller sends back to itself. Zero means a dummy
-    /// output is still needed to reach two.
+    /// The change, which the caller sends back to itself. Zero means no change
+    /// output, or for a single destination a dummy one to reach two.
     pub change: u64,
     pub fee: u64,
     /// The weight the fee was computed from: the estimate while planning, the
@@ -224,9 +253,10 @@ pub struct SpendPlan {
 }
 
 impl SpendPlan {
-    /// Total outputs, including change or the dummy that stands in for it.
+    /// Total outputs: `get_num_outputs`, the destinations, change if there is
+    /// any, and a dummy to reach two.
     pub fn output_count(&self) -> usize {
-        (self.amounts.len() + 1).max(MIN_OUTPUTS)
+        (self.amounts.len() + usize::from(self.change > 0)).max(MIN_OUTPUTS)
     }
 
     /// The same inputs and destinations at another fee.
@@ -326,13 +356,28 @@ pub enum SpendError {
     OutputSpent,
     #[error("that output is not spendable yet: it is locked, or too new")]
     OutputLocked,
+    #[error(
+        "No transaction created: no output in this account is eligible to spend, once outputs \
+         below the fee they cost and outside ignore-outputs-above and -below are left out"
+    )]
+    NothingToSpend,
+    #[error("the tx uses funds from multiple accounts")]
+    MultipleAccounts,
 }
+
+/// `DEFAULT_MIN_OUTPUT_COUNT`.
+pub const DEFAULT_MIN_OUTPUT_COUNT: u32 = 5;
+/// `DEFAULT_MIN_OUTPUT_VALUE`: 2 WOW.
+pub const DEFAULT_MIN_OUTPUT_VALUE: u64 = 2 * constants::COIN;
+/// `SECOND_OUTPUT_RELATEDNESS_THRESHOLD`.
+const SECOND_OUTPUT_RELATEDNESS_THRESHOLD: f32 = 0.0;
 
 /// Which transfers are eligible to spend.
 ///
-/// Unspent, unlocked, with a key image known — a view-only wallet has none, so
-/// it can select nothing, which is the correct answer rather than an error the
-/// caller has to special-case.
+/// Unspent, unlocked, with a key image known, in the account asked for and
+/// inside `ignore_below..=ignore_above`. A view-only wallet has no key
+/// images, so it can select nothing, which is the correct answer rather than
+/// an error the caller has to special-case.
 pub fn spendable<'a>(
     transfers: &'a [Transfer],
     options: &SpendOptions,
@@ -343,11 +388,161 @@ pub fn spendable<'a>(
         .filter(|(_, t)| !t.spent && t.key_image.is_some())
         .filter(|(_, t)| t.unlocked(options.chain_height, options.now))
         .filter(|(_, t)| t.amount >= options.ignore_below && t.amount <= options.ignore_above)
-        .filter(|(_, t)| match options.from_account {
-            Some(a) => t.subaddress.major == a,
-            None => true,
-        })
+        .filter(|(_, t)| t.subaddress.major == options.account)
         .collect()
+}
+
+/// `wallet2::get_output_relatedness`: "a handwavy estimation of how much two
+/// outputs are related". From one transaction, fully; from one block, or
+/// blocks close together, somewhat; otherwise not at all.
+///
+/// Two outputs spent together tell an observer that one wallet held both. If
+/// they arrived together as well, that says little more; if they were paid a
+/// block apart, it links two payments.
+pub fn output_relatedness(a: &Transfer, b: &Transfer) -> f32 {
+    if a.txid == b.txid {
+        return 1.0;
+    }
+    match a.block_height.abs_diff(b.block_height) {
+        0 => 0.9,
+        1 => 0.8,
+        2..=9 => 0.2,
+        _ => 0.0,
+    }
+}
+
+/// `wallet2::pop_best_value_from`: take, out of `unused`, one of the outputs
+/// least related to those already `selected`: the smallest of them when
+/// `smallest`, and otherwise one at random.
+fn pop_best_value(
+    transfers: &[Transfer],
+    unused: &mut Vec<usize>,
+    selected: &[usize],
+    smallest: bool,
+    rng: &mut dyn crate::decoys::RandomSource,
+) -> usize {
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut best = 1.0f32;
+    for (n, &i) in unused.iter().enumerate() {
+        let mut relatedness = 0.0f32;
+        for &s in selected {
+            let r = output_relatedness(&transfers[i], &transfers[s]);
+            if r > relatedness {
+                relatedness = r;
+                if relatedness == 1.0 {
+                    break;
+                }
+            }
+        }
+        if relatedness < best {
+            best = relatedness;
+            candidates.clear();
+        }
+        if relatedness == best {
+            candidates.push(n);
+        }
+    }
+    let pick = if smallest {
+        let mut at = 0;
+        for (n, &c) in candidates.iter().enumerate() {
+            if transfers[unused[c]].amount < transfers[unused[candidates[at]]].amount {
+                at = n;
+            }
+        }
+        at
+    } else {
+        rng.below(candidates.len() as u64) as usize
+    };
+    // `pop_index`: the last element takes the popped one's place.
+    unused.swap_remove(candidates[pick])
+}
+
+/// `pop_if_present`.
+fn pop_if_present(unused: &mut Vec<usize>, index: usize) {
+    if let Some(at) = unused.iter().position(|&i| i == index) {
+        unused.swap_remove(at);
+    }
+}
+
+/// Whether `t` may pay a transfer from `account`'s `indices`, in the checks
+/// every selection path in `create_transactions_2` shares.
+fn eligible(t: &Transfer, options: &SpendOptions, indices: &BTreeSet<u32>) -> bool {
+    !t.spent
+        && t.key_image.is_some()
+        && t.unlocked(options.chain_height, options.now)
+        && t.subaddress.major == options.account
+        && indices.contains(&t.subaddress.minor)
+}
+
+fn outside_range(t: &Transfer, options: &SpendOptions) -> bool {
+    t.amount > options.ignore_above || t.amount < options.ignore_below
+}
+
+/// `wallet2::pick_preferred_rct_inputs`: "to build a tx that's 1 or 2 inputs,
+/// and 2 outputs, which will get us a known fee".
+///
+/// The first output, oldest first, that covers `needed` alone. Failing that,
+/// the least related pair from one subaddress that covers it together, the
+/// first pair found among equals, and as soon as an unrelated pair is found.
+/// Nothing when neither exists.
+fn pick_preferred_inputs(
+    transfers: &[Transfer],
+    needed: u64,
+    options: &SpendOptions,
+    indices: &BTreeSet<u32>,
+) -> Vec<usize> {
+    for (i, t) in transfers.iter().enumerate() {
+        if eligible(t, options, indices) && t.amount >= needed && !outside_range(t, options) {
+            return vec![i];
+        }
+    }
+
+    let mut picks = Vec::new();
+    let mut current = 1.0f32;
+    for (i, t) in transfers.iter().enumerate() {
+        if !eligible(t, options, indices) || outside_range(t, options) {
+            continue;
+        }
+        for (j, t2) in transfers.iter().enumerate().skip(i + 1) {
+            if outside_range(t2, options) {
+                continue;
+            }
+            if !t2.spent
+                && t2.key_image.is_some()
+                && t.amount.saturating_add(t2.amount) >= needed
+                && t2.unlocked(options.chain_height, options.now)
+                && t2.subaddress == t.subaddress
+            {
+                // "update our picks if those outputs are less related than any
+                // we already found. If the same, don't update, and oldest
+                // suitable outputs will be used in preference."
+                let relatedness = output_relatedness(t, t2);
+                if relatedness < current {
+                    picks = vec![i, j];
+                    if relatedness == 0.0 {
+                        return picks;
+                    }
+                    current = relatedness;
+                }
+            }
+        }
+    }
+    picks
+}
+
+/// `get_num_outputs`: the destinations, change unless the inputs match them
+/// exactly, and a dummy to reach two.
+fn num_outputs(destinations: &[u64], found: u64) -> usize {
+    let needed: u64 = destinations.iter().sum();
+    (destinations.len() + usize::from(found != needed)).max(MIN_OUTPUTS)
+}
+
+/// `fractional_threshold` in `create_transactions_2` and `_all`: what one
+/// more input costs in fee, from the weight of two inputs less one.
+fn fractional_threshold(options: &SpendOptions) -> u64 {
+    let one = estimate_tx_weight(1, options.ring_size, 2, 0);
+    let two = estimate_tx_weight(2, options.ring_size, 2, 0);
+    options.fee_per_byte.saturating_mul(two - one)
 }
 
 /// Plan a transaction: pick inputs, settle the fee.
@@ -355,6 +550,33 @@ pub fn spendable<'a>(
 /// `destinations` are the amounts going out, not counting change. The caller
 /// supplies the addresses; this only does arithmetic, because which address
 /// change goes to is a policy question and the amounts are not.
+///
+/// # Which outputs pay
+///
+/// `wallet2::create_transactions_2`, for one transaction:
+///
+/// - only outputs of one account, from the minor indices asked for or every
+///   one that holds anything, grouped by subaddress, the group with the most
+///   unlocked first; less than the fee an input costs, or outside the ignore
+///   range, left out;
+/// - first choice is `pick_preferred_rct_inputs`: the oldest output that pays
+///   the whole of it with the fee a two-input transaction would need, or the
+///   least related pair from one subaddress that does, which brings that
+///   subaddress's group to the front;
+/// - otherwise outputs are taken from the front group one at a time, at
+///   random among those least related to what is already taken, moving to the
+///   next group when one runs out;
+/// - and a transaction that one input paid for gets a second, the smallest of
+///   the least related, when that one is unrelated to the first and taking it
+///   still leaves enough outputs of some size, so that most transactions have
+///   two inputs and two outputs.
+///
+/// The C++ builds the transaction to measure it at the point it decides the
+/// inputs are enough, and goes back for more if the real fee is higher. Here
+/// the estimate decides, and [`crate::transfer::construct_settled`] then
+/// settles on the built weight; the estimate runs over, so an input the real
+/// fee would have needed is never missing. A send that would need a second
+/// transaction to finish is refused as [`SpendError::TooHeavy`].
 pub fn plan(
     transfers: &[Transfer],
     destinations: &[u64],
@@ -371,191 +593,389 @@ pub fn plan(
     if destinations.len() + 1 > MAX_OUTPUTS {
         return Err(SpendError::TooManyDestinations(destinations.len()));
     }
-
-    let sending: u64 = destinations.iter().copied().sum();
-
-    let mut candidates = spendable(transfers, options);
-    let available: u64 = candidates.iter().map(|(_, t)| t.amount).sum();
-
-    let mut chosen: Vec<usize> = Vec::new();
-    let mut in_total = 0u64;
-    let mut fee = 0u64;
-    let mut weight = 0u64;
-
-    for _ in 0..FEE_CALCULATION_MAX_RETRIES {
-        // Take inputs until they cover the send plus the fee we currently
-        // believe in. Inputs already taken are kept: the loop only ever raises
-        // the fee, so a second pass appends rather than starting over, and the
-        // choice does not wobble as the fee settles.
-        let target = sending.saturating_add(fee);
-        while in_total < target {
-            let need = target - in_total;
-            let Some(pick) = choose_input(&candidates, need, rng) else {
-                return Err(SpendError::NotEnough {
-                    available,
-                    needed: target,
-                    fee,
-                });
-            };
-            let (i, t) = candidates.swap_remove(pick);
-            chosen.push(i);
-            in_total += t.amount;
-        }
-
-        // The change output exists unless it would be zero — and even then an
-        // output is needed to reach two, so the count is the same either way.
-        let outputs = (destinations.len() + 1).max(MIN_OUTPUTS);
-        let next_weight =
-            estimate_tx_weight(chosen.len(), options.ring_size, outputs, options.extra_size);
-
-        // Refused here rather than by the node. A wallet that built one anyway
-        // would find out only after fetching a ring for every input and
-        // signing each one -- the slowest, most expensive way to learn it.
-        if next_weight > options.weight_limit {
-            return Err(SpendError::TooHeavy {
-                weight: next_weight,
-                limit: options.weight_limit,
-            });
-        }
-        let next_fee = fee_from_weight(options.fee_per_byte, next_weight);
-
-        if next_fee == fee && in_total >= sending + fee {
-            weight = next_weight;
-            let change = in_total - sending - fee;
-            return Ok(SpendPlan {
-                inputs: chosen,
-                amounts: destinations.to_vec(),
-                change,
-                fee,
-                estimated_weight: weight,
-                sweep: false,
-                left_behind: 0,
-            });
-        }
-        fee = next_fee;
-        weight = next_weight;
-    }
-
-    // The loop only ever raises the fee, so failing to settle means the inputs
-    // could not keep up with it.
-    Err(if in_total < sending.saturating_add(fee) {
-        SpendError::NotEnough {
-            available,
-            needed: sending.saturating_add(fee),
-            fee,
-        }
-    } else {
-        let _ = weight;
-        SpendError::FeeDidNotSettle(FEE_CALCULATION_MAX_RETRIES)
-    })
-}
-
-/// Which output pays next.
-///
-/// # Why this is not simply the largest
-///
-/// Largest-first is the obvious policy and it is a fingerprint. Every wallet
-/// that uses it produces transactions whose inputs, seen from outside, are
-/// exactly the outputs an observer would have guessed — which is a signature
-/// that says *this* software built *this* transaction, and one more fact to
-/// hang on whoever sent it. `decoys.rs` makes this argument at length about
-/// ring members; it applies just as much to the real spend.
-///
-/// So: among the outputs that could finish the job on their own, one is taken
-/// **at random**. That keeps the input count as low as largest-first would --
-/// each input costs weight, a fee and a ring to fetch -- while making which
-/// output pays unpredictable from the amounts alone. Only when nothing left
-/// can cover what remains does it fall back to taking the largest, because at
-/// that point every remaining output will be needed anyway and the order
-/// stops mattering.
-///
-/// `wallet2` reaches for the same two ideas from a different direction:
-/// `pick_preferred_rct_inputs` looks for a single output that covers the
-/// amount, and `select_transfers` picks at random among what is left.
-fn choose_input(
-    candidates: &[(usize, &Transfer)],
-    need: u64,
-    rng: &mut dyn crate::decoys::RandomSource,
-) -> Option<usize> {
-    if candidates.is_empty() {
-        return None;
-    }
-    let finishers: Vec<usize> = candidates
+    let needed_money = destinations
         .iter()
-        .enumerate()
-        .filter(|(_, (_, t))| t.amount >= need)
-        .map(|(pos, _)| pos)
-        .collect();
-    if !finishers.is_empty() {
-        let pick = rng.below(finishers.len() as u64) as usize;
-        return Some(finishers[pick]);
-    }
-    // Nothing covers the rest by itself, so every remaining output is going to
-    // be needed. Take the largest to get there in the fewest.
-    candidates
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, (_, t))| t.amount)
-        .map(|(pos, _)| pos)
-}
-
-/// Plan a sweep: send **everything** eligible to one destination.
-///
-/// The difference from [`plan`] is that the amount is an output of the
-/// calculation rather than an input — the fee comes out of what is being sent,
-/// so there is no change and the destination gets whatever is left.
-pub fn plan_sweep(transfers: &[Transfer], options: &SpendOptions) -> Result<SpendPlan, SpendError> {
-    let mut candidates = spendable(transfers, options);
-    if candidates.is_empty() {
-        return Err(SpendError::NotEnough {
+        .try_fold(0u64, |sum, d| sum.checked_add(*d))
+        .ok_or(SpendError::NotEnough {
             available: 0,
-            needed: 0,
+            needed: u64::MAX,
+            fee: 0,
+        })?;
+
+    // `balance_per_subaddress` and `unlocked_balance_per_subaddress`, for the
+    // account.
+    let mut balance: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut unlocked: BTreeMap<u32, u64> = BTreeMap::new();
+    for t in transfers
+        .iter()
+        .filter(|t| t.subaddress.major == options.account && !t.spent)
+    {
+        *balance.entry(t.subaddress.minor).or_default() += t.amount;
+        let u = unlocked.entry(t.subaddress.minor).or_default();
+        if t.unlocked(options.chain_height, options.now) {
+            *u += t.amount;
+        }
+    }
+    // "all changes go to 0-th subaddress (in the current subaddress account)"
+    if options.pending_change > 0 {
+        *balance.entry(0).or_default() += options.pending_change;
+    }
+    let indices: BTreeSet<u32> = if options.subaddr_indices.is_empty() {
+        balance.keys().copied().collect()
+    } else {
+        options.subaddr_indices.iter().copied().collect()
+    };
+
+    // "early out if we know we can't make it anyway"
+    let min_fee = options.fee_per_byte.saturating_mul(estimate_tx_size(
+        1,
+        options.ring_size,
+        2,
+        options.extra_size,
+    ) as u64);
+    let total_needed = needed_money.saturating_add(min_fee);
+    let subtotal = |per: &BTreeMap<u32, u64>| -> u64 {
+        indices.iter().filter_map(|m| per.get(m)).sum()
+    };
+    let (balance_subtotal, unlocked_subtotal) = (subtotal(&balance), subtotal(&unlocked));
+    if total_needed > balance_subtotal.min(unlocked_subtotal)
+        || min_fee > balance_subtotal.min(unlocked_subtotal)
+    {
+        return Err(SpendError::NotEnough {
+            available: unlocked_subtotal,
+            needed: needed_money,
             fee: 0,
         });
     }
 
-    // Largest first, so a sweep that cannot take everything takes the most
-    // money it can and leaves the smallest outputs for the next one.
-    candidates.sort_by_key(|(_, t)| std::cmp::Reverse(t.amount));
-
-    // How many inputs fit. At ring size 22 an input costs about 880 bytes, so
-    // a wallet with a few hundred outputs used to produce a transaction
-    // several times over the relay limit: perfectly valid, signed, and
-    // refused by every node it was offered to.
-    //
-    // `wallet2` splits a sweep across as many transactions as it needs. This
-    // builds one and reports what it left, so sweeping such a wallet is
-    // running `sweep_all` until it says it took everything. Less convenient,
-    // and it never signs a transaction that cannot be relayed.
-    let mut n = 0usize;
-    while n < candidates.len() {
-        // A sweep still needs two outputs, so the second is a zero-amount
-        // dummy.
-        let weight = estimate_tx_weight(n + 1, options.ring_size, MIN_OUTPUTS, options.extra_size);
-        if weight > options.weight_limit {
-            break;
+    // Every eligible output, grouped by the subaddress it is at, the group with
+    // the most unlocked first.
+    let threshold = fractional_threshold(options);
+    let mut groups: Vec<(u32, Vec<usize>)> = Vec::new();
+    for (i, t) in transfers.iter().enumerate() {
+        if options.ignore_fractional_outputs && t.amount < threshold {
+            continue;
         }
-        n += 1;
+        if !eligible(t, options, &indices) || outside_range(t, options) {
+            continue;
+        }
+        match groups.iter_mut().find(|(minor, _)| *minor == t.subaddress.minor) {
+            Some((_, group)) => group.push(i),
+            None => groups.push((t.subaddress.minor, vec![i])),
+        }
     }
-    if n == 0 {
-        return Err(SpendError::TooHeavy {
-            weight: estimate_tx_weight(1, options.ring_size, MIN_OUTPUTS, options.extra_size),
-            limit: options.weight_limit,
+    groups.sort_by_key(|(minor, _)| std::cmp::Reverse(unlocked.get(minor).copied().unwrap_or(0)));
+    if groups.is_empty() {
+        return Err(SpendError::NothingToSpend);
+    }
+
+    let two_input_fee = fee_from_weight(
+        options.fee_per_byte,
+        estimate_tx_weight(2, options.ring_size, 2, options.extra_size),
+    );
+    let mut preferred = pick_preferred_inputs(
+        transfers,
+        needed_money.saturating_add(two_input_fee),
+        options,
+        &indices,
+    );
+    if let Some(&first) = preferred.first() {
+        // "bring the list of available outputs stored by the same subaddress
+        // index to the front of the list"
+        let minor = transfers[first].subaddress.minor;
+        if let Some(at) = groups.iter().skip(1).position(|(m, _)| *m == minor) {
+            groups.swap(0, at + 1);
+        }
+    }
+
+    let limit = options.weight_limit;
+    let weight_with = |inputs: usize, outputs: usize| {
+        estimate_tx_weight(inputs, options.ring_size, outputs, options.extra_size)
+    };
+
+    let mut dsts: Vec<u64> = destinations.to_vec();
+    let mut tx_dsts: Vec<u64> = Vec::new();
+    let mut original_output_index = 0usize;
+    let mut selected: Vec<usize> = Vec::new();
+    let mut adding_fee = false;
+    let mut needed_fee = 0u64;
+    let mut available_for_fee = 0u64;
+    let mut made: Option<SpendPlan> = None;
+
+    // "while we have something to send, or we need to gather more fee, or we
+    // have just one input in that tx, which is rct (to try and make all/most
+    // rct txes 2/2)"
+    while dsts.first().is_some_and(|d| *d > 0)
+        || adding_fee
+        || !preferred.is_empty()
+        || (selected.len() <= 1 && !groups[0].1.is_empty())
+    {
+        if groups[0].1.is_empty() {
+            return Err(SpendError::NotEnough {
+                available: unlocked_subtotal,
+                needed: needed_money,
+                fee: needed_fee,
+            });
+        }
+
+        let idx = if let Some(p) = preferred.pop() {
+            pop_if_present(&mut groups[0].1, p);
+            p
+        } else if dsts.first().is_none_or(|d| *d == 0) && !adding_fee {
+            // The 2/2 case: a small output to clean up the wallet, but only if
+            // spending it costs nothing in privacy or in spare outputs.
+            let mut candidates = groups[0].1.clone();
+            let second = pop_best_value(transfers, &mut candidates, &selected, true, rng);
+            let (min_value, min_count) =
+                if options.min_output_value == 0 && options.min_output_count == 0 {
+                    (DEFAULT_MIN_OUTPUT_VALUE, DEFAULT_MIN_OUTPUT_COUNT)
+                } else {
+                    (options.min_output_value, options.min_output_count)
+                };
+            let above = groups[0]
+                .1
+                .iter()
+                .filter(|&&i| transfers[i].amount >= min_value)
+                .count();
+            if transfers[second].amount >= min_value && above < min_count as usize {
+                break;
+            }
+            if output_relatedness(&transfers[second], &transfers[selected[0]])
+                > SECOND_OUTPUT_RELATEDNESS_THRESHOLD
+            {
+                break;
+            }
+            pop_if_present(&mut groups[0].1, second);
+            second
+        } else {
+            pop_best_value(transfers, &mut groups[0].1, &selected, false, rng)
+        };
+        selected.push(idx);
+        let mut available = transfers[idx].amount;
+
+        let mut out_slots_exhausted = false;
+        if adding_fee {
+            available_for_fee = available_for_fee.saturating_add(available);
+        } else {
+            while let Some(&d) = dsts.first() {
+                if d > available || weight_with(selected.len(), tx_dsts.len() + 1) >= limit {
+                    break;
+                }
+                // "we can fully pay that destination"
+                if !add_destination(&mut tx_dsts, d, original_output_index) {
+                    out_slots_exhausted = true;
+                    break;
+                }
+                available -= d;
+                dsts.remove(0);
+                original_output_index += 1;
+            }
+            if !out_slots_exhausted
+                && available > 0
+                && !dsts.is_empty()
+                && weight_with(selected.len(), tx_dsts.len() + 1) < limit
+            {
+                // "we can partially fill that destination"
+                if add_destination(&mut tx_dsts, available, original_output_index) {
+                    dsts[0] -= available;
+                } else {
+                    out_slots_exhausted = true;
+                }
+            }
+        }
+
+        let try_tx = if out_slots_exhausted {
+            true
+        } else if !preferred.is_empty() {
+            false
+        } else if adding_fee {
+            available_for_fee >= needed_fee
+        } else {
+            let weight = weight_with(selected.len(), tx_dsts.len() + 1);
+            let full = dsts.is_empty() || weight >= limit;
+            if full && tx_dsts.is_empty() {
+                return Err(SpendError::TooHeavy { weight, limit });
+            }
+            full
+        };
+
+        if try_tx {
+            let found: u64 = selected.iter().map(|&i| transfers[i].amount).sum();
+            let outputs = num_outputs(&tx_dsts, found);
+            let weight = weight_with(selected.len(), outputs);
+            needed_fee = fee_from_weight(options.fee_per_byte, weight);
+            let paying = tx_dsts.iter().sum::<u64>().saturating_add(needed_fee);
+            if found < paying {
+                // "We don't have enough for the basic fee, switching to
+                // adding_fee"
+                adding_fee = true;
+            } else if !dsts.is_empty() {
+                // The C++ makes this transaction and starts another for the
+                // rest, carving its fee from a partial payment if it must.
+                // This wallet sends one.
+                return Err(SpendError::TooHeavy {
+                    weight: weight_with(selected.len(), tx_dsts.len() + 1),
+                    limit,
+                });
+            } else {
+                // "We made a tx": what building it would show, from the
+                // estimate, which runs over the built weight.
+                adding_fee = false;
+                available_for_fee = found - tx_dsts.iter().sum::<u64>();
+                made = Some(SpendPlan {
+                    inputs: selected.clone(),
+                    amounts: tx_dsts.clone(),
+                    change: found - paying,
+                    fee: needed_fee,
+                    estimated_weight: weight,
+                    sweep: false,
+                    left_behind: 0,
+                });
+            }
+        }
+
+        // "if unused_*_indices is empty ... and if we still have something to
+        // pay, pop front of unused_*_indices_per_subaddr"
+        if (dsts.first().is_some_and(|d| *d > 0) || adding_fee)
+            && groups[0].1.is_empty()
+            && groups.len() > 1
+        {
+            groups.remove(0);
+        }
+    }
+
+    if adding_fee {
+        return Err(SpendError::NotEnough {
+            available: unlocked_subtotal,
+            needed: needed_money,
+            fee: needed_fee,
         });
     }
-    let left_behind = candidates.len() - n;
-    candidates.truncate(n);
+    made.ok_or(SpendError::FeeDidNotSettle(FEE_CALCULATION_MAX_RETRIES))
+}
 
-    let inputs: Vec<usize> = candidates.iter().map(|(i, _)| *i).collect();
-    let in_total: u64 = candidates.iter().map(|(_, t)| t.amount).sum();
+/// `TX::add` in `create_transactions_2`, with `merge_destinations` off: pay
+/// `amount` toward the destination at `index`, a new output when it is the
+/// next one. False when that would pass the outputs a transaction may have,
+/// change aside.
+fn add_destination(tx_dsts: &mut Vec<u64>, amount: u64, index: usize) -> bool {
+    if index == tx_dsts.len() {
+        if tx_dsts.len() >= MAX_OUTPUTS - 1 {
+            return false;
+        }
+        tx_dsts.push(0);
+    }
+    tx_dsts[index] += amount;
+    true
+}
 
+/// Plan a sweep: send everything eligible to one destination,
+/// `wallet2::create_transactions_all` and `create_transactions_from`.
+///
+/// The amount is an output of the calculation rather than an input: the fee
+/// comes out of what is being sent, so there is no change and the destination
+/// gets whatever is left.
+///
+/// # Which outputs go
+///
+/// One account's, and of those, when no minor index is named, one
+/// subaddress's, chosen at random, the main address only if nothing else
+/// holds anything: sweeping two subaddresses into one transaction would tie
+/// them together. Outputs worth less than their own fee are left out, and so
+/// are those not below `sweep_below` when it is set. They are taken at random
+/// among those least related to what is already taken, until there are no
+/// more or the transaction's estimated weight reaches the limit.
+///
+/// `wallet2` splits what does not fit across more transactions. This builds
+/// the first and reports how many it left, so sweeping such a wallet is
+/// running `sweep_all` until it says it took everything. Less convenient, and
+/// it never signs a transaction that cannot be relayed.
+pub fn plan_sweep(
+    transfers: &[Transfer],
+    options: &SpendOptions,
+    rng: &mut dyn crate::decoys::RandomSource,
+) -> Result<SpendPlan, SpendError> {
+    let nothing = SpendError::NotEnough {
+        available: 0,
+        needed: 0,
+        fee: 0,
+    };
+    // "No unlocked balance in the specified account"
+    let unlocked_balance: u64 = transfers
+        .iter()
+        .filter(|t| t.subaddress.major == options.account && !t.spent)
+        .filter(|t| t.unlocked(options.chain_height, options.now))
+        .map(|t| t.amount)
+        .sum();
+    if unlocked_balance == 0 {
+        return Err(nothing);
+    }
+
+    let threshold = fractional_threshold(options);
+    let mut by_minor: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    let mut fund_found = false;
+    for (i, t) in transfers.iter().enumerate() {
+        if options.ignore_fractional_outputs && t.amount < threshold {
+            continue;
+        }
+        if !t.spent
+            && t.key_image.is_some()
+            && t.unlocked(options.chain_height, options.now)
+            && t.subaddress.major == options.account
+            && (options.subaddr_indices.is_empty()
+                || options.subaddr_indices.contains(&t.subaddress.minor))
+        {
+            fund_found = true;
+            if options.sweep_below == 0 || t.amount < options.sweep_below {
+                by_minor.entry(t.subaddress.minor).or_default().push(i);
+            }
+        }
+    }
+    // "No unlocked balance in the specified subaddress(es)", and "The
+    // smallest amount found is not below the specified threshold".
+    if !fund_found {
+        return Err(nothing);
+    }
+    if by_minor.is_empty() {
+        return Err(SpendError::NothingToSpend);
+    }
+
+    let mut unused: Vec<usize> = if options.subaddr_indices.is_empty() {
+        // "choose non-empty subaddress randomly (with index=0 being chosen
+        // last)"
+        if by_minor.len() > 1 {
+            by_minor.remove(&0);
+        }
+        let pick = rng.below(by_minor.len() as u64) as usize;
+        by_minor.into_values().nth(pick).unwrap_or_default()
+    } else {
+        by_minor.into_values().flatten().collect()
+    };
+
+    let mut selected: Vec<usize> = Vec::new();
+    while !unused.is_empty() {
+        selected.push(pop_best_value(transfers, &mut unused, &selected, false, rng));
+        // Two outputs: the destination, and change or its dummy.
+        let weight = estimate_tx_weight(
+            selected.len(),
+            options.ring_size,
+            MIN_OUTPUTS,
+            options.extra_size,
+        );
+        if weight >= options.weight_limit {
+            break;
+        }
+    }
+
+    let in_total: u64 = selected.iter().map(|&i| transfers[i].amount).sum();
     let weight = estimate_tx_weight(
-        inputs.len(),
+        selected.len(),
         options.ring_size,
         MIN_OUTPUTS,
         options.extra_size,
     );
     let fee = fee_from_weight(options.fee_per_byte, weight);
+    // "Transaction cannot pay for itself"
     if fee >= in_total {
         return Err(SpendError::NotEnough {
             available: in_total,
@@ -565,13 +985,13 @@ pub fn plan_sweep(transfers: &[Transfer], options: &SpendOptions) -> Result<Spen
     }
 
     Ok(SpendPlan {
-        inputs,
+        inputs: selected,
         amounts: vec![in_total - fee],
         change: 0,
         fee,
         estimated_weight: weight,
         sweep: true,
-        left_behind,
+        left_behind: unused.len(),
     })
 }
 
@@ -584,7 +1004,9 @@ pub fn plan_sweep(transfers: &[Transfer], options: &SpendOptions) -> Result<Spen
 /// can already link to them.
 ///
 /// `key_image` names it, because that is what `unspent_outputs` prints and
-/// what the reference's `sweep_single` takes.
+/// what the reference's `sweep_single` takes. As in
+/// `create_transactions_single`, neither the account nor the ignore settings
+/// apply: the output is the one asked for.
 pub fn plan_sweep_single(
     transfers: &[Transfer],
     key_image: &KeyImage,
@@ -598,7 +1020,7 @@ pub fn plan_sweep_single(
     if transfer.spent {
         return Err(SpendError::OutputSpent);
     }
-    if spendable(std::slice::from_ref(transfer), options).is_empty() {
+    if !transfer.unlocked(options.chain_height, options.now) {
         return Err(SpendError::OutputLocked);
     }
 
@@ -682,12 +1104,22 @@ mod tests {
         Seq(0x5eed)
     }
 
+    /// Options for these tests, which pick among small amounts: outputs worth
+    /// less than their own fee are kept in, except where a test says.
     fn options(fee_per_byte: u64) -> SpendOptions {
         SpendOptions {
             fee_per_byte,
             chain_height: 1_000,
             now: 1_700_000_000,
+            ignore_fractional_outputs: false,
             ..Default::default()
+        }
+    }
+
+    fn at(amount: u64, height: u64, seed: u8, major: u32, minor: u32) -> Transfer {
+        Transfer {
+            subaddress: SubaddressIndex::new(major, minor),
+            ..transfer(amount, height, seed)
         }
     }
 
@@ -721,8 +1153,9 @@ mod tests {
         assert!(weight3 > size3, "three outputs pay a clawback");
     }
 
-    /// A sweep of a wallet with more outputs than fit takes the largest it
-    /// can and says how many it left.
+    /// A sweep of a wallet with more outputs than fit takes inputs until the
+    /// estimate reaches the limit, as `create_transactions_from` does before
+    /// it starts another transaction, and says how many it left.
     ///
     /// This is the case that used to produce a signed, valid transaction
     /// several times over the relay limit, which every node refuses. At ring
@@ -730,14 +1163,12 @@ mod tests {
     /// a hundred.
     #[test]
     fn a_sweep_too_heavy_for_one_transaction_is_capped_and_says_so() {
-        // Amounts spread widely, so "largest first" is a decision with a
-        // consequence rather than an ordering of equals.
         let transfers: Vec<Transfer> = (0..255u16)
-            .map(|i| transfer(1_000 * (u64::from(i) + 1), 1, i as u8))
+            .map(|i| transfer(1_000_000 * (u64::from(i) + 1), u64::from(i), i as u8))
             .collect();
         let opts = options(3);
 
-        let p = plan_sweep(&transfers, &opts).expect("a sweep");
+        let p = plan_sweep(&transfers, &opts, &mut seq()).expect("a sweep");
         assert!(
             p.inputs.len() < transfers.len(),
             "255 inputs cannot fit in one transaction"
@@ -747,56 +1178,137 @@ mod tests {
             transfers.len() - p.inputs.len(),
             "what it could not take is reported, not silently dropped"
         );
+        let weight = |n: usize| estimate_tx_weight(n, opts.ring_size, MIN_OUTPUTS, opts.extra_size);
+        assert_eq!(p.estimated_weight, weight(p.inputs.len()));
         assert!(
-            p.estimated_weight <= opts.weight_limit,
-            "{} is over the {} a node will relay",
-            p.estimated_weight,
-            opts.weight_limit
+            weight(p.inputs.len()) >= opts.weight_limit
+                && weight(p.inputs.len() - 1) < opts.weight_limit,
+            "the input that reached the limit is the last one taken"
         );
-        // One more input would not have fitted: the cap is tight, not timid.
-        assert!(
-            estimate_tx_weight(p.inputs.len() + 1, opts.ring_size, MIN_OUTPUTS, opts.extra_size)
-                > opts.weight_limit
-        );
-
-        // Largest first, so what is left behind is the small change.
-        let taken: u64 = p.inputs.iter().map(|&i| transfers[i].amount).sum();
-        let everything: u64 = transfers.iter().map(|t| t.amount).sum();
-        assert!(taken > everything / 2, "the money goes, not the dust");
+        let mut distinct = p.inputs.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), p.inputs.len());
     }
 
-    /// Which output pays is not a function of the amounts.
-    ///
-    /// Largest-first was a fingerprint: an observer who knew the wallet's
-    /// outputs could name the inputs before seeing the transaction. Two
-    /// different sources must be able to reach two different plans over the
-    /// same wallet.
+    /// The first output, oldest first, that pays the amount and a two-input
+    /// fee alone is the one `pick_preferred_rct_inputs` takes, whatever the
+    /// source of randomness.
     #[test]
-    fn which_output_pays_is_not_decided_by_its_size() {
-        // Ten outputs, any one of which covers the amount on its own.
+    fn the_oldest_output_that_covers_it_alone_is_preferred() {
+        // Ten outputs, any one of which covers the amount on its own, paid in
+        // ten neighbouring blocks.
         let transfers: Vec<Transfer> = (0..10u8)
-            .map(|i| transfer(1_000_000_000 + u64::from(i) * 1_000, 1, i))
+            .map(|i| transfer(1_000_000_000 + u64::from(i) * 1_000, u64::from(i) + 1, i))
             .collect();
 
-        let mut seen = std::collections::HashSet::new();
-        for seed in 0..40u64 {
+        for seed in 0..10u64 {
             let mut rng = Seq(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
             let p = plan(&transfers, &[500_000_000], &options(3), &mut rng).expect("a plan");
-            assert_eq!(p.inputs.len(), 1, "one output covers it, so one is taken");
-            seen.insert(p.inputs[0]);
+            // No second input either: every other output was paid within ten
+            // blocks of it, so none is unrelated.
+            assert_eq!(p.inputs, vec![0]);
         }
-        assert!(
-            seen.len() > 1,
-            "every source chose the same output: selection is still deterministic"
-        );
+    }
 
-        // And in particular it is not always the largest, which is what the
-        // old policy did every single time.
-        let largest = transfers.len() - 1;
-        assert!(
-            seen.iter().any(|&i| i != largest),
-            "still always the largest"
+    /// A transaction one input pays for takes a second, the smallest of those
+    /// least related to it, when that one is unrelated, so that most
+    /// transactions are two in, two out.
+    #[test]
+    fn an_unrelated_second_input_is_added() {
+        let transfers = vec![
+            transfer(9_000_000_000, 100, 1),
+            transfer(3_000_000_000, 500, 2),
+            transfer(1_000_000_000, 700, 3),
+            transfer(2_000_000_000, 105, 4),
+        ];
+        let o = options(3);
+        let p = plan(&transfers, &[1_000_000_000], &o, &mut seq()).expect("a plan");
+        assert_eq!(p.inputs, vec![0, 2], "the smallest unrelated one");
+        assert_eq!(
+            p.fee,
+            fee_from_weight(3, estimate_tx_weight(2, o.ring_size, 2, o.extra_size))
         );
+        assert_eq!(p.change, 10_000_000_000 - 1_000_000_000 - p.fee);
+    }
+
+    /// No second input when it would leave fewer than five outputs of 2 WOW,
+    /// or when it is related to the first.
+    #[test]
+    fn a_second_input_that_costs_something_is_not_added() {
+        let big = 300_000_000_000;
+        let transfers = vec![transfer(big * 3, 100, 1), transfer(big, 500, 2)];
+        let p = plan(&transfers, &[1_000_000_000], &options(3), &mut seq()).expect("a plan");
+        assert_eq!(p.inputs, vec![0], "too few outputs of value would be left");
+
+        let transfers = vec![transfer(9_000_000_000, 100, 1), transfer(1_000, 101, 2)];
+        let p = plan(&transfers, &[1_000_000_000], &options(3), &mut seq()).expect("a plan");
+        assert_eq!(p.inputs, vec![0], "paid a block apart, so related");
+    }
+
+    /// With no one output enough, the least related pair from one subaddress
+    /// that is enough together is preferred, an unrelated one as soon as it is
+    /// found.
+    #[test]
+    fn an_unrelated_pair_is_preferred() {
+        let transfers = vec![
+            transfer(3_000_000_000, 100, 1),
+            transfer(3_000_000_000, 101, 2),
+            transfer(3_000_000_000, 500, 3),
+        ];
+        let p = plan(&transfers, &[5_000_000_000], &options(3), &mut seq()).expect("a plan");
+        assert_eq!(p.inputs, vec![2, 0], "the pair a block apart is passed over");
+    }
+
+    /// Inputs come from the account asked for only, the subaddress with the
+    /// most unlocked first, and from the next once that one runs out.
+    #[test]
+    fn inputs_come_from_one_account_the_fullest_subaddress_first() {
+        let transfers = vec![
+            at(1_000_000_000, 100, 1, 0, 1),
+            at(2_000_000_000, 300, 2, 0, 2),
+            at(2_000_000_000, 600, 3, 0, 2),
+            at(9_000_000_000, 900, 4, 1, 0),
+        ];
+        let p = plan(&transfers, &[4_500_000_000], &options(0), &mut seq()).expect("a plan");
+        assert_eq!(p.inputs.len(), 3);
+        let mut first_two = p.inputs[..2].to_vec();
+        first_two.sort_unstable();
+        assert_eq!(first_two, vec![1, 2], "subaddress 2 holds more");
+        assert_eq!(p.inputs[2], 0, "then subaddress 1");
+
+        let mut o = options(0);
+        o.account = 1;
+        let p = plan(&transfers, &[4_500_000_000], &o, &mut seq()).expect("a plan");
+        assert_eq!(p.inputs, vec![3], "the other account's only output");
+
+        o.account = 0;
+        o.subaddr_indices = vec![1];
+        assert!(matches!(
+            plan(&transfers, &[4_500_000_000], &o, &mut seq()),
+            Err(SpendError::NotEnough { .. })
+        ));
+    }
+
+    /// Outputs worth less than the fee one more input costs are left out, as
+    /// `ignore_fractional_outputs` has it by default.
+    #[test]
+    fn outputs_worth_less_than_their_fee_are_left_out() {
+        let o = SpendOptions {
+            ignore_fractional_outputs: true,
+            ..options(3)
+        };
+        let threshold = 3 * (estimate_tx_weight(2, 22, 2, 0) - estimate_tx_weight(1, 22, 2, 0));
+        let transfers = vec![
+            transfer(threshold - 1, 100, 1),
+            transfer(9_000_000_000, 500, 2),
+        ];
+        let p = plan(&transfers, &[1_000_000_000], &o, &mut seq()).expect("a plan");
+        assert_eq!(p.inputs, vec![1], "the fractional one is no second input");
+
+        let p = plan_sweep(&transfers, &o, &mut seq()).expect("a sweep");
+        assert_eq!(p.inputs, vec![1], "nor swept");
+        assert_eq!(p.left_behind, 0, "and not left behind either: ignored");
     }
 
     /// Randomness must not cost inputs. An output that finishes the job is
@@ -818,18 +1330,6 @@ mod tests {
                 "only the third output can cover it alone"
             );
         }
-    }
-
-    /// When nothing left covers what remains, every remaining output is going
-    /// to be needed, so it takes the largest and gets there in the fewest.
-    #[test]
-    fn what_cannot_be_covered_alone_is_taken_largest_first() {
-        let transfers: Vec<Transfer> = (0..6u8)
-            .map(|i| transfer(1_000_000 * (u64::from(i) + 1), 1, i))
-            .collect();
-        // 21,000,000 in all; asking for nearly that takes everything.
-        let p = plan(&transfers, &[20_000_000], &options(0), &mut seq()).expect("a plan");
-        assert_eq!(p.inputs.len(), 6);
     }
 
     /// `sweep_single` takes the output named and no other, whatever else the
@@ -887,9 +1387,54 @@ mod tests {
     #[test]
     fn a_sweep_that_fits_leaves_nothing_behind() {
         let transfers = vec![transfer(5_000, 1, 1), transfer(3_000, 1, 2)];
-        let p = plan_sweep(&transfers, &options(3)).expect("a sweep");
+        let p = plan_sweep(&transfers, &options(3), &mut seq()).expect("a sweep");
         assert_eq!(p.inputs.len(), 2);
         assert_eq!(p.left_behind, 0);
+    }
+
+    /// A sweep takes one subaddress's outputs, chosen at random, and the main
+    /// address's only when nothing else holds anything: sweeping two
+    /// subaddresses together would tie them to each other.
+    #[test]
+    fn a_sweep_takes_one_subaddress_and_the_main_address_last() {
+        let transfers = vec![
+            at(5_000_000_000, 100, 1, 0, 0),
+            at(5_000_000_000, 300, 2, 0, 1),
+            at(6_000_000_000, 500, 3, 0, 2),
+            at(7_000_000_000, 700, 4, 0, 2),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..16u64 {
+            let mut rng = Seq(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let p = plan_sweep(&transfers, &options(3), &mut rng).expect("a sweep");
+            let mut inputs = p.inputs.clone();
+            inputs.sort_unstable();
+            assert!(inputs == vec![1] || inputs == vec![2, 3], "{inputs:?}");
+            seen.insert(inputs);
+        }
+        assert_eq!(seen.len(), 2, "either subaddress, at random");
+
+        let p = plan_sweep(&transfers[..1], &options(3), &mut seq()).expect("a sweep");
+        assert_eq!(p.inputs, vec![0], "the main address when it is all there is");
+
+        // Named indices are swept together.
+        let o = SpendOptions {
+            subaddr_indices: vec![0, 2],
+            ..options(3)
+        };
+        let mut inputs = plan_sweep(&transfers, &o, &mut seq()).expect("a sweep").inputs;
+        inputs.sort_unstable();
+        assert_eq!(inputs, vec![0, 2, 3]);
+
+        // And `below_amount` leaves out what is not below it.
+        let o = SpendOptions {
+            subaddr_indices: vec![2],
+            sweep_below: 7_000_000_000,
+            ..options(3)
+        };
+        let p = plan_sweep(&transfers, &o, &mut seq()).expect("a sweep");
+        assert_eq!(p.inputs, vec![2]);
+        assert_eq!(p.left_behind, 0, "the larger one was never a candidate");
     }
 
     /// An ordinary send that would not be relayed is refused while it is still
@@ -897,14 +1442,14 @@ mod tests {
     /// one of them signed.
     #[test]
     fn a_send_too_heavy_to_relay_is_refused_before_it_is_built() {
-        // Dust, so covering the amount takes every one of them.
+        // Small outputs, so covering the amount takes far more than fit.
         let transfers: Vec<Transfer> = (0..255u16)
-            .map(|i| transfer(1_000, 1, i as u8))
+            .map(|i| transfer(1_000_000, u64::from(i), i as u8))
             .collect();
-        let e = plan(&transfers, &[250_000], &options(3), &mut seq()).expect_err("too heavy");
+        let e = plan(&transfers, &[250_000_000], &options(3), &mut seq()).expect_err("too heavy");
         match e {
             SpendError::TooHeavy { weight, limit } => {
-                assert!(weight > limit);
+                assert!(weight >= limit);
                 assert_eq!(limit, default_weight_limit());
             }
             other => panic!("expected TooHeavy, got {other}"),
@@ -976,8 +1521,10 @@ mod tests {
         let p = plan(&transfers, &[8_000_000_000], &options(3), &mut seq()).expect("a plan");
         assert_eq!(p.inputs, vec![1], "the 9 WOW output alone covers it");
 
+        // No one output covers 11, and the only pair that does is the 9 and
+        // the 3, the later-received taken first.
         let p = plan(&transfers, &[11_000_000_000], &options(3), &mut seq()).expect("a plan");
-        assert_eq!(p.inputs, vec![1, 2], "largest first");
+        assert_eq!(p.inputs, vec![2, 1], "the pair that covers it");
     }
 
     /// Not enough money is an error that says how much was available.
@@ -1079,21 +1626,20 @@ mod tests {
         assert_eq!(eligible[0].1.amount, 50_000);
     }
 
-    /// Spending is confined to one account when asked.
+    /// Spending is confined to one account, account 0 unless another is named.
     #[test]
-    fn it_can_spend_from_one_account() {
+    fn it_spends_from_one_account() {
         let mut other = transfer(9_000_000_000, 100, 1);
         other.subaddress = SubaddressIndex::new(3, 7);
         let mine = transfer(8_000_000_000, 100, 2);
         let transfers = vec![other, mine];
 
         let mut o = options(3);
-        o.from_account = Some(0);
         let eligible = spendable(&transfers, &o);
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].0, 1);
 
-        o.from_account = Some(3);
+        o.account = 3;
         assert_eq!(spendable(&transfers, &o)[0].0, 0);
     }
 
@@ -1156,7 +1702,7 @@ mod tests {
             transfer(4_000_000_000, 100, 2),
             transfer(5_000_000_000, 100, 3),
         ];
-        let p = plan_sweep(&transfers, &options(3)).expect("a sweep");
+        let p = plan_sweep(&transfers, &options(3), &mut seq()).expect("a sweep");
 
         assert_eq!(p.inputs.len(), 3, "every eligible output");
         assert_eq!(p.change, 0, "a sweep leaves nothing behind");
@@ -1172,10 +1718,10 @@ mod tests {
     /// errors rather than transactions that would be rejected.
     #[test]
     fn a_sweep_that_cannot_pay_is_refused() {
-        assert!(plan_sweep(&[], &options(3)).is_err());
+        assert!(plan_sweep(&[], &options(3), &mut seq()).is_err());
 
         let dust = vec![transfer(10, 100, 1)];
-        let e = plan_sweep(&dust, &options(1_000)).expect_err("cannot pay");
+        let e = plan_sweep(&dust, &options(1_000), &mut seq()).expect_err("cannot pay");
         assert!(matches!(e, SpendError::NotEnough { .. }), "{e}");
     }
 
@@ -1188,7 +1734,7 @@ mod tests {
         let transfers = vec![t];
 
         let mut o = options(3);
-        o.from_account = Some(2);
+        o.account = 2;
         let p = plan(&transfers, &[1_000_000], &o, &mut seq()).expect("a plan");
         assert_eq!(change_index(&p, &transfers), SubaddressIndex::new(2, 0));
     }
@@ -1218,7 +1764,7 @@ mod tests {
     #[test]
     fn a_new_fee_on_a_sweep_moves_the_amount() {
         let transfers = vec![transfer(7_000_000_000, 100, 1)];
-        let p = plan_sweep(&transfers, &options(3)).expect("a sweep");
+        let p = plan_sweep(&transfers, &options(3), &mut seq()).expect("a sweep");
         assert!(p.sweep);
 
         let lower = p.with_fee(p.fee - 1_000).expect("a lower fee");

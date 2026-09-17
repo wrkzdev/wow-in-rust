@@ -953,6 +953,12 @@ fn send(
         ring_size,
         payment_id: explicit_pid,
         sweep_output,
+        // This build has one account in the CLI, and spends from every
+        // subaddress in it, or sweeps one at random, as `transfer` and
+        // `sweep_all` do without `index=`.
+        account: 0,
+        subaddr_indices: Vec::new(),
+        below_amount: 0,
     };
     let prepared = session.prepare_send(&request).map_err(|e| e.to_string())?;
 

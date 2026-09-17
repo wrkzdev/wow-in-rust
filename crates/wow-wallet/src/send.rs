@@ -14,6 +14,7 @@ use wow_types::Network;
 
 use crate::decoys::{self, DecoyError, GammaPicker, RandomSource};
 use crate::files::{now, Session};
+use crate::history::SentState;
 use crate::priority::{self, PrioritySettings};
 use crate::spend::{self, SpendError, SpendOptions, SpendPlan};
 use crate::transfer::{self, Destination, Outputs, SettleError, SpendableOutput, TransferError};
@@ -37,6 +38,25 @@ pub struct SendRequest<'a> {
     /// Only read when `amount` is `None`; an amount says what to send, and
     /// which outputs pay for it is the wallet's business.
     pub sweep_output: Option<wow_crypto::types::KeyImage>,
+    /// The subaddress account to spend from, `account_index`. Change goes
+    /// back to its main address.
+    pub account: u32,
+    /// `subaddr_indices`: the minor indices in `account` to spend from. Empty
+    /// is every one holding anything, or for a sweep one at random
+    /// ([`spend::plan_sweep`]).
+    pub subaddr_indices: Vec<u32>,
+    /// A sweep's `below_amount`: only outputs worth less. Zero is all of them.
+    pub below_amount: u64,
+}
+
+/// A number among the settings the keys file keeps for `wallet2`, or
+/// `default` when the file has none.
+fn setting(keys_file: &crate::KeysFile, name: &str, default: u64) -> u64 {
+    keys_file
+        .settings
+        .get(name)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(default)
 }
 
 /// A transaction built and signed, and not yet relayed.
@@ -160,11 +180,26 @@ impl Session {
         };
 
         let subaddress = decoded.kind == AddressKind::Subaddress;
+        let pending_change: u64 = self
+            .state
+            .sent
+            .iter()
+            .filter(|s| s.state == SentState::Pending && s.account == request.account)
+            .map(|s| s.change)
+            .sum();
         let options = SpendOptions {
             ring_size: request.ring_size,
             fee_per_byte,
             // One payee and change: no per-output keys, even to a subaddress.
             extra_size: spend::extra_size(2, payment_id.is_some(), false),
+            account: request.account,
+            subaddr_indices: request.subaddr_indices.clone(),
+            ignore_fractional_outputs: setting(&self.keys_file, "ignore_fractional_outputs", 1)
+                != 0,
+            min_output_count: setting(&self.keys_file, "min_output_count", 0) as u32,
+            min_output_value: setting(&self.keys_file, "min_output_value", 0),
+            pending_change,
+            sweep_below: request.below_amount,
             chain_height: self.chain_height(),
             now: now(),
             ..Default::default()
@@ -179,8 +214,21 @@ impl Session {
                 spend::plan(&self.state.transfers, &[amount], &options, &mut rng)
             }
             (None, Some(k)) => spend::plan_sweep_single(&self.state.transfers, k, &options),
-            (None, None) => spend::plan_sweep(&self.state.transfers, &options),
+            (None, None) => spend::plan_sweep(&self.state.transfers, &options, &mut rng),
         }?;
+        // "the tx uses funds from multiple accounts": never, the way the plans
+        // pick, and refused rather than built if it ever did.
+        let account = plan
+            .inputs
+            .first()
+            .map_or(request.account, |&i| self.state.transfers[i].subaddress.major);
+        if plan
+            .inputs
+            .iter()
+            .any(|&i| self.state.transfers[i].subaddress.major != account)
+        {
+            return Err(SendError::Plan(SpendError::MultipleAccounts));
+        }
 
         // A ring for each input, of members the chain has unlocked, or no node
         // will take the transaction.
@@ -261,8 +309,9 @@ impl Session {
             });
         }
 
-        // Outputs: the payee, and change back to the primary address, named
-        // as change. The builder shuffles them.
+        // Outputs: the payee, and change back to the main address of the
+        // account the inputs came from, `{subaddr_account, 0}`, named as
+        // change. The builder shuffles them.
         //
         // A transaction still needs two outputs when there is no change, as
         // after a sweep or a send of exactly what an output holds, and
@@ -273,8 +322,14 @@ impl Session {
         // the output is derived from this wallet's view key as change is, so
         // nobody holds the key to it.
         let payee = decoded.keys;
-        let change_to = self.keys_file.account.keys.account_address;
-        let view_secret_key = self.keys_file.account.keys.view_secret_key;
+        let keys = &self.keys_file.account.keys;
+        let change_to = wow_crypto::get_subaddress(
+            &keys.account_address,
+            &keys.view_secret_key,
+            wow_crypto::types::SubaddressIndex::new(account, 0),
+        )
+        .ok_or(SendError::Damaged("its change address does not derive"))?;
+        let view_secret_key = keys.view_secret_key;
         let dummy = crate::account::AccountBase::from_spend_key(
             wow_crypto::types::SecretKey(rng.random_scalar()),
             0,
@@ -282,6 +337,7 @@ impl Session {
         .ok_or_else(|| SendError::Entropy("cannot make an address for zero change".into()))?
         .keys
         .account_address;
+        let change_to = (change_to, account != 0);
         let outputs = |p: &SpendPlan| outputs_for(p, (payee, subaddress), change_to, dummy);
         let settled = transfer::construct_settled(
             &inputs,
@@ -367,17 +423,18 @@ impl Session {
 /// The outputs of a plan paying one address: the payee, and change to
 /// `change_to`, or, when there is no change, nothing to `dummy`
 /// (`transfer_selected_rct`). Whichever of the two takes the change is named
-/// as change, so its output is derived from the sender's view key.
+/// as change, so its output is derived from the sender's view key. Each
+/// address comes with whether it is a subaddress.
 fn outputs_for(
     plan: &SpendPlan,
     (payee, payee_is_subaddress): (AccountPublicAddress, bool),
-    change_to: AccountPublicAddress,
+    (change_to, change_is_subaddress): (AccountPublicAddress, bool),
     dummy: AccountPublicAddress,
 ) -> Outputs {
-    let (change, amount) = if plan.change > 0 {
-        (change_to, plan.change)
+    let (change, is_subaddress, amount) = if plan.change > 0 {
+        (change_to, change_is_subaddress, plan.change)
     } else {
-        (dummy, 0)
+        (dummy, false, 0)
     };
     Outputs {
         destinations: vec![
@@ -388,7 +445,7 @@ fn outputs_for(
             },
             Destination {
                 address: change,
-                is_subaddress: false,
+                is_subaddress,
                 amount,
             },
         ],
@@ -440,6 +497,9 @@ mod tests {
             ring_size: decoys::RING_SIZE,
             payment_id: None,
             sweep_output: None,
+            account: 0,
+            subaddr_indices: Vec::new(),
+            below_amount: 0,
         }
     }
 
@@ -504,7 +564,7 @@ mod tests {
             left_behind: 0,
         };
 
-        let o = outputs_for(&plan, (payee, true), me, dummy);
+        let o = outputs_for(&plan, (payee, true), (me, true), dummy);
         assert_eq!(o.change, Some(me));
         assert_eq!(o.destinations[0].address, payee);
         assert!(o.destinations[0].is_subaddress);
@@ -512,9 +572,11 @@ mod tests {
             (o.destinations[1].address, o.destinations[1].amount),
             (me, 250)
         );
+        assert!(o.destinations[1].is_subaddress, "an account's main address");
 
         plan.change = 0;
-        let o = outputs_for(&plan, (payee, false), me, dummy);
+        let o = outputs_for(&plan, (payee, false), (me, true), dummy);
+        assert!(!o.destinations[1].is_subaddress);
         assert_eq!(o.change, Some(dummy));
         assert_eq!(
             (o.destinations[1].address, o.destinations[1].amount),

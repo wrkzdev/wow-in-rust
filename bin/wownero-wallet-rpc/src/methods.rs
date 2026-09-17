@@ -1116,6 +1116,28 @@ fn build_and_send_inner(
         ));
     }
 
+    // `account_index` and `subaddr_indices`, as `create_transactions_2` and
+    // `_all` take them. `subaddr_indices_all` names every index in the account,
+    // and the ones holding outputs are all that can matter.
+    let account = u32_param(params, "account_index", 0);
+    let subaddr_indices: Vec<u32> =
+        if params.get("subaddr_indices_all").and_then(Value::as_bool) == Some(true) {
+            let all: std::collections::BTreeSet<u32> = session
+                .state
+                .transfers
+                .iter()
+                .filter(|t| t.subaddress.major == account)
+                .map(|t| t.subaddress.minor)
+                .collect();
+            all.into_iter().collect()
+        } else {
+            params
+                .get("subaddr_indices")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_u64).map(|i| i as u32).collect())
+                .unwrap_or_default()
+        };
+
     let request = SendRequest {
         address,
         amount,
@@ -1125,6 +1147,12 @@ fn build_and_send_inner(
         ring_size,
         payment_id: None,
         sweep_output,
+        account,
+        subaddr_indices,
+        below_amount: params
+            .get("below_amount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     };
     let prepared = session.prepare_send(&request).map_err(send_error)?;
 
@@ -1233,8 +1261,14 @@ fn spend_error(e: spend::SpendError) -> Error {
         spend::SpendError::TooHeavy { .. }
         | spend::SpendError::NoSuchOutput
         | spend::SpendError::OutputSpent
-        | spend::SpendError::OutputLocked => {
+        | spend::SpendError::OutputLocked
+        | spend::SpendError::NothingToSpend => {
             Error::new(errors::TX_NOT_POSSIBLE, e.to_string())
+        }
+        // An exception from inside `transfer_selected_rct`, which
+        // `handle_rpc_exception` reports under the transfer's default code.
+        spend::SpendError::MultipleAccounts => {
+            Error::new(errors::GENERIC_TRANSFER_ERROR, e.to_string())
         }
     }
 }

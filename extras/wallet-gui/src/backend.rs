@@ -720,6 +720,12 @@ impl<P: Platform> Backend<P> {
             // The GUI has no way to pick one output yet; sweeping there means
             // the whole wallet.
             sweep_output: None,
+            // Nor an account or a subaddress: account 0, every subaddress in
+            // it, and for a sweep one of them at random, as the C++ wallets
+            // do when none is named.
+            account: 0,
+            subaddr_indices: Vec::new(),
+            below_amount: 0,
         };
         let prepared = w
             .session
@@ -869,7 +875,7 @@ impl<P: Platform> Backend<P> {
         let mut rng = wow_wallet::entropy::seeded_rng().map_err(|e| e.to_string())?;
         let plan = match form.amount {
             Some(amount) => spend::plan(transfers, &[amount], &options, &mut rng),
-            None => spend::plan_sweep(transfers, &options),
+            None => spend::plan_sweep(transfers, &options, &mut rng),
         }
         .map_err(|e| e.to_string())?;
         Ok((plan.amounts.first().copied().unwrap_or(0), plan.fee))
