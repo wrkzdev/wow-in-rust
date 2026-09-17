@@ -23,6 +23,28 @@
 //! height above zero from that height whatever the history says, so a wallet
 //! that kept naming one was answered from the same place every time.
 //!
+//! # What a history must not say
+//!
+//! A daemon sees every history a wallet sends, from wherever it connects. A
+//! history that ends at the block the wallet was restored at names the wallet
+//! across sessions and addresses, and so does a first request for exactly that
+//! height. `wallet2` sends neither, and this copies how:
+//!
+//! * the hashes a wallet holds begin where every wallet's begin: at the last
+//!   hard-coded checkpoint for a wallet restored above it, and at genesis for
+//!   any other. The ones between there and the restore height are listed with
+//!   `gethashes.bin` rather than downloaded as blocks
+//!   (`wallet2::fast_refresh`), and scanning still starts at the restore
+//!   height (`should_skip_block`);
+//! * the first request of a session to an untrusted daemon goes by the hashes
+//!   up to the last whole 1,024 blocks (`FIRST_REFRESH_GRANULARITY`), so it
+//!   says where the wallet is only to that; the blocks between are sent again
+//!   and compared.
+//!
+//! `wallet2::trim_hashchain` also moves the start of the hashes up to just
+//! below the wallet's first payment, to save memory. That is not copied: it
+//! would put the block before the wallet's first payment in every history.
+//!
 //! # What is checked, and what is taken on trust
 //!
 //! Blocks arrive as blobs from a node the wallet did not write. Every one is
@@ -55,6 +77,10 @@ pub const MAX_BLOCKS_PER_CALL: u64 = 1_000;
 /// The fewest blocks a batch is cut down to. A reply starts with a block the
 /// wallet already holds, so one block alone would never bring anything new.
 const MIN_BLOCKS_PER_CALL: u64 = 2;
+
+/// `FIRST_REFRESH_GRANULARITY`: how finely the first request of a session
+/// tells an untrusted daemon how far the wallet has got.
+pub const FIRST_REFRESH_GRANULARITY: u64 = 1_024;
 
 /// `wallet2`'s log category, so one `--log-level` means the same to both.
 const LOG: &str = "wallet.wallet2";
@@ -163,6 +189,15 @@ pub struct Batch {
     pub current_height: u64,
 }
 
+/// Block hashes, as `gethashes.bin` lists them.
+#[derive(Clone, Debug, Default)]
+pub struct Hashes {
+    /// From `start_height` up.
+    pub hashes: Vec<Hash256>,
+    pub start_height: u64,
+    pub current_height: u64,
+}
+
 /// Where blocks come from.
 ///
 /// A trait rather than a `DaemonClient` directly, so the loop can be driven by
@@ -184,6 +219,20 @@ pub trait BlockSource {
     /// fewer blocks might get past.
     fn cut_short(_error: &Self::Error) -> bool {
         false
+    }
+
+    /// Block hashes from where `block_ids` meets the source's chain, that
+    /// block included: `gethashes.bin`.
+    ///
+    /// `None` for a source that cannot list hashes on their own. A wallet
+    /// restored above zero then names its height, and its hashes begin
+    /// there, as they did before hashes could be listed; a daemon lists them,
+    /// and only a fixture says `None`.
+    fn get_hashes(
+        &self,
+        _block_ids: &[Hash256],
+    ) -> std::result::Result<Option<Hashes>, Self::Error> {
+        Ok(None)
     }
 }
 
@@ -209,6 +258,15 @@ pub enum RefreshError {
         "the daemon answered from height {from} with no block this wallet could add, though its chain reaches {current}"
     )]
     NoProgress { from: u64, current: u64 },
+    #[error(
+        "the daemon listed block hashes from height {got}, not from a block it was asked about: \
+         it is still syncing, or on another chain"
+    )]
+    UnaskedHashes { got: u64 },
+    #[error(
+        "the daemon's chain stops at height {top}, below the blocks this wallet holds from {held}"
+    )]
+    ShortChain { top: u64, held: u64 },
 }
 
 type Result<T> = std::result::Result<T, RefreshError>;
@@ -277,8 +335,15 @@ pub struct WalletState {
     /// block, which is a few megabytes for this chain, and it is what makes the
     /// short chain history and reorg detection possible without a round trip.
     pub hashes: Vec<Hash256>,
-    /// The height `hashes[0]` sits at.
+    /// The height `hashes[0]` sits at: `m_blockchain.offset()`. Once filled
+    /// in, a height every wallet shares (the module documentation says why).
     pub start_height: u64,
+    /// `m_refresh_from_block_height`: nothing below it is scanned. The hashes
+    /// below it are still kept.
+    pub refresh_from_height: u64,
+    /// `trusted_daemon`: the first request of a session goes by every hash
+    /// held, not by the last whole [`FIRST_REFRESH_GRANULARITY`] of them.
+    pub trusted_daemon: bool,
     pub transfers: Vec<Transfer>,
     /// Key image → index into `transfers`, for spotting our own outputs being
     /// spent.
@@ -300,6 +365,15 @@ pub struct WalletState {
     /// doubled back after one that arrives whole. Not saved; each run starts
     /// at the most a daemon sends.
     batch_size: u64,
+    /// This network's last hard-coded checkpoint: where the hashes of a
+    /// wallet restored above it begin.
+    checkpoint: Option<(u64, Hash256)>,
+    /// Hashes listed from where the held ones should begin, while they are
+    /// being filled in below. Not saved.
+    fill: Vec<Hash256>,
+    /// `m_first_refresh_done`. Not saved: the first request of every session
+    /// is the coarse one, as it is in the reference.
+    first_refresh_done: bool,
 }
 
 impl WalletState {
@@ -325,12 +399,19 @@ impl WalletState {
                 Vec::new()
             },
             start_height,
+            refresh_from_height: start_height,
+            trusted_daemon: false,
             transfers: Vec::new(),
             by_key_image: HashMap::new(),
             by_public_key: HashMap::new(),
             sent: Vec::new(),
             max_reorg_depth: 0,
             batch_size: MAX_BLOCKS_PER_CALL,
+            checkpoint: wow_consensus::checkpoints::table(network)
+                .last()
+                .map(|c| (c.height, c.hash)),
+            fill: Vec::new(),
+            first_refresh_done: false,
         }
     }
 
@@ -390,6 +471,15 @@ impl WalletState {
     /// Newest first. The gaps are what make a deep reorg cost one round trip
     /// instead of one per block.
     pub fn short_chain_history(&self) -> Vec<Hash256> {
+        self.history_at(1)
+    }
+
+    /// `wallet2::get_short_chain_history(ids, granularity)`: the history of
+    /// the hashes held up to the last whole `granularity` blocks of the chain,
+    /// and never fewer than the first. The first request of a session to an
+    /// untrusted daemon goes by [`FIRST_REFRESH_GRANULARITY`], so its newest
+    /// hash says where the wallet is only to the nearest 1,024 blocks.
+    fn history_at(&self, granularity: u64) -> Vec<Hash256> {
         let mut out = Vec::new();
         // A wallet that has scanned nothing still sends genesis, never an
         // empty list. `wallet2::get_short_chain_history` does the same:
@@ -412,7 +502,8 @@ impl WalletState {
             return out;
         }
 
-        let len = self.hashes.len();
+        let whole = self.scan_height() / granularity.max(1) * granularity.max(1);
+        let len = (whole.saturating_sub(self.start_height) as usize).min(self.hashes.len());
         let mut i = 0usize; // how far back from the tip
         let mut step = 1usize;
         while i < len {
@@ -432,6 +523,151 @@ impl WalletState {
             }
         }
         out
+    }
+
+    /// Where this wallet's hashes begin once they are filled in:
+    /// `wallet2::fast_refresh`.
+    ///
+    /// The last checkpoint, for a wallet that starts scanning above it, and
+    /// genesis for any other. Every wallet on the network begins at one of
+    /// the two, so the oldest hash in a history says nothing about which
+    /// wallet sent it.
+    fn history_base(&self) -> u64 {
+        match self.checkpoint {
+            Some((height, _)) if self.refresh_from_height > height => height,
+            _ => 0,
+        }
+    }
+
+    /// Where the held hashes should reach down to, when they do not reach
+    /// [`history_base`](Self::history_base) yet: the first held one, or where
+    /// scanning starts when none is held.
+    fn fill_target(&self) -> Option<u64> {
+        let base = self.history_base();
+        let target = if self.hashes.is_empty() {
+            self.refresh_from_height.max(self.start_height)
+        } else {
+            self.start_height
+        };
+        (target > base && (self.hashes.is_empty() || self.start_height > base))
+            .then_some(target)
+    }
+
+    /// One `gethashes.bin` toward [`fill_target`](Self::fill_target), as a
+    /// turn of `wallet2::fast_refresh`'s loop.
+    ///
+    /// Hashes are gathered apart from the held ones, and put under them once
+    /// they reach them. `None` when the source cannot list hashes, and the
+    /// refresh carries on without.
+    fn fill_below<S: BlockSource>(
+        &mut self,
+        source: &S,
+        target: u64,
+    ) -> Result<Option<RefreshSummary>> {
+        let base = self.history_base();
+        if self.fill.is_empty() {
+            self.fill.push(match self.checkpoint {
+                // Checked against the hard-coded one: a daemon that disagrees
+                // is on another chain.
+                Some((height, hash)) if base > 0 && height == base => hash,
+                _ => self.genesis,
+            });
+        }
+        // The newest three gathered, then where they began, then genesis.
+        // `fast_refresh` keeps three for the reason given there: a block or two
+        // reorganised away since the last call.
+        let mut history: Vec<Hash256> = self.fill.iter().rev().take(3).copied().collect();
+        for anchor in [self.fill[0], self.genesis] {
+            if history.last() != Some(&anchor) {
+                history.push(anchor);
+            }
+        }
+        let listed = source
+            .get_hashes(&history)
+            .map_err(|e| RefreshError::Source(e.to_string()))?;
+        let Some(listed) = listed else {
+            self.fill.clear();
+            return Ok(None);
+        };
+
+        let top = base + self.fill.len() as u64;
+        if listed.start_height < base || listed.start_height >= top {
+            self.fill.clear();
+            return Err(RefreshError::UnaskedHashes {
+                got: listed.start_height,
+            });
+        }
+        let before = self.fill.len();
+        let mut at_target = None;
+        for (i, hash) in listed.hashes.iter().enumerate() {
+            let height = listed.start_height + i as u64;
+            if height >= target {
+                at_target = Some(*hash);
+                break;
+            }
+            let at = (height - base) as usize;
+            if at < self.fill.len() {
+                if self.fill[at] == *hash {
+                    continue;
+                }
+                if at == 0 {
+                    let expected = self.fill[0];
+                    self.fill.clear();
+                    return Err(RefreshError::BrokenChain {
+                        height,
+                        names: wow_crypto::hex::encode(hash),
+                        expected: wow_crypto::hex::encode(&expected),
+                    });
+                }
+                // Reorganised away since it was listed.
+                self.fill.truncate(at);
+            }
+            self.fill.push(*hash);
+        }
+        let reached = at_target.is_some() || base + self.fill.len() as u64 >= target;
+        wow_log::debug!(
+            LOG,
+            "{} block hash(es) listed from {}, filled in from {base} to {}",
+            listed.hashes.len(),
+            listed.start_height,
+            base + self.fill.len() as u64
+        );
+        let mut summary = RefreshSummary {
+            current_height: listed.current_height,
+            ..Default::default()
+        };
+        if !reached && self.fill.len() > before {
+            return Ok(Some(summary));
+        }
+
+        // Reached the held hashes, or the daemon has no more to list.
+        let gathered = std::mem::take(&mut self.fill);
+        if !self.hashes.is_empty() {
+            if !reached {
+                return Err(RefreshError::ShortChain {
+                    top: base + gathered.len() as u64,
+                    held: self.start_height,
+                });
+            }
+            if at_target.is_some_and(|h| h != self.hashes[0]) {
+                // The chain changed below the first block held since it was
+                // scanned: what was scanned from there goes, and is scanned
+                // again.
+                self.check_reorg_depth(self.scan_height() - self.start_height)?;
+                wow_log::info!(
+                    LOG,
+                    "the chain changed below height {}; detaching from there",
+                    self.start_height
+                );
+                summary.reorg_to = Some(self.start_height);
+                self.detach(self.start_height);
+            }
+        }
+        let mut hashes = gathered;
+        hashes.append(&mut self.hashes);
+        self.hashes = hashes;
+        self.start_height = base;
+        Ok(Some(summary))
     }
 
     pub(crate) fn keys(&self) -> ScanKeys<'_> {
@@ -498,6 +734,8 @@ impl WalletState {
         self.by_key_image.clear();
         self.by_public_key.clear();
         self.start_height = height;
+        self.refresh_from_height = height;
+        self.fill.clear();
         self.detach_sent(height);
     }
 
@@ -505,8 +743,24 @@ impl WalletState {
     ///
     /// Returns what happened. Call it until
     /// [`caught_up`](RefreshSummary::caught_up).
+    ///
+    /// A wallet whose hashes do not yet begin where every wallet's begin gets
+    /// hashes rather than blocks, a call at a time, until they do: no blocks
+    /// are scanned by those calls, and they are not caught up.
     pub fn refresh_once<S: BlockSource>(&mut self, source: &S) -> Result<RefreshSummary> {
-        let history = self.short_chain_history();
+        if let Some(target) = self.fill_target() {
+            if let Some(summary) = self.fill_below(source, target)? {
+                return Ok(summary);
+            }
+        }
+        // `wallet2::refresh`: coarse for the first request of a session,
+        // unless the daemon is trusted.
+        let granularity = if self.first_refresh_done || self.trusted_daemon {
+            1
+        } else {
+            FIRST_REFRESH_GRANULARITY
+        };
+        let history = self.history_at(granularity);
         // A start height above zero makes the reference answer from there and
         // ignore the history, so it is only named while there is no history to
         // go by. After that it is zero and the hashes decide, as
@@ -542,6 +796,7 @@ impl WalletState {
         };
         // Back toward the most, after a reply that arrived whole.
         self.batch_size = (self.batch_size * 2).min(MAX_BLOCKS_PER_CALL);
+        self.first_refresh_done = true;
 
         let mut summary = RefreshSummary {
             current_height: batch.current_height,
@@ -586,8 +841,13 @@ impl WalletState {
         }
 
         // The scalar multiplications for the whole batch, on every core, before
-        // anything is decided. See `precompute_derivations`.
-        let ready = precompute_derivations(&batch, &self.account.keys.view_secret_key);
+        // anything is decided. See `precompute_derivations`. Not for blocks
+        // held already, nor below where scanning starts: neither is scanned.
+        let ready = precompute_derivations(
+            &batch,
+            &self.account.keys.view_secret_key,
+            self.scan_height().max(self.refresh_from_height),
+        );
 
         for (n, bundle) in batch.blocks.iter().enumerate() {
             let height = batch.start_height + n as u64;
@@ -623,7 +883,10 @@ impl WalletState {
             summary.blocks_scanned,
             self.scan_height()
         );
-        if summary.blocks_scanned == 0 && !summary.caught_up {
+        // A coarse request is answered from up to 1,023 blocks below the tip
+        // of what is held, which can be a whole batch of nothing new. The
+        // next request goes by every hash, and does get further.
+        if summary.blocks_scanned == 0 && !summary.caught_up && granularity == 1 {
             // Asking again would get the same answer, forever.
             return Err(RefreshError::NoProgress {
                 from: batch.start_height,
@@ -690,6 +953,17 @@ impl WalletState {
                     expected: wow_crypto::hex::encode(previous),
                 });
             }
+        }
+
+        // Below where this wallet starts scanning, only the hash is kept, for
+        // the history: `wallet2::should_skip_block`. Such a block arrives after
+        // a reorg below the restore height, or when the hashes could not be
+        // listed up to it.
+        if height < self.refresh_from_height {
+            if height == self.scan_height() {
+                self.hashes.push(block_hash);
+            }
+            return Ok(());
         }
 
         // Each transaction's id is the block's, as `wallet2` takes it: a pruned
@@ -939,15 +1213,22 @@ impl Derivations {
     }
 }
 
-/// One batch's worth of transactions, as `(height, slot, blob)`.
+/// One batch's worth of transactions, as `(height, slot, blob)`, from the
+/// block at `from` up.
 ///
 /// The blobs are borrowed from the batch; the coinbase is re-serialized,
 /// because it arrives inside the block rather than beside it.
-fn batch_transactions(batch: &Batch) -> Vec<(u64, usize, bool, std::borrow::Cow<'_, [u8]>)> {
+fn batch_transactions(
+    batch: &Batch,
+    from: u64,
+) -> Vec<(u64, usize, bool, std::borrow::Cow<'_, [u8]>)> {
     use std::borrow::Cow;
     let mut out = Vec::new();
     for (n, bundle) in batch.blocks.iter().enumerate() {
         let height = batch.start_height + n as u64;
+        if height < from {
+            continue;
+        }
         if let Ok(block) = Block::from_blob(&bundle.block) {
             let mut w = wow_serialize::binary::Writer::with_capacity(1024);
             block.miner_tx.write(&mut w);
@@ -961,13 +1242,13 @@ fn batch_transactions(batch: &Batch) -> Vec<(u64, usize, bool, std::borrow::Cow<
     out
 }
 
-/// Compute a batch's derivations on every core.
+/// Compute a batch's derivations on every core, from the block at `from` up.
 #[cfg(not(target_arch = "wasm32"))]
-fn precompute_derivations(batch: &Batch, view_secret_key: &SecretKey) -> Derivations {
+fn precompute_derivations(batch: &Batch, view_secret_key: &SecretKey, from: u64) -> Derivations {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    let work = batch_transactions(batch);
+    let work = batch_transactions(batch, from);
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(work.len());
@@ -1014,7 +1295,7 @@ fn precompute_derivations(batch: &Batch, view_secret_key: &SecretKey) -> Derivat
 /// A browser has no threads to spread this over, so the scan does its own
 /// derivations as it always did.
 #[cfg(target_arch = "wasm32")]
-fn precompute_derivations(_batch: &Batch, _view_secret_key: &SecretKey) -> Derivations {
+fn precompute_derivations(_batch: &Batch, _view_secret_key: &SecretKey, _from: u64) -> Derivations {
     Derivations::default()
 }
 
@@ -1108,6 +1389,18 @@ impl BlockSource for wow_daemon_client::DaemonClient {
             error,
             wow_daemon_client::DaemonError::Http(wow_daemon_client::HttpError::Truncated { .. })
         )
+    }
+
+    fn get_hashes(
+        &self,
+        block_ids: &[Hash256],
+    ) -> std::result::Result<Option<Hashes>, Self::Error> {
+        let res = wow_daemon_client::DaemonClient::get_hashes(self, block_ids)?;
+        Ok(Some(Hashes {
+            hashes: res.hashes,
+            start_height: res.start_height,
+            current_height: res.current_height,
+        }))
     }
 }
 
@@ -2064,10 +2357,10 @@ mod tests {
         assert_eq!(w.hashes, chain.hashes);
     }
 
-    /// A wallet restored above zero names its height only while it holds no
-    /// hashes. The reference answers a start height above zero from that
-    /// height whatever the history says, so a wallet that went on naming it
-    /// was sent the same blocks on every call.
+    /// A wallet restored above zero, from a source that cannot list hashes,
+    /// names its height only while it holds no hashes. The reference answers a
+    /// start height above zero from that height whatever the history says, so
+    /// a wallet that went on naming it was sent the same blocks on every call.
     #[test]
     fn a_restored_wallet_names_its_height_only_until_it_has_a_history() {
         use std::cell::RefCell;
@@ -2310,5 +2603,182 @@ mod tests {
         w.rescan_from(40);
         assert!(w.hashes.is_empty());
         assert_eq!(w.scan_height(), 40);
+        assert_eq!(w.refresh_from_height, 40, "and scanning starts there");
+    }
+
+    /// A daemon over a [`Chain`] that lists hashes too, at most a thousand a
+    /// call as this node's `gethashes.bin` does, and writes down what it was
+    /// asked.
+    struct Listing<'a> {
+        chain: &'a Chain,
+        blocks_asked: std::cell::RefCell<Vec<(Vec<Hash256>, u64)>>,
+        hashes_asked: std::cell::RefCell<Vec<Vec<Hash256>>>,
+    }
+
+    impl<'a> Listing<'a> {
+        fn new(chain: &'a Chain) -> Listing<'a> {
+            Listing {
+                chain,
+                blocks_asked: Default::default(),
+                hashes_asked: Default::default(),
+            }
+        }
+    }
+
+    impl BlockSource for Listing<'_> {
+        type Error = Never;
+
+        fn get_blocks(
+            &self,
+            ids: &[Hash256],
+            start: u64,
+            max: u64,
+        ) -> std::result::Result<Batch, Never> {
+            self.blocks_asked.borrow_mut().push((ids.to_vec(), start));
+            self.chain.get_blocks(ids, start, max)
+        }
+
+        fn get_hashes(&self, ids: &[Hash256]) -> std::result::Result<Option<Hashes>, Never> {
+            self.hashes_asked.borrow_mut().push(ids.to_vec());
+            let from = ids
+                .iter()
+                .find_map(|h| self.chain.hashes.iter().position(|x| x == h))
+                .unwrap_or(0);
+            let end = self
+                .chain
+                .hashes
+                .len()
+                .min(from + MAX_BLOCKS_PER_CALL as usize);
+            Ok(Some(Hashes {
+                hashes: self.chain.hashes[from..end].to_vec(),
+                start_height: from as u64,
+                current_height: self.chain.hashes.len() as u64,
+            }))
+        }
+    }
+
+    /// A wallet restored at 1,500 on a chain whose last checkpoint is at
+    /// 1,000, as `wallet2` would be: its hashes begin at the checkpoint and
+    /// are listed rather than downloaded, the first request goes by the last
+    /// whole 1,024 blocks, and no request names the restore height or carries
+    /// the block there. Scanning still starts at 1,500, so a payment below it
+    /// is not found.
+    #[test]
+    fn a_restored_wallet_shows_a_daemon_only_what_every_wallet_shares() {
+        let mut w = state(7, 1_500);
+        let to = w.account.keys.account_address;
+        let mut chain = Chain::new();
+        for height in 0..2_100u64 {
+            match height {
+                1_200 => chain.push(&[payment(&to, 1_000, 31)], vec![vec![], vec![5]]),
+                1_800 => chain.push(&[payment(&to, 2_000, 32)], vec![vec![], vec![6]]),
+                _ => chain.push(&[], Vec::new()),
+            }
+        }
+        w.genesis = chain.hashes[0];
+        w.checkpoint = Some((1_000, chain.hashes[1_000]));
+
+        let daemon = Listing::new(&chain);
+        let s = w.refresh(&daemon, 50).expect("refresh");
+        assert!(s.caught_up);
+        assert_eq!(s.reorg_to, None);
+        assert_eq!(w.start_height, 1_000, "the hashes begin at the checkpoint");
+        assert_eq!(w.hashes, chain.hashes[1_000..]);
+        assert_eq!(w.balance(), 2_000, "nothing below the restore height");
+
+        let restore = chain.hashes[1_500];
+        let blocks = daemon.blocks_asked.into_inner();
+        assert_eq!(
+            blocks[0].0[0],
+            chain.hashes[1_023],
+            "the first request goes by the last whole 1,024 blocks"
+        );
+        for (ids, start) in &blocks {
+            assert_eq!(*start, 0, "no height is named");
+            assert!(!ids.contains(&restore), "the restore block is never sent");
+            assert_eq!(
+                ids[ids.len() - 2..],
+                [chain.hashes[1_000], chain.hashes[0]],
+                "every history ends where every wallet's does"
+            );
+        }
+        let hashes = daemon.hashes_asked.into_inner();
+        assert!(!hashes.is_empty(), "the hashes were listed");
+        assert!(hashes.iter().all(|ids| !ids.contains(&restore)));
+    }
+
+    /// A trusted daemon is shown the whole history on the first request, as
+    /// `wallet2::refresh` shows one.
+    #[test]
+    fn a_trusted_daemon_is_shown_every_hash_at_once() {
+        let mut chain = Chain::new();
+        for _ in 0..1_300 {
+            chain.push(&[], Vec::new());
+        }
+
+        let mut w = state_on(7, &chain);
+        w.hashes = chain.hashes[..1_100].to_vec();
+        let untrusted = Listing::new(&chain);
+        w.refresh_once(&untrusted).expect("refresh");
+        assert_eq!(untrusted.blocks_asked.borrow()[0].0[0], chain.hashes[1_023]);
+        // The next request of the session goes by every hash.
+        w.refresh_once(&untrusted).expect("refresh");
+        assert_eq!(untrusted.blocks_asked.borrow()[1].0[0], chain.hashes[1_299]);
+
+        let mut w = state_on(7, &chain);
+        w.hashes = chain.hashes[..1_100].to_vec();
+        w.trusted_daemon = true;
+        let trusted = Listing::new(&chain);
+        w.refresh_once(&trusted).expect("refresh");
+        assert_eq!(trusted.blocks_asked.borrow()[0].0[0], chain.hashes[1_099]);
+    }
+
+    /// A cache written before hashes were filled in holds them from the
+    /// restore height. They are filled in below, and nothing is scanned again.
+    #[test]
+    fn hashes_held_from_the_restore_height_are_filled_in_below() {
+        let mut chain = Chain::new();
+        for _ in 0..1_700 {
+            chain.push(&[], Vec::new());
+        }
+        let mut w = state(7, 1_500);
+        w.genesis = chain.hashes[0];
+        w.checkpoint = Some((1_000, chain.hashes[1_000]));
+        w.hashes = chain.hashes[1_500..1_600].to_vec();
+
+        let s = w.refresh(&Listing::new(&chain), 10).expect("refresh");
+        assert!(s.caught_up);
+        assert_eq!(s.reorg_to, None);
+        assert_eq!(w.start_height, 1_000);
+        assert_eq!(w.hashes, chain.hashes[1_000..]);
+
+        // Held hashes the chain no longer has are dropped, and the blocks
+        // scanned again.
+        let mut w = state(7, 1_500);
+        w.genesis = chain.hashes[0];
+        w.checkpoint = Some((1_000, chain.hashes[1_000]));
+        w.hashes = vec![[0xee; 32]; 100];
+        let s = w.refresh(&Listing::new(&chain), 10).expect("refresh");
+        assert!(s.caught_up);
+        assert_eq!(s.reorg_to, Some(1_500));
+        assert_eq!(w.hashes, chain.hashes[1_000..]);
+    }
+
+    /// A daemon whose chain does not hold the checkpoint is on another chain,
+    /// and its hashes are refused.
+    #[test]
+    fn hashes_from_a_chain_without_the_checkpoint_are_refused() {
+        let mut chain = Chain::new();
+        for _ in 0..1_200 {
+            chain.push(&[], Vec::new());
+        }
+        let mut w = state(7, 1_100);
+        w.genesis = chain.hashes[0];
+        w.checkpoint = Some((1_000, [0xcd; 32]));
+        let e = w
+            .refresh_once(&Listing::new(&chain))
+            .expect_err("another chain");
+        assert!(matches!(e, RefreshError::UnaskedHashes { got: 0 }), "{e}");
+        assert!(w.hashes.is_empty(), "nothing was taken from it");
     }
 }

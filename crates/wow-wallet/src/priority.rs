@@ -13,9 +13,17 @@
 //! When the choice cannot be made -- a daemon call fails, the wallet holds
 //! fewer than ten blocks -- `adjust_priority` hands the 0 back, and
 //! `get_base_fee` maps a 0 that reaches it to the lowest tier all the same.
+//!
+//! # The backlog, and not the pool
+//!
+//! The backlog is read with `get_txpool_backlog`, as `estimate_backlog` reads
+//! it: a weight and a fee per transaction. Downloading the whole pool to work
+//! that out, as this once did, sent the daemon a request no C++ wallet makes,
+//! at the moment it was about to send, and fetched every blob in the pool to
+//! read two numbers from each. A daemon that does not serve the call (this
+//! workspace's does not yet) fails it, and the 0 comes back.
 
 use wow_daemon_client::DaemonClient;
-use wow_types::tx::Transaction;
 
 use crate::keys_file::KeysFile;
 
@@ -92,7 +100,7 @@ pub fn adjust_priority(
     // `estimate_backlog`. Every throw in the C++ lands in one `catch`, which
     // leaves the priority at 0 -- a zero rate and a zero reward zone included.
     let low = fee_per_byte(tiers, 1);
-    let Ok(pool) = client.get_transaction_pool() else {
+    let Ok(backlog) = client.get_txpool_backlog() else {
         return 0;
     };
     let Ok(info) = client.get_info() else {
@@ -102,10 +110,7 @@ pub fn adjust_priority(
     if low == 0 || full_reward_zone == 0 {
         return 0;
     }
-    let backlog: Vec<(u64, u64)> = pool
-        .iter()
-        .filter_map(|t| weight_and_fee(&t.blob))
-        .collect();
+    let backlog: Vec<(u64, u64)> = backlog.iter().map(|e| (e.weight, e.fee)).collect();
     if backlog_blocks(&backlog, low, full_reward_zone) > 0 {
         // "We don't use the low priority because there's a backlog in the tx
         // pool."
@@ -156,15 +161,6 @@ pub fn fullness_percent(weights: &[u64], full_reward_zone: u64) -> u64 {
         return 0;
     }
     (100 * sum / capacity) as u64
-}
-
-/// What `get_txpool_backlog` reports per transaction, read from a pool blob
-/// instead: this node does not serve that call, and the listing is one a
-/// wallet already makes.
-fn weight_and_fee(blob: &[u8]) -> Option<(u64, u64)> {
-    let tx = Transaction::from_blob(blob).ok()?;
-    let weight = wow_types::weight::get_transaction_weight(&tx, blob.len());
-    Some((weight, tx.rct_signatures.txn_fee))
 }
 
 #[cfg(test)]

@@ -455,6 +455,7 @@ impl Session {
         let start = height - 1;
         self.keys_file.set_refresh_height(start);
         self.state.start_height = start;
+        self.state.refresh_from_height = start;
         // The genesis anchor belongs to height zero and this wallet no longer
         // starts there. Leaving it would claim a hash for the wrong height.
         self.state.hashes.clear();
@@ -507,13 +508,12 @@ impl Session {
     /// ([`WalletState::update_pending`]).
     ///
     /// Only once a refresh has caught up; `update_pending` says why.
+    ///
+    /// Always, whatever the wallet holds: a view-only wallet and an empty one
+    /// included. `wallet2::refresh` reads the pool on every refresh. A wallet
+    /// that only started asking once it owned a key image told the daemon,
+    /// by the first request, which block had just paid it.
     pub fn check_pending(&mut self) -> Result<PoolCheck, String> {
-        // A view-only wallet has no key images to find, and nothing pending.
-        if self.state.by_key_image.is_empty()
-            && self.state.sent.iter().all(|s| s.height().is_some())
-        {
-            return Ok(PoolCheck::default());
-        }
         let pool = self.read_pool()?;
         let ids: HashSet<Hash256> = pool.iter().map(|p| p.txid).collect();
         let noted = self.state.note_pool_spends(&pool, now());
@@ -638,6 +638,7 @@ pub mod cache {
         json!({
             "version": VERSION,
             "start_height": state.start_height,
+            "refresh_from_height": state.refresh_from_height,
             "hashes": hashes,
             "transfers": transfers,
             "sent": state.sent.iter().map(sent_to_json).collect::<Vec<_>>(),
@@ -706,6 +707,12 @@ pub mod cache {
             .get("start_height")
             .and_then(Value::as_u64)
             .unwrap_or(state.start_height);
+        // Added without a version bump: a cache from before has hashes from
+        // where scanning started, and the restore height stands for it.
+        state.refresh_from_height = v
+            .get("refresh_from_height")
+            .and_then(Value::as_u64)
+            .unwrap_or(state.refresh_from_height);
 
         state.hashes = v
             .get("hashes")
@@ -912,6 +919,40 @@ mod tests {
             "the tip block, not the block count"
         );
         assert_eq!(s.keys_file.refresh_height(), 873_426);
+        assert_eq!(s.state.refresh_from_height, 873_426, "and scanning starts there");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Where scanning starts survives the cache apart from where the hashes
+    /// begin, and a cache from before it was kept takes the restore height.
+    #[test]
+    fn where_scanning_starts_survives_the_cache() {
+        let dir = scratch("refresh-from");
+        let mut s = fresh_session(&dir, 0);
+        s.state.start_height = 838_800;
+        s.state.refresh_from_height = 850_000;
+        s.state.hashes.push([7u8; 32]);
+        let raw = cache::store(&s.state);
+
+        let fresh = || {
+            let keys = &s.keys_file.account.keys;
+            let table = SubaddressTable::new(&keys.account_address, &keys.view_secret_key, 1, 1);
+            WalletState::new(s.keys_file.account.clone(), table, 42, Network::Mainnet)
+        };
+        let mut back = fresh();
+        cache::load(&mut back, &raw).expect("loads");
+        assert_eq!(back.start_height, 838_800);
+        assert_eq!(back.refresh_from_height, 850_000);
+
+        let mut older: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        older
+            .as_object_mut()
+            .expect("an object")
+            .remove("refresh_from_height");
+        let mut old = fresh();
+        cache::load(&mut old, older.to_string().as_bytes()).expect("loads");
+        assert_eq!(old.refresh_from_height, 42, "the restore height");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

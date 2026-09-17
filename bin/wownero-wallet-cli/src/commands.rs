@@ -397,8 +397,10 @@ fn refresh(session: &mut Session) -> Result<(), String> {
             println!("{}", describe_event(e));
         }
         if s.blocks_scanned > 0 {
+            // From where scanning starts: the hashes begin lower, where every
+            // wallet's do.
             progress.update(
-                session.state.start_height,
+                session.state.refresh_from_height,
                 session.state.scan_height(),
                 session.chain_height(),
             );

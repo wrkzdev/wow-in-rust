@@ -797,6 +797,9 @@ fn refresh(session: &mut Session, params: &Value) -> MethodResult {
         if h < session.state.scan_height() {
             session.state.hashes.clear();
             session.state.start_height = h;
+            // Scanned from there, whatever the restore height; the hashes
+            // below it are listed again from where every wallet's begin.
+            session.state.refresh_from_height = h;
         }
     }
 

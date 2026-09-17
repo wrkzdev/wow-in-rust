@@ -224,9 +224,10 @@ fn refreshing_again_does_nothing() {
     assert_eq!(w.hashes.len(), hashes.len());
 }
 
-/// A wallet restored above zero names its height once, then goes by its
-/// history: synced, it asks again and gets nothing. Naming the height every
-/// time would be answered from that height every time.
+/// A wallet restored above zero never names its height: the hashes below it
+/// come from `gethashes.bin`, from genesis on a chain below the last
+/// checkpoint, and then it goes by its history. Synced, it asks again and gets
+/// nothing.
 #[test]
 fn a_wallet_restored_above_zero_syncs_and_stays_synced() {
     let (d, hashes) = start("restored", 12);
@@ -236,12 +237,14 @@ fn a_wallet_restored_above_zero_syncs_and_stays_synced() {
     let summary = w.refresh(&c, 20).expect("refresh");
     assert!(summary.caught_up);
     assert_eq!(summary.reorg_to, None);
-    assert_eq!(w.hashes, hashes[5..]);
+    assert_eq!(w.start_height, 0, "the hashes begin where every wallet's do");
+    assert_eq!(w.hashes, hashes);
+    assert_eq!(w.refresh_from_height, 5, "and scanning began where it was restored");
 
     let again = w.refresh_once(&c).expect("refresh again");
     assert!(again.caught_up);
     assert_eq!(again.blocks_scanned, 0);
-    assert_eq!(w.hashes, hashes[5..]);
+    assert_eq!(w.hashes, hashes);
 }
 
 /// `get_blocks.bin` answers from the wallet's history, not from a height it was
