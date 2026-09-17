@@ -155,6 +155,7 @@ impl Platform for Browser {
         node: &NodeAddress,
         _any_certificate: bool,
         _login: Option<&wow_daemon_client::digest::Credentials>,
+        _proxy: Option<&wow_daemon_client::Proxy>,
     ) -> DaemonClient {
         DaemonClient::with_transport(Arc::new(BrowserTransport { base: node.url() }))
     }

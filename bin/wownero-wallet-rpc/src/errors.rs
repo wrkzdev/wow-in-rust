@@ -86,6 +86,7 @@ codes! {
     ZERO_AMOUNT = -46, "An amount of zero.";
     INVALID_SIGNATURE_TYPE = -47, "An unknown signature type.";
     DISABLED = -48, "The method is disabled in this build.";
+    PROXY_ALREADY_DEFINED = -49, "A proxy for one daemon, when --proxy gives one for all.";
     NONZERO_UNLOCK_TIME = -50, "Wownero does not relay a non-zero unlock time.";
 }
 

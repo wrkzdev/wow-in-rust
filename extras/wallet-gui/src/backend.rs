@@ -61,13 +61,14 @@ pub trait Platform {
     fn secure_page(&self) -> bool;
     /// A client for `node`. `any_certificate` accepts the node's TLS
     /// certificate whoever signed it, where the platform decides that.
-    /// `login` is for a node started with `--rpc-login`, where the platform
-    /// can send one.
+    /// `login` is for a node started with `--rpc-login`, and `proxy` what to
+    /// reach it through, where the platform can use them.
     fn connect(
         &self,
         node: &NodeAddress,
         any_certificate: bool,
         login: Option<&wow_daemon_client::digest::Credentials>,
+        proxy: Option<&wow_daemon_client::Proxy>,
     ) -> DaemonClient;
     /// A clock for timing a node's answer, in milliseconds from any start.
     fn millis(&self) -> f64;
@@ -103,6 +104,8 @@ pub struct Backend<P: Platform> {
     /// [`Command::SetNodeLogin`], for a node started with `--rpc-login`. In
     /// memory only, and never written with the settings.
     node_login: Option<wow_daemon_client::digest::Credentials>,
+    /// [`Command::SetProxy`], with a login of this run's own.
+    proxy: Option<wow_daemon_client::Proxy>,
 }
 
 impl<P: Platform> Backend<P> {
@@ -114,6 +117,7 @@ impl<P: Platform> Backend<P> {
             working: false,
             any_certificate: Vec::new(),
             node_login: None,
+            proxy: None,
         }
     }
 
@@ -187,6 +191,28 @@ impl<P: Platform> Backend<P> {
             Command::AcceptAnyCertificate(nodes) => {
                 self.any_certificate = nodes;
                 Ok(())
+            }
+            Command::SetProxy(text) => {
+                self.proxy = match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    None => None,
+                    Some(text) => {
+                        let proxy = wow_daemon_client::Proxy::parse(text)?;
+                        // A login of this run's own, so Tor keeps this
+                        // wallet's circuits apart from other programs'.
+                        let mut token = [0u8; 16];
+                        wow_wallet::entropy::seeded_rng()?.fill(&mut token);
+                        Some(proxy.isolated(&token))
+                    }
+                };
+                let in_use = self
+                    .wallet
+                    .as_ref()
+                    .and_then(|w| w.session.daemon.as_ref())
+                    .map(|d| d.address().to_string());
+                match in_use {
+                    Some(address) => self.use_node(&address),
+                    None => Ok(()),
+                }
             }
             Command::SetNodeLogin(login) => {
                 self.node_login = login
@@ -579,14 +605,15 @@ impl<P: Platform> Backend<P> {
     /// `network`.
     fn connect_checked(&self, address: &str, network: Net) -> Result<(DaemonClient, Info), String> {
         let node = NodeAddress::parse(address)?;
-        if let Some(why) =
-            node.unreachable_reason(self.platform.in_browser(), self.platform.secure_page())
-        {
+        if let Some(why) = self.unreachable(&node) {
             return Err(why.to_string());
         }
-        let client = self
-            .platform
-            .connect(&node, self.accepts_any(&node), self.node_login.as_ref());
+        let client = self.platform.connect(
+            &node,
+            self.accepts_any(&node),
+            self.node_login.as_ref(),
+            self.proxy.as_ref(),
+        );
         let info = client
             .get_info()
             .map_err(|e| self.unanswered(&node, &e.to_string()))?;
@@ -603,15 +630,18 @@ impl<P: Platform> Backend<P> {
 
     fn test_node(&self, address: &str, network: Net) -> Result<NodeReport, String> {
         let node = NodeAddress::parse(address)?;
-        if let Some(why) =
-            node.unreachable_reason(self.platform.in_browser(), self.platform.secure_page())
-        {
+        if let Some(why) = self.unreachable(&node) {
             return Err(why.to_string());
         }
         let started = self.platform.millis();
         let info = self
             .platform
-            .connect(&node, self.accepts_any(&node), self.node_login.as_ref())
+            .connect(
+                &node,
+                self.accepts_any(&node),
+                self.node_login.as_ref(),
+                self.proxy.as_ref(),
+            )
             .get_info()
             .map_err(|e| self.unanswered(&node, &e.to_string()))?;
         let millis = (self.platform.millis() - started).max(0.0) as u64;
@@ -631,11 +661,28 @@ impl<P: Platform> Backend<P> {
         self.any_certificate.contains(&node.host_port())
     }
 
+    /// Why `node` cannot be reached from here, when that is known before
+    /// trying.
+    fn unreachable(&self, node: &NodeAddress) -> Option<&'static str> {
+        node.unreachable_reason(
+            self.platform.in_browser(),
+            self.platform.secure_page(),
+            self.proxy.is_some(),
+        )
+    }
+
     fn unanswered(&self, node: &NodeAddress, error: &str) -> String {
         if self.platform.in_browser() {
             format!(
                 "{} did not answer: {error}. A browser can only use a node that allows requests \
                  from web pages (CORS), and many do not.",
+                node.url()
+            )
+        } else if self.proxy.is_some() && !node.is_onion() && !node.is_i2p() {
+            format!(
+                "{} did not answer: {error}. Through a proxy, a node that is not a .onion or \
+                 .i2p one is reached only over TLS, so whoever runs the proxy's exit can neither \
+                 read it nor pose as the node: use one that answers TLS, or an onion node.",
                 node.url()
             )
         } else {
@@ -756,13 +803,16 @@ impl<P: Platform> Backend<P> {
             Some(w) => w.session.chain_height(),
             None => {
                 let address = NodeAddress::parse(node)?;
-                if let Some(why) = address
-                    .unreachable_reason(self.platform.in_browser(), self.platform.secure_page())
-                {
+                if let Some(why) = self.unreachable(&address) {
                     return Err(why.to_string());
                 }
                 self.platform
-                    .connect(&address, self.accepts_any(&address), self.node_login.as_ref())
+                    .connect(
+                        &address,
+                        self.accepts_any(&address),
+                        self.node_login.as_ref(),
+                        self.proxy.as_ref(),
+                    )
                     .get_info()
                     .map_err(|e| self.unanswered(&address, &e.to_string()))?
                     .height

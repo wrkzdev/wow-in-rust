@@ -64,6 +64,8 @@ pub struct State {
     /// `--daemon-ssl` and the options beside it, or what `set_daemon` last
     /// said instead: applied as `daemon_login` is.
     daemon_options: Mutex<wow_daemon_client::ConnectOptions>,
+    /// `--proxy` was given: `set_daemon` may not name a proxy of its own.
+    proxy_option: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -85,8 +87,18 @@ impl State {
             daemon_address: Mutex::new(daemon_address),
             daemon_login,
             daemon_options: Mutex::new(Default::default()),
+            proxy_option: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         }
+    }
+
+    /// `wallet2::has_proxy_option`: whether `--proxy` was given.
+    pub fn has_proxy_option(&self) -> bool {
+        self.proxy_option.load(Ordering::SeqCst)
+    }
+
+    pub fn set_proxy_option(&self, on: bool) {
+        self.proxy_option.store(on, Ordering::SeqCst);
     }
 
     /// How newly opened wallets reach the daemon.
@@ -98,6 +110,9 @@ impl State {
     }
 
     /// Remember how to reach the daemon, for wallets opened later too.
+    ///
+    /// Called with the startup options first, whose proxy, if any, is
+    /// `--proxy`.
     pub fn set_daemon_options(&self, options: wow_daemon_client::ConnectOptions) {
         *self
             .daemon_options

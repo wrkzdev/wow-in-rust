@@ -54,6 +54,9 @@ wownero-wallet-rpc — the Wownero wallet RPC (specs/14)
   --daemon-ssl-allow-any-cert       accept any certificate
   --daemon-ssl-certificate <path> --daemon-ssl-private-key <path>
                                     a certificate to show a daemon that asks
+  --proxy [socks5://][<user>:<pass>@][<host>:]<port>
+                                    reach the daemon through a SOCKS5 proxy,
+                                    Tor's say; its name is not looked up here
   --testnet / --stagenet
   --kdf-rounds <n>                  default 1
   --no-initial-sync
@@ -84,6 +87,8 @@ struct Options {
     daemon_login: Option<String>,
     /// `--daemon-ssl` and the options beside it, as given.
     ssl: wow_daemon_client::SslFlags,
+    /// `--proxy`, as given: it may carry a password.
+    proxy: Option<String>,
     network: Network,
     kdf_rounds: u64,
     no_initial_sync: bool,
@@ -114,6 +119,7 @@ impl std::fmt::Debug for Options {
             .field("daemon", &self.daemon)
             .field("daemon_login", &self.daemon_login.as_ref().map(|_| "<redacted>"))
             .field("ssl", &self.ssl)
+            .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
             .field("network", &self.network)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("no_initial_sync", &self.no_initial_sync)
@@ -139,6 +145,7 @@ impl Default for Options {
             daemon: "127.0.0.1:34568".into(),
             daemon_login: None,
             ssl: Default::default(),
+            proxy: None,
             network: Network::Mainnet,
             kdf_rounds: 1,
             no_initial_sync: false,
@@ -203,6 +210,7 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
                 .push(next("--daemon-ssl-allowed-fingerprints")?),
             "--daemon-ssl-allow-any-cert" => o.ssl.allow_any_cert = true,
             "--daemon-ssl-allow-chained" => o.ssl.allow_chained = true,
+            "--proxy" => o.proxy = Some(next("--proxy")?),
             "--testnet" => o.network = Network::Testnet,
             "--stagenet" => o.network = Network::Stagenet,
             "--kdf-rounds" => {
@@ -335,14 +343,25 @@ fn run(options: Options) -> Result<(), String> {
         None => None,
     };
     // Refused where `make_basic` refuses it, before any wallet is opened.
-    let daemon_options = wow_daemon_client::ConnectOptions::from_flags(&options.ssl)?;
-    if daemon_options.lacks_strong_verification(&options.daemon, false) {
-        return Err(
-            "Enabling --daemon-ssl requires --daemon-ssl-allow-any-cert or \
+    let mut daemon_options = wow_daemon_client::ConnectOptions::from_flags(&options.ssl)?;
+    if let Some(text) = &options.proxy {
+        let proxy = wow_daemon_client::Proxy::parse(text).map_err(|e| format!("--proxy: {e}"))?;
+        // A login of this server's own, so Tor keeps its circuits apart.
+        let mut token = [0u8; 16];
+        wow_wallet::entropy::seeded_rng()?.fill(&mut token);
+        daemon_options.proxy = Some(proxy.isolated(&token));
+    }
+    if daemon_options.lacks_strong_verification(&options.daemon) {
+        let flag = if daemon_options.proxy.is_some() {
+            "--proxy"
+        } else {
+            "--daemon-ssl"
+        };
+        return Err(format!(
+            "Enabling {flag} requires --daemon-ssl-allow-any-cert or \
              --daemon-ssl-ca-certificates or --daemon-ssl-allowed-fingerprints or use of a \
              .onion/.i2p domain"
-                .into(),
-        );
+        ));
     }
 
     let state = Arc::new(State::new(
@@ -356,6 +375,7 @@ fn run(options: Options) -> Result<(), String> {
         options.daemon.clone(),
         daemon_login,
     ));
+    state.set_proxy_option(daemon_options.proxy.is_some());
     state.set_daemon_options(daemon_options);
 
     state.open_at_startup()?;
@@ -506,6 +526,31 @@ mod tests {
         args.push("--mine-please");
         let e = opts(&args).expect_err("rejected");
         assert!(e.contains("--mine-please"), "{e}");
+    }
+
+    /// `--proxy` and the `--daemon-ssl` options, by the C++'s names, and a
+    /// proxy kept out of `{:?}`: it can carry a password.
+    #[test]
+    fn the_proxy_and_ssl_options_parse() {
+        let mut args = MINIMUM.to_vec();
+        args.extend_from_slice(&[
+            "--proxy",
+            "socks5://u:hunter2@127.0.0.1:9050",
+            "--daemon-ssl",
+            "enabled",
+            "--daemon-ssl-allowed-fingerprints",
+            "aa",
+            "--daemon-ssl-allow-any-cert",
+        ]);
+        let o = opts(&args).expect("parses");
+        assert_eq!(
+            o.proxy.as_deref(),
+            Some("socks5://u:hunter2@127.0.0.1:9050")
+        );
+        assert_eq!(o.ssl.ssl.as_deref(), Some("enabled"));
+        assert_eq!(o.ssl.allowed_fingerprints, ["aa"]);
+        assert!(o.ssl.allow_any_cert);
+        assert!(!format!("{o:?}").contains("hunter2"));
     }
 
     /// The log options, with the C++'s rotation defaults.

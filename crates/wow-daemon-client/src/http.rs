@@ -18,6 +18,11 @@
 //! [`Endpoint`] is never spoken to in the clear by it again, so a connection
 //! cut during a handshake cannot quietly turn into a plain one.
 //!
+//! A node can be reached through a SOCKS5 proxy ([`Proxy`], `--proxy`), Tor's
+//! say. Its name then goes to the proxy as a name, and is never looked up on
+//! this machine, where the lookup would say which node the wallet uses to
+//! whoever answers it.
+//!
 //! A reply may come back chunked. A daemon never sends one, but the reverse
 //! proxy §1.2 lets a node sit behind may: nginx and Cloudflare both re-frame a
 //! node's replies as chunks.
@@ -57,6 +62,11 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long a proxy has to reach the node, and a TLS handshake through it to
+/// finish. Tor building a circuit to an onion service can take most of a
+/// minute.
+const PROXY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The C++ HTTP client's log category, so one `--log-level` means the same to
 /// both.
@@ -115,6 +125,8 @@ pub enum HttpError {
     /// A [`Transport`] other than [`Endpoint`] failed, in its own words: a
     /// browser refusing a cross-origin request, say.
     Transport(String),
+    /// The proxy could not be reached, or would not reach the node.
+    Proxy(String),
 }
 
 impl std::fmt::Display for HttpError {
@@ -152,6 +164,7 @@ impl std::fmt::Display for HttpError {
                  unless it was started with --disable-rpc-ban"
             ),
             HttpError::Transport(what) => write!(f, "{what}"),
+            HttpError::Proxy(what) => write!(f, "proxy: {what}"),
         }
     }
 }
@@ -282,13 +295,112 @@ pub struct ClientCertificate {
     pub private_key: PathBuf,
 }
 
-/// How a node is reached, whatever its address: what the `--daemon-ssl`
-/// options say.
+/// `--proxy`: a SOCKS5 proxy (RFC 1928) a node is reached through.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Proxy {
+    /// The proxy's own `host:port`.
+    pub address: String,
+    /// An RFC 1929 user name and password.
+    pub login: Option<(String, String)>,
+}
+
+/// Never print the proxy's password, including through `{:?}`.
+impl std::fmt::Debug for Proxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Proxy")
+            .field("address", &self.address)
+            .field("login", &self.login.as_ref().map(|(user, _)| user))
+            .finish()
+    }
+}
+
+impl Proxy {
+    /// `--proxy` as `[socks5://][<user>:<pass>@][<host>:]<port>`: the C++'s
+    /// `socks::endpoint::get`, with a port alone meaning one on this machine.
+    ///
+    /// The C++ speaks SOCKS4a to an address without a scheme. This speaks
+    /// SOCKS5 to every proxy: Tor and every other proxy a wallet would use
+    /// speak it, it carries a login, and it passes a node's name on to be
+    /// looked up at the far end as 4a does.
+    pub fn parse(text: &str) -> Result<Proxy, String> {
+        let text = text.trim();
+        let rest = match text.split_once("://") {
+            None => text,
+            Some((scheme, rest))
+                if scheme.eq_ignore_ascii_case("socks5")
+                    || scheme.eq_ignore_ascii_case("socks5h") =>
+            {
+                rest
+            }
+            Some((scheme, _)) => {
+                return Err(format!(
+                    "`{scheme}://` is not a proxy this wallet speaks: it speaks SOCKS5, so give \
+                     socks5://host:port or host:port"
+                ))
+            }
+        };
+        let (login, host_port) = match rest.rsplit_once('@') {
+            Some((userinfo, host_port)) => {
+                let (user, pass) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+                if user.is_empty() || user.len() > 255 || pass.len() > 255 {
+                    return Err(
+                        "a SOCKS5 user name is 1 to 255 bytes, and a password at most 255".into(),
+                    );
+                }
+                (Some((user.to_string(), pass.to_string())), host_port)
+            }
+            None => (None, rest),
+        };
+        let host_port = host_port.trim_end_matches('/');
+        let address = if host_port.parse::<u16>().is_ok() {
+            format!("127.0.0.1:{host_port}")
+        } else {
+            host_port.to_string()
+        };
+        let port = address
+            .rsplit_once(':')
+            .filter(|(host, _)| !host.is_empty())
+            .and_then(|(_, port)| port.parse::<u16>().ok());
+        if port.is_none_or(|p| p == 0) {
+            return Err(format!(
+                "`{text}` is not a proxy's address: give its host and port, as 127.0.0.1:9050"
+            ));
+        }
+        Ok(Proxy { address, login })
+    }
+
+    /// This proxy with a login of its own when it has none: `token`, drawn
+    /// at random for the session.
+    ///
+    /// Tor puts connections that log in differently on different circuits
+    /// (`IsolateSOCKSAuth`, on by default), so a wallet with a login of its
+    /// own does not share a circuit, and an exit, with other programs or
+    /// other wallets. A login given with `--proxy` is kept as it is.
+    pub fn isolated(mut self, token: &[u8]) -> Proxy {
+        if self.login.is_none() {
+            let hex = wow_crypto::hex::encode(token);
+            self.login = Some((format!("wow-wallet-{hex}"), hex));
+        }
+        self
+    }
+}
+
+/// Whether `host` is a `.onion` or `.i2p` name: one whose name is its key, so
+/// a connection to it is authenticated and encrypted end to end by the
+/// network that carries it.
+pub fn is_onion_or_i2p(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host.ends_with(".onion") || host.ends_with(".i2p")
+}
+
+/// How a node is reached, whatever its address: what the `--daemon-ssl` and
+/// `--proxy` options say.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConnectOptions {
     pub tls: TlsMode,
     pub certificates: Certificates,
     pub client_certificate: Option<ClientCertificate>,
+    pub proxy: Option<Proxy>,
 }
 
 /// The `--daemon-ssl` options as given, before they are made sense of.
@@ -362,24 +474,21 @@ impl ConnectOptions {
             tls,
             certificates,
             client_certificate,
+            proxy: None,
         })
     }
 
     /// Whether `address` needs a certificate named ahead that these options
     /// do not give: `wallet2.cpp`'s `verification_required &&
     /// !has_strong_verification`. Required TLS checked only against the roots
-    /// is not enough for the C++ wallet, nor is anything through a proxy
-    /// (`proxy`), unless the host is a `.onion` or `.i2p` one, whose name is
-    /// its key.
-    pub fn lacks_strong_verification(&self, address: &str, proxy: bool) -> bool {
+    /// is not enough for the C++ wallet, nor is anything through a proxy,
+    /// where an exit could pose as the node, unless the host is a `.onion` or
+    /// `.i2p` one, whose name is its key.
+    pub fn lacks_strong_verification(&self, address: &str) -> bool {
         let required = !matches!(self.certificates, Certificates::Any)
-            && (self.tls == TlsMode::Enabled || proxy);
-        let host = Target::parse(address)
-            .map(|t| t.host.to_ascii_lowercase())
-            .unwrap_or_default();
-        let strong = matches!(self.certificates, Certificates::Pinned(_))
-            || host.ends_with(".onion")
-            || host.ends_with(".i2p");
+            && (self.tls == TlsMode::Enabled || self.proxy.is_some());
+        let onion = Target::parse(address).is_ok_and(|t| is_onion_or_i2p(&t.host));
+        let strong = matches!(self.certificates, Certificates::Pinned(_)) || onion;
         required && !strong
     }
 }
@@ -414,6 +523,8 @@ pub struct Endpoint {
     /// For a TLS connection.
     pub certificates: Certificates,
     pub client_certificate: Option<ClientCertificate>,
+    /// What the node is reached through, when it is not reached directly.
+    pub proxy: Option<Proxy>,
     /// For a node started with `--rpc-login`. Shared rather than owned so a
     /// cloned `Endpoint` keeps answering with the same nonce counter, which
     /// the daemon requires to rise.
@@ -448,10 +559,16 @@ impl Endpoint {
             tls: TlsMode::Autodetect,
             certificates: Certificates::Checked,
             client_certificate: None,
+            proxy: None,
             login: None,
             idle: std::sync::Arc::new(std::sync::Mutex::new(None)),
             security: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_proxy(mut self, proxy: Option<Proxy>) -> Endpoint {
+        self.proxy = proxy;
+        self
     }
 
     pub fn with_certificates(mut self, certificates: Certificates) -> Endpoint {
@@ -469,6 +586,7 @@ impl Endpoint {
         self.tls = options.tls;
         self.certificates = options.certificates.clone();
         self.client_certificate = options.client_certificate.clone();
+        self.proxy = options.proxy.clone();
         self
     }
 
@@ -507,6 +625,9 @@ impl Endpoint {
                     strict: false,
                     fallback: false,
                 },
+                // Tor or I2P already carries it encrypted, to the key its
+                // name is, so there is nothing for TLS to add.
+                (_, None) if is_onion_or_i2p(&target.host) => Plan::Plain,
                 (_, None) => Plan::Tls {
                     strict: false,
                     fallback: true,
@@ -521,13 +642,18 @@ impl Endpoint {
             }
             return Ok(Connection::Plain(tcp));
         };
+        let handshake_timeout = if self.proxy.is_some() {
+            PROXY_TIMEOUT
+        } else {
+            self.connect_timeout
+        };
         match crate::tls::connect(
             tcp,
             &target.host,
             &self.certificates,
             self.client_certificate.as_ref(),
             strict,
-            self.connect_timeout,
+            handshake_timeout,
             self.timeout,
         ) {
             Ok((stream, verified)) => {
@@ -560,28 +686,44 @@ impl Endpoint {
         }
     }
 
-    /// A socket to the node, with the timeouts set.
+    /// A socket to the node, directly or through the proxy, with the timeouts
+    /// set.
     fn open(&self, target: &Target) -> Result<TcpStream, HttpError> {
-        let mut last = None;
-        let addrs = target
-            .host_port
-            .to_socket_addrs()
-            .map_err(|_| HttpError::BadAddress(self.address.clone()))?;
-        for addr in addrs {
-            match TcpStream::connect_timeout(&addr, self.connect_timeout) {
-                Ok(s) => {
-                    s.set_read_timeout(Some(self.timeout))?;
-                    s.set_write_timeout(Some(self.timeout))?;
-                    s.set_nodelay(true)?;
-                    return Ok(s);
-                }
-                Err(e) => last = Some(e),
+        let s = match &self.proxy {
+            None => {
+                let addrs = target
+                    .host_port
+                    .to_socket_addrs()
+                    .map_err(|_| HttpError::BadAddress(self.address.clone()))?;
+                connect_any(addrs, self.connect_timeout).map_err(|e| {
+                    e.map_or_else(|| HttpError::BadAddress(self.address.clone()), HttpError::Io)
+                })?
             }
-        }
-        Err(match last {
-            Some(e) => HttpError::Io(e),
-            None => HttpError::BadAddress(self.address.clone()),
-        })
+            Some(proxy) => {
+                // The node's name goes to the proxy, never to this machine's
+                // resolver: only the proxy's own address is looked up here.
+                let port = target
+                    .port()
+                    .ok_or_else(|| HttpError::BadAddress(self.address.clone()))?;
+                let addrs = proxy.address.to_socket_addrs().map_err(|_| {
+                    HttpError::Proxy(format!("cannot resolve the proxy `{}`", proxy.address))
+                })?;
+                let mut s = connect_any(addrs, self.connect_timeout).map_err(|e| {
+                    HttpError::Proxy(match e {
+                        Some(e) => format!("cannot reach the proxy at {}: {e}", proxy.address),
+                        None => format!("cannot resolve the proxy `{}`", proxy.address),
+                    })
+                })?;
+                s.set_read_timeout(Some(PROXY_TIMEOUT))?;
+                s.set_write_timeout(Some(PROXY_TIMEOUT))?;
+                socks5_connect(&mut s, proxy.login.as_ref(), &target.host, port)?;
+                s
+            }
+        };
+        s.set_read_timeout(Some(self.timeout))?;
+        s.set_write_timeout(Some(self.timeout))?;
+        s.set_nodelay(true)?;
+        Ok(s)
     }
 
     /// `POST path` with `body`, returning the response body.
@@ -826,6 +968,150 @@ impl Target {
             host_header,
         })
     }
+
+    /// The port to connect to, when the address gives one.
+    fn port(&self) -> Option<u16> {
+        self.host_port.rsplit_once(':')?.1.parse().ok()
+    }
+}
+
+/// A connection to the first of `addrs` that takes one: `Err(Some(_))` with
+/// the last failure, and `Err(None)` when there was no address to try.
+fn connect_any(
+    addrs: impl Iterator<Item = std::net::SocketAddr>,
+    timeout: Duration,
+) -> Result<TcpStream, Option<std::io::Error>> {
+    let mut last = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last)
+}
+
+/// Ask a SOCKS5 proxy (RFC 1928) to connect to `host`, logging in with
+/// `login` (RFC 1929) when the proxy takes one, as `net::socks::client`'s
+/// `process_v5` does.
+///
+/// An address goes as an address, and a name as a name for the proxy to look
+/// up: never looked up here.
+fn socks5_connect<S: Read + Write>(
+    s: &mut S,
+    login: Option<&(String, String)>,
+    host: &str,
+    port: u16,
+) -> Result<(), HttpError> {
+    const VERSION: u8 = 5;
+    const NO_AUTH: u8 = 0;
+    const USER_PASS: u8 = 2;
+    let refused = |what: &str| HttpError::Proxy(what.to_string());
+
+    // `v5_auth_initial` offers both, and Tor takes the login when it is
+    // offered, which is what isolates a wallet's circuits.
+    if login.is_some() {
+        s.write_all(&[VERSION, 2, NO_AUTH, USER_PASS])?;
+    } else {
+        s.write_all(&[VERSION, 1, NO_AUTH])?;
+    }
+    let mut chosen = [0u8; 2];
+    s.read_exact(&mut chosen)?;
+    if chosen[0] != VERSION {
+        return Err(refused("it does not speak SOCKS5"));
+    }
+    match (chosen[1], login) {
+        (NO_AUTH, _) => {}
+        (USER_PASS, Some((user, pass))) => {
+            let (Ok(user_len), Ok(pass_len)) = (u8::try_from(user.len()), u8::try_from(pass.len()))
+            else {
+                return Err(refused("the login is longer than SOCKS5 can carry"));
+            };
+            let mut auth = vec![1, user_len];
+            auth.extend_from_slice(user.as_bytes());
+            auth.push(pass_len);
+            auth.extend_from_slice(pass.as_bytes());
+            s.write_all(&auth)?;
+            let mut status = [0u8; 2];
+            s.read_exact(&mut status)?;
+            if status[1] != 0 {
+                return Err(refused("it refused the login"));
+            }
+        }
+        _ => return Err(refused("it takes no way of logging in this wallet offers")),
+    }
+
+    let mut connect = vec![VERSION, 1, 0];
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            connect.push(1);
+            connect.extend_from_slice(&ip.octets());
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            connect.push(4);
+            connect.extend_from_slice(&ip.octets());
+        }
+        Err(_) => {
+            let len = u8::try_from(host.len()).map_err(|_| HttpError::BadAddress(host.into()))?;
+            connect.push(3);
+            connect.push(len);
+            connect.extend_from_slice(host.as_bytes());
+        }
+    }
+    connect.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&connect)?;
+    s.flush()?;
+
+    let mut reply = [0u8; 4];
+    s.read_exact(&mut reply)?;
+    if reply[0] != VERSION {
+        return Err(refused("it does not speak SOCKS5"));
+    }
+    if reply[1] != 0 {
+        return Err(HttpError::Proxy(format!(
+            "it could not reach {host}:{port}: {}",
+            socks5_reply(reply[1])
+        )));
+    }
+    // The address the proxy connected from, which nothing here needs.
+    let bound = match reply[3] {
+        1 => 4 + 2,
+        4 => 16 + 2,
+        3 => {
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len)?;
+            usize::from(len[0]) + 2
+        }
+        _ => return Err(refused("it answered with an address of no SOCKS5 type")),
+    };
+    let mut skip = [0u8; 257];
+    s.read_exact(&mut skip[..bound])?;
+    Ok(())
+}
+
+/// What a SOCKS5 reply code means: RFC 1928's, and the ones Tor adds for
+/// onion services (`socks-extensions.txt`).
+fn socks5_reply(code: u8) -> String {
+    let what = match code {
+        1 => "general failure",
+        2 => "not allowed by its rules",
+        3 => "network unreachable",
+        4 => "host unreachable",
+        5 => "connection refused",
+        6 => "TTL expired",
+        7 => "command not supported",
+        8 => "address type not supported",
+        0xf0 => "onion service descriptor not found",
+        0xf1 => "onion service descriptor is invalid",
+        0xf2 => "onion service introduction failed",
+        0xf3 => "onion service rendezvous failed",
+        0xf4 => "onion service needs client authorization",
+        0xf5 => "onion service client authorization is wrong",
+        0xf6 => "the onion address is invalid",
+        0xf7 => "onion service introduction timed out",
+        other => return format!("reply {other}"),
+    };
+    what.to_string()
 }
 
 /// A connection to a daemon: plain, or TLS.
@@ -1755,25 +2041,33 @@ mod tests {
             tls: TlsMode::Enabled,
             ..Default::default()
         };
-        assert!(enabled.lacks_strong_verification("node.example:34568", false));
-        assert!(!enabled.lacks_strong_verification("http://abc.onion:34568", false));
-        assert!(!enabled.lacks_strong_verification("abc.i2p:34568", false));
+        assert!(enabled.lacks_strong_verification("node.example:34568"));
+        assert!(!enabled.lacks_strong_verification("http://abc.onion:34568"));
+        assert!(!enabled.lacks_strong_verification("abc.i2p:34568"));
 
+        let proxy = Some(Proxy::parse("9050").expect("a proxy"));
         let pinned = ConnectOptions {
             certificates: Certificates::Pinned(Pins::default()),
+            proxy: proxy.clone(),
             ..enabled
         };
-        assert!(!pinned.lacks_strong_verification("node.example:34568", true));
+        assert!(!pinned.lacks_strong_verification("node.example:34568"));
 
         let auto = ConnectOptions::default();
-        assert!(!auto.lacks_strong_verification("node.example:34568", false));
-        assert!(auto.lacks_strong_verification("node.example:34568", true));
+        assert!(!auto.lacks_strong_verification("node.example:34568"));
+        let proxied = ConnectOptions {
+            proxy: proxy.clone(),
+            ..Default::default()
+        };
+        assert!(proxied.lacks_strong_verification("node.example:34568"));
+        assert!(!proxied.lacks_strong_verification("abc.onion:34568"));
 
         let any = ConnectOptions {
             certificates: Certificates::Any,
+            proxy,
             ..Default::default()
         };
-        assert!(!any.lacks_strong_verification("node.example:34568", true));
+        assert!(!any.lacks_strong_verification("node.example:34568"));
     }
 
     #[test]
@@ -1783,5 +2077,110 @@ mod tests {
         assert_eq!(parse_fingerprint(&"AB ".repeat(32)).expect("spaces"), [0xab; 32]);
         assert!(parse_fingerprint("abcd").expect_err("short").contains("32 bytes"));
         assert!(parse_fingerprint("zz").expect_err("not hex").contains("not hex"));
+    }
+
+    /// `--proxy` as the C++ takes it, SOCKS5 only, with a port alone meaning
+    /// this machine, and a login kept out of `{:?}`.
+    #[test]
+    fn a_proxy_is_read_as_typed() {
+        let p = Proxy::parse("127.0.0.1:9050").expect("host and port");
+        assert_eq!(p.address, "127.0.0.1:9050");
+        assert_eq!(p.login, None);
+        assert_eq!(Proxy::parse("9050").expect("port").address, "127.0.0.1:9050");
+        let p = Proxy::parse("socks5://alice:s3cret@[::1]:1080").expect("the lot");
+        assert_eq!(p.address, "[::1]:1080");
+        assert_eq!(p.login, Some(("alice".into(), "s3cret".into())));
+        assert!(!format!("{p:?}").contains("s3cret"), "{p:?}");
+
+        for bad in ["", "socks4://127.0.0.1:9050", "127.0.0.1", "127.0.0.1:0", ":9050", "@1"] {
+            assert!(Proxy::parse(bad).is_err(), "`{bad}` should be refused");
+        }
+
+        // A login of its own for the session, unless one was given.
+        let p = Proxy::parse("9050").expect("port").isolated(&[0xab; 8]);
+        assert_eq!(
+            p.login,
+            Some(("wow-wallet-abababababababab".into(), "abababababababab".into()))
+        );
+        let p = Proxy::parse("bob:pw@9050").expect("login").isolated(&[1; 8]);
+        assert_eq!(p.login, Some(("bob".into(), "pw".into())));
+    }
+
+    /// A SOCKS5 proxy that takes a login and connects wherever it is asked,
+    /// writing down where, and then answers one HTTP request itself.
+    fn fake_socks5(reply_code: u8) -> (u16, std::thread::JoinHandle<(String, u16, String)>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("an address").port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut greeting = [0u8; 4];
+            s.read_exact(&mut greeting).expect("greeting");
+            assert_eq!(greeting, [5, 2, 0, 2], "no auth, and a login");
+            s.write_all(&[5, 2]).expect("choose the login");
+            let mut head = [0u8; 2];
+            s.read_exact(&mut head).expect("login head");
+            let mut user = vec![0u8; usize::from(head[1])];
+            s.read_exact(&mut user).expect("user");
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).expect("password length");
+            let mut pass = vec![0u8; usize::from(len[0])];
+            s.read_exact(&mut pass).expect("password");
+            s.write_all(&[1, 0]).expect("logged in");
+
+            let mut request = [0u8; 4];
+            s.read_exact(&mut request).expect("connect");
+            assert_eq!(request[..3], [5, 1, 0]);
+            assert_eq!(request[3], 3, "a name, for the proxy to look up");
+            s.read_exact(&mut len).expect("name length");
+            let mut name = vec![0u8; usize::from(len[0])];
+            s.read_exact(&mut name).expect("name");
+            let mut port = [0u8; 2];
+            s.read_exact(&mut port).expect("port");
+            s.write_all(&[5, reply_code, 0, 1, 10, 0, 0, 1, 0x1f, 0x90])
+                .expect("reply");
+            if reply_code == 0 && read_request(&mut s) {
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                    .expect("answer");
+            }
+            (
+                String::from_utf8(name).expect("a name"),
+                u16::from_be_bytes(port),
+                String::from_utf8(user).expect("a user"),
+            )
+        });
+        (port, server)
+    }
+
+    /// Through a proxy, the node's name goes to the proxy unresolved -- a name
+    /// that resolves nowhere still works -- with the session's login.
+    #[test]
+    fn a_node_is_reached_through_a_socks5_proxy_by_name() {
+        let (port, proxy) = fake_socks5(0);
+        let endpoint = plain("node.invalid:34568".into()).with_proxy(Some(
+            Proxy::parse(&port.to_string())
+                .expect("a proxy")
+                .isolated(&[7; 8]),
+        ));
+        let body = endpoint
+            .post("/get_info", "application/json", b"")
+            .expect("through the proxy");
+        assert_eq!(body, b"hi");
+        let (name, node_port, user) = proxy.join().expect("the proxy");
+        assert_eq!(name, "node.invalid");
+        assert_eq!(node_port, 34568);
+        assert_eq!(user, "wow-wallet-0707070707070707");
+
+        let (port, proxy) = fake_socks5(5);
+        let e = plain("node.invalid:34568".into())
+            .with_proxy(Some(
+                Proxy::parse(&port.to_string())
+                    .expect("a proxy")
+                    .isolated(&[7; 8]),
+            ))
+            .post("/get_info", "application/json", b"")
+            .expect_err("refused");
+        proxy.join().expect("the proxy");
+        assert!(matches!(e, HttpError::Proxy(_)), "{e}");
+        assert!(e.to_string().contains("connection refused"), "{e}");
     }
 }

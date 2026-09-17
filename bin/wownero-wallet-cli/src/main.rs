@@ -67,6 +67,8 @@ struct Options {
     daemon_login: Option<String>,
     /// `--daemon-ssl` and the options beside it, as given.
     ssl: wow_daemon_client::SslFlags,
+    /// `--proxy`, as given: it may carry a password.
+    proxy: Option<String>,
     /// `None` when not given, so a restore knows to ask.
     restore_height: Option<u64>,
     kdf_rounds: u64,
@@ -98,6 +100,7 @@ impl std::fmt::Debug for Options {
             .field("daemon", &self.daemon)
             .field("daemon_login", &redacted(&self.daemon_login))
             .field("ssl", &self.ssl)
+            .field("proxy", &redacted(&self.proxy))
             .field("restore_height", &self.restore_height)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("language", &self.language)
@@ -125,6 +128,7 @@ impl Default for Options {
             daemon: None,
             daemon_login: None,
             ssl: Default::default(),
+            proxy: None,
             restore_height: None,
             kdf_rounds: 1,
             language: None,
@@ -175,6 +179,9 @@ Whatever the options below leave out is asked for.
   --daemon-ssl-allow-any-cert       accept any certificate
   --daemon-ssl-certificate <path> --daemon-ssl-private-key <path>
                                     a certificate to show a daemon that asks
+  --proxy [socks5://][<user>:<pass>@][<host>:]<port>
+                                    reach the daemon through a SOCKS5 proxy,
+                                    Tor's say; its name is not looked up here
   --testnet / --stagenet
   --restore-height <n>
   --mnemonic-language <lang>
@@ -257,6 +264,7 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
                 .push(next("--daemon-ssl-allowed-fingerprints")?),
             "--daemon-ssl-allow-any-cert" => o.ssl.allow_any_cert = true,
             "--daemon-ssl-allow-chained" => o.ssl.allow_chained = true,
+            "--proxy" => o.proxy = Some(next("--proxy")?),
             "--daemon-host" => {
                 let host = next("--daemon-host")?;
                 o.daemon = Some(format!("{host}:34568"));
@@ -406,17 +414,28 @@ fn start_logging(o: &Options) -> Result<(), String> {
     Ok(())
 }
 
-/// The `--daemon-ssl` options made sense of, and refused where `make_basic`
-/// refuses them: before any password is asked for.
+/// The `--daemon-ssl` and `--proxy` options made sense of, and refused where
+/// `make_basic` refuses them: before any password is asked for.
 fn daemon_options(o: &Options, daemon: &str) -> Result<wow_daemon_client::ConnectOptions, String> {
-    let options = wow_daemon_client::ConnectOptions::from_flags(&o.ssl)?;
-    if options.lacks_strong_verification(daemon, false) {
-        return Err(
-            "Enabling --daemon-ssl requires --daemon-ssl-allow-any-cert or \
+    let mut options = wow_daemon_client::ConnectOptions::from_flags(&o.ssl)?;
+    if let Some(text) = &o.proxy {
+        let proxy = wow_daemon_client::Proxy::parse(text).map_err(|e| format!("--proxy: {e}"))?;
+        // A login of this session's own, so Tor keeps its circuits apart.
+        let mut token = [0u8; 16];
+        term::seeded_rng()?.fill(&mut token);
+        options.proxy = Some(proxy.isolated(&token));
+    }
+    if options.lacks_strong_verification(daemon) {
+        let flag = if options.proxy.is_some() {
+            "--proxy"
+        } else {
+            "--daemon-ssl"
+        };
+        return Err(format!(
+            "Enabling {flag} requires --daemon-ssl-allow-any-cert or \
              --daemon-ssl-ca-certificates or --daemon-ssl-allowed-fingerprints or use of a \
              .onion/.i2p domain"
-                .into(),
-        );
+        ));
     }
     Ok(options)
 }
@@ -756,6 +775,34 @@ mod tests {
         assert!(daemon_options(&enabled, "abc.onion:34568").is_ok());
         let plain = opts(&["--wallet-file", "w"]).expect("parses");
         assert!(daemon_options(&plain, "node.example:34568").is_ok());
+    }
+
+    /// `--proxy`, and what `make_basic` asks of a node reached through one: a
+    /// certificate named ahead, or an onion address.
+    #[test]
+    fn a_proxy_needs_a_named_certificate_or_an_onion() {
+        let o = opts(&["--wallet-file", "w", "--proxy", "127.0.0.1:9050"]).expect("parses");
+        assert_eq!(o.proxy.as_deref(), Some("127.0.0.1:9050"));
+        let e = daemon_options(&o, "node.example:34568").expect_err("clearnet, unchecked");
+        assert!(e.contains("Enabling --proxy"), "{e}");
+        let options = daemon_options(&o, "abc.onion:34568").expect("an onion");
+        let proxy = options.proxy.expect("the proxy");
+        assert_eq!(proxy.address, "127.0.0.1:9050");
+        assert!(proxy.login.is_some(), "a login of the session's own");
+
+        let any = opts(&[
+            "--wallet-file",
+            "w",
+            "--proxy",
+            "9050",
+            "--daemon-ssl-allow-any-cert",
+        ])
+        .expect("parses");
+        assert!(daemon_options(&any, "node.example:34568").is_ok());
+
+        let socks4 = opts(&["--wallet-file", "w", "--proxy", "socks4://127.0.0.1:9050"])
+            .expect("parses");
+        assert!(daemon_options(&socks4, "abc.onion:34568").is_err());
     }
 
     #[test]

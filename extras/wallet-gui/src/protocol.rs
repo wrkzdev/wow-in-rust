@@ -67,6 +67,10 @@ pub enum Command {
     /// node's certificate being checked. The desktop only: a browser decides
     /// that itself.
     AcceptAnyCertificate(Vec<String>),
+    /// Reach nodes through this SOCKS5 proxy, as `--proxy` takes one, or
+    /// directly with `None`. The node in use is connected to again. The
+    /// desktop only: a page cannot open a socket to a proxy.
+    SetProxy(Option<String>),
     /// Log in to a node started with `--rpc-login`, or stop trying with
     /// `None`. The desktop only: a browser's `fetch` does not do HTTP Digest.
     ///

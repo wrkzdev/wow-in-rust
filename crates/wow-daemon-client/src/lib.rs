@@ -70,8 +70,8 @@ use serde_json::{json, Value as Json};
 use wow_serialize::epee::{self, Section};
 
 pub use http::{
-    parse_fingerprint, Certificates, ClientCertificate, ConnectOptions, Endpoint, HttpError, Pins,
-    Security, SslFlags, TlsMode, Transport, BINARY_CONTENT_TYPE,
+    is_onion_or_i2p, parse_fingerprint, Certificates, ClientCertificate, ConnectOptions, Endpoint,
+    HttpError, Pins, Proxy, Security, SslFlags, TlsMode, Transport, BINARY_CONTENT_TYPE,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use tls::fingerprint;

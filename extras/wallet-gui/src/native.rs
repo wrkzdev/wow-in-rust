@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use wow_daemon_client::{Certificates, DaemonClient, Endpoint};
+use wow_daemon_client::{Certificates, DaemonClient, Endpoint, Proxy, TlsMode};
 use wow_wallet::files::Paths;
 use wow_wallet::store::{FileStore, Store};
 
@@ -218,13 +218,23 @@ impl Platform for Folder {
         node: &NodeAddress,
         any_certificate: bool,
         login: Option<&wow_daemon_client::digest::Credentials>,
+        proxy: Option<&Proxy>,
     ) -> DaemonClient {
         let certificates = if any_certificate {
             Certificates::Any
         } else {
             Certificates::Checked
         };
-        let mut endpoint = Endpoint::new(node.url()).with_certificates(certificates);
+        let mut endpoint = Endpoint::new(node.url())
+            .with_certificates(certificates)
+            .with_proxy(proxy.cloned());
+        // Through a proxy, whoever runs its exit could read and change plain
+        // HTTP, and could pose as the node to TLS that is let fall back. So a
+        // node that is not .onion or .i2p is reached over TLS or not at all:
+        // what `wallet2`'s `make_basic` asks for, with a proxy.
+        if proxy.is_some() && !node.is_onion() && !node.is_i2p() {
+            endpoint = endpoint.with_tls(TlsMode::Enabled);
+        }
         if let Some(c) = login {
             endpoint = endpoint.with_login(c.clone());
         }
@@ -326,14 +336,15 @@ impl Host for NativeHost {
         }
     }
 
-    fn fetch_nodes(&mut self, url: &str) {
+    fn fetch_nodes(&mut self, url: &str, proxy: Option<&str>) {
         let events = self.events_out.clone();
         let ctx = self.ctx.clone();
         let url = url.to_string();
+        let proxy = proxy.map(str::to_string);
         let spawned = std::thread::Builder::new()
             .name("node list".into())
             .spawn(move || {
-                let result = fetch_list(&url).map_err(|e| unfetched(&e));
+                let result = fetch_list(&url, proxy.as_deref()).map_err(|e| unfetched(&e));
                 if events.send(Event::NodeList(result)).is_ok() {
                     ctx.request_repaint();
                 }
@@ -345,16 +356,29 @@ impl Host for NativeHost {
     }
 }
 
-/// The public list, over https. `url` is on [`nodes::LIST_SITE`].
-fn fetch_list(url: &str) -> Result<Vec<Node>, String> {
+/// The public list, over https, through `proxy` when there is one. `url` is
+/// on [`nodes::LIST_SITE`].
+fn fetch_list(url: &str, proxy: Option<&str>) -> Result<Vec<Node>, String> {
     let path = url
         .strip_prefix(nodes::LIST_SITE)
         .ok_or_else(|| format!("{url} is not on {}", nodes::LIST_SITE))?;
     let body = Endpoint::new(nodes::LIST_SITE)
+        .with_proxy(isolated_proxy(proxy)?)
         .get(path)
         .map_err(|e| e.to_string())?;
     let text = String::from_utf8(body).map_err(|e| e.to_string())?;
     nodes::parse_listing(&text)
+}
+
+/// `proxy` as typed, with a login of its own: a fetch of the public list does
+/// not share a Tor circuit with the wallet's requests to its node.
+fn isolated_proxy(proxy: Option<&str>) -> Result<Option<Proxy>, String> {
+    let Some(text) = proxy else {
+        return Ok(None);
+    };
+    let mut token = [0u8; 16];
+    wow_wallet::entropy::seeded_rng()?.fill(&mut token);
+    Ok(Some(Proxy::parse(text)?.isolated(&token)))
 }
 
 fn unfetched(why: &str) -> String {

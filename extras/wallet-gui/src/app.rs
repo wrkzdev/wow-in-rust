@@ -85,8 +85,9 @@ pub trait Host {
     fn download(&mut self, name: &str, bytes: &[u8]);
     /// Ask for a file, which arrives as [`Event::Picked`]. The browser only.
     fn pick_file(&mut self, purpose: Pick);
-    /// Fetch the public node list, which arrives as [`Event::NodeList`].
-    fn fetch_nodes(&mut self, url: &str);
+    /// Fetch the public node list, which arrives as [`Event::NodeList`]:
+    /// through `proxy`, where the host can use one.
+    fn fetch_nodes(&mut self, url: &str, proxy: Option<&str>);
     /// Seconds east of UTC where the wallet runs, at `timestamp`: for times
     /// as the local clock reads them.
     fn utc_offset(&self, timestamp: u64) -> i64;
@@ -140,6 +141,9 @@ pub struct Settings {
     /// was, is not read back: trusting one's own node's certificate should not
     /// stop every other node's being checked.
     pub any_certificate_nodes: Vec<String>,
+    /// The SOCKS5 proxy nodes and the public node list are reached through,
+    /// as `--proxy` takes one; empty for none. The desktop only.
+    pub proxy: String,
     pub theme: Theme,
     /// The whole interface's zoom, 1 being this wallet's own text sizes.
     pub text_scale: f32,
@@ -174,6 +178,7 @@ impl Default for Settings {
             accepted_risk: false,
             last_wallet: String::new(),
             any_certificate_nodes: Vec::new(),
+            proxy: String::new(),
             theme: Theme::System,
             text_scale: 1.0,
             hide_notice: false,
@@ -451,6 +456,8 @@ struct NodePicker {
     /// long as the window does.
     login_user: String,
     login_pass: String,
+    /// The proxy as typed, before it is used; `None` until first shown.
+    proxy_input: Option<String>,
 }
 
 enum Test {
@@ -572,6 +579,9 @@ impl WalletApp {
         host.send(Command::AcceptAnyCertificate(
             settings.any_certificate_nodes.clone(),
         ));
+        if !host.in_browser() && !settings.proxy.trim().is_empty() {
+            host.send(Command::SetProxy(Some(settings.proxy.clone())));
+        }
         host.send(Command::SetLog {
             level: settings.log_level,
             to_file: settings.log_to_file,
@@ -1135,6 +1145,7 @@ impl WalletApp {
                     wallet_open: open,
                     in_browser,
                     secure,
+                    proxy: !in_browser && !self.settings.proxy.trim().is_empty(),
                 };
                 node_picker(ui, &mut self.nodes, &mut self.settings, &mut *self.host, cx);
             }
@@ -2916,6 +2927,8 @@ struct NodeContext {
     wallet_open: bool,
     in_browser: bool,
     secure: bool,
+    /// Nodes are reached through a proxy.
+    proxy: bool,
 }
 
 /// A node typed in or picked from the list, each with a Test button.
@@ -2933,7 +2946,11 @@ fn node_picker(
         picker.fetched = Some(cx.network);
         picker.fetching = true;
         picker.list = nodes::own_nodes(cx.network);
-        host.fetch_nodes(&nodes::list_url(cx.network));
+        let proxy = settings.proxy.trim();
+        host.fetch_nodes(
+            &nodes::list_url(cx.network),
+            (cx.proxy && !proxy.is_empty()).then_some(proxy),
+        );
     }
     let use_label = if cx.wallet_open { "Use" } else { "Choose" };
     let weak = ui.visuals().weak_text_color();
@@ -2966,7 +2983,7 @@ fn node_picker(
     let input = picker.input.trim().to_string();
     match NodeAddress::parse(&input) {
         Ok(node) => {
-            if let Some(why) = node.unreachable_reason(cx.in_browser, cx.secure) {
+            if let Some(why) = node.unreachable_reason(cx.in_browser, cx.secure, cx.proxy) {
                 ui.colored_label(t.warn, why);
             }
         }
@@ -3055,6 +3072,51 @@ fn node_picker(
         if !picker.login_user.is_empty() {
             ui.label("Kept until this window closes; it is not saved with the settings.");
         }
+
+        // A page cannot open a socket to a proxy, so this is the desktop's.
+        ui.add_space(8.0);
+        ui.label(RichText::new("Proxy").strong());
+        ui.label(
+            "A SOCKS5 proxy to reach nodes and the node list through: Tor's is 127.0.0.1:9050. A \
+             node's name then goes to the proxy, and .onion and .i2p nodes can be used. Other \
+             nodes are reached only over TLS through it, so whoever runs its exit can neither \
+             read what this wallet asks nor pose as the node.",
+        );
+        let proxy_input = picker
+            .proxy_input
+            .get_or_insert_with(|| settings.proxy.clone());
+        let mut apply = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                TextEdit::singleline(proxy_input)
+                    .hint_text("127.0.0.1:9050")
+                    .desired_width(200.0),
+            );
+            let typed = proxy_input.trim().to_string();
+            let valid = typed.is_empty() || wow_daemon_client::Proxy::parse(&typed).is_ok();
+            let changed = typed != settings.proxy;
+            if ui.add_enabled(valid && changed, Button::new("Use")).clicked() {
+                apply = Some(typed.clone());
+            }
+            if !settings.proxy.is_empty() && ui.button("None").clicked() {
+                apply = Some(String::new());
+            }
+            if !valid {
+                if let Err(e) = wow_daemon_client::Proxy::parse(&typed) {
+                    ui.colored_label(t.bad, e);
+                }
+            }
+        });
+        if let Some(proxy) = apply {
+            *proxy_input = proxy.clone();
+            settings.proxy = proxy.clone();
+            host.send(Command::SetProxy((!proxy.is_empty()).then_some(proxy)));
+            // The list comes again, through the proxy or not.
+            picker.fetched = None;
+        }
+        if !settings.proxy.is_empty() {
+            ui.label(format!("Nodes are reached through {}.", settings.proxy));
+        }
     }
 
     ui.add_space(16.0);
@@ -3096,7 +3158,7 @@ fn node_picker(
                 for node in &picker.list {
                     let unusable = NodeAddress::parse(&node.url)
                         .ok()
-                        .and_then(|a| a.unreachable_reason(cx.in_browser, cx.secure));
+                        .and_then(|a| a.unreachable_reason(cx.in_browser, cx.secure, cx.proxy));
                     ui.label(RichText::new(node.url.as_str()).monospace())
                         .on_hover_text(node.country_name.as_deref().unwrap_or("location unknown"));
                     ui.label(node.note.as_deref().unwrap_or(""));

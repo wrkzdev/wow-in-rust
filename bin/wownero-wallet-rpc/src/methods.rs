@@ -145,7 +145,7 @@ pub fn dispatch(state: &State, method: &str, params: &Value) -> MethodResult {
             "this build does not keep transaction keys yet",
         )),
         "set_daemon" => {
-            let out = set_daemon(session, params)?;
+            let out = set_daemon(session, params, state.has_proxy_option())?;
             // Remember it for wallets opened later, not just this one.
             if let Some(a) = params.get("address").and_then(Value::as_str) {
                 state.set_daemon_address(a);
@@ -770,19 +770,48 @@ const SSL_PARAMS: [&str; 6] = [
     "ssl_allow_any_cert",
 ];
 
-fn set_daemon(session: &mut Session, params: &Value) -> MethodResult {
+fn set_daemon(session: &mut Session, params: &Value, proxy_option: bool) -> MethodResult {
     let address = params
         .get("address")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::new(errors::NO_DAEMON_CONNECTION, "address is missing"))?;
+    // `proxy`: one for this daemon alone, which `--proxy` rules out, as
+    // `on_set_daemon` rules it out.
+    let proxy = match params
+        .get("proxy")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+    {
+        Some(_) if proxy_option => {
+            return Err(Error::new(
+                errors::PROXY_ALREADY_DEFINED,
+                "It is not possible to set daemon specific proxy when --proxy is defined.",
+            ))
+        }
+        Some(text) => {
+            let proxy = wow_daemon_client::Proxy::parse(text)
+                .map_err(|e| Error::new(errors::NO_DAEMON_CONNECTION, e))?;
+            let mut token = [0u8; 16];
+            wow_wallet::entropy::seeded_rng()
+                .map_err(internal)?
+                .fill(&mut token);
+            Some(proxy.isolated(&token))
+        }
+        None => None,
+    };
     // A request that names none of the TLS parameters keeps how the node is
     // reached now: what the server was started with, which its own
     // `set_daemon` at startup does not repeat. Taken on only once the node
     // has answered, so a refused request changes nothing.
-    let options = if SSL_PARAMS.iter().any(|p| params.get(*p).is_some()) {
+    let mut options = if SSL_PARAMS.iter().any(|p| params.get(*p).is_some()) {
         daemon_options(params, address)?
     } else {
         session.daemon_options.clone()
+    };
+    options.proxy = if proxy_option {
+        session.daemon_options.proxy.clone()
+    } else {
+        proxy
     };
     let kept = std::mem::replace(&mut session.daemon_options, options);
     let client = session.client_for(address);
@@ -843,7 +872,7 @@ fn daemon_options(
     };
     let options = wow_daemon_client::ConnectOptions::from_flags(&flags)
         .map_err(|e| Error::new(errors::NO_DAEMON_CONNECTION, e))?;
-    if options.lacks_strong_verification(address, false) {
+    if options.lacks_strong_verification(address) {
         return Err(Error::new(
             errors::NO_DAEMON_CONNECTION,
             "SSL is enabled but no user certificate or fingerprints were provided",
