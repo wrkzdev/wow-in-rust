@@ -4,6 +4,22 @@
 //! the exact ones on the wire — a C++ node looks them up by name, so a rename
 //! is a break.
 //!
+//! # What the C++ leaves out
+//!
+//! Two epee rules decide which entries a message carries, and a node that
+//! wrote more than the C++ does could be told apart by its bytes alone:
+//!
+//! * `KV_SERIALIZE_OPT(x, default)` skips `x` on store when it equals its
+//!   default (`contrib/epee/include/serialization/keyvalue_serialization.h`).
+//! * An empty container -- an array, or a `CONTAINER_POD_AS_BLOB` string -- is
+//!   not stored at all, optional or not (`serialize_stl_container_t_val`,
+//!   `serialize_stl_container_t_obj` and
+//!   `serialize_stl_container_pod_val_as_blob` in
+//!   `keyvalue_serialization_overloads.h` return before inserting anything).
+//!
+//! Reading goes the other way: an absent entry is its default, as the C++
+//! loader has it, so a peer that writes more than it must is still read.
+//!
 //! # Everything here parses bytes a stranger chose
 //!
 //! A peer is unauthenticated. `specs/15` §4.4 governs: **never panic**. Every
@@ -130,8 +146,16 @@ fn hashes_of(s: &Section, name: &'static str, max: usize) -> Result<Vec<[u8; 32]
     Ok(raw.as_chunks::<32>().0.to_vec())
 }
 
-fn packed_hashes(hashes: &[[u8; 32]]) -> Value {
-    Value::String(hashes.iter().flatten().copied().collect())
+/// Store a `CONTAINER_POD_AS_BLOB`: the elements packed into one string, and
+/// no entry at all when there are none.
+fn insert_pod_blob(s: &mut Section, name: &str, packed: Vec<u8>) {
+    if !packed.is_empty() {
+        s.insert(name.into(), Value::String(packed));
+    }
+}
+
+fn packed_hashes(hashes: &[[u8; 32]]) -> Vec<u8> {
+    hashes.iter().flatten().copied().collect()
 }
 
 fn strings(items: &[Vec<u8>]) -> Value {
@@ -155,17 +179,26 @@ pub struct BasicNodeData {
 }
 
 impl BasicNodeData {
+    /// `rpc_port`, `rpc_credits_per_hash` and `support_flags` are
+    /// `KV_SERIALIZE_OPT` with a default of zero, so zero is left out;
+    /// `my_port` is plain `KV_SERIALIZE` and is written even when zero.
     pub fn to_section(&self) -> Section {
         let mut s = Section::new();
         s.insert("network_id".into(), Value::String(self.network_id.to_vec()));
         s.insert("peer_id".into(), Value::U64(self.peer_id));
         s.insert("my_port".into(), Value::U32(self.my_port));
-        s.insert("rpc_port".into(), Value::U16(self.rpc_port));
-        s.insert(
-            "rpc_credits_per_hash".into(),
-            Value::U32(self.rpc_credits_per_hash),
-        );
-        s.insert("support_flags".into(), Value::U32(self.support_flags));
+        if self.rpc_port != 0 {
+            s.insert("rpc_port".into(), Value::U16(self.rpc_port));
+        }
+        if self.rpc_credits_per_hash != 0 {
+            s.insert(
+                "rpc_credits_per_hash".into(),
+                Value::U32(self.rpc_credits_per_hash),
+            );
+        }
+        if self.support_flags != 0 {
+            s.insert("support_flags".into(), Value::U32(self.support_flags));
+        }
         s
     }
 
@@ -208,14 +241,20 @@ impl CoreSyncData {
             "cumulative_difficulty".into(),
             Value::U64(self.cumulative_difficulty as u64),
         );
-        // Always written, even when zero, which is what the reference does.
+        // Always written, even when zero, which is what the reference does:
+        // it is `KV_SERIALIZE` on store and `KV_SERIALIZE_OPT` only on load.
         s.insert(
             "cumulative_difficulty_top64".into(),
             Value::U64((self.cumulative_difficulty >> 64) as u64),
         );
         s.insert("top_id".into(), Value::String(self.top_id.to_vec()));
-        s.insert("top_version".into(), Value::U8(self.top_version));
-        s.insert("pruning_seed".into(), Value::U32(self.pruning_seed));
+        // Both `KV_SERIALIZE_OPT` with a default of zero.
+        if self.top_version != 0 {
+            s.insert("top_version".into(), Value::U8(self.top_version));
+        }
+        if self.pruning_seed != 0 {
+            s.insert("pruning_seed".into(), Value::U32(self.pruning_seed));
+        }
         s
     }
 
@@ -394,14 +433,24 @@ impl PeerlistEntry {
     }
 
     /// `peerlist_entry` as the C++ writes it (`specs/08` §3.2).
+    ///
+    /// `adr` and `id` always; `last_seen`, `pruning_seed`, `rpc_port` and
+    /// `rpc_credits_per_hash` are `KV_SERIALIZE_OPT` with a default of zero
+    /// and only written when set. This node keeps no credits per hash, so
+    /// that one never is.
     pub fn to_section(&self) -> Section {
         let mut s = Section::new();
         s.insert("adr".into(), Value::Object(self.address.to_section()));
         s.insert("id".into(), Value::U64(self.id));
-        s.insert("last_seen".into(), Value::I64(self.last_seen));
-        s.insert("pruning_seed".into(), Value::U32(self.pruning_seed));
-        s.insert("rpc_port".into(), Value::U16(self.rpc_port));
-        s.insert("rpc_credits_per_hash".into(), Value::U32(0));
+        if self.last_seen != 0 {
+            s.insert("last_seen".into(), Value::I64(self.last_seen));
+        }
+        if self.pruning_seed != 0 {
+            s.insert("pruning_seed".into(), Value::U32(self.pruning_seed));
+        }
+        if self.rpc_port != 0 {
+            s.insert("rpc_port".into(), Value::U16(self.rpc_port));
+        }
         s
     }
 }
@@ -454,7 +503,7 @@ impl HandshakeRequest {
     }
 }
 
-/// A `COMMAND_HANDSHAKE` response.
+/// A `COMMAND_HANDSHAKE` response. An empty peer list is no entry at all.
 pub fn handshake_response(
     node: &BasicNodeData,
     sync: &CoreSyncData,
@@ -463,7 +512,9 @@ pub fn handshake_response(
     let mut s = Section::new();
     s.insert("node_data".into(), Value::Object(node.to_section()));
     s.insert("payload_data".into(), Value::Object(sync.to_section()));
-    s.insert("local_peerlist_new".into(), peer_list_value(peers));
+    if !peers.is_empty() {
+        s.insert("local_peerlist_new".into(), peer_list_value(peers));
+    }
     epee::to_bytes(&s).unwrap_or_default()
 }
 
@@ -489,11 +540,14 @@ impl TimedSync {
     }
 }
 
-/// A `COMMAND_TIMED_SYNC` response that offers peers.
+/// A `COMMAND_TIMED_SYNC` response that offers peers. An empty peer list is
+/// no entry at all.
 pub fn timed_sync_response_with_peers(sync: &CoreSyncData, peers: &[PeerlistEntry]) -> Vec<u8> {
     let mut s = Section::new();
     s.insert("payload_data".into(), Value::Object(sync.to_section()));
-    s.insert("local_peerlist_new".into(), peer_list_value(peers));
+    if !peers.is_empty() {
+        s.insert("local_peerlist_new".into(), peer_list_value(peers));
+    }
     epee::to_bytes(&s).unwrap_or_default()
 }
 
@@ -576,11 +630,13 @@ pub fn chain_entry_response(
         "cumulative_difficulty_top64".into(),
         Value::U64((cumulative_difficulty >> 64) as u64),
     );
-    s.insert("m_block_ids".into(), packed_hashes(block_ids));
-    s.insert(
-        "m_block_weights".into(),
-        Value::String(block_weights.iter().flat_map(|w| w.to_le_bytes()).collect()),
+    insert_pod_blob(&mut s, "m_block_ids", packed_hashes(block_ids));
+    insert_pod_blob(
+        &mut s,
+        "m_block_weights",
+        block_weights.iter().flat_map(|w| w.to_le_bytes()).collect(),
     );
+    // A `std::string`, not a container: written even when empty.
     s.insert("first_block".into(), Value::String(first_block.to_vec()));
     epee::to_bytes(&s).unwrap_or_default()
 }
@@ -607,12 +663,19 @@ impl ObjectsRequest {
 
 impl BlockEntry {
     /// `block_complete_entry`, unpruned (`specs/08` §3.5).
+    ///
+    /// `pruned` is `KV_SERIALIZE_OPT(pruned, false)` and so never written
+    /// here, `block_weight` is optional with a default of zero, and a block
+    /// with no transactions has no `txs` entry.
     pub fn to_section(&self) -> Section {
         let mut s = Section::new();
-        s.insert("pruned".into(), Value::Bool(false));
         s.insert("block".into(), Value::String(self.block.clone()));
-        s.insert("block_weight".into(), Value::U64(self.block_weight));
-        s.insert("txs".into(), strings(&self.txs));
+        if self.block_weight != 0 {
+            s.insert("block_weight".into(), Value::U64(self.block_weight));
+        }
+        if !self.txs.is_empty() {
+            s.insert("txs".into(), strings(&self.txs));
+        }
         s
     }
 }
@@ -624,11 +687,13 @@ pub fn objects_response(
     current_blockchain_height: u64,
 ) -> Vec<u8> {
     let mut s = Section::new();
-    s.insert(
-        "blocks".into(),
-        section_array(blocks.iter().map(BlockEntry::to_section).collect()),
-    );
-    s.insert("missed_ids".into(), packed_hashes(missed_ids));
+    if !blocks.is_empty() {
+        s.insert(
+            "blocks".into(),
+            section_array(blocks.iter().map(BlockEntry::to_section).collect()),
+        );
+    }
+    insert_pod_blob(&mut s, "missed_ids", packed_hashes(missed_ids));
     s.insert(
         "current_blockchain_height".into(),
         Value::U64(current_blockchain_height),
@@ -714,14 +779,13 @@ impl FluffyMissingTxs {
             "current_blockchain_height".into(),
             Value::U64(self.current_blockchain_height),
         );
-        s.insert(
-            "missing_tx_indices".into(),
-            Value::String(
-                self.missing_tx_indices
-                    .iter()
-                    .flat_map(|i| i.to_le_bytes())
-                    .collect(),
-            ),
+        insert_pod_blob(
+            &mut s,
+            "missing_tx_indices",
+            self.missing_tx_indices
+                .iter()
+                .flat_map(|i| i.to_le_bytes())
+                .collect(),
         );
         epee::to_bytes(&s).unwrap_or_default()
     }
@@ -793,7 +857,7 @@ impl TxpoolComplement {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut s = Section::new();
-        s.insert("hashes".into(), packed_hashes(&self.hashes));
+        insert_pod_blob(&mut s, "hashes", packed_hashes(&self.hashes));
         epee::to_bytes(&s).unwrap_or_default()
     }
 }
@@ -853,15 +917,15 @@ impl HandshakeResponse {
     }
 }
 
-/// `NOTIFY_REQUEST_CHAIN` (`specs/08` §5.2).
+/// `NOTIFY_REQUEST_CHAIN` (`specs/08` §5.2). `prune` is
+/// `KV_SERIALIZE_OPT(prune, false)`, written only when set.
 pub fn request_chain(block_ids: &[[u8; 32]], prune: bool) -> Vec<u8> {
     let mut s = Section::new();
     // `CONTAINER_POD_AS_BLOB`: one string of concatenated hashes.
-    s.insert(
-        "block_ids".into(),
-        Value::String(block_ids.iter().flatten().copied().collect()),
-    );
-    s.insert("prune".into(), Value::Bool(prune));
+    insert_pod_blob(&mut s, "block_ids", packed_hashes(block_ids));
+    if prune {
+        s.insert("prune".into(), Value::Bool(true));
+    }
     epee::to_bytes(&s).unwrap_or_default()
 }
 
@@ -907,14 +971,14 @@ impl ChainEntry {
     }
 }
 
-/// `NOTIFY_REQUEST_GET_OBJECTS` (`specs/08` §5.4).
+/// `NOTIFY_REQUEST_GET_OBJECTS` (`specs/08` §5.4). `prune` is written only
+/// when set, as for [`request_chain`].
 pub fn request_objects(blocks: &[[u8; 32]], prune: bool) -> Vec<u8> {
     let mut s = Section::new();
-    s.insert(
-        "blocks".into(),
-        Value::String(blocks.iter().flatten().copied().collect()),
-    );
-    s.insert("prune".into(), Value::Bool(prune));
+    insert_pod_blob(&mut s, "blocks", packed_hashes(blocks));
+    if prune {
+        s.insert("prune".into(), Value::Bool(true));
+    }
     epee::to_bytes(&s).unwrap_or_default()
 }
 
@@ -1059,12 +1123,10 @@ pub const PING_OK: &str = "OK";
 /// A `COMMAND_TIMED_SYNC` response (`specs/08` §4.4).
 ///
 /// The peer list is empty: this node has no peers of its own to offer that the
-/// other side did not already give it.
+/// other side did not already give it. Empty, the C++ writes no
+/// `local_peerlist_new` entry at all, and neither does this.
 pub fn timed_sync_response(sync: &CoreSyncData) -> Vec<u8> {
-    let mut s = Section::new();
-    s.insert("payload_data".into(), Value::Object(sync.to_section()));
-    s.insert("local_peerlist_new".into(), section_array(Vec::new()));
-    epee::to_bytes(&s).unwrap_or_default()
+    timed_sync_response_with_peers(sync, &[])
 }
 
 /// Build an array value from sections, for the few places this node sends one.
@@ -1121,8 +1183,415 @@ mod tests {
         assert_eq!(back.cumulative_difficulty, 5_678);
         assert_eq!(back.top_id, [7u8; 32]);
         assert!(
-            s.contains_key("local_peerlist_new"),
-            "the field is present even when empty; the reference reads it"
+            !s.contains_key("local_peerlist_new"),
+            "an empty list is no entry, as the reference writes it"
+        );
+        assert!(TimedSync::parse(&timed_sync_response(&ours))
+            .expect("an absent list reads as an empty one")
+            .peers
+            .is_empty());
+    }
+
+    // ---- bytes as the C++ writes them ----
+    //
+    // The expected bytes below are put together by hand from epee's
+    // `portable_storage_to_bin.h`, not by the encoder they check: the nine
+    // header bytes, then the root section. A section is a varint count of its
+    // entries, then each entry in name order -- a C++ section is a `std::map`
+    // -- as a one-byte name length, the name, a type byte and the value. An
+    // array's type byte carries `SERIALIZE_FLAG_ARRAY` and is followed by a
+    // varint count and the elements, which have no type byte of their own. A
+    // varint below 64 is the byte `n << 2`; below 16384 it is `(n << 2) | 1`
+    // as a little-endian `u16`.
+
+    /// `SERIALIZE_TYPE_*` and `SERIALIZE_FLAG_ARRAY` (`portable_storage_base.h`).
+    const T_I64: u8 = 1;
+    const T_U64: u8 = 5;
+    const T_U32: u8 = 6;
+    const T_U16: u8 = 7;
+    const T_U8: u8 = 8;
+    const T_STRING: u8 = 10;
+    const T_BOOL: u8 = 11;
+    const T_OBJECT: u8 = 12;
+    const T_ARRAY: u8 = 0x80;
+
+    const PEER_ID: u64 = 0x0123_4567_89ab_cdef;
+
+    fn varint(n: usize) -> Vec<u8> {
+        if n < 64 {
+            vec![(n << 2) as u8]
+        } else {
+            assert!(n < 16_384, "these tests need no longer varint");
+            (((n << 2) | 1) as u16).to_le_bytes().to_vec()
+        }
+    }
+
+    fn le64(v: u64) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    fn le32(v: u32) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    fn le16(v: u16) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    /// A STRING: a varint length, then the bytes.
+    fn blob(bytes: &[u8]) -> Vec<u8> {
+        let mut out = varint(bytes.len());
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// A section from its entries: name, type byte and value.
+    fn section(entries: &[(&str, u8, Vec<u8>)]) -> Vec<u8> {
+        assert!(
+            entries.windows(2).all(|w| w[0].0 < w[1].0),
+            "a C++ section writes its entries in name order"
+        );
+        let mut out = varint(entries.len());
+        for (name, ty, value) in entries {
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.push(*ty);
+            out.extend_from_slice(value);
+        }
+        out
+    }
+
+    /// An array's value after its type byte: a varint count, then the
+    /// elements.
+    fn elements(items: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = varint(items.len());
+        for i in items {
+            out.extend_from_slice(i);
+        }
+        out
+    }
+
+    /// A whole message: `PORTABLE_STORAGE_SIGNATUREA` and `_SIGNATUREB` as
+    /// little-endian `u32`s, `PORTABLE_STORAGE_FORMAT_VER`, the root section.
+    fn message(root: &[(&str, u8, Vec<u8>)]) -> Vec<u8> {
+        let mut out = vec![0x01, 0x11, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01, 0x01];
+        out.extend(section(root));
+        out
+    }
+
+    fn node_with(rpc_port: u16, rpc_credits_per_hash: u32, support_flags: u32) -> BasicNodeData {
+        BasicNodeData {
+            network_id: NETWORK_ID_MAINNET,
+            peer_id: PEER_ID,
+            my_port: 34_567,
+            rpc_port,
+            rpc_credits_per_hash,
+            support_flags,
+        }
+    }
+
+    fn tip_with(top_version: u8, pruning_seed: u32) -> CoreSyncData {
+        CoreSyncData {
+            current_height: 500_000,
+            cumulative_difficulty: (3u128 << 64) | 77,
+            top_id: [9u8; 32],
+            top_version,
+            pruning_seed,
+        }
+    }
+
+    /// The entries of [`node_with`]'s `basic_node_data` that are always there.
+    fn node_entries() -> Vec<(&'static str, u8, Vec<u8>)> {
+        vec![
+            ("my_port", T_U32, le32(34_567)),
+            ("network_id", T_STRING, blob(&NETWORK_ID_MAINNET)),
+            ("peer_id", T_U64, le64(PEER_ID)),
+        ]
+    }
+
+    /// The entries of [`tip_with`]'s `CORE_SYNC_DATA` that are always there,
+    /// the high word of the difficulty among them.
+    fn tip_entries() -> Vec<(&'static str, u8, Vec<u8>)> {
+        vec![
+            ("cumulative_difficulty", T_U64, le64(77)),
+            ("cumulative_difficulty_top64", T_U64, le64(3)),
+            ("current_height", T_U64, le64(500_000)),
+            ("top_id", T_STRING, blob(&[9u8; 32])),
+        ]
+    }
+
+    /// A handshake request with every optional field at its default carries
+    /// none of them. Writing `rpc_port: 0`, `support_flags: 0` or
+    /// `pruning_seed: 0` would tell a peer from the first message that this is
+    /// not the C++.
+    #[test]
+    fn a_handshake_request_leaves_out_the_defaults() {
+        let node = node_with(0, 0, 0);
+        let tip = tip_with(0, 0);
+        let want = message(&[
+            ("node_data", T_OBJECT, section(&node_entries())),
+            ("payload_data", T_OBJECT, section(&tip_entries())),
+        ]);
+        assert_eq!(handshake_request(&node, &tip), want);
+
+        // What is left out reads back as its default.
+        let back = HandshakeRequest::parse(&want).expect("parses");
+        assert_eq!(back.node_data, node);
+        assert_eq!(back.payload_data, tip);
+    }
+
+    /// Set, the optional fields are written with the C++ types: `rpc_port` a
+    /// `uint16_t`, `top_version` a `uint8_t`, the rest `uint32_t`.
+    #[test]
+    fn optional_fields_are_written_when_set() {
+        let node = node_with(34_568, 5, SUPPORT_FLAG_FLUFFY_BLOCKS);
+        let mut node_want = node_entries();
+        node_want.extend([
+            ("rpc_credits_per_hash", T_U32, le32(5)),
+            ("rpc_port", T_U16, le16(34_568)),
+            ("support_flags", T_U32, le32(1)),
+        ]);
+        let tip = tip_with(20, 0x181);
+        let mut tip_want = tip_entries();
+        tip_want.insert(3, ("pruning_seed", T_U32, le32(0x181)));
+        tip_want.push(("top_version", T_U8, vec![20]));
+
+        let body = handshake_request(&node, &tip);
+        assert_eq!(
+            body,
+            message(&[
+                ("node_data", T_OBJECT, section(&node_want)),
+                ("payload_data", T_OBJECT, section(&tip_want)),
+            ])
+        );
+        let back = HandshakeRequest::parse(&body).expect("parses");
+        assert_eq!(back.node_data, node);
+        assert_eq!(back.payload_data, tip);
+    }
+
+    /// A peer list entry: `adr` and `id` always, `last_seen` as an `int64_t`
+    /// when set, and `pruning_seed`, `rpc_port` and `rpc_credits_per_hash`
+    /// not at all when zero. With no peers there is no `local_peerlist_new`.
+    #[test]
+    fn a_peer_list_is_written_as_the_cpp_writes_it() {
+        let node = node_with(0, 0, SUPPORT_FLAG_FLUFFY_BLOCKS);
+        let tip = tip_with(0, 0);
+        let peers = [
+            PeerlistEntry {
+                address: NetworkAddress::from_socket_addr("10.20.30.40:34567".parse().unwrap()),
+                id: 7,
+                last_seen: 0,
+                pruning_seed: 0,
+                rpc_port: 0,
+            },
+            PeerlistEntry {
+                address: NetworkAddress::from_socket_addr("5.6.7.8:34567".parse().unwrap()),
+                id: 8,
+                last_seen: 1_700_000_000,
+                pruning_seed: 0x181,
+                rpc_port: 34_568,
+            },
+        ];
+
+        // `m_ip` holds the octets in wire order.
+        let adr = |ip: [u8; 4]| {
+            let addr = section(&[
+                ("m_ip", T_U32, ip.to_vec()),
+                ("m_port", T_U16, le16(34_567)),
+            ]);
+            section(&[("addr", T_OBJECT, addr), ("type", T_U8, vec![1])])
+        };
+        let list = elements(&[
+            section(&[
+                ("adr", T_OBJECT, adr([10, 20, 30, 40])),
+                ("id", T_U64, le64(7)),
+            ]),
+            section(&[
+                ("adr", T_OBJECT, adr([5, 6, 7, 8])),
+                ("id", T_U64, le64(8)),
+                // An `int64_t`, so INT64, though its bytes are a u64's.
+                ("last_seen", T_I64, le64(1_700_000_000)),
+                ("pruning_seed", T_U32, le32(0x181)),
+                ("rpc_port", T_U16, le16(34_568)),
+            ]),
+        ]);
+        let mut node_want = node_entries();
+        node_want.push(("support_flags", T_U32, le32(1)));
+
+        let want = message(&[
+            ("local_peerlist_new", T_OBJECT | T_ARRAY, list),
+            ("node_data", T_OBJECT, section(&node_want)),
+            ("payload_data", T_OBJECT, section(&tip_entries())),
+        ]);
+        assert_eq!(handshake_response(&node, &tip, &peers), want);
+        assert_eq!(
+            HandshakeResponse::parse(&want).expect("parses").peers,
+            peers.to_vec()
+        );
+
+        // Nobody to offer: no `local_peerlist_new` at all.
+        assert_eq!(
+            handshake_response(&node, &tip, &[]),
+            message(&[
+                ("node_data", T_OBJECT, section(&node_want)),
+                ("payload_data", T_OBJECT, section(&tip_entries())),
+            ])
+        );
+        assert_eq!(
+            timed_sync_response_with_peers(&tip, &[]),
+            message(&[("payload_data", T_OBJECT, section(&tip_entries()))])
+        );
+    }
+
+    /// `block_complete_entry` for an unpruned block: `block` always, never
+    /// `pruned`, `block_weight` only when set, and `txs`, an array of
+    /// strings, only when there are any.
+    #[test]
+    fn a_block_is_written_as_the_cpp_writes_it() {
+        let bare = NewBlock {
+            entry: BlockEntry {
+                block: vec![1, 2, 3],
+                txs: Vec::new(),
+                block_weight: 0,
+            },
+            current_blockchain_height: 101,
+        };
+        let block = section(&[("block", T_STRING, blob(&[1, 2, 3]))]);
+        assert_eq!(
+            bare.to_bytes(),
+            message(&[
+                ("b", T_OBJECT, block.clone()),
+                ("current_blockchain_height", T_U64, le64(101)),
+            ])
+        );
+
+        let full = NewBlock {
+            entry: BlockEntry {
+                block: vec![1, 2, 3],
+                txs: vec![vec![4], vec![5, 6]],
+                block_weight: 300,
+            },
+            current_blockchain_height: 101,
+        };
+        let txs = elements(&[blob(&[4]), blob(&[5, 6])]);
+        let entry = section(&[
+            ("block", T_STRING, blob(&[1, 2, 3])),
+            ("block_weight", T_U64, le64(300)),
+            ("txs", T_STRING | T_ARRAY, txs),
+        ]);
+        assert_eq!(
+            full.to_bytes(),
+            message(&[
+                ("b", T_OBJECT, entry),
+                ("current_blockchain_height", T_U64, le64(101)),
+            ])
+        );
+
+        // In a block response, with nothing missed: no `missed_ids`.
+        assert_eq!(
+            objects_response(std::slice::from_ref(&bare.entry), &[], 7),
+            message(&[
+                ("blocks", T_OBJECT | T_ARRAY, elements(&[block])),
+                ("current_blockchain_height", T_U64, le64(7)),
+            ])
+        );
+        let back = NewBlock::parse(&bare.to_bytes()).expect("parses");
+        assert!(back.entry.txs.is_empty());
+        assert_eq!(back.entry.block_weight, 0);
+    }
+
+    /// An empty container is no entry at all, optional or not, and `prune` is
+    /// written only when true.
+    #[test]
+    fn empty_containers_and_false_flags_are_left_out() {
+        let empty = message(&[]);
+        assert_eq!(
+            empty,
+            [0x01, 0x11, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00]
+        );
+        assert_eq!(empty_body(), empty);
+        assert_eq!(request_objects(&[], false), empty);
+        assert_eq!(request_chain(&[], false), empty);
+        assert_eq!(TxpoolComplement::default().to_bytes(), empty);
+        assert_eq!(
+            objects_response(&[], &[], 7),
+            message(&[("current_blockchain_height", T_U64, le64(7))])
+        );
+        let no_indices = FluffyMissingTxs {
+            block_hash: [8u8; 32],
+            current_blockchain_height: 101,
+            missing_tx_indices: Vec::new(),
+        };
+        assert_eq!(
+            no_indices.to_bytes(),
+            message(&[
+                ("block_hash", T_STRING, blob(&[8u8; 32])),
+                ("current_blockchain_height", T_U64, le64(101)),
+            ])
+        );
+
+        let ids = [[1u8; 32], [2u8; 32]];
+        let mut packed = vec![1u8; 32];
+        packed.extend([2u8; 32]);
+        assert_eq!(
+            blob(&packed)[..2],
+            [0x01, 0x01],
+            "64 bytes take a two-byte length"
+        );
+        assert_eq!(
+            request_chain(&ids, true),
+            message(&[
+                ("block_ids", T_STRING, blob(&packed)),
+                ("prune", T_BOOL, vec![1]),
+            ])
+        );
+        assert_eq!(
+            request_objects(&ids, false),
+            message(&[("blocks", T_STRING, blob(&packed))])
+        );
+
+        // A chain entry's ids and weights are containers; `first_block` is a
+        // `std::string`, and there even when empty.
+        assert_eq!(
+            chain_entry_response(5, 99, (2u128 << 64) | 1, &[], &[], &[]),
+            message(&[
+                ("cumulative_difficulty", T_U64, le64(1)),
+                ("cumulative_difficulty_top64", T_U64, le64(2)),
+                ("first_block", T_STRING, blob(&[])),
+                ("start_height", T_U64, le64(5)),
+                ("total_height", T_U64, le64(99)),
+            ])
+        );
+        let mut weights = le64(10);
+        weights.extend(le64(20));
+        assert_eq!(
+            chain_entry_response(5, 99, 1, &ids, &[10, 20], b"blob"),
+            message(&[
+                ("cumulative_difficulty", T_U64, le64(1)),
+                ("cumulative_difficulty_top64", T_U64, le64(0)),
+                ("first_block", T_STRING, blob(b"blob")),
+                ("m_block_ids", T_STRING, blob(&packed)),
+                ("m_block_weights", T_STRING, blob(&weights)),
+                ("start_height", T_U64, le64(5)),
+                ("total_height", T_U64, le64(99)),
+            ])
+        );
+    }
+
+    /// The replies to a request are plain `KV_SERIALIZE`: there even when
+    /// zero.
+    #[test]
+    fn ping_and_support_flags_replies_are_written_whole() {
+        assert_eq!(
+            support_flags_response_with(0),
+            message(&[("support_flags", T_U32, le32(0))])
+        );
+        assert_eq!(
+            ping_response(PEER_ID),
+            message(&[
+                ("peer_id", T_U64, le64(PEER_ID)),
+                ("status", T_STRING, blob(b"OK")),
+            ])
         );
     }
 
