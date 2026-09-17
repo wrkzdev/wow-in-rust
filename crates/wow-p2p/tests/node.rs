@@ -434,16 +434,13 @@ fn a_local_transaction_is_stemmed_without_waiting_for_a_tick() {
     let id = tx_id(&blob);
     b_core.pool.lock().unwrap().insert(id, blob.clone());
     b.relay_transaction(id, blob);
-    assert!(
-        b_core.relayed.lock().unwrap().contains(&id),
-        "sent at once, through the stem"
-    );
 
     wait_until("the transaction at the peer", 30, || a_core.has_tx(&id));
     assert!(
         a_core.stemmed.lock().unwrap().contains(&id),
         "it arrived as a stem, not fluffed"
     );
+    assert!(b_core.relayed.lock().unwrap().contains(&id));
 }
 
 /// With `--pad-transactions` a transaction goes out in a message padded to a

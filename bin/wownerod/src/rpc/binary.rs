@@ -91,9 +91,9 @@ pub fn dispatch(server: &Server, path: &str, body: &[u8], restricted: bool) -> B
 /// Whether an output distribution request asks for amount 0 -- RingCT outputs
 /// -- and nothing else, the one a restricted listener serves
 /// (`on_get_output_distribution_bin`). Before anything else about the request
-/// is looked at, as there: a histogram of every pre-RingCT denomination is a
-/// whole-chain scan a public node should not run for anyone who asks, and a
-/// request with no amounts at all is not `[0]` either.
+/// is looked at, as there: a distribution for every pre-RingCT denomination
+/// is a whole-chain scan a public node should not run for anyone who asks,
+/// and a request with no amounts at all is not `[0]` either.
 fn rct_amounts_only(request: &Section) -> bool {
     request
         .get("amounts")
