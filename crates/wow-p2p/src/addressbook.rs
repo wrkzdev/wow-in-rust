@@ -342,15 +342,25 @@ impl AddressBook {
         Some(candidates[rand_below(candidates.len())].clone())
     }
 
-    /// Up to `n` white peers, chosen at random, for a handshake or timed-sync
-    /// response.
+    /// Up to `n` white peers for a handshake or timed-sync response, picked
+    /// as `get_peerlist_head(..., anonymize = true, depth = n)` picks them
+    /// (`p2p/net_peerlist.h`).
+    ///
+    /// At random from the whole white list, and with `last_seen` zeroed.
+    /// This node sets a peer's `last_seen` when it connects to it or the peer
+    /// answers a ping-back, so the real timestamps -- or a list that took the
+    /// `n` most recently seen -- would tell anyone who asks which peers this
+    /// node is connected to right now, its Dandelion++ stems among them. The
+    /// C++ comment cites Cao et al., "Exploring the Monero Peer-to-Peer
+    /// Network", for the attack.
     pub fn handshake_peers(
         &self,
         n: usize,
         rand_below: &mut dyn FnMut(usize) -> usize,
     ) -> Vec<PeerlistEntry> {
         let mut all: Vec<&PeerRecord> = self.white.values().collect();
-        // A partial Fisher-Yates: only the first `n` places need shuffling.
+        // A partial Fisher-Yates: only the first `n` places need shuffling,
+        // which picks the same way as the C++'s whole shuffle and truncate.
         let take = n.min(all.len());
         for i in 0..take {
             let j = i + rand_below(all.len() - i);
@@ -358,7 +368,10 @@ impl AddressBook {
         }
         all.into_iter()
             .take(take)
-            .map(PeerRecord::to_entry)
+            .map(|r| PeerlistEntry {
+                last_seen: 0,
+                ..r.to_entry()
+            })
             .collect()
     }
 
@@ -627,6 +640,26 @@ mod tests {
             .iter()
             .all(|e| e.address.socket_addr().unwrap().ip().to_string() != "9.9.9.9"));
         assert_eq!(b.handshake_peers(250, &mut first).len(), 10);
+    }
+
+    /// A shared peer carries no `last_seen`: the real one says when this node
+    /// last connected to that peer, which is who it is connected to now.
+    #[test]
+    fn shared_peers_do_not_say_when_they_were_seen() {
+        let mut b = AddressBook::new(false);
+        for i in 1..=5 {
+            b.add_white(rec(&format!("8.8.8.{i}:34567"), 1_700_000_000 + i));
+        }
+        let offered = b.handshake_peers(250, &mut first);
+        assert_eq!(offered.len(), 5);
+        assert!(offered.iter().all(|e| e.last_seen == 0));
+        assert!(
+            offered.iter().all(|e| e.id != 0),
+            "only the timestamp is hidden"
+        );
+
+        // The book itself keeps them, for its own choices and the state file.
+        assert!(b.white().iter().all(|r| r.last_seen >= 1_700_000_001));
     }
 
     #[test]

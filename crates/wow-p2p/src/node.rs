@@ -54,7 +54,8 @@ use crate::levin::{self, command, Header, Kind};
 use crate::messages::{
     self, BasicNodeData, BlockEntry, ChainEntry, ChainRequest, CoreSyncData, FluffyMissingTxs,
     HandshakeRequest, HandshakeResponse, NewBlock, NewTransactions, ObjectsRequest,
-    ObjectsResponse, PingResponse, TimedSync, TxpoolComplement, SUPPORT_FLAG_FLUFFY_BLOCKS,
+    ObjectsResponse, PeerlistEntry, PingResponse, TimedSync, TxpoolComplement,
+    SUPPORT_FLAG_FLUFFY_BLOCKS,
 };
 use crate::queue::{self, BlockQueue, SpanInfo};
 use crate::sync::BatchSize;
@@ -484,10 +485,13 @@ struct Proto {
     last_timed_sync: Instant,
     next_housekeeping: Instant,
     asked_complement: bool,
+    /// The addresses this peer has been given in a peer list
+    /// (`sent_addresses` in the C++'s connection context).
+    sent_addresses: HashSet<SocketAddr>,
 }
 
 impl Proto {
-    fn new() -> Proto {
+    fn new(sent_addresses: HashSet<SocketAddr>) -> Proto {
         let now = Instant::now();
         Proto {
             pending: None,
@@ -499,6 +503,7 @@ impl Proto {
             last_timed_sync: now,
             next_housekeeping: now,
             asked_complement: false,
+            sent_addresses,
         }
     }
 }
@@ -1289,10 +1294,11 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
                 return;
             }
 
+            let peers = shared.handshake_peers();
             let resp = messages::handshake_response(
                 &shared.node_data(),
                 &shared.core.sync_data(),
-                &shared.handshake_peers(),
+                &peers,
             );
             if write_frame(
                 &mut stream,
@@ -1314,6 +1320,11 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
             }
 
             reader.set_limit(levin::DEFAULT_MAX_PACKET_SIZE);
+            // What the handshake handed over, no timed sync hands over again.
+            let sent_addresses = peers
+                .iter()
+                .filter_map(|e| e.address.socket_addr())
+                .collect();
             run_connection(
                 shared,
                 stream,
@@ -1322,6 +1333,7 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
                 req.node_data,
                 req.payload_data,
                 reader,
+                sent_addresses,
             );
         }
         _ => {}
@@ -1682,6 +1694,7 @@ fn make_connections(shared: &Arc<Shared>) {
                             hs.node_data,
                             hs.payload_data,
                             reader,
+                            HashSet::new(),
                         );
                     }
                     Err(e) => {
@@ -1756,6 +1769,13 @@ fn pick_candidate(
 }
 
 /// Run a handshaken connection on the current thread until it ends.
+///
+/// `sent_addresses` is what the handshake gave the peer: nothing for an
+/// outgoing connection, whose handshake request carries no peer list.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "what the handshake settled, which each side gathers differently"
+)]
 fn run_connection(
     shared: Arc<Shared>,
     mut stream: TcpStream,
@@ -1764,6 +1784,7 @@ fn run_connection(
     node: BasicNodeData,
     sync: CoreSyncData,
     mut reader: FrameReader,
+    sent_addresses: HashSet<SocketAddr>,
 ) {
     let (Ok(writer), Ok(socket)) = (stream.try_clone(), stream.try_clone()) else {
         return;
@@ -1810,7 +1831,7 @@ fn run_connection(
         .name("p2p-write".into())
         .spawn(move || write_loop(writer, rx, closed, sent));
 
-    let mut proto = Proto::new();
+    let mut proto = Proto::new(sent_addresses);
     let _ = stream.set_read_timeout(Some(TICK));
     advance(&shared, &conn, &mut proto);
 
@@ -1896,10 +1917,8 @@ fn handle_message(
         (Kind::Request, command::TIMED_SYNC) => {
             let t = TimedSync::parse(body).map_err(|e| malformed("timed sync", e))?;
             *lock(&conn.sync) = t.payload_data;
-            let reply = messages::timed_sync_response_with_peers(
-                &core.sync_data(),
-                &shared.handshake_peers(),
-            );
+            let peers = unsent(shared.handshake_peers(), &mut proto.sent_addresses);
+            let reply = messages::timed_sync_response_with_peers(&core.sync_data(), &peers);
             conn.respond(command::TIMED_SYNC, 1, &reply);
         }
         (Kind::Response, command::TIMED_SYNC) => {
@@ -2009,6 +2028,19 @@ fn handle_message(
         _ => {}
     }
     Ok(())
+}
+
+/// The peers of `peers` this connection has not been given yet, now marked
+/// given (`handle_timed_sync`).
+///
+/// A peer asks for a timed sync every minute. Handing it a fresh random
+/// selection each time would give it the whole white list within the hour,
+/// and show it, entry by entry, what joined the list and when.
+fn unsent(peers: Vec<PeerlistEntry>, sent: &mut HashSet<SocketAddr>) -> Vec<PeerlistEntry> {
+    peers
+        .into_iter()
+        .filter(|e| e.address.socket_addr().is_none_or(|a| sent.insert(a)))
+        .collect()
 }
 
 fn housekeeping(shared: &Shared, conn: &Conn, proto: &mut Proto) -> Result<(), Fault> {
@@ -2457,6 +2489,37 @@ mod tests {
         assert!(!stall.waiting(later));
         assert!(!stall.cleared(), "only once");
         assert_eq!(stall.failed("clock", later).0, Duration::from_secs(1));
+    }
+
+    /// A peer is given each address once per connection: what the handshake
+    /// gave, and what an earlier timed sync gave, the next timed sync leaves
+    /// out.
+    #[test]
+    fn a_timed_sync_gives_only_peers_not_given_before() {
+        let entry = |host: &str| PeerlistEntry {
+            address: messages::NetworkAddress::from_socket_addr(host.parse().unwrap()),
+            id: 1,
+            last_seen: 0,
+            pruning_seed: 0,
+            rpc_port: 0,
+        };
+        let a = entry("8.8.8.8:34567");
+        let b = entry("9.9.9.9:34567");
+        let c = entry("1.1.1.1:34567");
+
+        // The handshake gave `a`.
+        let mut sent = HashSet::new();
+        sent.insert("8.8.8.8:34567".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            unsent(vec![a.clone(), b.clone()], &mut sent),
+            vec![b.clone()]
+        );
+        assert_eq!(
+            unsent(vec![b.clone(), c.clone(), a.clone()], &mut sent),
+            vec![c]
+        );
+        assert!(unsent(vec![a, b], &mut sent).is_empty());
+        assert_eq!(sent.len(), 3);
     }
 
     #[test]

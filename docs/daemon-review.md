@@ -66,7 +66,7 @@ Statuses:
 | Item | Status | Notes |
 |---|---|---|
 | `--p2p-bind-ip`, `--p2p-bind-port`, `--p2p-external-port`, `--hide-my-port`, `--no-igd` | Done | `--igd disabled` is accepted too; any other `--igd` value is refused |
-| Answer incoming handshakes with the peer list, real port and support flags | Done | |
+| Answer incoming handshakes with the peer list, real port and support flags | Done | The list is a random pick of the white list with `last_seen` zeroed, and a timed sync gives a peer only addresses it has not had yet, as `get_peerlist_head` and `sent_addresses` do in the C++ |
 | Serve `REQUEST_CHAIN` and `REQUEST_GET_OBJECTS` | Done | At most 100 objects per request ([spec-deltas §22](spec-deltas.md)) |
 | White, gray and anchor lists; ping back before white-listing; state file | Done | Saved to `p2pstate-rs.bin`, so a C++ node's `p2pstate.bin` is left alone |
 | `--out-peers`, `--in-peers`, `--max-connections-per-ip`; drop idle connections after 300 s | Done | |
