@@ -233,7 +233,7 @@ impl Core for MemCore {
     fn incoming_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
         let mut pool = self.pool.lock().unwrap();
         // As the message says: this pool has no stem of its own to loop.
-        let how = match fluff {
+        let relay = match fluff {
             true => TxRelay::Fluff,
             false => TxRelay::Stem,
         };
@@ -244,7 +244,10 @@ impl Core for MemCore {
                     std::collections::hash_map::Entry::Occupied(_) => TxVerdict::Known { id },
                     std::collections::hash_map::Entry::Vacant(slot) => {
                         slot.insert(blob.clone());
-                        TxVerdict::Accepted { id, how: Some(how) }
+                        TxVerdict::Accepted {
+                            id,
+                            how: Some(relay),
+                        }
                     }
                 }
             })

@@ -79,7 +79,7 @@ Statuses:
 
 | Item | Status | Notes |
 |---|---|---|
-| Relay transactions from `send_raw_transaction` and from peers | Done | Dandelion++ from the start rather than broadcast-first: 2 stems, 20% fluff, 39 s embargo, 10-minute epochs. The pool keeps each transaction's relay method as the C++ does (saved in its `txpool_meta` flags), and only fluffed or mined ones reach the restricted RPC, the ZMQ RPC, a peer's complement request, block templates, miner data and ZMQ `txpool_add` |
+| Relay transactions from `send_raw_transaction` and from peers | Done | Dandelion++ from the start rather than broadcast-first: 2 stems, 10-minute epochs of which 20% fluff, stems kept per source for the epoch as the C++'s `connection_map` keeps them, and Poisson timers in the C++'s units (a 39 s embargo; a 5 s flush for incoming peers, 2.5 s for outgoing), with batches sent sorted rather than in arrival order. The pool keeps each transaction's relay method as the C++ does (saved in its `txpool_meta` flags), and only fluffed or mined ones reach the restricted RPC, the ZMQ RPC, a peer's complement request, block templates, miner data and ZMQ `txpool_add` |
 | Fluffy block announcements; requests for missing transactions | Done | |
 | Keep the pool across restarts | Done | Saved on shutdown and by `save_bc`, loaded at start |
 

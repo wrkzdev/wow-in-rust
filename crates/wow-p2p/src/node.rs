@@ -115,6 +115,12 @@ const DANDELION_EPOCH_RANGE_SECS: u64 = 30;
 const DANDELION_EMBARGO_AVERAGE: Duration = Duration::from_secs(39);
 /// `CRYPTONOTE_DANDELIONPP_FLUSH_AVERAGE`.
 const DANDELION_FLUSH_AVERAGE: Duration = Duration::from_secs(5);
+/// The flush average for an incoming connection in the quarter seconds the
+/// C++ draws it in (`fluff_average_in`): 20.
+const FLUSH_QUARTERS_IN: u64 = DANDELION_FLUSH_AVERAGE.as_secs() * 4;
+/// Half that for an outgoing connection (`fluff_average_out`), as Bitcoin
+/// Core halves it: the operator chose those peers.
+const FLUSH_QUARTERS_OUT: u64 = FLUSH_QUARTERS_IN / 2;
 
 /// The hard-coded mainnet seed nodes (`specs/01` §12.2). Wownero has no DNS
 /// seeds, and testnet and stagenet have no seeds of their own.
@@ -534,17 +540,197 @@ impl Proto {
 // relay state
 // ---------------------------------------------------------------------------
 
-/// Transactions with their ids, waiting to go to one peer.
+/// Transactions with their ids, going to a peer together.
 type TxBatch = Vec<(Hash256, Vec<u8>)>;
 
 struct Relay {
     epoch_ends: Instant,
-    /// This epoch's stem peers: outgoing connection ids.
-    stems: Vec<u64>,
+    /// Whether this epoch fluffs what arrives through a stem, rather than
+    /// passing it on through one (`zone::fluffing`). Drawn once an epoch, as
+    /// the C++ draws it: a per-transaction draw fluffed a fifth of every
+    /// stem, where Dandelion++ has a fifth of the nodes fluff everything for
+    /// ten minutes.
+    fluffing: bool,
+    /// This epoch's stems, and which one each source is sent to.
+    stems: StemMap,
     /// Stem transactions waiting to be seen fluffed, with their deadline.
     embargo: HashMap<Hash256, (Instant, Vec<u8>)>,
     /// Fluff transactions waiting for each connection's next flush.
     queued: HashMap<u64, (Instant, TxBatch)>,
+}
+
+/// `net::dandelionpp::connection_map`: this epoch's stem connections, and the
+/// stem each source's transactions go to.
+///
+/// The mapping is sticky. Every transaction from one peer -- and every one
+/// this node originates, whose source is `None` -- takes the same stem for
+/// the whole epoch, and a new source takes the least used, so the stems
+/// split the sources between them. A transaction's path therefore says
+/// nothing about it that its source does not, where choosing afresh for each
+/// one let a stem peer that saw several correlate them. A stem that goes away
+/// leaves its slot empty; [`StemMap::update`] refills that slot alone, and a
+/// source mapped to it is moved on the next time it sends.
+#[derive(Debug, Default)]
+struct StemMap {
+    /// `out_mapping_`: the connection in each stem slot, `None` where one
+    /// went away.
+    out: Vec<Option<u64>>,
+    /// `in_mapping_`: the slot each source is sent to.
+    sources: HashMap<Option<u64>, usize>,
+    /// `usage_count_`: how many sources each slot has, one entry a stem.
+    usage: Vec<usize>,
+}
+
+impl StemMap {
+    /// `connection_map(out_connections, stems)`: `stems` of `connections`,
+    /// chosen at random.
+    fn new(
+        mut connections: Vec<u64>,
+        stems: usize,
+        rand: &mut impl FnMut(usize) -> usize,
+    ) -> StemMap {
+        if stems < connections.len() {
+            for i in 0..stems {
+                let j = i + rand(connections.len() - i);
+                connections.swap(i, j);
+            }
+            connections.truncate(stems);
+        } else {
+            for i in (1..connections.len()).rev() {
+                let j = rand(i + 1);
+                connections.swap(i, j);
+            }
+        }
+        StemMap {
+            out: connections.into_iter().map(Some).collect(),
+            sources: HashMap::new(),
+            usage: vec![0; stems],
+        }
+    }
+
+    /// `connection_map::update`: merge in the connections a stem may use
+    /// now. A slot whose connection is not among them is emptied, and empty
+    /// slots -- or ones never filled, for a map made with fewer connections
+    /// than stems -- take a connection not already a stem. Returns whether
+    /// anything changed.
+    fn update(&mut self, mut current: Vec<u64>, rand: &mut impl FnMut(usize) -> usize) -> bool {
+        current.sort_unstable();
+        let mut replace = false;
+        for slot in &mut self.out {
+            match slot.map(|id| current.binary_search(&id)) {
+                // Already a stem, so not a candidate for another slot.
+                Some(Ok(at)) => {
+                    current.remove(at);
+                }
+                _ => {
+                    *slot = None;
+                    replace = true;
+                }
+            }
+        }
+        if !replace && self.out.len() == self.usage.len() {
+            return false;
+        }
+        let existing = self.out.len();
+        for i in 0..self.usage.len() {
+            if current.is_empty() {
+                break;
+            }
+            let grow = self.out.len() <= i;
+            if grow || self.out[i].is_none() {
+                let last = current.len() - 1;
+                let pick = rand(current.len());
+                current.swap(last, pick);
+                let id = current.pop();
+                if grow {
+                    self.out.push(id);
+                } else {
+                    self.out[i] = id;
+                }
+            }
+        }
+        replace || existing < self.out.len()
+    }
+
+    /// `connection_map::get_stem`: the stem for transactions from `source`,
+    /// or `None` when no stem is left.
+    fn get_stem(
+        &mut self,
+        source: Option<u64>,
+        rand: &mut impl FnMut(usize) -> usize,
+    ) -> Option<u64> {
+        let slot = match self.sources.get(&source).copied() {
+            Some(slot) if self.out[slot].is_some() => slot,
+            mapped => {
+                // Never mapped, or mapped to a stem that has gone.
+                if let Some(old) = mapped {
+                    self.usage[old] = self.usage[old].saturating_sub(1);
+                }
+                let Some(slot) = self.least_used(rand) else {
+                    self.sources.remove(&source);
+                    return None;
+                };
+                self.sources.insert(source, slot);
+                self.usage[slot] += 1;
+                slot
+            }
+        };
+        self.out[slot]
+    }
+
+    /// `select_stem`: a live slot with the fewest sources, at random among
+    /// equals.
+    fn least_used(&self, rand: &mut impl FnMut(usize) -> usize) -> Option<usize> {
+        let mut lowest = usize::MAX;
+        let mut choices = Vec::new();
+        for (i, slot) in self.out.iter().enumerate() {
+            if slot.is_none() {
+                continue;
+            }
+            match self.usage[i].cmp(&lowest) {
+                std::cmp::Ordering::Less => {
+                    lowest = self.usage[i];
+                    choices.clear();
+                    choices.push(i);
+                }
+                std::cmp::Ordering::Equal => choices.push(i),
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        match choices.len() {
+            0 => None,
+            1 => Some(choices[0]),
+            n => Some(choices[rand(n)]),
+        }
+    }
+}
+
+/// A Poisson-distributed count with the given mean, from uniform draws in
+/// (0, 1]: Knuth's method, multiplying draws until the product falls to
+/// e^-mean.
+///
+/// The C++'s Dandelion++ timers are `std::poisson_distribution` in whole units
+/// (`crypto::random_poisson_duration`): seconds for an embargo, quarter
+/// seconds for a flush. An exponential delay with the same mean, which this
+/// used, spreads far wider -- a fifth of the embargoes under 9 s where the
+/// C++'s almost never go under 27 -- and the spread is what an observer
+/// times. At the means used here it takes as many draws as the mean.
+fn poisson(mean: u64, mut uniform: impl FnMut() -> f64) -> u64 {
+    let floor = (-(mean as f64)).exp();
+    let mut product = uniform();
+    let mut k = 0;
+    while product > floor {
+        k += 1;
+        product *= uniform();
+    }
+    k
+}
+
+/// Sorted by blob, each once: the order a peer is sent transactions in must
+/// not be the order this node received them (`fluff_flush`).
+fn flush_order(txs: &mut TxBatch) {
+    txs.sort_by(|(_, a), (_, b)| a.cmp(b));
+    txs.dedup_by(|(_, a), (_, b)| a == b);
 }
 
 // ---------------------------------------------------------------------------
@@ -662,7 +848,8 @@ impl Node {
             rng: Mutex::new(rng),
             relay: Mutex::new(Relay {
                 epoch_ends: Instant::now(),
-                stems: Vec::new(),
+                fluffing: false,
+                stems: StemMap::default(),
                 embargo: HashMap::new(),
                 queued: HashMap::new(),
             }),
@@ -824,14 +1011,14 @@ impl Node {
     /// Send a transaction this node originated. It starts in the Dandelion++
     /// stem phase (`specs/08` §7.2).
     pub fn relay_transaction(&self, id: Hash256, blob: Vec<u8>) {
-        self.shared.relay_tx(None, id, blob, TxRelay::Local);
+        self.shared.relay_txs(None, vec![(id, blob)], TxRelay::Local);
     }
 
     /// Send a transaction the network already has to every peer, as the
     /// `relay_tx` RPC does for a public one: stemming it again would only
     /// look like a loop to the stem.
     pub fn fluff_transaction(&self, id: Hash256, blob: Vec<u8>) {
-        self.shared.relay_tx(None, id, blob, TxRelay::Fluff);
+        self.shared.relay_txs(None, vec![(id, blob)], TxRelay::Fluff);
     }
 
     /// Announce a block this node added itself, such as one submitted over
@@ -892,11 +1079,34 @@ impl Shared {
         }
     }
 
-    /// An exponentially distributed delay with the given mean -- the Poisson
-    /// timers of `specs/08` §7.2.
-    fn exp_delay(&self, mean: Duration) -> Duration {
-        let u = (self.rand_u64() >> 11) as f64 / (1u64 << 53) as f64;
-        Duration::from_secs_f64(-mean.as_secs_f64() * (1.0 - u).ln())
+    /// A [`poisson`] count with the given mean, drawn from the node's CSPRNG
+    /// as `crypto::random_poisson_duration` draws from `crypto::random_device`.
+    fn poisson_draw(&self, mean: u64) -> u64 {
+        let mut rng = lock(&self.rng);
+        poisson(mean, || {
+            let mut b = [0u8; 8];
+            rng.fill(&mut b);
+            // 53 random bits, shifted off zero: a draw in (0, 1].
+            ((u64::from_le_bytes(b) >> 11) + 1) as f64 / (1u64 << 53) as f64
+        })
+    }
+
+    /// An embargo (`tx_pool.cpp`'s `embargo_duration`): whole seconds, Poisson
+    /// about `CRYPTONOTE_DANDELIONPP_EMBARGO_AVERAGE`.
+    fn embargo(&self) -> Duration {
+        Duration::from_secs(self.poisson_draw(DANDELION_EMBARGO_AVERAGE.as_secs()))
+    }
+
+    /// The wait before a connection's first queued fluff goes (`fluff_notify`):
+    /// quarter seconds, Poisson about 5 s for an incoming connection and 2.5 s
+    /// for an outgoing one.
+    fn flush_delay(&self, incoming: bool) -> Duration {
+        let mean = if incoming {
+            FLUSH_QUARTERS_IN
+        } else {
+            FLUSH_QUARTERS_OUT
+        };
+        Duration::from_millis(250 * self.poisson_draw(mean))
     }
 
     fn node_data(&self) -> BasicNodeData {
@@ -1023,123 +1233,144 @@ impl Shared {
 
     // ---------------------------------------------------------------- relay
 
-    /// Pass a transaction on (`specs/08` §7).
+    /// Pass transactions on (`specs/08` §7; `levin_notify.cpp`'s `send_txs`).
     ///
-    /// One this node originated, or a stem transaction that loses the 20%
-    /// draw, goes to a single stem peer and waits under an embargo; if it has
-    /// not been seen fluffed when the embargo ends, this node fluffs it. A
-    /// fluff transaction is queued to every other peer and flushed on each
+    /// What this node originated always goes through a stem; what arrived
+    /// through one goes on through one in a stem epoch, and is fluffed in a
+    /// fluff epoch. A stem send is one message to the stem the epoch maps
+    /// the sender to, after which each transaction waits under an embargo --
+    /// if it has not been seen fluffed when the embargo ends, this node
+    /// fluffs it. A fluff is queued to every other peer and flushed on each
     /// one's Poisson timer.
-    fn relay_tx(&self, from: Option<u64>, id: Hash256, blob: Vec<u8>, how: TxRelay) {
-        let fluff_now = match how {
-            TxRelay::Local => false,
-            TxRelay::Stem => self.rand_below(100) < DANDELION_FLUFF_PERCENT,
-            TxRelay::Fluff => true,
-        };
-
-        if !fluff_now {
-            if let Some(target) = self.stem_peer(from) {
-                let body = NewTransactions {
-                    txs: vec![blob.clone()],
-                    dandelionpp_fluff: false,
-                }
-                .to_bytes();
-                if target.notify(command::NEW_TRANSACTIONS, &body) {
-                    let deadline = Instant::now() + self.exp_delay(DANDELION_EMBARGO_AVERAGE);
-                    lock(&self.relay).embargo.insert(id, (deadline, blob));
-                    self.core.tx_relayed(&[id], TxRelay::Stem);
-                    return;
-                }
-            }
+    fn relay_txs(&self, from: Option<u64>, txs: TxBatch, how: TxRelay) {
+        if txs.is_empty() {
+            return;
         }
-        self.fluff(from, id, blob);
+        let stem = match how {
+            TxRelay::Local => true,
+            TxRelay::Stem => !lock(&self.relay).fluffing,
+            TxRelay::Fluff => false,
+        };
+        if stem && self.stem(from, &txs) {
+            return;
+        }
+        self.fluff(from, txs);
     }
 
-    fn fluff(&self, except: Option<u64>, id: Hash256, blob: Vec<u8>) {
-        let targets: Vec<u64> = self
+    /// Send `txs` through the stem the epoch's map gives `from`, together.
+    /// Returns whether they went.
+    fn stem(&self, from: Option<u64>, txs: &TxBatch) -> bool {
+        let target = {
+            let mut relay = lock(&self.relay);
+            let mut rand = |n: usize| self.rand_below(n);
+            relay.stems.get_stem(from, &mut rand)
+        };
+        let conn = target
+            .and_then(|id| lock(&self.conns).get(&id).cloned())
+            .filter(|c| c.state() == STATE_NORMAL);
+        let Some(conn) = conn else {
+            return false;
+        };
+        let body = NewTransactions {
+            txs: txs.iter().map(|(_, blob)| blob.clone()).collect(),
+            dandelionpp_fluff: false,
+        }
+        .to_bytes();
+        if !conn.notify(command::NEW_TRANSACTIONS, &body) {
+            return false;
+        }
+        let now = Instant::now();
+        {
+            let mut relay = lock(&self.relay);
+            for (id, blob) in txs {
+                let deadline = now + self.embargo();
+                relay.embargo.insert(*id, (deadline, blob.clone()));
+            }
+        }
+        let ids: Vec<Hash256> = txs.iter().map(|(id, _)| *id).collect();
+        self.core.tx_relayed(&ids, TxRelay::Stem);
+        true
+    }
+
+    /// Queue `txs` to every synchronised peer but `except` (`fluff_notify`).
+    fn fluff(&self, except: Option<u64>, txs: TxBatch) {
+        let targets: Vec<(u64, bool)> = self
             .snapshot()
             .iter()
             .filter(|c| Some(c.id) != except && c.state() == STATE_NORMAL)
-            .map(|c| c.id)
+            .map(|c| (c.id, c.incoming))
             .collect();
+        let ids: Vec<Hash256> = txs.iter().map(|(id, _)| *id).collect();
         let mut relay = lock(&self.relay);
-        relay.embargo.remove(&id);
+        for id in &ids {
+            relay.embargo.remove(id);
+        }
         if targets.is_empty() {
-            // Sent to nobody, so not marked relayed: the pool offers it again
-            // ([`Core::due_for_relay`]) until a synchronised peer can take it.
-            // Marking it here left it in the pool for good.
+            // Sent to nobody, so not marked relayed: the pool offers them
+            // again ([`Core::due_for_relay`]) until a synchronised peer can
+            // take them. Marking them here left them in the pool for good.
             wow_log::debug!(
                 LOG,
-                "no synchronised peer to send transaction {} to; it waits in the pool",
-                wow_crypto::hex::encode(&id)
+                "no synchronised peer to send {} transaction(s) to; they wait in the pool",
+                ids.len()
             );
             return;
         }
-        for t in targets {
-            let flush_at = Instant::now() + self.exp_delay(DANDELION_FLUSH_AVERAGE);
-            let entry = relay.queued.entry(t).or_insert((flush_at, Vec::new()));
-            if !entry.1.iter().any(|(i, _)| *i == id) {
-                entry.1.push((id, blob.clone()));
-            }
+        let now = Instant::now();
+        for (t, incoming) in targets {
+            // The timer starts with the first transaction a connection's
+            // queue takes, and the rest wait for it.
+            let queue = relay
+                .queued
+                .entry(t)
+                .or_insert_with(|| (now + self.flush_delay(incoming), Vec::new()));
+            queue.1.extend(txs.iter().cloned());
         }
         drop(relay);
-        self.core.tx_relayed(&[id], TxRelay::Fluff);
+        self.core.tx_relayed(&ids, TxRelay::Fluff);
     }
 
-    /// The stem peer for a transaction: for one received from `from`, the
-    /// epoch's mapping of that connection; for a local one, either stem.
-    fn stem_peer(&self, from: Option<u64>) -> Option<Arc<Conn>> {
-        let stems = lock(&self.relay).stems.clone();
-        let conns = lock(&self.conns);
-        let live: Vec<&Arc<Conn>> = stems
+    /// The outgoing connections a stem may use (`get_out_connections`):
+    /// synchronised ones.
+    fn stem_candidates(&self) -> Vec<u64> {
+        self.snapshot()
             .iter()
-            .filter_map(|id| conns.get(id))
-            .filter(|c| Some(c.id) != from && c.state() == STATE_NORMAL)
-            .collect();
-        if live.is_empty() {
-            return None;
-        }
-        let i = match from {
-            Some(f) => (f as usize) % live.len(),
-            None => self.rand_below(live.len()),
-        };
-        Some(live[i].clone())
+            .filter(|c| !c.incoming && c.state() == STATE_NORMAL)
+            .map(|c| c.id)
+            .collect()
     }
 
     fn relay_tick(&self) {
         let now = Instant::now();
 
-        // A new epoch picks new stem peers from the outgoing connections -- as
-        // does losing one, or having none: an epoch that began before any
-        // connection was up would otherwise run ten minutes with no stems.
-        let rotate = {
-            let relay = lock(&self.relay);
-            let conns = lock(&self.conns);
-            now >= relay.epoch_ends
-                || relay.stems.is_empty()
-                || relay.stems.iter().any(|id| !conns.contains_key(id))
-        };
-        if rotate {
-            let mut outgoing: Vec<u64> = self
-                .snapshot()
-                .iter()
-                .filter(|c| !c.incoming && c.state() == STATE_NORMAL)
-                .map(|c| c.id)
-                .collect();
-            let mut stems = Vec::new();
-            while stems.len() < DANDELION_STEMS && !outgoing.is_empty() {
-                let i = self.rand_below(outgoing.len());
-                stems.push(outgoing.swap_remove(i));
-            }
+        // A new epoch (`start_epoch`): new stems from the outgoing
+        // connections, and a new draw of whether it fluffs. Between epochs a
+        // stem that went away is replaced, and only it; replacing both and
+        // starting the epoch over whenever one stem dropped reshuffled every
+        // source's path.
+        let candidates = self.stem_candidates();
+        let new_epoch = now >= lock(&self.relay).epoch_ends;
+        let mut rand = |n: usize| self.rand_below(n);
+        if new_epoch {
+            let fluffing = rand(100) < DANDELION_FLUFF_PERCENT;
+            let stems = StemMap::new(candidates, DANDELION_STEMS, &mut rand);
             let epoch = DANDELION_MIN_EPOCH
                 + Duration::from_secs(self.rand_u64() % DANDELION_EPOCH_RANGE_SECS);
             let mut relay = lock(&self.relay);
+            relay.fluffing = fluffing;
             relay.stems = stems;
             relay.epoch_ends = now + epoch;
+            wow_log::debug!(
+                LOG,
+                "a new Dandelion++ epoch: {}",
+                if fluffing { "fluff" } else { "stem" }
+            );
+        } else {
+            lock(&self.relay).stems.update(candidates, &mut rand);
         }
 
         // Embargoes that ran out without the transaction coming back fluffed.
-        let expired: Vec<(Hash256, Vec<u8>)> = {
+        let expired: TxBatch = {
             let mut relay = lock(&self.relay);
             let ids: Vec<Hash256> = relay
                 .embargo
@@ -1151,9 +1382,7 @@ impl Shared {
                 .filter_map(|id| relay.embargo.remove(&id).map(|(_, blob)| (id, blob)))
                 .collect()
         };
-        for (id, blob) in expired {
-            self.fluff(None, id, blob);
-        }
+        self.relay_txs(None, expired, TxRelay::Fluff);
 
         // Flushes that are due.
         let due: Vec<(u64, TxBatch)> = {
@@ -1170,8 +1399,9 @@ impl Shared {
         };
         if !due.is_empty() {
             let conns = lock(&self.conns);
-            for (id, txs) in due {
+            for (id, mut txs) in due {
                 if let Some(c) = conns.get(&id) {
+                    flush_order(&mut txs);
                     let body = NewTransactions {
                         txs: txs.into_iter().map(|(_, b)| b).collect(),
                         dandelionpp_fluff: true,
@@ -1185,14 +1415,18 @@ impl Shared {
         // A transaction sent once can still have reached no one: a peer that
         // dropped it, a connection that closed before its flush. The pool says
         // what is due to go again, as `relay_txpool_transactions` asks it in
-        // the C++: one submitted here and never stemmed through the stem, the
-        // rest as fluff.
+        // the C++, and they go together: those submitted here and never
+        // stemmed through the stem, the rest as fluff.
+        let mut local = TxBatch::new();
+        let mut public = TxBatch::new();
         for (id, blob, how) in self.core.due_for_relay() {
             match how {
-                TxRelay::Local => self.relay_tx(None, id, blob, TxRelay::Local),
-                TxRelay::Stem | TxRelay::Fluff => self.fluff(None, id, blob),
+                TxRelay::Local => local.push((id, blob)),
+                TxRelay::Stem | TxRelay::Fluff => public.push((id, blob)),
             }
         }
+        self.relay_txs(None, local, TxRelay::Local);
+        self.relay_txs(None, public, TxRelay::Fluff);
     }
 
     /// Announce a block to every synchronised peer but `except`: fluffy, with
@@ -2592,15 +2826,25 @@ fn on_new_transactions(shared: &Shared, conn: &Conn, body: &[u8]) -> Result<(), 
     }
     let m = NewTransactions::parse(body).map_err(|e| malformed("transactions", e))?;
     let verdicts = shared.core.incoming_txs(&m.txs, m.dandelionpp_fluff);
-    for (blob, verdict) in m.txs.iter().zip(verdicts) {
+    // Passed on as two batches, the stem and the fluff, as the C++ relays
+    // them (`handle_notify_new_transactions`); one message per transaction
+    // told a stem peer how many there had been, and in what order.
+    let mut stem = TxBatch::new();
+    let mut fluff = TxBatch::new();
+    for (blob, verdict) in m.txs.into_iter().zip(verdicts) {
         match verdict {
             // As the pool says, not as the message says: a stem copy of a
             // transaction this node already holds in its stem is a loop, and
             // is fluffed -- where answering "known" left it to sit out the
             // embargo while the stem went quiet.
-            TxVerdict::Accepted { id, how: Some(how) } => {
-                shared.relay_tx(Some(conn.id), id, blob.clone(), how);
-            }
+            TxVerdict::Accepted {
+                id,
+                how: Some(TxRelay::Local | TxRelay::Stem),
+            } => stem.push((id, blob)),
+            TxVerdict::Accepted {
+                id,
+                how: Some(TxRelay::Fluff),
+            } => fluff.push((id, blob)),
             TxVerdict::Accepted { .. } => {}
             TxVerdict::Known { id } => {
                 // Seen fluffed: any embargo on it has served its purpose.
@@ -2612,6 +2856,8 @@ fn on_new_transactions(shared: &Shared, conn: &Conn, body: &[u8]) -> Result<(), 
             TxVerdict::Rejected { .. } => {}
         }
     }
+    shared.relay_txs(Some(conn.id), stem, TxRelay::Stem);
+    shared.relay_txs(Some(conn.id), fluff, TxRelay::Fluff);
     Ok(())
 }
 
@@ -2636,6 +2882,107 @@ mod tests {
         assert_eq!(DANDELION_MIN_EPOCH, Duration::from_secs(600));
         assert_eq!(DANDELION_EMBARGO_AVERAGE, Duration::from_secs(39));
         assert_eq!(DANDELION_FLUSH_AVERAGE, Duration::from_secs(5));
+        assert_eq!((FLUSH_QUARTERS_IN, FLUSH_QUARTERS_OUT), (20, 10));
+    }
+
+    /// splitmix64, as uniform draws in (0, 1]: a fixed sequence, so the
+    /// statistics below are the same on every run.
+    fn uniforms(mut state: u64) -> impl FnMut() -> f64 {
+        move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            ((z >> 11) + 1) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// The timers are Poisson counts, as `std::poisson_distribution` gives
+    /// them: the mean asked for, and a variance equal to it. An exponential
+    /// delay, which this used, has the mean but a variance of its square --
+    /// 1,521 s² for the embargo rather than 39.
+    #[test]
+    fn the_dandelion_timers_are_poisson() {
+        for mean in [10u64, 20, 39] {
+            let mut next = uniforms(mean);
+            let n = 20_000;
+            let draws: Vec<f64> = (0..n).map(|_| poisson(mean, &mut next) as f64).collect();
+            let avg = draws.iter().sum::<f64>() / n as f64;
+            let var = draws.iter().map(|d| (d - avg).powi(2)).sum::<f64>() / n as f64;
+            let expected = mean as f64;
+            assert!((avg - expected).abs() < 0.3, "mean {mean}: {avg}");
+            assert!((var / expected - 1.0).abs() < 0.1, "mean {mean}: {var}");
+        }
+        assert_eq!(poisson(0, uniforms(1)), 0);
+    }
+
+    /// A batch goes out sorted and without repeats, whatever order it was
+    /// queued in.
+    #[test]
+    fn a_flush_does_not_keep_the_arrival_order() {
+        let mut txs: TxBatch = vec![
+            ([3; 32], vec![3, 3]),
+            ([1; 32], vec![1]),
+            ([3; 32], vec![3, 3]),
+            ([2; 32], vec![2]),
+        ];
+        flush_order(&mut txs);
+        let blobs: Vec<Vec<u8>> = txs.into_iter().map(|(_, b)| b).collect();
+        assert_eq!(blobs, vec![vec![1], vec![2], vec![3, 3]]);
+    }
+
+    /// Each source keeps its stem for the epoch; a new source takes the least
+    /// used; a stem that goes away is replaced alone, and a source mapped to it
+    /// moves on.
+    #[test]
+    fn the_stem_map_is_sticky_and_mends_only_what_broke() {
+        let mut first = |_: usize| 0;
+        let mut map = StemMap::new(vec![10, 11, 12, 13], DANDELION_STEMS, &mut first);
+        let stems: Vec<Option<u64>> = map.out.clone();
+        assert_eq!(stems.len(), 2);
+        assert!(stems.iter().all(|s| s.is_some()));
+
+        let local = map.get_stem(None, &mut first).unwrap();
+        let peer = map.get_stem(Some(7), &mut first).unwrap();
+        assert_ne!(local, peer, "the second source takes the other stem");
+        for _ in 0..5 {
+            assert_eq!(map.get_stem(None, &mut first), Some(local));
+            assert_eq!(map.get_stem(Some(7), &mut first), Some(peer));
+        }
+        assert_eq!(map.usage, vec![1, 1]);
+
+        // Nothing changed: nothing to do.
+        assert!(!map.update((10..14).collect(), &mut first));
+
+        // The local stem goes away. Its slot takes another connection, the
+        // other slot keeps its own, and the local source moves.
+        let live: Vec<u64> = (10..14).filter(|c| *c != local).collect();
+        assert!(map.update(live, &mut first));
+        assert!(map.out.contains(&Some(peer)));
+        assert!(!map.out.contains(&Some(local)));
+        assert_eq!(map.get_stem(Some(7), &mut first), Some(peer));
+        let moved = map.get_stem(None, &mut first).unwrap();
+        assert_ne!(moved, local);
+        assert_eq!(map.usage.iter().sum::<usize>(), 2);
+
+        // With no connections left, there is no stem, and no mapping kept.
+        assert!(map.update(Vec::new(), &mut first));
+        assert_eq!(map.get_stem(None, &mut first), None);
+        assert!(!map.sources.contains_key(&None));
+    }
+
+    /// An epoch that starts with no connections fills its stems as they come.
+    #[test]
+    fn an_empty_stem_map_fills_up() {
+        let mut first = |_: usize| 0;
+        let mut map = StemMap::new(Vec::new(), DANDELION_STEMS, &mut first);
+        assert_eq!(map.get_stem(None, &mut first), None);
+        assert!(map.update(vec![5], &mut first));
+        assert_eq!(map.get_stem(None, &mut first), Some(5));
+        assert!(map.update(vec![5, 6, 7], &mut first));
+        assert_eq!(map.out.len(), DANDELION_STEMS);
+        assert_eq!(map.get_stem(Some(1), &mut first), map.out[1]);
     }
 
     /// Mainnet has its six hard-coded seeds; the test networks have none of
