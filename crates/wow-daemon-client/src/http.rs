@@ -51,6 +51,13 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 /// both.
 const LOG: &str = "net.http";
 
+/// What a binary request is, to a [`Transport`] that has to say.
+///
+/// [`Endpoint`] does not say it: epee's `invoke_http_bin` sends no
+/// `Content-Type` at all, and a request that carries one is a request no C++
+/// wallet made.
+pub const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
+
 #[derive(Debug)]
 pub enum HttpError {
     Io(std::io::Error),
@@ -124,11 +131,14 @@ impl std::fmt::Display for HttpError {
             HttpError::Status { code } => write!(f, "daemon returned HTTP {code}"),
             HttpError::Unauthorized { .. } => write!(
                 f,
-                "the daemon wants a login (it was started with --rpc-login); give one with                  --daemon-login <user>:<password>"
+                "the daemon wants a login (it was started with --rpc-login); give one with \
+                 --daemon-login <user>:<password>"
             ),
             HttpError::BadLogin { user } => write!(
                 f,
-                "the daemon refused the login for `{user}`. Check the user name and the                  password: three wrong attempts and it blocks this address for a day,                  unless it was started with --disable-rpc-ban"
+                "the daemon refused the login for `{user}`. Check the user name and the \
+                 password: three wrong attempts and it blocks this address for a day, \
+                 unless it was started with --disable-rpc-ban"
             ),
             HttpError::Transport(what) => write!(f, "{what}"),
         }
@@ -384,14 +394,23 @@ impl Endpoint {
         // connection as soon as it has answered a request that asks for that,
         // cancelling the reply it is still writing, so a large one arrives cut
         // short. `wallet2` never sends it, and neither does this.
+        //
+        // The head is epee's `http_simple_client::invoke`, field for field and
+        // in its order: `Host` without the port, `Content-Length`, the
+        // `Content-Type` only `invoke_http_json` adds, then `Authorization`.
+        // Nothing else, `Accept` included, so a node or anyone on the path
+        // sees the request a C++ wallet sends.
         let mut head = format!(
             "POST {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
-             Content-Type: {content_type}\r\n\
-             Content-Length: {len}\r\n\
-             Accept: */*\r\n",
+             Content-Length: {len}\r\n",
             len = body.len(),
         );
+        if content_type != BINARY_CONTENT_TYPE {
+            head.push_str("Content-Type: ");
+            head.push_str(content_type);
+            head.push_str("\r\n");
+        }
         if let Some(a) = authorization {
             head.push_str("Authorization: ");
             head.push_str(a);
@@ -448,7 +467,8 @@ struct Target {
     /// The host alone, without brackets: the name a certificate is checked
     /// for.
     host: String,
-    /// `Host:`, as the address gave it, less the scheme.
+    /// `Host:`: the host alone, as epee's client sends it, with an IPv6
+    /// address still in brackets so the header stays one a proxy can read.
     host_header: String,
 }
 
@@ -486,11 +506,16 @@ impl Target {
             (false, Some(_)) => format!("{rest}:{}", if tls { 443 } else { 80 }),
             _ => rest.to_string(),
         };
+        let host_header = if rest.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
         Ok(Target {
             tls,
             host_port,
             host: host.to_string(),
-            host_header: rest.to_string(),
+            host_header,
         })
     }
 }
@@ -810,7 +835,7 @@ mod tests {
                 tls: false,
                 host_port: "127.0.0.1:34568".into(),
                 host: "127.0.0.1".into(),
-                host_header: "127.0.0.1:34568".into(),
+                host_header: "127.0.0.1".into(),
             }
         );
 
@@ -821,10 +846,11 @@ mod tests {
         assert_eq!(t.host, "wow-node.0z.network");
         assert_eq!(t.host_header, "wow-node.0z.network");
 
+        // `Host:` never carries the port, as epee's never does.
         let t = Target::parse("HTTPS://wow-node.0z.network:443").expect("ok");
         assert!(t.tls);
         assert_eq!(t.host_port, "wow-node.0z.network:443");
-        assert_eq!(t.host_header, "wow-node.0z.network:443");
+        assert_eq!(t.host_header, "wow-node.0z.network");
 
         let t = Target::parse("http://[::1]").expect("ok");
         assert!(!t.tls);
@@ -834,6 +860,7 @@ mod tests {
         let t = Target::parse("[::1]:34568").expect("ok");
         assert_eq!(t.host_port, "[::1]:34568");
         assert_eq!(t.host, "::1");
+        assert_eq!(t.host_header, "[::1]");
 
         assert!(matches!(
             Target::parse("http://[::1:34568"),
@@ -862,6 +889,57 @@ mod tests {
             s.write_all(reply).expect("write");
         });
         (address, server)
+    }
+
+    /// Answer one request with an empty `200`, and hand back the request's
+    /// head as it arrived.
+    fn capture_head() -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("an address").to_string();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut chunk).expect("read");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("write");
+            let end = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(request.len(), |p| p + 4);
+            String::from_utf8_lossy(&request[..end]).into_owned()
+        });
+        (address, server)
+    }
+
+    /// The head of a request is epee's: `Host` without the port, then
+    /// `Content-Length`, a `Content-Type` only on JSON, and no `Accept`.
+    #[test]
+    fn a_request_head_is_the_one_a_cpp_wallet_sends() {
+        let (address, server) = capture_head();
+        Endpoint::new(address)
+            .post("/getblocks.bin", BINARY_CONTENT_TYPE, b"")
+            .expect("ok");
+        assert_eq!(
+            server.join().expect("the server"),
+            "POST /getblocks.bin HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n"
+        );
+
+        let (address, server) = capture_head();
+        Endpoint::new(address)
+            .post("/json_rpc", crate::JSON_CONTENT_TYPE, b"")
+            .expect("ok");
+        assert_eq!(
+            server.join().expect("the server"),
+            "POST /json_rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\
+             Content-Type: application/json; charset=utf-8\r\n\r\n"
+        );
     }
 
     /// A server that answers `replies.len()` requests, all on connections it

@@ -27,6 +27,10 @@ use crate::{DaemonClient, DaemonError};
 
 type Result<T> = std::result::Result<T, DaemonError>;
 
+/// `COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT`: the most blocks one
+/// `getblocks.bin` answer carries, whatever the request asks.
+const GET_BLOCKS_MAX_BLOCK_COUNT: u64 = 1_000;
+
 /// One block as `get_blocks.bin` returns it: the block blob and its
 /// transactions' blobs, unparsed.
 ///
@@ -50,6 +54,24 @@ pub struct GetBlocks {
     pub start_height: u64,
     pub current_height: u64,
     pub daemon_time: u64,
+}
+
+/// What `gethashes.bin` answers: block hashes, from `start_height` up.
+#[derive(Clone, Debug, Default)]
+pub struct GetHashes {
+    pub hashes: Vec<Hash256>,
+    pub start_height: u64,
+    pub current_height: u64,
+}
+
+/// One transaction in the pool, as `get_txpool_backlog` reports it:
+/// `tx_backlog_entry`. No id and no blob, which is the point of asking this
+/// rather than for the pool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BacklogEntry {
+    pub weight: u64,
+    pub fee: u64,
+    pub time_in_pool: u64,
 }
 
 /// One ring member, as `get_outs.bin` returns it.
@@ -169,19 +191,27 @@ impl DaemonClient {
         })
     }
 
-    /// `/send_raw_transaction` (`specs/11` §3.1).
+    /// `/sendrawtransaction` (`specs/11` §3.1).
     ///
     /// `do_not_relay` submits without broadcasting, which is how a wallet
     /// checks a transaction would be accepted before committing to it.
+    ///
+    /// By the name and with the fields `wallet2::commit_tx` sends, so a node
+    /// sees the request a C++ wallet makes: `do_not_relay` and
+    /// `do_sanity_checks` are `KV_SERIALIZE_OPT`, which epee leaves out at
+    /// their defaults, false and true. `client` is left out altogether: it is
+    /// a signature under a key the C++ wallet keeps in its cache
+    /// (`m_rpc_client_secret_key`), which names the wallet across sessions
+    /// rather than being a fingerprint worth copying.
     pub fn send_raw_transaction(&self, blob: &[u8], do_not_relay: bool) -> Result<SendResult> {
-        let params = json!({
-            "tx_as_hex": wow_crypto::hex::encode(blob),
-            "do_not_relay": do_not_relay,
-        });
+        let mut params = json!({ "tx_as_hex": wow_crypto::hex::encode(blob) });
+        if do_not_relay {
+            params["do_not_relay"] = Json::Bool(true);
+        }
         // The status here is the *transaction's*, not the daemon's, so a
         // rejection must come back as a value rather than an error.
         let body = params.to_string();
-        let raw = self.endpoint_post("/send_raw_transaction", body.as_bytes())?;
+        let raw = self.endpoint_post("/sendrawtransaction", body.as_bytes())?;
         let v: Json = serde_json::from_slice(&raw)?;
 
         Ok(SendResult {
@@ -228,7 +258,7 @@ impl DaemonClient {
 
     // -- binary -------------------------------------------------------------
 
-    /// `/get_blocks.bin` — the refresh workhorse (`specs/11` §5.1).
+    /// `/getblocks.bin` — the refresh workhorse (`specs/11` §5.1).
     ///
     /// `block_ids` is the wallet's short chain history, newest first, genesis
     /// last. The daemon answers from the newest block in it that it has, that
@@ -237,6 +267,13 @@ impl DaemonClient {
     ///
     /// `max_block_count` caps the reply below the daemon's own limit of 1000,
     /// and 0 leaves it there. A daemon that predates the field ignores it.
+    ///
+    /// The request is the one `wallet2::pull_blocks` sends, by the name it
+    /// uses: `no_miner_tx` and `max_block_count` are `KV_SERIALIZE_OPT`, so
+    /// epee leaves them out at their defaults, and `wallet2` never sets the
+    /// second at all. It is only sent here below the daemon's limit, after a
+    /// reply was cut short, when asking for fewer is worth being told apart
+    /// by. `client` is left out: `send_raw_transaction` says why.
     pub fn get_blocks(
         &self,
         block_ids: &[Hash256],
@@ -253,13 +290,35 @@ impl DaemonClient {
         );
         req.insert("start_height".into(), Value::U64(start_height));
         req.insert("prune".into(), Value::Bool(prune));
-        req.insert("no_miner_tx".into(), Value::Bool(no_miner_tx));
-        if max_block_count > 0 {
+        if no_miner_tx {
+            req.insert("no_miner_tx".into(), Value::Bool(true));
+        }
+        if max_block_count > 0 && max_block_count < GET_BLOCKS_MAX_BLOCK_COUNT {
             req.insert("max_block_count".into(), Value::U64(max_block_count));
         }
 
-        let res = self.binary("/get_blocks.bin", &req)?;
+        let res = self.binary("/getblocks.bin", &req)?;
         parse_get_blocks(&res)
+    }
+
+    /// `/gethashes.bin` — block hashes, from the newest hash in `block_ids`
+    /// the daemon has, that block included (`find_blockchain_supplement`), up
+    /// to the daemon's limit per call.
+    ///
+    /// How a wallet fills in the hashes below where it starts scanning without
+    /// downloading the blocks, as `wallet2::fast_refresh` does. `start_height`
+    /// is sent at zero, as `pull_hashes` sends it: `on_get_hashes` overwrites
+    /// it with the split it finds.
+    pub fn get_hashes(&self, block_ids: &[Hash256]) -> Result<GetHashes> {
+        let mut req = Section::new();
+        req.insert(
+            "block_ids".into(),
+            Value::String(block_ids.iter().flatten().copied().collect()),
+        );
+        // `KV_SERIALIZE`, not `_OPT`: written even at zero.
+        req.insert("start_height".into(), Value::U64(0));
+        let res = self.binary("/gethashes.bin", &req)?;
+        parse_get_hashes(&res)
     }
 
     /// `/get_o_indexes.bin` — the global output indices of one transaction.
@@ -395,6 +454,24 @@ impl DaemonClient {
         parse_transaction_pool(&v)
     }
 
+    /// `get_txpool_backlog`: the weight and fee of each transaction in the
+    /// pool, and nothing else about them. What `wallet2::estimate_backlog`
+    /// asks when it chooses a fee.
+    ///
+    /// Not through [`DaemonClient::json_rpc`]: the answer is not JSON a strict
+    /// parser takes. [`parse_txpool_backlog`] says why.
+    pub fn get_txpool_backlog(&self) -> Result<Vec<BacklogEntry>> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": "0",
+            "method": "get_txpool_backlog",
+            "params": {},
+        })
+        .to_string();
+        let raw = self.raw_post("/json_rpc", crate::JSON_CONTENT_TYPE, body.as_bytes())?;
+        parse_txpool_backlog(&raw)
+    }
+
     /// `/is_key_image_spent`, one status per key image, in order.
     pub fn is_key_image_spent(&self, key_images: &[[u8; 32]]) -> Result<Vec<KeyImageStatus>> {
         let hex: Vec<String> = key_images
@@ -422,8 +499,137 @@ impl DaemonClient {
 
     /// A `POST` that returns the raw body regardless of the `status` field.
     fn endpoint_post(&self, path: &str, body: &[u8]) -> Result<Vec<u8>> {
-        Ok(self.raw_post(path, "application/json", body)?)
+        Ok(self.raw_post(path, crate::JSON_CONTENT_TYPE, body)?)
     }
+}
+
+/// Pull a `gethashes.bin` response apart.
+fn parse_get_hashes(res: &Section) -> Result<GetHashes> {
+    // CONTAINER_POD_AS_BLOB: packed 32-byte hashes.
+    let blob = res
+        .get("m_block_ids")
+        .and_then(Value::as_bytes)
+        .unwrap_or(&[]);
+    if !blob.len().is_multiple_of(32) {
+        return Err(DaemonError::BadField("m_block_ids"));
+    }
+    Ok(GetHashes {
+        hashes: blob.as_chunks::<32>().0.to_vec(),
+        start_height: res.get("start_height").and_then(Value::as_u64).unwrap_or(0),
+        current_height: res
+            .get("current_height")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+/// The bytes of one `tx_backlog_entry`: three `uint64_t`, little-endian.
+const BACKLOG_ENTRY_BYTES: usize = 24;
+
+/// Pull a `get_txpool_backlog` answer apart.
+///
+/// `backlog` is `KV_SERIALIZE_CONTAINER_POD_AS_BLOB`: the entries' own bytes,
+/// put into a JSON string by epee's writer, which escapes nine characters
+/// (`transform_to_escape_sequence`) and passes every other byte through as it
+/// is. So the answer is not UTF-8, and a raw control byte makes it JSON no
+/// strict parser takes. The string is cut out and unescaped here, and only
+/// what is left, with an empty string in its place, goes to `serde_json`.
+fn parse_txpool_backlog(raw: &[u8]) -> Result<Vec<BacklogEntry>> {
+    let (blob, rest) = match cut_string(raw, b"\"backlog\"") {
+        Some(cut) => cut,
+        // An empty pool can come back without the field.
+        None => (Vec::new(), raw.to_vec()),
+    };
+    let v: Json = serde_json::from_slice(&rest)?;
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+        return Err(DaemonError::Rpc {
+            code: err.get("code").and_then(Json::as_i64).unwrap_or(0),
+            message: err
+                .get("message")
+                .and_then(Json::as_str)
+                .unwrap_or("no message")
+                .to_string(),
+        });
+    }
+    let result = v.get("result").ok_or(DaemonError::Missing("result"))?;
+    crate::check_status(result)?;
+    if !blob.len().is_multiple_of(BACKLOG_ENTRY_BYTES) {
+        return Err(DaemonError::BadField("backlog"));
+    }
+    Ok(blob
+        .chunks_exact(BACKLOG_ENTRY_BYTES)
+        .map(|e| {
+            let word = |i: usize| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&e[i * 8..i * 8 + 8]);
+                u64::from_le_bytes(b)
+            };
+            BacklogEntry {
+                weight: word(0),
+                fee: word(1),
+                time_in_pool: word(2),
+            }
+        })
+        .collect())
+}
+
+/// Find the string value of `key` in raw epee JSON, and return its bytes
+/// unescaped along with the document with that string emptied.
+///
+/// `None` when `key` is not followed by a string. The escapes are epee's, and
+/// `\u00XX` besides, which is how a writer that does escape control
+/// characters writes them.
+fn cut_string(raw: &[u8], key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let at = raw.windows(key.len()).position(|w| w == key)?;
+    let skip_space = |mut i: usize| {
+        while raw.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        i
+    };
+    let mut i = skip_space(at + key.len());
+    if raw.get(i) != Some(&b':') {
+        return None;
+    }
+    i = skip_space(i + 1);
+    if raw.get(i) != Some(&b'"') {
+        return None;
+    }
+    let open = i;
+    i += 1;
+    let mut bytes = Vec::new();
+    loop {
+        let b = *raw.get(i)?;
+        i += 1;
+        match b {
+            b'"' => break,
+            b'\\' => {
+                let escaped = *raw.get(i)?;
+                i += 1;
+                bytes.push(match escaped {
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 0x0b,
+                    b'u' => {
+                        let hex = std::str::from_utf8(raw.get(i..i + 4)?).ok()?;
+                        i += 4;
+                        u8::try_from(u16::from_str_radix(hex, 16).ok()?).ok()?
+                    }
+                    // `"`, `\` and `/` stand for themselves.
+                    other => other,
+                });
+            }
+            other => bytes.push(other),
+        }
+    }
+    let mut rest = Vec::with_capacity(raw.len());
+    rest.extend_from_slice(&raw[..open]);
+    rest.extend_from_slice(b"\"\"");
+    rest.extend_from_slice(&raw[i..]);
+    Some((bytes, rest))
 }
 
 /// Pull a `get_blocks.bin` response apart.
@@ -831,6 +1037,100 @@ mod tests {
         assert!(matches!(
             parse_transaction_pool(&json!({"transactions": [{"id_hash": "zz", "tx_blob": "00"}]})),
             Err(DaemonError::BadField("id_hash"))
+        ));
+    }
+
+    /// Hashes come back packed, from the height the daemon found, and a blob
+    /// that is not whole hashes is refused.
+    #[test]
+    fn a_hashes_response_parses() {
+        let mut res = Section::new();
+        let mut packed = vec![1u8; 32];
+        packed.extend_from_slice(&[2u8; 32]);
+        res.insert("m_block_ids".into(), Value::String(packed));
+        res.insert("start_height".into(), Value::U64(838_800));
+        res.insert("current_height".into(), Value::U64(880_000));
+        let got = parse_get_hashes(&res).expect("parses");
+        assert_eq!(got.hashes, vec![[1u8; 32], [2u8; 32]]);
+        assert_eq!(got.start_height, 838_800);
+        assert_eq!(got.current_height, 880_000);
+
+        res.insert("m_block_ids".into(), Value::String(vec![0u8; 33]));
+        assert!(matches!(
+            parse_get_hashes(&res),
+            Err(DaemonError::BadField("m_block_ids"))
+        ));
+    }
+
+    /// epee's JSON writer as `transform_to_escape_sequence` has it: nine
+    /// characters escaped, every other byte as it is.
+    fn epee_escape(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            match b {
+                0x08 => out.extend_from_slice(b"\\b"),
+                0x0c => out.extend_from_slice(b"\\f"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                0x0b => out.extend_from_slice(b"\\v"),
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'/' => out.extend_from_slice(b"\\/"),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// The backlog is read from the raw bytes epee writes into a JSON string:
+    /// escapes, a NUL, bytes that are not UTF-8 and a quote among them.
+    #[test]
+    fn a_backlog_is_read_from_the_bytes_epee_writes() {
+        let entries = [
+            BacklogEntry {
+                weight: 0x2f5c_220a,
+                fee: 0x0d0b_0c09_0800_ff80,
+                time_in_pool: 12,
+            },
+            BacklogEntry {
+                weight: 1_500,
+                fee: 390_000_000,
+                time_in_pool: 0,
+            },
+        ];
+        let mut blob = Vec::new();
+        for e in &entries {
+            blob.extend_from_slice(&e.weight.to_le_bytes());
+            blob.extend_from_slice(&e.fee.to_le_bytes());
+            blob.extend_from_slice(&e.time_in_pool.to_le_bytes());
+        }
+        let mut raw = b"{\r\n  \"id\": \"0\",\r\n  \"jsonrpc\": \"2.0\",\r\n  \"result\": {\r\n    \"backlog\": \"".to_vec();
+        raw.extend_from_slice(&epee_escape(&blob));
+        raw.extend_from_slice(
+            b"\",\r\n    \"credits\": 0,\r\n    \"status\": \"OK\",\r\n    \"top_hash\": \"\",\r\n    \"untrusted\": false\r\n  }\r\n}",
+        );
+        assert!(serde_json::from_slice::<Json>(&raw).is_err(), "not JSON as it stands");
+        assert_eq!(parse_txpool_backlog(&raw).expect("parses"), entries);
+
+        // An empty pool, with the field or without it.
+        let empty = br#"{"id": "0", "jsonrpc": "2.0", "result": {"backlog": "", "status": "OK"}}"#;
+        assert!(parse_txpool_backlog(empty).expect("parses").is_empty());
+        let absent = br#"{"id": "0", "jsonrpc": "2.0", "result": {"status": "OK"}}"#;
+        assert!(parse_txpool_backlog(absent).expect("parses").is_empty());
+
+        // A node that does not serve it says so as an error, not as a backlog.
+        let refused = br#"{"id": "0", "jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}}"#;
+        assert!(matches!(
+            parse_txpool_backlog(refused),
+            Err(DaemonError::Rpc { code: -32601, .. })
+        ));
+        let busy = br#"{"id": "0", "jsonrpc": "2.0", "result": {"status": "BUSY"}}"#;
+        assert!(matches!(parse_txpool_backlog(busy), Err(DaemonError::Status(_))));
+        let torn = br#"{"id": "0", "jsonrpc": "2.0", "result": {"backlog": "abc", "status": "OK"}}"#;
+        assert!(matches!(
+            parse_txpool_backlog(torn),
+            Err(DaemonError::BadField("backlog"))
         ));
     }
 }

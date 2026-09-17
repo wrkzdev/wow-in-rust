@@ -10,7 +10,7 @@
 //! |---|---|---|
 //! | JSON-RPC 2.0 | `/json_rpc` | JSON, `{method, params}` |
 //! | direct | `/get_height`, … | JSON |
-//! | binary | `/get_blocks.bin`, … | **epee portable storage** |
+//! | binary | `/getblocks.bin`, … | **epee portable storage** |
 //!
 //! The binary ones are the wallet's sync path and are where all the volume is.
 //!
@@ -63,8 +63,11 @@ use std::sync::Arc;
 use serde_json::{json, Value as Json};
 use wow_serialize::epee::{self, Section};
 
-pub use http::{Certificates, Endpoint, HttpError, Transport};
+pub use http::{Certificates, Endpoint, HttpError, Transport, BINARY_CONTENT_TYPE};
 pub use types::*;
+
+/// What a JSON request says it is, as epee's `invoke_http_json` says it.
+pub const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 /// A connection to one daemon. Clones share one transport.
 #[derive(Clone, Debug)]
@@ -131,7 +134,7 @@ impl DaemonClient {
 
         let raw = self
             .transport
-            .post("/json_rpc", "application/json", body.as_bytes())?;
+            .post("/json_rpc", JSON_CONTENT_TYPE, body.as_bytes())?;
         let mut v: Json = serde_json::from_slice(&raw)?;
 
         if let Some(err) = v.get_mut("error") {
@@ -156,7 +159,7 @@ impl DaemonClient {
         let body = params.to_string();
         let raw = self
             .transport
-            .post(path, "application/json", body.as_bytes())?;
+            .post(path, JSON_CONTENT_TYPE, body.as_bytes())?;
         let v: Json = serde_json::from_slice(&raw)?;
         check_status(&v)?;
         Ok(v)
@@ -183,16 +186,14 @@ impl DaemonClient {
     /// no, and the typed helpers would turn that into an error and throw the
     /// rejection flags away.
     pub fn raw_post_for_test(&self, path: &str, body: &str) -> Result<Vec<u8>> {
-        Ok(self.raw_post(path, "application/json", body.as_bytes())?)
+        Ok(self.raw_post(path, JSON_CONTENT_TYPE, body.as_bytes())?)
     }
 
     /// A binary endpoint (`specs/11` §5). Request and response are epee
     /// portable storage.
     pub fn binary(&self, path: &str, request: &Section) -> Result<Section> {
         let body = epee::to_bytes(request)?;
-        let raw = self
-            .transport
-            .post(path, "application/octet-stream", &body)?;
+        let raw = self.transport.post(path, BINARY_CONTENT_TYPE, &body)?;
         let section = epee::from_bytes(&raw)?;
         check_binary_status(&section)?;
         Ok(section)
