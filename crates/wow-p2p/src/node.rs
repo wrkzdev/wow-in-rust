@@ -5,12 +5,12 @@
 //!
 //! Each connection is two threads. The **reader** owns the socket's read side
 //! and runs the protocol: it answers requests, follows the sync, and wakes
-//! once a second to send timed syncs and notice a peer that has stopped
-//! answering. The **writer** drains a bounded outbox, so anything -- another
-//! connection relaying a transaction, the RPC server announcing a block -- can
-//! send to a peer without waiting on its socket. A peer too slow to keep its
-//! outbox from filling is disconnected rather than allowed to hold up the
-//! senders.
+//! once a second to notice a peer that has stopped answering. The **writer**
+//! drains a bounded outbox, so anything -- another connection relaying a
+//! transaction, the RPC server announcing a block, the maintenance thread's
+//! timed syncs -- can send to a peer without waiting on its socket. A peer too
+//! slow to keep its outbox from filling is disconnected rather than allowed to
+//! hold up the senders.
 //!
 //! At the connection counts a node runs with (a dozen outgoing, some tens
 //! incoming) that is well within what threads do comfortably, and it keeps
@@ -377,6 +377,8 @@ struct Conn {
     recv_bytes: AtomicU64,
     sent_bytes: Arc<AtomicU64>,
     last_recv: Mutex<Instant>,
+    /// When the timed sync still unanswered went out (`m_in_timedsync`).
+    timed_sync_sent: Mutex<Option<Instant>>,
 }
 
 impl Conn {
@@ -488,7 +490,6 @@ struct Proto {
     batch: BatchSize,
     /// When a peer whose chain entry offered nothing new may be asked again.
     chain_again_at: Instant,
-    last_timed_sync: Instant,
     next_housekeeping: Instant,
     asked_complement: bool,
     /// The addresses this peer has been given in a peer list
@@ -506,7 +507,6 @@ impl Proto {
             generation: 0,
             batch: BatchSize::default(),
             chain_again_at: now,
-            last_timed_sync: now,
             next_housekeeping: now,
             asked_complement: false,
             sent_addresses,
@@ -592,6 +592,9 @@ impl Node {
             (false, None, None) => 0,
         };
 
+        let mut id = [0u8; 8];
+        rng.fill(&mut id);
+
         let mut book = match &cfg.state_file {
             Some(p) => AddressBook::load(p, cfg.allow_local_ip).unwrap_or_else(|e| {
                 wow_log::warn!(LOG, "starting with empty peer lists: {e}");
@@ -600,10 +603,15 @@ impl Node {
             None => AddressBook::new(cfg.allow_local_ip),
         };
         for addr in &cfg.add_peers {
+            // A random id, as the C++ gives each `--add-peer` entry
+            // (`crypto::rand<uint64_t>()`). The id goes out in peer lists,
+            // and zero is an id no node has.
+            let mut peer_id = [0u8; 8];
+            rng.fill(&mut peer_id);
             book.add_white(
                 PeerRecord {
                     addr: *addr,
-                    id: 0,
+                    id: u64::from_le_bytes(peer_id),
                     last_seen: 0,
                     pruning_seed: 0,
                     rpc_port: 0,
@@ -614,9 +622,6 @@ impl Node {
         for target in &cfg.ban_list {
             book.ban(*target, u64::MAX, 0);
         }
-
-        let mut id = [0u8; 8];
-        rng.fill(&mut id);
 
         let shared = Arc::new(Shared {
             out_peers: AtomicUsize::new(cfg.out_peers),
@@ -1632,9 +1637,14 @@ fn drain_queue(shared: &Shared, stall: &mut Stall) {
 
 fn maintenance(shared: Arc<Shared>) {
     let mut last_save = Instant::now();
-    // Due at once, as `once_a_time_seconds` is on its first call.
+    // Both due at once, as `once_a_time_seconds` is on its first call.
+    let mut last_timed_sync: Option<Instant> = None;
     let mut last_gray_check: Option<Instant> = None;
     while !shared.stopping() {
+        if last_timed_sync.is_none_or(|t| t.elapsed() >= TIMED_SYNC_INTERVAL) {
+            last_timed_sync = Some(Instant::now());
+            timed_sync_all(&shared);
+        }
         make_connections(&shared);
         if last_gray_check.is_none_or(|t| t.elapsed() >= GRAY_HOUSEKEEPING_INTERVAL) {
             last_gray_check = Some(Instant::now());
@@ -1920,6 +1930,7 @@ fn run_connection(
         recv_bytes: AtomicU64::new(0),
         sent_bytes: sent.clone(),
         last_recv: Mutex::new(Instant::now()),
+        timed_sync_sent: Mutex::new(None),
     });
 
     {
@@ -2034,6 +2045,7 @@ fn handle_message(
             conn.respond(command::TIMED_SYNC, 1, &reply);
         }
         (Kind::Response, command::TIMED_SYNC) => {
+            *lock(&conn.timed_sync_sent) = None;
             if header.return_code >= 0 {
                 let t = TimedSync::parse(body).map_err(|e| malformed("timed sync", e))?;
                 let pruning_seed = t.payload_data.pruning_seed;
@@ -2182,15 +2194,29 @@ fn housekeeping(shared: &Shared, conn: &Conn, proto: &mut Proto) -> Result<(), F
     if now.duration_since(*lock(&conn.last_recv)) > IDLE_TIMEOUT {
         return Err(Fault::drop("idle"));
     }
-    if now.duration_since(proto.last_timed_sync) >= TIMED_SYNC_INTERVAL {
-        proto.last_timed_sync = now;
-        conn.request(
-            command::TIMED_SYNC,
-            &messages::timed_sync_request(&shared.core.sync_data()),
-        );
-    }
     advance(shared, conn, proto);
     Ok(())
+}
+
+/// A timed sync to every connection not still waiting on its last one
+/// (`peer_sync_idle_maker`).
+///
+/// One clock for all of them, as the C++ runs it from its idle loop, so a
+/// peer's first comes anywhere up to a minute after its handshake. On each
+/// connection's own clock, a timed sync came exactly a minute after every
+/// handshake, which only this node did.
+fn timed_sync_all(shared: &Shared) {
+    let body = messages::timed_sync_request(&shared.core.sync_data());
+    for c in shared.snapshot() {
+        let mut sent = lock(&c.timed_sync_sent);
+        // One the peer never answered stops holding the next back after
+        // `P2P_DEFAULT_INVOKE_TIMEOUT`, when the C++'s invoke would time out.
+        if sent.is_some_and(|t| t.elapsed() < INVOKE_TIMEOUT) {
+            continue;
+        }
+        *sent = Some(Instant::now());
+        c.request(command::TIMED_SYNC, &body);
+    }
 }
 
 /// Move this connection's part of the sync along (`request_missing_objects`).

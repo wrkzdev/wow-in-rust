@@ -460,6 +460,29 @@ fn a_reachable_peer_is_white_listed_after_a_ping_back() {
         .any(|r| Some(r.addr) == a.local_addr()));
 }
 
+/// An `--add-peer` address is white-listed under a random id, as the C++
+/// lists one. The id goes out in peer lists, and a zero there was this node's
+/// alone.
+#[test]
+fn an_added_peer_has_an_id_of_its_own() {
+    let t = template();
+    let genesis = make_block(&t, [0u8; 32], 0);
+    let mut cfg = config(Vec::new());
+    // Nothing listens on either; being unreachable does not take them off
+    // the list.
+    cfg.add_peers = vec![
+        "127.0.0.1:1".parse().unwrap(),
+        "127.0.0.1:2".parse().unwrap(),
+    ];
+    let node = Node::start(cfg, MemCore::new(&genesis), rng(4)).unwrap();
+
+    let (white, _) = node.peer_lists();
+    assert_eq!(white.len(), 2);
+    assert!(white.iter().all(|r| r.id != 0));
+    assert_ne!(white[0].id, white[1].id);
+    assert_ne!(white[0].id, node.peer_id());
+}
+
 /// A banned address gets no connection.
 #[test]
 fn a_banned_address_cannot_connect() {

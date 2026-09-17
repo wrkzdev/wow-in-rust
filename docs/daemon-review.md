@@ -52,7 +52,7 @@ Statuses:
 | Sync inside `--serve`, with one writer | Done | The chain sits behind a single lock in `NodeCore`, and locks are always taken chain first, then pool ([`node.rs`](../bin/wownerod/src/node.rs)) |
 | Bootstrap from seeds; `--add-peer`, `--seed-node`, `--add-priority-node`, `--add-exclusive-node` | Done | Six mainnet seeds. Testnet and stagenet have none, so they need `--add-peer` |
 | Move to another peer on disconnect | Done | |
-| Stay connected: timed sync every 60 s, `NEW_BLOCK` and `NEW_FLUFFY_BLOCK` | Done | |
+| Stay connected: timed sync every 60 s, `NEW_BLOCK` and `NEW_FLUFFY_BLOCK` | Done | Timed syncs go out on one clock for all connections, as the C++ sends them from its idle loop |
 | Alternative blocks and reorgs | Done | See bug 6 |
 | Keep the pool in step with the chain | Done | Mined transactions leave the pool. After a reorg or `pop_blocks`, transactions from the replaced blocks go back in |
 | Real `synchronized`, `target_height` and connection counts in `get_info`; `sync_info` | Done | `untrusted` also follows the sync state |
