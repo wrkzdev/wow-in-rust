@@ -57,6 +57,10 @@ wownero-wallet-rpc — the Wownero wallet RPC (specs/14)
   --proxy [socks5://][<user>:<pass>@][<host>:]<port>
                                     reach the daemon through a SOCKS5 proxy,
                                     Tor's say; its name is not looked up here
+  --trusted-daemon / --untrusted-daemon
+                                    whether the daemon may see what reveals
+                                    the wallet; default: trusted only on
+                                    this machine
   --testnet / --stagenet
   --kdf-rounds <n>                  default 1
   --no-initial-sync
@@ -89,6 +93,9 @@ struct Options {
     ssl: wow_daemon_client::SslFlags,
     /// `--proxy`, as given: it may carry a password.
     proxy: Option<String>,
+    /// `--trusted-daemon` and `--untrusted-daemon`: `None` when neither was
+    /// given, and a daemon on this machine is trusted.
+    trusted_daemon: Option<bool>,
     network: Network,
     kdf_rounds: u64,
     no_initial_sync: bool,
@@ -120,6 +127,7 @@ impl std::fmt::Debug for Options {
             .field("daemon_login", &self.daemon_login.as_ref().map(|_| "<redacted>"))
             .field("ssl", &self.ssl)
             .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
+            .field("trusted_daemon", &self.trusted_daemon)
             .field("network", &self.network)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("no_initial_sync", &self.no_initial_sync)
@@ -146,6 +154,7 @@ impl Default for Options {
             daemon_login: None,
             ssl: Default::default(),
             proxy: None,
+            trusted_daemon: None,
             network: Network::Mainnet,
             kdf_rounds: 1,
             no_initial_sync: false,
@@ -211,6 +220,15 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             "--daemon-ssl-allow-any-cert" => o.ssl.allow_any_cert = true,
             "--daemon-ssl-allow-chained" => o.ssl.allow_chained = true,
             "--proxy" => o.proxy = Some(next("--proxy")?),
+            "--trusted-daemon" | "--untrusted-daemon" => {
+                let trusted = arg == "--trusted-daemon";
+                if o.trusted_daemon.is_some_and(|t| t != trusted) {
+                    return Err("--trusted-daemon and --untrusted-daemon contradict each other; \
+                                give one"
+                        .into());
+                }
+                o.trusted_daemon = Some(trusted);
+            }
             "--testnet" => o.network = Network::Testnet,
             "--stagenet" => o.network = Network::Stagenet,
             "--kdf-rounds" => {
@@ -377,12 +395,16 @@ fn run(options: Options) -> Result<(), String> {
     ));
     state.set_proxy_option(daemon_options.proxy.is_some());
     state.set_daemon_options(daemon_options);
+    state.set_trusted_daemon(options.trusted_daemon);
 
     state.open_at_startup()?;
 
     // Point the wallet at a daemon, and sync, if one is open.
     if state.wallet().is_some() {
-        let params = serde_json::json!({ "address": options.daemon });
+        let params = serde_json::json!({
+            "address": options.daemon,
+            "trusted": state.trusted_daemon_for(&options.daemon),
+        });
         match methods::dispatch(&state, "set_daemon", &params) {
             Ok(_) => {
                 if !options.no_initial_sync {
@@ -551,6 +573,13 @@ mod tests {
         assert_eq!(o.ssl.allowed_fingerprints, ["aa"]);
         assert!(o.ssl.allow_any_cert);
         assert!(!format!("{o:?}").contains("hunter2"));
+
+        assert_eq!(o.trusted_daemon, None);
+        let mut trusted = MINIMUM.to_vec();
+        trusted.push("--untrusted-daemon");
+        assert_eq!(opts(&trusted).expect("parses").trusted_daemon, Some(false));
+        trusted.push("--trusted-daemon");
+        assert!(opts(&trusted).is_err(), "not both");
     }
 
     /// The log options, with the C++'s rotation defaults.

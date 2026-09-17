@@ -579,6 +579,10 @@ impl<P: Platform> Backend<P> {
             }
             Ok(Some((client, info))) => {
                 w.session.daemon_height = info.height;
+                // A node on this machine is trusted, and any other is not, as
+                // wallet-cli decides without --trusted-daemon.
+                w.session.state.trusted_daemon =
+                    wow_daemon_client::is_local_address(client.address());
                 w.session.daemon = Some(client);
                 w.node_error = None;
                 // As wallet-cli does for a new wallet: keys made moments ago

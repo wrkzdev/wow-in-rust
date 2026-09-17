@@ -69,6 +69,9 @@ struct Options {
     ssl: wow_daemon_client::SslFlags,
     /// `--proxy`, as given: it may carry a password.
     proxy: Option<String>,
+    /// `--trusted-daemon` and `--untrusted-daemon`: `None` when neither was
+    /// given, and a daemon on this machine is trusted.
+    trusted_daemon: Option<bool>,
     /// `None` when not given, so a restore knows to ask.
     restore_height: Option<u64>,
     kdf_rounds: u64,
@@ -101,6 +104,7 @@ impl std::fmt::Debug for Options {
             .field("daemon_login", &redacted(&self.daemon_login))
             .field("ssl", &self.ssl)
             .field("proxy", &redacted(&self.proxy))
+            .field("trusted_daemon", &self.trusted_daemon)
             .field("restore_height", &self.restore_height)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("language", &self.language)
@@ -129,6 +133,7 @@ impl Default for Options {
             daemon_login: None,
             ssl: Default::default(),
             proxy: None,
+            trusted_daemon: None,
             restore_height: None,
             kdf_rounds: 1,
             language: None,
@@ -182,6 +187,10 @@ Whatever the options below leave out is asked for.
   --proxy [socks5://][<user>:<pass>@][<host>:]<port>
                                     reach the daemon through a SOCKS5 proxy,
                                     Tor's say; its name is not looked up here
+  --trusted-daemon / --untrusted-daemon
+                                    whether the daemon may see what reveals
+                                    this wallet; default: trusted only on
+                                    this machine
   --testnet / --stagenet
   --restore-height <n>
   --mnemonic-language <lang>
@@ -265,6 +274,15 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             "--daemon-ssl-allow-any-cert" => o.ssl.allow_any_cert = true,
             "--daemon-ssl-allow-chained" => o.ssl.allow_chained = true,
             "--proxy" => o.proxy = Some(next("--proxy")?),
+            "--trusted-daemon" | "--untrusted-daemon" => {
+                let trusted = arg == "--trusted-daemon";
+                if o.trusted_daemon.is_some_and(|t| t != trusted) {
+                    return Err("--trusted-daemon and --untrusted-daemon contradict each other; \
+                                give one"
+                        .into());
+                }
+                o.trusted_daemon = Some(trusted);
+            }
             "--daemon-host" => {
                 let host = next("--daemon-host")?;
                 o.daemon = Some(format!("{host}:34568"));
@@ -440,6 +458,24 @@ fn daemon_options(o: &Options, daemon: &str) -> Result<wow_daemon_client::Connec
     Ok(options)
 }
 
+/// `simple_wallet::init`'s warning about a daemon that is not trusted, on
+/// standard error so a `--command` script's output stays clean.
+fn warn_untrusted(session: &session::Session) {
+    let Some(daemon) = &session.daemon else {
+        return;
+    };
+    eprintln!("Warning: using an untrusted daemon at {}", daemon.address());
+    eprintln!("Using a third party daemon can be detrimental to your security and privacy");
+    if !matches!(
+        daemon.security(),
+        Some(wow_daemon_client::Security::Tls { .. })
+    ) {
+        eprintln!("Using your own without SSL exposes your RPC traffic to monitoring");
+    }
+    eprintln!("You are strongly encouraged to connect to the Wownero network using your own daemon");
+    eprintln!("If you or someone you trust are operating this daemon, you can use --trusted-daemon");
+}
+
 fn run(mut options: Options) -> Result<(), String> {
     start_logging(&options)?;
     let daemon = options
@@ -459,8 +495,14 @@ fn run(mut options: Options) -> Result<(), String> {
         }
     }
 
-    // Connect, and sync unless told not to.
-    match commands::run_one(&mut session, &format!("set_daemon {daemon}")) {
+    // Connect, and sync unless told not to. `set_daemon` trusts a daemon on
+    // this machine unless told otherwise, as `make_basic` does.
+    let trust = match options.trusted_daemon {
+        Some(true) => " trusted",
+        Some(false) => " untrusted",
+        None => "",
+    };
+    match commands::run_one(&mut session, &format!("set_daemon {daemon}{trust}")) {
         Err(e) => {
             // Diagnostics go to stderr, so `--command bc_height` prints a
             // height on stdout and nothing else. A script reading stdout must
@@ -469,6 +511,10 @@ fn run(mut options: Options) -> Result<(), String> {
             eprintln!("(carrying on offline; `set_daemon <host:port>` to try again)");
         }
         Ok(_) => {
+            if !session.state.trusted_daemon {
+                warn_untrusted(&session);
+            }
+
             // A wallet whose keys were generated moments ago cannot own an
             // output older than the tip, so it starts there rather than
             // reading the whole chain to find nothing. `wallet2::generate`
@@ -775,6 +821,24 @@ mod tests {
         assert!(daemon_options(&enabled, "abc.onion:34568").is_ok());
         let plain = opts(&["--wallet-file", "w"]).expect("parses");
         assert!(daemon_options(&plain, "node.example:34568").is_ok());
+    }
+
+    /// `--trusted-daemon` and `--untrusted-daemon`, and not both.
+    #[test]
+    fn the_trust_options_parse() {
+        assert_eq!(opts(&["--wallet-file", "w"]).expect("ok").trusted_daemon, None);
+        let o = opts(&["--wallet-file", "w", "--trusted-daemon"]).expect("ok");
+        assert_eq!(o.trusted_daemon, Some(true));
+        let o = opts(&["--wallet-file", "w", "--untrusted-daemon"]).expect("ok");
+        assert_eq!(o.trusted_daemon, Some(false));
+        let e = opts(&[
+            "--wallet-file",
+            "w",
+            "--trusted-daemon",
+            "--untrusted-daemon",
+        ])
+        .expect_err("both");
+        assert!(e.contains("contradict"), "{e}");
     }
 
     /// `--proxy`, and what `make_basic` asks of a node reached through one: a

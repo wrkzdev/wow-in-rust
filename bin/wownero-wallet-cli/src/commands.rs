@@ -163,8 +163,9 @@ Wallet
   save                          write the keys file and cache
 
 Chain
-  set_daemon <address> [<user>:<pass>]
+  set_daemon <address> [trusted|untrusted] [<user>:<pass>]
                                 point at a daemon: host:port, or https://host:port.
+                                One on this machine is trusted unless told not.
                                 A login is needed for one started with --rpc-login
   refresh                       scan up to the daemon's tip
   rescan_bc                     forget what was scanned and start over
@@ -321,14 +322,24 @@ fn save(session: &mut Session) -> Result<(), String> {
 fn set_daemon(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let address = args
         .first()
-        .ok_or("usage: set_daemon <host:port> [<user>:<password>]")?;
-    // A login given here replaces whatever --daemon-login set; one left out
-    // keeps it, so pointing at a second node on the same box does not mean
-    // typing the password again.
-    if let Some(text) = args.get(1) {
-        let c = wow_daemon_client::digest::Credentials::parse(text)
-            .ok_or("a daemon login is <user>:<password>")?;
-        session.daemon_login = Some(c);
+        .ok_or("usage: set_daemon <host:port> [trusted|untrusted] [<user>:<password>]")?;
+    // `simple_wallet::set_daemon`'s trust word, and this build's login. A login
+    // given here replaces whatever --daemon-login set; one left out keeps it,
+    // so pointing at a second node on the same box does not mean typing the
+    // password again.
+    let mut trusted = None;
+    for arg in &args[1..] {
+        match *arg {
+            "trusted" => trusted = Some(true),
+            "untrusted" | "this-is-probably-a-spy-node" => trusted = Some(false),
+            text => {
+                let c = wow_daemon_client::digest::Credentials::parse(text).ok_or(
+                    "expected trusted, untrusted or this-is-probably-a-spy-node, or a daemon login \
+                     as <user>:<password>",
+                )?;
+                session.daemon_login = Some(c);
+            }
+        }
     }
     let client = session.client_for(address);
     let info = client
@@ -345,18 +356,29 @@ fn set_daemon(session: &mut Session, args: &[&str]) -> Result<(), String> {
         ));
     }
 
+    // Not told: trusted when it is on this machine, as `make_basic` and
+    // `set_daemon` both decide.
+    let trusted = trusted.unwrap_or_else(|| {
+        let local = wow_daemon_client::is_local_address(address);
+        if local {
+            wow_log::info!("wallet.simplewallet", "Daemon is local, assuming trusted");
+        }
+        local
+    });
     eprintln!(
-        "Connected to {address}: height {}, {}, {}",
+        "Connected to {address}: height {}, {}, {}, {}",
         info.height,
         if info.synchronized {
             "synced"
         } else {
             "still syncing"
         },
+        if trusted { "trusted" } else { "untrusted" },
         describe_security(client.security())
     );
     session.daemon_height = info.height;
     session.daemon = Some(client);
+    session.state.trusted_daemon = trusted;
     Ok(())
 }
 
@@ -1030,6 +1052,17 @@ fn explain_double_spend(
     let Some(client) = session.daemon.clone() else {
         return;
     };
+    // Asking which of these key images are spent tells the daemon they are
+    // this wallet's: `rescan_spent` and `import_key_images` refuse to ask an
+    // untrusted one.
+    if !session.state.trusted_daemon {
+        println!(
+            "  This wallet does not ask an untrusted daemon which input was spent: the question \
+             would tell it which outputs are this wallet's. `rescan_bc` finds a spend in a block; \
+             a daemon you run can be asked, with --trusted-daemon."
+        );
+        return;
+    }
 
     let inputs: Vec<(usize, [u8; 32])> = plan
         .inputs

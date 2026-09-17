@@ -66,6 +66,9 @@ pub struct State {
     daemon_options: Mutex<wow_daemon_client::ConnectOptions>,
     /// `--proxy` was given: `set_daemon` may not name a proxy of its own.
     proxy_option: AtomicBool,
+    /// `--trusted-daemon` or `--untrusted-daemon`, or what `set_daemon` last
+    /// said: `None` when neither, and a daemon on this machine is trusted.
+    trusted_daemon: Mutex<Option<bool>>,
     stop: AtomicBool,
 }
 
@@ -88,8 +91,26 @@ impl State {
             daemon_login,
             daemon_options: Mutex::new(Default::default()),
             proxy_option: AtomicBool::new(false),
+            trusted_daemon: Mutex::new(None),
             stop: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the daemon at `address` is trusted: as told, or else when it is
+    /// on this machine, as `make_basic` decides.
+    pub fn trusted_daemon_for(&self, address: &str) -> bool {
+        let told = *self
+            .trusted_daemon
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        told.unwrap_or_else(|| wow_daemon_client::is_local_address(address))
+    }
+
+    pub fn set_trusted_daemon(&self, trusted: Option<bool>) {
+        *self
+            .trusted_daemon
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = trusted;
     }
 
     /// `wallet2::has_proxy_option`: whether `--proxy` was given.
@@ -150,6 +171,7 @@ impl State {
         }
         session.daemon_login = self.daemon_login.clone();
         session.daemon_options = self.daemon_options();
+        session.state.trusted_daemon = self.trusted_daemon_for(&address);
         let client = session.client_for(&address);
         match client.get_info() {
             Ok(info) => {

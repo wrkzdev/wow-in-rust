@@ -385,6 +385,21 @@ impl Proxy {
     }
 }
 
+/// `tools::is_local_address`: whether `address` is on this machine --
+/// `localhost`, a name under `.localhost` (RFC 6761), or a loopback address.
+/// The C++ trusts a daemon there unless told otherwise.
+pub fn is_local_address(address: &str) -> bool {
+    let Ok(target) = Target::parse(address) else {
+        return false;
+    };
+    let host = target.host.to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Whether `host` is a `.onion` or `.i2p` name: one whose name is its key, so
 /// a connection to it is authenticated and encrypted end to end by the
 /// network that carries it.
@@ -2077,6 +2092,30 @@ mod tests {
         assert_eq!(parse_fingerprint(&"AB ".repeat(32)).expect("spaces"), [0xab; 32]);
         assert!(parse_fingerprint("abcd").expect_err("short").contains("32 bytes"));
         assert!(parse_fingerprint("zz").expect_err("not hex").contains("not hex"));
+    }
+
+    /// A daemon on this machine is local, and one anywhere else is not, the
+    /// LAN included, as `tools::is_local_address` has it.
+    #[test]
+    fn local_addresses_are_this_machine_only() {
+        for local in [
+            "127.0.0.1:34568",
+            "http://127.0.0.2:34568",
+            "[::1]:34568",
+            "localhost:34568",
+            "https://wallet.localhost:34568",
+        ] {
+            assert!(is_local_address(local), "{local}");
+        }
+        for remote in [
+            "192.168.1.2:34568",
+            "node.example:34568",
+            "abc.onion:34568",
+            "localhost.example:34568",
+            "ftp://127.0.0.1:1",
+        ] {
+            assert!(!is_local_address(remote), "{remote}");
+        }
     }
 
     /// `--proxy` as the C++ takes it, SOCKS5 only, with a port alone meaning

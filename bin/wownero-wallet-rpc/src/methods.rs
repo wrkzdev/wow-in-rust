@@ -151,6 +151,7 @@ pub fn dispatch(state: &State, method: &str, params: &Value) -> MethodResult {
                 state.set_daemon_address(a);
             }
             state.set_daemon_options(session.daemon_options.clone());
+            state.set_trusted_daemon(Some(session.state.trusted_daemon));
             Ok(out)
         }
         "refresh" => refresh(session, params),
@@ -837,6 +838,11 @@ fn set_daemon(session: &mut Session, params: &Value, proxy_option: bool) -> Meth
     session.daemon_height = info.height;
     session.daemon = Some(client);
     session.daemon_options = options;
+    // `trusted`, false unless given, as `wallet2::set_daemon` takes it.
+    session.state.trusted_daemon = params
+        .get("trusted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Ok(json!({}))
 }
 
