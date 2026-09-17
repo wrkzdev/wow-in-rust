@@ -308,19 +308,20 @@ impl Session {
 
     /// Relay a prepared transaction and, once a daemon has taken it, record
     /// it: its inputs spent, and where it went when `store-tx-info` is on.
+    /// `wallet2::commit_tx`.
     ///
-    /// With `do_not_relay` the daemon checks the transaction without passing
-    /// it on, and nothing is recorded, as `wallet2::commit_tx` does not run.
+    /// A caller asked not to relay does not call this at all. That is what
+    /// `do_not_relay` means in `wallet_rpc_server::fill_response`, which then
+    /// skips `commit_tx` entirely: the transaction is built and handed back,
+    /// and no node hears of it until someone relays it. Showing it to a node
+    /// "without passing it on" would still show it to that node.
+    ///
     /// Saving is the caller's to do, and soon: a wallet that forgot a send
     /// would offer the same inputs to the next one.
-    pub fn commit_send(
-        &mut self,
-        prepared: &PreparedSend,
-        do_not_relay: bool,
-    ) -> Result<Relayed, SendError> {
+    pub fn commit_send(&mut self, prepared: &PreparedSend) -> Result<Relayed, SendError> {
         let client = self.daemon.clone().ok_or(SendError::NoDaemon)?;
         let result = client
-            .send_raw_transaction(&prepared.blob, do_not_relay)
+            .send_raw_transaction(&prepared.blob, false)
             .map_err(SendError::Relay)?;
 
         if !result.accepted() {
@@ -338,21 +339,19 @@ impl Session {
             });
         }
 
-        if !do_not_relay {
-            let store = self.keys_file.store_tx_info();
-            let payees = if store {
-                vec![prepared.address.as_str()]
-            } else {
-                Vec::new()
-            };
-            self.state.record_sent(
-                prepared.txid,
-                &prepared.plan,
-                &payees,
-                prepared.payment_id.filter(|_| store),
-                now(),
-            );
-        }
+        let store = self.keys_file.store_tx_info();
+        let payees = if store {
+            vec![prepared.address.as_str()]
+        } else {
+            Vec::new()
+        };
+        self.state.record_sent(
+            prepared.txid,
+            &prepared.plan,
+            &payees,
+            prepared.payment_id.filter(|_| store),
+            now(),
+        );
         self.dirty = true;
         Ok(Relayed {
             result,

@@ -886,10 +886,7 @@ impl<P: Platform> Backend<P> {
         self.working("Sending…");
 
         let w = self.wallet.as_mut().ok_or(NO_WALLET)?;
-        let relayed = w
-            .session
-            .commit_send(&prepared, false)
-            .map_err(|e| e.to_string())?;
+        let relayed = w.session.commit_send(&prepared).map_err(|e| e.to_string())?;
         let result = relayed.result;
 
         if result.accepted() {

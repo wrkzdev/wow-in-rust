@@ -986,9 +986,7 @@ fn send(
         return Ok(());
     }
 
-    let relayed = session
-        .commit_send(&prepared, false)
-        .map_err(|e| e.to_string())?;
+    let relayed = session.commit_send(&prepared).map_err(|e| e.to_string())?;
     let result = relayed.result;
 
     if result.accepted() {

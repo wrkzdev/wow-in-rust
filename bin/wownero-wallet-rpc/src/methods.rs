@@ -990,6 +990,7 @@ fn transfer_method(session: &mut Session, params: &Value, split: bool) -> Method
             "fee_list": [outcome["fee"]],
             "weight_list": [outcome["weight"]],
             "tx_blob_list": [outcome["tx_blob"]],
+            "tx_metadata_list": [outcome["tx_metadata"]],
             "multisig_txset": "",
             "unsigned_txset": "",
             "spent_key_images_list": [outcome["spent_key_images"].clone()],
@@ -1015,23 +1016,18 @@ fn sweep_single(session: &mut Session, params: &Value) -> MethodResult {
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| Error::new(errors::WRONG_KEY_IMAGE, "key_image is 64 hex characters"))?;
 
-    let outcome = build_and_send_output(
+    // One transaction, and answered as one: `COMMAND_RPC_SWEEP_SINGLE`'s
+    // response has `tx_hash`, `fee` and the rest, not lists of them.
+    let mut outcome = build_and_send_output(
         session,
         address,
         Some(wow_crypto::types::KeyImage(image)),
         params,
     )?;
-    Ok(json!({
-        "tx_hash_list": [outcome["tx_hash"]],
-        "tx_key_list": [],
-        "amount_list": [outcome["amount"]],
-        "fee_list": [outcome["fee"]],
-        "weight_list": [outcome["weight"]],
-        "tx_blob_list": [outcome["tx_blob"]],
-        "multisig_txset": "",
-        "unsigned_txset": "",
-        "spent_key_images_list": [outcome["spent_key_images"].clone()],
-    }))
+    if let Some(fields) = outcome.as_object_mut() {
+        fields.remove("outputs_left_behind");
+    }
+    Ok(outcome)
 }
 
 fn sweep_all(session: &mut Session, params: &Value) -> MethodResult {
@@ -1047,6 +1043,7 @@ fn sweep_all(session: &mut Session, params: &Value) -> MethodResult {
         "fee_list": [outcome["fee"]],
         "weight_list": [outcome["weight"]],
         "tx_blob_list": [outcome["tx_blob"]],
+        "tx_metadata_list": [outcome["tx_metadata"]],
         "multisig_txset": "",
         "unsigned_txset": "",
         "spent_key_images_list": [outcome["spent_key_images"].clone()],
@@ -1131,23 +1128,24 @@ fn build_and_send_inner(
     };
     let prepared = session.prepare_send(&request).map_err(send_error)?;
 
-    let do_not_relay = params
-        .get("do_not_relay")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    // `wallet2::commit_tx`, which `do_not_relay` skips, records it: its inputs
-    // spent, whether or not `store-tx-info` keeps where it went.
-    let relayed = session
-        .commit_send(&prepared, do_not_relay)
-        .map_err(send_error)?;
-    if !relayed.result.accepted() {
-        return Err(Error::new(
-            errors::GENERIC_TRANSFER_ERROR,
-            format!(
-                "the daemon rejected the transaction: {}",
-                relayed.result.reason
-            ),
-        ));
+    let flag = |name: &str| params.get(name).and_then(Value::as_bool) == Some(true);
+    // `wallet_rpc_server::fill_response`: `do_not_relay` skips
+    // `wallet2::commit_tx` entirely. No node is shown the transaction, not
+    // even to check it, and nothing is recorded: its inputs stay unspent, and
+    // `relay_tx` is how it is sent later. Otherwise `commit_tx` relays it and
+    // records it, its inputs spent whether or not `store-tx-info` keeps where
+    // it went.
+    if !flag("do_not_relay") {
+        let relayed = session.commit_send(&prepared).map_err(send_error)?;
+        if !relayed.result.accepted() {
+            return Err(Error::new(
+                errors::GENERIC_TRANSFER_ERROR,
+                format!(
+                    "the daemon rejected the transaction: {}",
+                    relayed.result.reason
+                ),
+            ));
+        }
     }
 
     let plan = &prepared.plan;
@@ -1171,11 +1169,23 @@ fn build_and_send_inner(
         // other call.
         "outputs_left_behind": plan.left_behind,
     });
-    if params.get("get_tx_hex").and_then(Value::as_bool) == Some(true) {
-        out["tx_blob"] = json!(wow_crypto::hex::encode(&prepared.blob));
+    // Each only when asked for, as `fill_response` fills them.
+    let blob_hex = wow_crypto::hex::encode(&prepared.blob);
+    let tx_blob = if flag("get_tx_hex") {
+        blob_hex.as_str()
     } else {
-        out["tx_blob"] = json!("");
-    }
+        ""
+    };
+    // The C++ writes its own `pending_tx` here, which only a C++ wallet can
+    // read back. This build's `relay_tx` takes the transaction itself, so
+    // that is what its metadata is.
+    let tx_metadata = if flag("get_tx_metadata") {
+        blob_hex.as_str()
+    } else {
+        ""
+    };
+    out["tx_blob"] = json!(tx_blob);
+    out["tx_metadata"] = json!(tx_metadata);
     Ok(out)
 }
 
@@ -1257,13 +1267,27 @@ fn get_default_fee_priority(session: &Session) -> MethodResult {
     Ok(json!({ "priority": priority }))
 }
 
+/// `relay_tx`: send what a `do_not_relay` transfer handed back, and record it
+/// as `wallet2::commit_tx` does.
+///
+/// `hex` is that transfer's `tx_metadata`, which in this build is the
+/// transaction itself. It is parsed before any node is asked, as the C++
+/// parses its metadata first. Once a node has taken it, it is recorded as a
+/// spend of this wallet's outputs waiting for a block, the way one found in
+/// the pool is: its inputs spent from now, its change counted by scanning it,
+/// and its inputs given back if it never reaches a block. Where it went is
+/// not known here, because the metadata does not say.
 fn relay_tx(session: &mut Session, params: &Value) -> MethodResult {
     let hex = params
         .get("hex")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::new(errors::BAD_HEX, "hex is missing"))?;
     let blob = wow_crypto::hex::decode(hex)
-        .ok_or_else(|| Error::new(errors::BAD_HEX, "hex is not hex"))?;
+        .ok_or_else(|| Error::new(errors::BAD_HEX, "Failed to parse hex."))?;
+    let tx = wow_types::tx::Transaction::from_blob(&blob)
+        .map_err(|e| Error::new(errors::BAD_TX_METADATA, e.to_string()))?;
+    let id = wow_types::hashes::transaction_hash_from_blob(&tx, &blob)
+        .ok_or_else(|| Error::new(errors::BAD_TX_METADATA, "Failed to parse tx metadata."))?;
 
     let client = session
         .daemon
@@ -1279,9 +1303,14 @@ fn relay_tx(session: &mut Session, params: &Value) -> MethodResult {
         ));
     }
 
-    let tx = wow_types::tx::Transaction::from_blob(&blob)
-        .map_err(|e| Error::new(errors::BAD_TX_METADATA, e.to_string()))?;
-    let id = wow_types::hashes::transaction_hash_from_blob(&tx, &blob).unwrap_or_default();
+    let now = wow_wallet::files::now();
+    let sent = wow_wallet::PooledTx {
+        txid: id,
+        tx,
+        receive_time: now,
+    };
+    session.state.note_pool_spends(std::slice::from_ref(&sent), now);
+    session.dirty = true;
     Ok(json!({ "tx_hash": wow_crypto::hex::encode(&id) }))
 }
 
