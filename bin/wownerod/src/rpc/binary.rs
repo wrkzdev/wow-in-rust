@@ -74,10 +74,31 @@ pub fn dispatch(server: &Server, path: &str, body: &[u8], restricted: bool) -> B
         "/get_hashes.bin" | "/gethashes.bin" => get_hashes(db, &request),
         "/get_o_indexes.bin" => get_o_indexes(db, &request),
         "/get_outs.bin" => get_outs(db, &request),
-        "/get_output_distribution.bin" => get_output_distribution(db, &request),
+        "/get_output_distribution.bin" => {
+            if restricted && !rct_amounts_only(&request) {
+                return Err(RpcError::new(
+                    error::WRONG_PARAM,
+                    "Restricted RPC can only get output distribution for rct outputs. Use your own node.",
+                ));
+            }
+            get_output_distribution(db, &request)
+        }
         "/get_transaction_pool_hashes.bin" => get_pool_hashes(server, restricted),
         other => Err(RpcError::unsupported(other)),
     }
+}
+
+/// Whether an output distribution request asks for amount 0 -- RingCT outputs
+/// -- and nothing else, the one a restricted listener serves
+/// (`on_get_output_distribution_bin`). Before anything else about the request
+/// is looked at, as there: a histogram of every pre-RingCT denomination is a
+/// whole-chain scan a public node should not run for anyone who asks, and a
+/// request with no amounts at all is not `[0]` either.
+fn rct_amounts_only(request: &Section) -> bool {
+    request
+        .get("amounts")
+        .and_then(Value::as_array)
+        .is_some_and(|a| a.items.len() == 1 && a.items[0].as_u64() == Some(0))
 }
 
 /// The fields every response carries (`specs/11` §2).
@@ -562,6 +583,28 @@ mod tests {
             Some(&b"past the tip"[..])
         );
         assert_eq!(s.get("untrusted").and_then(Value::as_bool), Some(true));
+    }
+
+    /// A restricted listener serves the RingCT distribution and nothing else:
+    /// exactly `[0]`, not a list with more in it, and not no list at all.
+    #[test]
+    fn a_restricted_distribution_is_ringct_only() {
+        let with = |amounts: &[u64]| {
+            let mut s = Section::new();
+            s.insert(
+                "amounts".into(),
+                Value::Array(Array {
+                    elem_type: epee::ty::UINT64,
+                    items: amounts.iter().map(|a| Value::U64(*a)).collect(),
+                }),
+            );
+            s
+        };
+        assert!(rct_amounts_only(&with(&[0])));
+        assert!(!rct_amounts_only(&with(&[0, 1])));
+        assert!(!rct_amounts_only(&with(&[1])));
+        assert!(!rct_amounts_only(&with(&[])));
+        assert!(!rct_amounts_only(&Section::new()));
     }
 
     /// A base response carries the four fields `specs/11` §2 requires.

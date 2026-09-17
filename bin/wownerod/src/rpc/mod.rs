@@ -295,6 +295,7 @@ impl Server {
 /// until the server's stop flag is set.
 pub fn start(server: Arc<Server>) -> Result<Vec<JoinHandle<()>>, String> {
     let cfg = &server.cfg;
+    check_external_bind(cfg)?;
     let mut threads = listen(
         &server,
         &cfg.rpc_bind_ip,
@@ -304,13 +305,9 @@ pub fn start(server: Arc<Server>) -> Result<Vec<JoinHandle<()>>, String> {
         cfg.restricted_rpc,
     )?;
     if let Some(port) = cfg.rpc_restricted_bind_port {
-        let ip = cfg
-            .rpc_restricted_bind_ip
-            .clone()
-            .unwrap_or_else(|| cfg.rpc_bind_ip.clone());
         threads.extend(listen(
             &server,
-            &ip,
+            &cfg.rpc_restricted_bind_ip,
             cfg.rpc_use_ipv6
                 .then_some(cfg.rpc_restricted_bind_ipv6_address.as_str()),
             port,
@@ -318,6 +315,35 @@ pub fn start(server: Arc<Server>) -> Result<Vec<JoinHandle<()>>, String> {
         )?);
     }
     Ok(threads)
+}
+
+/// `rpc_args::process` (`specs/11` §1.2): a non-loopback `--rpc-bind-ip` or
+/// `--rpc-bind-ipv6-address` needs `--confirm-external-bind`, whatever else
+/// is given.
+///
+/// `--restricted-rpc` and `--rpc-login` used to waive it here, and the C++
+/// waives it for neither: a restricted RPC or a password is still an RPC in
+/// the clear to whoever can reach the address, and the consent is to that.
+/// The IPv6 address is checked even without `--rpc-use-ipv6`, as the C++
+/// checks it. The restricted listener's own addresses need no consent -- a
+/// public restricted port is what `--rpc-restricted-bind-port` is for -- and
+/// default to loopback like the others.
+fn check_external_bind(cfg: &Config) -> Result<(), String> {
+    if cfg.confirm_external_bind {
+        return Ok(());
+    }
+    for (flag, addr) in [
+        ("--rpc-bind-ip", &cfg.rpc_bind_ip),
+        ("--rpc-bind-ipv6-address", &cfg.rpc_bind_ipv6_address),
+    ] {
+        if !is_loopback(addr) {
+            return Err(format!(
+                "{flag} permits inbound unencrypted external connections. Consider SSH \
+                 tunnel or SSL proxy instead. Override with --confirm-external-bind"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One RPC server's listeners: IPv4, and IPv6 on the same port with
@@ -329,27 +355,6 @@ fn listen(
     port: u16,
     restricted: bool,
 ) -> Result<Vec<JoinHandle<()>>, String> {
-    // `specs/11` §1.2: exposing the full RPC in the clear needs explicit
-    // consent. As in the C++, a restricted listener -- what a public node
-    // offers -- and one behind `--rpc-login` do not.
-    for addr in std::iter::once(ip).chain(ipv6) {
-        if !is_loopback(addr)
-            && !restricted
-            && server.login.is_none()
-            && !server.cfg.confirm_external_bind
-        {
-            return Err(format!(
-                "refusing to bind {}: a non-loopback address exposes the \
-                 unrestricted RPC to the network, in the clear to any client \
-                 that does not use TLS.\n\
-                 Pass --confirm-external-bind if that is what you want; use \
-                 --restricted-rpc, --rpc-restricted-bind-port or --rpc-login; or put \
-                 a reverse proxy in front of 127.0.0.1.",
-                bind_address(addr, port)
-            ));
-        }
-    }
-
     let resolve = |a: &str| -> Result<SocketAddr, String> {
         let text = bind_address(a, port);
         text.to_socket_addrs()
@@ -758,6 +763,48 @@ mod tests {
             .is_ok());
         // A name goes through as given, to be resolved by the bind.
         assert_eq!(bind_address("localhost", 1), "localhost:1");
+    }
+
+    /// A non-loopback main RPC address needs `--confirm-external-bind`, and
+    /// neither a restricted RPC nor a login stands in for it; the restricted
+    /// listener's address needs nothing, and is loopback unless given.
+    #[test]
+    fn an_external_bind_needs_confirming_whatever_else_is_given() {
+        let defaults = Config::default();
+        assert!(check_external_bind(&defaults).is_ok());
+        assert_eq!(defaults.rpc_restricted_bind_ip, "127.0.0.1");
+
+        let exposed = Config {
+            rpc_bind_ip: "0.0.0.0".into(),
+            restricted_rpc: true,
+            rpc_login: Some(("alice".into(), Some("pw".into()))),
+            ..Config::default()
+        };
+        let e = check_external_bind(&exposed).unwrap_err();
+        assert!(
+            e.starts_with("--rpc-bind-ip permits inbound unencrypted external connections"),
+            "{e}"
+        );
+        let confirmed = Config {
+            confirm_external_bind: true,
+            ..exposed
+        };
+        assert!(check_external_bind(&confirmed).is_ok());
+
+        // IPv6 is checked whether or not it is in use, as the C++ checks it.
+        let v6 = Config {
+            rpc_bind_ipv6_address: "::".into(),
+            ..Config::default()
+        };
+        let e = check_external_bind(&v6).unwrap_err();
+        assert!(e.starts_with("--rpc-bind-ipv6-address"), "{e}");
+
+        let public_restricted = Config {
+            rpc_restricted_bind_ip: "0.0.0.0".into(),
+            rpc_restricted_bind_port: Some(34_570),
+            ..Config::default()
+        };
+        assert!(check_external_bind(&public_restricted).is_ok());
     }
 
     /// The connection caps are `specs/11` §1.2's numbers.

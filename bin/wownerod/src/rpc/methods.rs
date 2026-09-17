@@ -190,8 +190,12 @@ pub(crate) fn internal(e: impl std::fmt::Display) -> RpcError {
 /// -- bootstrap state, update checks -- are zero or false, which is accurate
 /// for a node with neither, not a placeholder.
 ///
-/// `restricted` is the listener's: a restricted one counts only the public
-/// pool transactions, as the C++ does.
+/// `restricted` is the listener's, and a restricted one says what the C++'s
+/// says (`core_rpc_server::on_get_info`): only the public pool transactions
+/// are counted, and what tells one node from another or says how it is
+/// connected -- its start time, its peer, RPC and alternative block counts,
+/// its peer lists -- is zero, its free space the largest number there is and
+/// its database size rounded up to the next 5 GiB.
 pub fn get_info(server: &super::Server, restricted: bool) -> RpcResult {
     let db = server.db();
     let cfg = server.config();
@@ -219,11 +223,29 @@ pub fn get_info(server: &super::Server, restricted: bool) -> RpcResult {
     let (block_weight_limit, block_weight_median) = (fee.cumulative_weight_limit, fee.median());
     let (white, grey) = server
         .p2p()
+        .filter(|_| !restricted)
         .map(|p| {
             let (w, g) = p.peer_lists();
             (w.len(), g.len())
         })
         .unwrap_or((0, 0));
+    let (start_time, alt_blocks, outgoing, incoming, rpc_connections) = if restricted {
+        (0, 0, 0, 0, 0)
+    } else {
+        (
+            server.start_time(),
+            db.get_alt_block_count().unwrap_or(0),
+            sync.outgoing,
+            sync.incoming,
+            server.rpc_connections(),
+        )
+    };
+    let db_size = database_size(cfg);
+    let db_size = if restricted {
+        round_up(db_size, DATABASE_SIZE_QUANTUM)
+    } else {
+        db_size
+    };
 
     let mut m = base("OK", untrusted());
     m.insert("height".into(), json!(height));
@@ -238,16 +260,10 @@ pub fn get_info(server: &super::Server, restricted: bool) -> RpcResult {
     // The store keeps no transaction count this node can read cheaply.
     m.insert("tx_count".into(), json!(0));
     m.insert("tx_pool_size".into(), json!(server.pool_size(!restricted)));
-    m.insert(
-        "alt_blocks_count".into(),
-        json!(db.get_alt_block_count().unwrap_or(0)),
-    );
-    m.insert("outgoing_connections_count".into(), json!(sync.outgoing));
-    m.insert("incoming_connections_count".into(), json!(sync.incoming));
-    m.insert(
-        "rpc_connections_count".into(),
-        json!(server.rpc_connections()),
-    );
+    m.insert("alt_blocks_count".into(), json!(alt_blocks));
+    m.insert("outgoing_connections_count".into(), json!(outgoing));
+    m.insert("incoming_connections_count".into(), json!(incoming));
+    m.insert("rpc_connections_count".into(), json!(rpc_connections));
     m.insert("white_peerlist_size".into(), json!(white));
     m.insert("grey_peerlist_size".into(), json!(grey));
 
@@ -263,19 +279,29 @@ pub fn get_info(server: &super::Server, restricted: bool) -> RpcResult {
     m.insert("block_weight_median".into(), json!(block_weight_median));
     m.insert("block_size_median".into(), json!(block_weight_median));
 
-    m.insert("start_time".into(), json!(server.start_time()));
+    m.insert("start_time".into(), json!(start_time));
     m.insert("adjusted_time".into(), json!(now()));
-    m.insert("free_space".into(), json!(0));
-    m.insert("database_size".into(), json!(database_size(cfg)));
+    // Not measured here, so zero -- but the largest number on a restricted
+    // listener, where the C++ puts it whatever the disk holds.
+    m.insert(
+        "free_space".into(),
+        json!(if restricted { u64::MAX } else { 0 }),
+    );
+    m.insert("database_size".into(), json!(db_size));
     m.insert("offline".into(), json!(server.p2p().is_none()));
     m.insert("bootstrap_daemon_address".into(), json!(""));
-    m.insert("height_without_bootstrap".into(), json!(height));
+    m.insert(
+        "height_without_bootstrap".into(),
+        json!(if restricted { 0 } else { height }),
+    );
     m.insert("was_bootstrap_ever_used".into(), json!(false));
     m.insert("update_available".into(), json!(false));
     m.insert("version".into(), json!(crate::cli::VERSION));
     m.insert("synchronized".into(), json!(sync.synchronized));
     m.insert("busy_syncing".into(), json!(sync.busy_syncing));
-    m.insert("restricted".into(), json!(cfg.restricted_rpc));
+    // The listener's, not `--restricted-rpc`'s: a restricted second port on
+    // an unrestricted node is restricted.
+    m.insert("restricted".into(), json!(restricted));
 
     let m = match with_difficulty(m, "difficulty", difficulty) {
         Value::Object(m) => m,
@@ -300,6 +326,14 @@ fn database_size(cfg: &Config) -> u64 {
     std::fs::metadata(dir.join("data.mdb"))
         .map(|m| m.len())
         .unwrap_or(0)
+}
+
+/// The step a restricted `get_info` rounds the database size up to: 5 GiB.
+const DATABASE_SIZE_QUANTUM: u64 = 5 * 1024 * 1024 * 1024;
+
+/// `round_up`: `value` up to the next multiple of `quantum`.
+fn round_up(value: u64, quantum: u64) -> u64 {
+    value.div_ceil(quantum).saturating_mul(quantum)
 }
 
 /// `get_version` (`specs/11` §4).
@@ -762,12 +796,17 @@ fn relay_flags(rejection: Option<&Rejection>) -> serde_json::Map<String, Value> 
     m
 }
 
+/// `RESTRICTED_TRANSACTIONS_COUNT`: the most transactions one
+/// `get_transactions` may ask a restricted listener for.
+const RESTRICTED_TRANSACTIONS_COUNT: usize = 100;
+
 /// `/get_transactions` — pool and chain transactions by hash.
 ///
 /// On a restricted listener a private pool transaction is not there at all,
 /// and a public one's receive time is zero, as the C++ answers
 /// (`get_transaction_info` without sensitive data): when a node first saw a
-/// transaction is a timing leak about where it came from.
+/// transaction is a timing leak about where it came from. Nor may one call
+/// ask it for more than [`RESTRICTED_TRANSACTIONS_COUNT`].
 pub fn get_transactions(server: &super::Server, body: &[u8], restricted: bool) -> RpcResult {
     let request: Value = serde_json::from_slice(body)
         .map_err(|e| RpcError::new(error::WRONG_PARAM, format!("invalid JSON: {e}")))?;
@@ -775,6 +814,14 @@ pub fn get_transactions(server: &super::Server, body: &[u8], restricted: bool) -
         .get("txs_hashes")
         .and_then(Value::as_array)
         .ok_or_else(|| RpcError::new(error::WRONG_PARAM, "txs_hashes is missing"))?;
+    if restricted && wanted.len() > RESTRICTED_TRANSACTIONS_COUNT {
+        // In `status`, as the C++ answers it.
+        let m = base(
+            "Too many transactions requested in restricted mode",
+            untrusted(),
+        );
+        return Ok(Value::Object(m));
+    }
 
     let db = server.db();
     let pool = server.pool();
@@ -853,6 +900,21 @@ mod tests {
         assert_eq!(fields[0].1, json!(0u64), "the low word is zero");
         assert_eq!(fields[1].1, json!(1u64), "the high word carries it");
         assert_eq!(fields[2].1, json!("0x10000000000000000"));
+    }
+
+    /// A restricted `get_info` rounds the database size up to the next 5 GiB,
+    /// as the C++'s `round_up` does, so the exact size cannot tell one node
+    /// from another.
+    #[test]
+    fn a_restricted_database_size_is_rounded_up() {
+        let gib = 1024 * 1024 * 1024;
+        let q = DATABASE_SIZE_QUANTUM;
+        assert_eq!(q, 5 * gib);
+        assert_eq!(round_up(0, q), 0);
+        assert_eq!(round_up(1, q), 5 * gib);
+        assert_eq!(round_up(5 * gib, q), 5 * gib);
+        assert_eq!(round_up(6_640 * 1024 * 1024, q), 10 * gib);
+        assert_eq!(RESTRICTED_TRANSACTIONS_COUNT, 100);
     }
 
     #[test]

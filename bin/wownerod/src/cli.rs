@@ -46,8 +46,9 @@ pub struct Config {
     pub rpc_bind_port: u16,
     /// `--restricted-rpc` (`specs/11` §1.3).
     pub restricted_rpc: bool,
-    /// Required to bind the unrestricted RPC to a non-loopback address without
-    /// a login (`specs/11` §1.2).
+    /// Required to bind `--rpc-bind-ip` or `--rpc-bind-ipv6-address` to a
+    /// non-loopback address, restricted or not, login or not (`specs/11`
+    /// §1.2).
     pub confirm_external_bind: bool,
     /// `--rpc-ssl` and its companions (`specs/11` §1.2, [`crate::rpc::tls`]).
     pub rpc_ssl: RpcSsl,
@@ -58,8 +59,10 @@ pub struct Config {
     pub rpc_ssl_allowed_fingerprints: Vec<[u8; 32]>,
     pub rpc_ssl_allow_chained: bool,
     pub rpc_ssl_allow_any_cert: bool,
-    /// A second, restricted listener (`specs/11` §1.3).
-    pub rpc_restricted_bind_ip: Option<String>,
+    /// A second, restricted listener (`specs/11` §1.3). Loopback by default,
+    /// as in the C++, and not `--rpc-bind-ip`: a node exposing its main RPC
+    /// has not thereby asked for a second port on the same address.
+    pub rpc_restricted_bind_ip: String,
     pub rpc_restricted_bind_port: Option<u16>,
     /// `--rpc-bind-ipv6-address` and `--rpc-restricted-bind-ipv6-address`,
     /// listened on as well with `--rpc-use-ipv6`.
@@ -197,7 +200,7 @@ impl Default for Config {
             rpc_ssl_allowed_fingerprints: Vec::new(),
             rpc_ssl_allow_chained: false,
             rpc_ssl_allow_any_cert: false,
-            rpc_restricted_bind_ip: None,
+            rpc_restricted_bind_ip: "127.0.0.1".into(),
             rpc_restricted_bind_port: None,
             rpc_bind_ipv6_address: "::1".into(),
             rpc_restricted_bind_ipv6_address: "::1".into(),
@@ -330,7 +333,7 @@ RPC (specs/11)
     --rpc-bind-ip <ip>        default: 127.0.0.1
     --rpc-bind-port <port>    default: 34568 (28081 testnet, 38081 stagenet)
     --restricted-rpc          run the server in restricted mode
-    --rpc-restricted-bind-ip <ip>
+    --rpc-restricted-bind-ip <ip>                               (default: 127.0.0.1)
     --rpc-restricted-bind-port <port>
                               also serve a restricted RPC here
     --rpc-use-ipv6            listen on IPv6 as well, on the same ports
@@ -362,8 +365,9 @@ RPC (specs/11)
                               file; makes TLS mandatory
     --rpc-ssl-allow-chained   ... or chains to a certificate in it
     --rpc-ssl-allow-any-cert  check no client certificates
-    --confirm-external-bind   required to bind the unrestricted RPC to a
-                              non-loopback address without --rpc-login
+    --confirm-external-bind   required to bind --rpc-bind-ip or
+                              --rpc-bind-ipv6-address to a non-loopback
+                              address, even restricted or behind a login
 
 ZMQ (specs/09 §3.2)
     --zmq-rpc-bind-ip <ip>    default: 127.0.0.1
@@ -986,7 +990,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 cfg.max_log_files = take!(number(&take!(value(&mut it, &arg, "a count")), &arg));
             }
             "--rpc-restricted-bind-ip" => {
-                cfg.rpc_restricted_bind_ip = Some(take!(value(&mut it, &arg, "an address")));
+                cfg.rpc_restricted_bind_ip = take!(value(&mut it, &arg, "an address"));
             }
             "--rpc-restricted-bind-port" => {
                 cfg.rpc_restricted_bind_port =

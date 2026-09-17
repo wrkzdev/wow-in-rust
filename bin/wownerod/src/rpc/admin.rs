@@ -497,14 +497,27 @@ pub fn get_transaction_pool_stats(server: &Server, restricted: bool) -> RpcResul
     Ok(Value::Object(m))
 }
 
+/// `RESTRICTED_SPENT_KEY_IMAGES_COUNT`: the most key images one
+/// `is_key_image_spent` may ask a restricted listener about.
+const RESTRICTED_SPENT_KEY_IMAGES_COUNT: usize = 5_000;
+
 /// `/is_key_image_spent`: 0 unspent, 1 spent on chain, 2 spent in the pool --
-/// by a public transaction, on a restricted listener.
+/// by a public transaction, on a restricted listener, which also takes no
+/// more than [`RESTRICTED_SPENT_KEY_IMAGES_COUNT`] at once.
 pub fn is_key_image_spent(server: &Server, body: &[u8], restricted: bool) -> RpcResult {
     let req = body_json(body)?;
     let images = req
         .get("key_images")
         .and_then(Value::as_array)
         .ok_or_else(|| RpcError::new(error::WRONG_PARAM, "key_images is missing"))?;
+    if restricted && images.len() > RESTRICTED_SPENT_KEY_IMAGES_COUNT {
+        // In `status`, as the C++ answers it.
+        let m = base(
+            "Too many key images queried in restricted mode",
+            untrusted(),
+        );
+        return Ok(Value::Object(m));
+    }
     let parsed: Vec<[u8; 32]> = images
         .iter()
         .map(|v| hash_of(v, "a key image"))
