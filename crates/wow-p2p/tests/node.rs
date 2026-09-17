@@ -70,6 +70,8 @@ struct MemCore {
     pool: Mutex<HashMap<Hash256, Vec<u8>>>,
     /// Pool transactions that went out to a peer.
     relayed: Mutex<HashSet<Hash256>>,
+    /// Transactions that arrived through a stem rather than fluffed.
+    stemmed: Mutex<HashSet<Hash256>>,
     /// Blocks handed to peers that asked for them.
     served: AtomicUsize,
 }
@@ -80,6 +82,7 @@ impl MemCore {
             chain: Mutex::new(vec![genesis.clone()]),
             pool: Mutex::new(HashMap::new()),
             relayed: Mutex::new(HashSet::new()),
+            stemmed: Mutex::new(HashSet::new()),
             served: AtomicUsize::new(0),
         })
     }
@@ -90,6 +93,7 @@ impl MemCore {
             chain: Mutex::new(other.chain.lock().unwrap().clone()),
             pool: Mutex::new(HashMap::new()),
             relayed: Mutex::new(HashSet::new()),
+            stemmed: Mutex::new(HashSet::new()),
             served: AtomicUsize::new(0),
         })
     }
@@ -231,6 +235,12 @@ impl Core for MemCore {
     }
 
     fn incoming_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
+        if !fluff {
+            self.stemmed
+                .lock()
+                .unwrap()
+                .extend(txs.iter().map(|b| tx_id(b)));
+        }
         let mut pool = self.pool.lock().unwrap();
         // As the message says: this pool has no stem of its own to loop.
         let relay = match fluff {
@@ -407,6 +417,33 @@ fn a_transaction_reaches_the_peer() {
     b.relay_transaction(id, blob);
 
     wait_until("the transaction at the peer", 60, || a_core.has_tx(&id));
+}
+
+/// A transaction this node originates goes through a stem the moment a peer
+/// can take it, without waiting for a maintenance tick to choose the stems:
+/// a send that finds none mends the map from the connections there are
+/// (`dandelionpp_notify`). Waiting fluffed it straight from this node.
+#[test]
+fn a_local_transaction_is_stemmed_without_waiting_for_a_tick() {
+    let (_a, a_core, b, b_core, _) = pair(3);
+    wait_until("a synchronised peer", 60, || {
+        b.normal_connection_count() == 1
+    });
+
+    let blob = b"a transaction sent the moment a stem exists".to_vec();
+    let id = tx_id(&blob);
+    b_core.pool.lock().unwrap().insert(id, blob.clone());
+    b.relay_transaction(id, blob);
+    assert!(
+        b_core.relayed.lock().unwrap().contains(&id),
+        "sent at once, through the stem"
+    );
+
+    wait_until("the transaction at the peer", 30, || a_core.has_tx(&id));
+    assert!(
+        a_core.stemmed.lock().unwrap().contains(&id),
+        "it arrived as a stem, not fluffed"
+    );
 }
 
 /// A transaction handed over before any peer is synchronised still reaches

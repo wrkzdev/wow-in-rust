@@ -1108,6 +1108,10 @@ mod tests {
         }
     }
 
+    fn put(pool: &mut TxPool, n: u8, relay: RelayMethod, weight: u64) {
+        pool.by_id.insert(id(n), with_relay(relay, weight));
+    }
+
     /// Never sent goes now; sent goes again on a delay that grows with its
     /// age; kept private or past half its lifetime, it never goes.
     #[test]
@@ -1153,8 +1157,8 @@ mod tests {
     #[test]
     fn a_stem_transaction_is_not_offered_before_it_is_sent() {
         let mut pool = TxPool::new();
-        pool.by_id.insert(id(1), with_relay(RelayMethod::Local, 10));
-        pool.by_id.insert(id(2), with_relay(RelayMethod::Stem, 11));
+        put(&mut pool, 1, RelayMethod::Local, 10);
+        put(&mut pool, 2, RelayMethod::Stem, 11);
 
         let due = pool.due_for_relay(0);
         assert_eq!(due.len(), 1);
@@ -1202,8 +1206,8 @@ mod tests {
     #[test]
     fn relaying_says_what_became_public() {
         let mut pool = TxPool::new();
-        pool.by_id.insert(id(1), with_relay(RelayMethod::Local, 10));
-        pool.by_id.insert(id(2), with_relay(RelayMethod::Fluff, 11));
+        put(&mut pool, 1, RelayMethod::Local, 10);
+        put(&mut pool, 2, RelayMethod::Fluff, 11);
 
         let stemmed = pool.set_relayed(&[id(1), id(2)], RelayMethod::Stem, 5);
         assert!(stemmed.is_empty());
@@ -1230,7 +1234,7 @@ mod tests {
             (4, RelayMethod::Fluff),
             (5, RelayMethod::Block),
         ] {
-            pool.by_id.insert(id(n), with_relay(method, 10 + u64::from(n)));
+            put(&mut pool, n, method, 10 + u64::from(n));
             pool.spent.insert(KeyImage([n; 32]), id(n));
         }
 
@@ -1261,7 +1265,7 @@ mod tests {
     #[test]
     fn a_private_transaction_seen_again_is_not_its_own_double_spend() {
         let mut pool = TxPool::new();
-        pool.by_id.insert(id(1), with_relay(RelayMethod::Stem, 10));
+        put(&mut pool, 1, RelayMethod::Stem, 10);
         pool.spent.insert(KeyImage([1; 32]), id(1));
 
         assert!(!pool.spent_in_pool(&KeyImage([1; 32]), &id(1)));
@@ -1341,8 +1345,8 @@ mod tests {
         stem_old.relayed = true;
         pool.by_id.insert(id(1), entry(100, 10, 1_000));
         pool.by_id.insert(id(2), stem_old);
-        pool.by_id.insert(id(3), with_relay(RelayMethod::None, 12));
-        pool.by_id.insert(id(4), with_relay(RelayMethod::Local, 13));
+        put(&mut pool, 3, RelayMethod::None, 12);
+        put(&mut pool, 4, RelayMethod::Local, 13);
 
         let out = pool.public_txs_except(&Default::default());
         assert_eq!(out.len(), 1);

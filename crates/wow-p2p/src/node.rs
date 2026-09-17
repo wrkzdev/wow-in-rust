@@ -1243,6 +1243,20 @@ impl Shared {
     /// fluffs it. A fluff is queued to every other peer and flushed on each
     /// one's Poisson timer.
     fn relay_txs(&self, from: Option<u64>, txs: TxBatch, how: TxRelay) {
+        let own = how == TxRelay::Local;
+        // This node's own transaction already under an embargo has just gone
+        // through a stem, sent by another thread that read the pool a moment
+        // before this one: the RPC and the pool's re-relay both reach here.
+        // Sending it again would show the stem peer what looks like a loop,
+        // and a loop is fluffed.
+        let txs: TxBatch = if own {
+            let relay = lock(&self.relay);
+            txs.into_iter()
+                .filter(|(id, _)| !relay.embargo.contains_key(id))
+                .collect()
+        } else {
+            txs
+        };
         if txs.is_empty() {
             return;
         }
@@ -1251,28 +1265,58 @@ impl Shared {
             TxRelay::Stem => !lock(&self.relay).fluffing,
             TxRelay::Fluff => false,
         };
-        if stem && self.stem(from, &txs) {
-            return;
+        if stem {
+            // As `dandelionpp_notify` tries it: the stem, and when that finds
+            // no connection, the map mended from the connections there are now
+            // and the stem again -- twice, before giving up and fluffing. With
+            // the stems mended only on the next tick, a transaction submitted
+            // just after a stem went, or just after the first peer arrived,
+            // was fluffed straight from this node.
+            for _ in 0..2 {
+                if self.stem(from, &txs, own) {
+                    return;
+                }
+                let candidates = self.stem_candidates();
+                let mut rand = |n: usize| self.rand_below(n);
+                lock(&self.relay).stems.update(candidates, &mut rand);
+            }
+            wow_log::debug!(
+                LOG,
+                "no Dandelion++ stem for {} transaction(s); fluffing",
+                txs.len()
+            );
         }
         self.fluff(from, txs);
     }
 
-    /// Send `txs` through the stem the epoch's map gives `from`, together.
-    /// Returns whether they went.
-    fn stem(&self, from: Option<u64>, txs: &TxBatch) -> bool {
-        let target = {
-            let mut relay = lock(&self.relay);
-            let mut rand = |n: usize| self.rand_below(n);
-            relay.stems.get_stem(from, &mut rand)
-        };
-        let conn = target
+    /// Send `txs` through the stem the epoch's map gives `from`, together,
+    /// and put them under an embargo. Returns whether they went -- or, when
+    /// they are this node's `own`, whether each is under an embargo now.
+    ///
+    /// The relay lock is held from choosing the stem to recording the
+    /// embargo, so two threads relaying the same transaction of this node's
+    /// cannot both send it.
+    fn stem(&self, from: Option<u64>, txs: &TxBatch, own: bool) -> bool {
+        let mut relay = lock(&self.relay);
+        let fresh: TxBatch = txs
+            .iter()
+            .filter(|(id, _)| !own || !relay.embargo.contains_key(id))
+            .cloned()
+            .collect();
+        if fresh.is_empty() {
+            return true;
+        }
+        let mut rand = |n: usize| self.rand_below(n);
+        let conn = relay
+            .stems
+            .get_stem(from, &mut rand)
             .and_then(|id| lock(&self.conns).get(&id).cloned())
             .filter(|c| c.state() == STATE_NORMAL);
         let Some(conn) = conn else {
             return false;
         };
         let body = NewTransactions {
-            txs: txs.iter().map(|(_, blob)| blob.clone()).collect(),
+            txs: fresh.iter().map(|(_, blob)| blob.clone()).collect(),
             dandelionpp_fluff: false,
         }
         .to_bytes();
@@ -1280,14 +1324,12 @@ impl Shared {
             return false;
         }
         let now = Instant::now();
-        {
-            let mut relay = lock(&self.relay);
-            for (id, blob) in txs {
-                let deadline = now + self.embargo();
-                relay.embargo.insert(*id, (deadline, blob.clone()));
-            }
+        for (id, blob) in &fresh {
+            let deadline = now + self.embargo();
+            relay.embargo.insert(*id, (deadline, blob.clone()));
         }
-        let ids: Vec<Hash256> = txs.iter().map(|(id, _)| *id).collect();
+        drop(relay);
+        let ids: Vec<Hash256> = fresh.iter().map(|(id, _)| *id).collect();
         self.core.tx_relayed(&ids, TxRelay::Stem);
         true
     }
@@ -1345,13 +1387,12 @@ impl Shared {
 
         // A new epoch (`start_epoch`): new stems from the outgoing
         // connections, and a new draw of whether it fluffs. Between epochs a
-        // stem that went away is replaced, and only it; replacing both and
-        // starting the epoch over whenever one stem dropped reshuffled every
-        // source's path.
-        let candidates = self.stem_candidates();
-        let new_epoch = now >= lock(&self.relay).epoch_ends;
-        let mut rand = |n: usize| self.rand_below(n);
-        if new_epoch {
+        // stem that went away is replaced when a send finds it gone, and only
+        // it ([`Shared::relay_txs`]); replacing both and starting the epoch
+        // over whenever one stem dropped reshuffled every source's path.
+        if now >= lock(&self.relay).epoch_ends {
+            let candidates = self.stem_candidates();
+            let mut rand = |n: usize| self.rand_below(n);
             let fluffing = rand(100) < DANDELION_FLUFF_PERCENT;
             let stems = StemMap::new(candidates, DANDELION_STEMS, &mut rand);
             let epoch = DANDELION_MIN_EPOCH
@@ -1365,8 +1406,6 @@ impl Shared {
                 "a new Dandelion++ epoch: {}",
                 if fluffing { "fluff" } else { "stem" }
             );
-        } else {
-            lock(&self.relay).stems.update(candidates, &mut rand);
         }
 
         // Embargoes that ran out without the transaction coming back fluffed.
