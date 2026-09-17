@@ -637,6 +637,14 @@ pub mod cache {
             .map(|h| wow_crypto::hex::encode(h))
             .collect();
 
+        // Rings, sealed with the rest: which outputs this wallet hid its
+        // spends among is exactly what it must not leave in the clear.
+        let rings: Vec<Value> = state
+            .rings
+            .iter()
+            .map(|(k, ring)| json!({ "key_image": wow_crypto::hex::encode(&k.0), "ring": ring }))
+            .collect();
+
         json!({
             "version": VERSION,
             "start_height": state.start_height,
@@ -644,6 +652,7 @@ pub mod cache {
             "hashes": hashes,
             "transfers": transfers,
             "sent": state.sent.iter().map(sent_to_json).collect::<Vec<_>>(),
+            "rings": rings,
         })
         .to_string()
         .into_bytes()
@@ -741,6 +750,25 @@ pub mod cache {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(sent_from_json).collect())
             .unwrap_or_default();
+
+        // Also added without a version bump: a cache from before has no rings.
+        state.rings = Default::default();
+        for entry in v.get("rings").and_then(Value::as_array).into_iter().flatten() {
+            let key_image = entry
+                .get("key_image")
+                .and_then(Value::as_str)
+                .and_then(wow_crypto::hex::decode)
+                .and_then(|b| <[u8; 32]>::try_from(b).ok());
+            let ring: Option<Vec<u64>> = entry
+                .get("ring")
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().map(Value::as_u64).collect());
+            if let (Some(k), Some(ring)) = (key_image, ring) {
+                state
+                    .rings
+                    .set_ring(wow_crypto::types::KeyImage(k), &ring, false);
+            }
+        }
 
         state.reindex();
         Ok(())
@@ -1008,6 +1036,35 @@ mod tests {
         let mut back = WalletState::new(s.keys_file.account.clone(), table, 0, Network::Mainnet);
         cache::load(&mut back, &raw).expect("loads");
         assert_eq!(back.sent, s.state.sent);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rings a wallet spent with survive the cache, and a cache from
+    /// before they were kept reads back with none.
+    #[test]
+    fn rings_survive_the_cache() {
+        let dir = scratch("rings");
+        let mut s = fresh_session(&dir, 0);
+        s.state
+            .rings
+            .set_ring(wow_crypto::types::KeyImage([5u8; 32]), &[9, 4, 70], false);
+        let raw = cache::store(&s.state);
+
+        let keys = &s.keys_file.account.keys;
+        let table = SubaddressTable::new(&keys.account_address, &keys.view_secret_key, 1, 1);
+        let mut back = WalletState::new(s.keys_file.account.clone(), table, 0, Network::Mainnet);
+        cache::load(&mut back, &raw).expect("loads");
+        assert_eq!(back.rings, s.state.rings);
+        assert_eq!(
+            back.rings.get(&wow_crypto::types::KeyImage([5u8; 32])),
+            Some(&[4u64, 9, 70][..])
+        );
+
+        let mut older: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        older.as_object_mut().expect("an object").remove("rings");
+        cache::load(&mut back, older.to_string().as_bytes()).expect("loads");
+        assert!(back.rings.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

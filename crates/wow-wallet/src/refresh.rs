@@ -354,6 +354,9 @@ pub struct WalletState {
     /// Transactions that spent this wallet's outputs, sent from here or found
     /// in a block ([`crate::history`]).
     pub sent: Vec<SentTx>,
+    /// The rings this wallet has spent with ([`crate::rings`]). Kept across a
+    /// rescan and a reorganisation, which is when they matter.
+    pub rings: crate::rings::RingDb,
     /// `max_reorg_depth`. Zero means unlimited, as in the reference.
     pub max_reorg_depth: u64,
     /// This chain's genesis hash.
@@ -405,6 +408,7 @@ impl WalletState {
             by_key_image: HashMap::new(),
             by_public_key: HashMap::new(),
             sent: Vec::new(),
+            rings: Default::default(),
             max_reorg_depth: 0,
             batch_size: MAX_BLOCKS_PER_CALL,
             checkpoint: wow_consensus::checkpoints::table(network)
@@ -1130,6 +1134,10 @@ impl WalletState {
         }
 
         if let Some(account) = account {
+            // `process_outgoing` keeps the rings of a spend of ours
+            // (`add_rings`), so an output spent again elsewhere is spent with
+            // the same ring.
+            self.rings.add_rings(&tx.prefix);
             minors.sort_unstable();
             minors.dedup();
             self.spend_seen(SeenSpend {

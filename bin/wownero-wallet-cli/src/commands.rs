@@ -48,12 +48,16 @@ const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("start_mining", "this wallet does not drive a miner"),
     ("stop_mining", "this wallet does not drive a miner"),
     (
-        "set_ring",
-        "ring management needs a trusted daemon and is not built yet",
+        "mark_output_spent",
+        "this wallet keeps no shared database of spent outputs",
     ),
     (
-        "get_ring",
-        "ring management needs a trusted daemon and is not built yet",
+        "mark_output_unspent",
+        "this wallet keeps no shared database of spent outputs",
+    ),
+    (
+        "is_output_spent",
+        "this wallet keeps no shared database of spent outputs",
     ),
     (
         "sweep_unmixable",
@@ -142,6 +146,10 @@ pub fn run_one(session: &mut Session, line: &str) -> Result<Outcome, String> {
         "transfer" => transfer_cmd(session, &args),
         "sweep_all" => sweep_all(session, &args),
         "sweep_single" => sweep_single(session, &args),
+        "print_ring" => print_ring(session, &args),
+        "set_ring" => set_ring(session, &args),
+        "unset_ring" => unset_ring(session, &args),
+        "save_known_rings" => Err("save_known_rings is deprecated".into()),
         "set" => set(session, &args),
 
         other => Err(format!("unknown command `{other}`. Try `help`.")),
@@ -185,6 +193,16 @@ Sending
   sweep_single <key_image> <address>
                                 send one output, by the key image
                                 unspent_outputs prints
+
+Rings
+  print_ring <key_image> | <txid>
+                                the ring(s) a key image or a sent transaction
+                                was spent with
+  set_ring <filename> | ( <key_image> absolute|relative <index> [<index>...] )
+                                keep a ring for a key image, to spend it with
+                                again on another chain
+  unset_ring <txid> | ( <key_image> [<key_image>...] )
+                                forget the ring(s)
 
 Settings
   set <option> <value>          persisted to the keys file
@@ -1100,6 +1118,167 @@ fn explain_double_spend(
     }
 }
 
+// -- rings -----------------------------------------------------------------
+
+/// Thirty-two bytes of hex: a key image, or a transaction id.
+fn parse_hash(text: &str) -> Option<[u8; 32]> {
+    wow_crypto::hex::decode(text)?.try_into().ok()
+}
+
+/// `simple_wallet::print_ring`: the ring a key image was spent with, or the
+/// rings of a transaction this wallet sent, in the form `set_ring` reads
+/// back.
+fn print_ring(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    let [arg] = args else {
+        return Err("usage: print_ring <key_image> | <txid>".into());
+    };
+    let bytes = parse_hash(arg).ok_or("Invalid key image")?;
+    let key_image = wow_crypto::types::KeyImage(bytes);
+
+    let rings: Vec<(wow_crypto::types::KeyImage, Vec<u64>)> =
+        if let Some(ring) = session.state.rings.get(&key_image) {
+            vec![(key_image, ring.to_vec())]
+        } else if let Some(sent) = session.state.sent.iter().find(|s| s.txid == bytes) {
+            // The C++ keeps each sent transaction's rings with it. This wallet
+            // keeps them by key image, and a sent transaction knows its own.
+            sent.key_images
+                .iter()
+                .filter_map(|k| Some((*k, session.state.rings.get(k)?.to_vec())))
+                .collect()
+        } else {
+            return Err("Key image either not spent, or spent with ring size 1".into());
+        };
+    for (k, ring) in rings {
+        let indices: String = ring.iter().map(|i| format!("{i} ")).collect();
+        // "absolute" is not translated: the line is input to `set_ring`.
+        println!("{} absolute {indices}", wow_crypto::hex::encode(&k.0));
+    }
+    Ok(())
+}
+
+/// `simple_wallet::set_ring`: keep a ring for a key image, from the command
+/// line or from a file of lines `print_ring` wrote.
+fn set_ring(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    const USAGE: &str =
+        "usage: set_ring <filename> | ( <key_image> absolute|relative <index> [<index>...] )";
+
+    if let [filename] = args {
+        let text = std::fs::read_to_string(filename).map_err(|_| "File doesn't exist")?;
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            match ring_from_line(line) {
+                Ok((key_image, ring, relative)) => {
+                    session.state.rings.set_ring(key_image, &ring, relative);
+                    session.dirty = true;
+                }
+                // A bad line is reported and the rest are read, as the C++
+                // reads them.
+                Err(e) => println!("Error: {e}"),
+            }
+        }
+        return Ok(());
+    }
+
+    let [image, kind, indices @ ..] = args else {
+        return Err(USAGE.into());
+    };
+    if indices.is_empty() {
+        return Err(USAGE.into());
+    }
+    let key_image = wow_crypto::types::KeyImage(parse_hash(image).ok_or("Invalid key image")?);
+    let relative = match *kind {
+        "absolute" => false,
+        "relative" => true,
+        _ => return Err("Missing absolute or relative keyword".into()),
+    };
+
+    let mut ring: Vec<u64> = Vec::with_capacity(indices.len());
+    let mut sum = 0u64;
+    for text in indices {
+        let index: u64 = text
+            .parse()
+            .map_err(|_| "invalid index: must be a strictly positive unsigned integer")?;
+        if relative {
+            if !ring.is_empty() && index == 0 {
+                return Err("invalid index: must be a strictly positive unsigned integer".into());
+            }
+            sum = sum
+                .checked_add(index)
+                .ok_or("invalid index: indices wrap")?;
+        } else if ring.last().is_some_and(|last| *last >= index) {
+            return Err("invalid index: indices should be in strictly ascending order".into());
+        }
+        ring.push(index);
+    }
+    session.state.rings.set_ring(key_image, &ring, relative);
+    session.dirty = true;
+    Ok(())
+}
+
+/// One line of a `set_ring` file: `<key_image> absolute|relative <index>...`,
+/// checked as `simple_wallet::set_ring` checks a file's lines.
+fn ring_from_line(line: &str) -> Result<(wow_crypto::types::KeyImage, Vec<u64>, bool), String> {
+    let mut words = line.split_whitespace();
+    let image = words
+        .next()
+        .and_then(parse_hash)
+        .ok_or_else(|| format!("Invalid key image: {line}"))?;
+    let relative = match words.next() {
+        Some("absolute") => false,
+        Some("relative") => true,
+        _ => return Err(format!("Invalid ring type, expected relative or absolute: {line}")),
+    };
+    let ring = words
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<u64>, _>>()
+        .map_err(|_| format!("Error reading line: {line}"))?;
+    if ring.is_empty() {
+        return Err(format!("Invalid ring: {line}"));
+    }
+    let valid = if relative {
+        ring[1..].iter().all(|i| *i > 0)
+    } else {
+        ring.windows(2).all(|w| w[0] < w[1])
+    };
+    if !valid {
+        let kind = if relative { "relative" } else { "absolute" };
+        return Err(format!("Invalid {kind} ring: {line}"));
+    }
+    Ok((wow_crypto::types::KeyImage(image), ring, relative))
+}
+
+/// `simple_wallet::unset_ring`: forget the rings of key images, or of the
+/// inputs of a transaction this wallet sent.
+///
+/// The C++ tries its arguments as key images first, and as a transaction id
+/// only if that fails, which with a ring database open it never does: a
+/// transaction id given alone is quietly no key image. Here one argument that
+/// forgets no key image's ring is looked up as a sent transaction.
+fn unset_ring(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("usage: unset_ring <txid> | ( <key_image> [<key_image>...] )".into());
+    }
+    let hashes: Vec<[u8; 32]> = args
+        .iter()
+        .map(|a| parse_hash(a).ok_or("Invalid key image or txid"))
+        .collect::<Result<_, _>>()?;
+    let key_images: Vec<wow_crypto::types::KeyImage> = hashes
+        .iter()
+        .map(|h| wow_crypto::types::KeyImage(*h))
+        .collect();
+
+    let mut forgotten = session.state.rings.unset(&key_images);
+    if forgotten == 0 && hashes.len() == 1 {
+        if let Some(sent) = session.state.sent.iter().find(|s| s.txid == hashes[0]) {
+            let inputs = sent.key_images.clone();
+            forgotten = session.state.rings.unset(&inputs);
+        }
+    }
+    if forgotten > 0 {
+        session.dirty = true;
+    }
+    Ok(())
+}
+
 // -- settings --------------------------------------------------------------
 
 fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
@@ -1263,6 +1442,32 @@ mod tests {
         let mut a = vec!["address"];
         assert_eq!(take_ring_size(&mut a).expect("absent"), 22);
         assert_eq!(a, vec!["address"]);
+    }
+
+    /// A `set_ring` file's line is read as `print_ring` writes one, and a ring
+    /// that could not be real is refused with the line.
+    #[test]
+    fn a_ring_file_line_is_read_as_print_ring_writes_it() {
+        let image = "ab".repeat(32);
+        let (k, ring, relative) =
+            ring_from_line(&format!("{image} absolute 3 9 20 ")).expect("a ring");
+        assert_eq!(k.0, [0xab; 32]);
+        assert_eq!((ring, relative), (vec![3, 9, 20], false));
+
+        let (_, ring, relative) =
+            ring_from_line(&format!("{image} relative 3 6 11")).expect("a ring");
+        assert_eq!((ring, relative), (vec![3, 6, 11], true));
+
+        for bad in [
+            format!("{image} absolute 9 3"),
+            format!("{image} relative 3 0"),
+            format!("{image} sideways 1 2"),
+            format!("{image} absolute"),
+            format!("{image} absolute 1 x"),
+            "abcd absolute 1 2".to_string(),
+        ] {
+            assert!(ring_from_line(&bad).is_err(), "{bad}");
+        }
     }
 
     /// Every unimplemented command in the list is refused by name, which

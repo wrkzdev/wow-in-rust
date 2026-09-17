@@ -463,6 +463,8 @@ pub struct RealOutput {
     pub public_key: [u8; 32],
     /// Its commitment, `rct::commit(amount, mask)`.
     pub commitment: [u8; 32],
+    /// Its key image, which its ring is kept under ([`crate::rings`]).
+    pub key_image: wow_crypto::types::KeyImage,
 }
 
 /// A ring member as a daemon describes it in `get_outs`.
@@ -832,6 +834,15 @@ fn median(sorted: &[u64]) -> u64 {
 /// this: they are the same indices, and judging them first means a
 /// transaction that would fail is never built and signed.
 ///
+/// # The ring database
+///
+/// Each attempt starts from the rings `db` holds for these key images, if it
+/// holds one for every one of them, and keeps the rings it chose in `db`,
+/// "for reuse", before they are judged: a ring is kept from the moment it is
+/// chosen, whether or not the transaction is ever relayed, because a node
+/// may already have seen the request. Rings that fail the check are
+/// forgotten again (`unset_ring`), so the next attempt picks afresh.
+///
 /// `offsets` is the distribution `picker` was built from, whose last entry is
 /// how many RingCT outputs the chain has.
 pub fn select_rings<F>(
@@ -840,15 +851,25 @@ pub fn select_rings<F>(
     rng: &mut dyn RandomSource,
     reals: &[RealOutput],
     ring_size: usize,
-    known: Option<&[Vec<u64>]>,
+    db: &mut crate::rings::RingDb,
     mut fetch: F,
 ) -> Result<Vec<(Ring, MemberKeys)>, DecoyError>
 where
     F: FnMut(&[u64]) -> Result<Vec<Member>, String>,
 {
     let available = offsets.last().copied().unwrap_or(0);
+    let key_images: Vec<wow_crypto::types::KeyImage> =
+        reals.iter().map(|r| r.key_image).collect();
     for _ in 0..SANITY_CHECK_ATTEMPTS {
-        let rings = get_outs(picker, rng, reals, ring_size, known, &mut fetch)?;
+        let known = db.get_rings(&key_images);
+        let rings = get_outs(picker, rng, reals, ring_size, known.as_deref(), &mut fetch)?;
+        db.set_rings(
+            key_images
+                .iter()
+                .copied()
+                .zip(rings.iter().map(|(r, _)| r.indices.as_slice())),
+        );
+
         let unique: BTreeSet<u64> = rings
             .iter()
             .flat_map(|(r, _)| r.indices.iter().copied())
@@ -857,6 +878,7 @@ where
         if tx_sanity_check(&unique, total, available) {
             return Ok(rings);
         }
+        db.unset(&key_images);
     }
     Err(DecoyError::SanityCheckFailed(SANITY_CHECK_ATTEMPTS))
 }
@@ -1282,10 +1304,13 @@ mod tests {
     }
 
     fn real(i: u64) -> RealOutput {
+        let mut image = [0u8; 32];
+        image[..8].copy_from_slice(&i.to_le_bytes());
         RealOutput {
             global_index: i,
             public_key: key_of(i),
             commitment: mask(),
+            key_image: wow_crypto::types::KeyImage(image),
         }
     }
 
@@ -1583,7 +1608,7 @@ mod tests {
     }
 
     /// Rings that fail the sanity check are picked again, three times in all,
-    /// and then the transaction is refused.
+    /// and then the transaction is refused, and none of them is kept.
     #[test]
     fn rings_that_fail_the_sanity_check_are_picked_again_three_times() {
         // A chain whose last block holds nearly every output, where the picker
@@ -1594,18 +1619,21 @@ mod tests {
         let p = GammaPicker::new(&o).expect("a picker");
         assert_eq!(p.num_rct_outputs(), 5_000);
 
+        let mut db = crate::rings::RingDb::default();
         let mut calls = 0;
         let mut answer = daemon(|_| false);
         let fetch = |indices: &[u64]| {
             calls += 1;
             answer(indices)
         };
-        let e = select_rings(&o, &p, &mut Lcg(8), &[real(4_000)], RING_SIZE, None, fetch)
+        let e = select_rings(&o, &p, &mut Lcg(8), &[real(4_000)], RING_SIZE, &mut db, fetch)
             .expect_err("fails every time");
         assert_eq!(e, DecoyError::SanityCheckFailed(3));
         assert_eq!(calls, 3, "picked and asked for again each time");
+        assert!(db.is_empty(), "a ring that failed is not kept");
 
-        // And the same rings from an ordinary chain pass the first time.
+        // And the same rings from an ordinary chain pass the first time, and
+        // are kept.
         let o = offsets(10_000, 4);
         let p = GammaPicker::new(&o).expect("a picker");
         let mut calls = 0;
@@ -1614,9 +1642,61 @@ mod tests {
             calls += 1;
             answer(indices)
         };
-        select_rings(&o, &p, &mut Lcg(8), &[real(39_000)], RING_SIZE, None, fetch)
+        let rings = select_rings(&o, &p, &mut Lcg(8), &[real(39_000)], RING_SIZE, &mut db, fetch)
             .expect("passes");
         assert_eq!(calls, 1);
+        assert_eq!(
+            db.get(&real(39_000).key_image),
+            Some(rings[0].0.indices.as_slice())
+        );
+    }
+
+    /// A key image spent before is spent again with the ring kept for it, so
+    /// two spends of it on two chains cannot be intersected. A transaction
+    /// whose inputs do not all have a kept ring picks every ring afresh, as
+    /// the C++ database answers all or nothing.
+    #[test]
+    fn a_kept_ring_is_spent_with_again() {
+        let o = offsets(10_000, 4);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let mut db = crate::rings::RingDb::default();
+
+        let first = select_rings(
+            &o,
+            &p,
+            &mut Lcg(31),
+            &[real(30_000)],
+            RING_SIZE,
+            &mut db,
+            daemon(|_| false),
+        )
+        .expect("rings");
+        let again = select_rings(
+            &o,
+            &p,
+            &mut Lcg(32),
+            &[real(30_000)],
+            RING_SIZE,
+            &mut db,
+            daemon(|_| false),
+        )
+        .expect("rings");
+        assert_eq!(again[0].0, first[0].0, "the same ring, from another source");
+
+        let with_another = select_rings(
+            &o,
+            &p,
+            &mut Lcg(33),
+            &[real(30_000), real(31_000)],
+            RING_SIZE,
+            &mut db,
+            daemon(|_| false),
+        )
+        .expect("rings");
+        assert_ne!(
+            with_another[0].0, first[0].0,
+            "not every input had a ring, so none was reused"
+        );
     }
 
     fn answer(

@@ -10,6 +10,7 @@
 //! | [`subaddress`] | the spend-key → `(major, minor)` table |
 //! | [`scan`] | deciding whether a transaction paid this wallet |
 //! | [`history`] | what this wallet sent, and its transfer history |
+//! | [`rings`] | the rings this wallet has spent with, to spend with again |
 //! | [`store`] | where an open wallet's files live: on disk, or in memory a program keeps |
 //! | [`send`] | a destination to a relayed transaction, prepared and then committed |
 //!
@@ -39,6 +40,7 @@ pub mod keys_file;
 pub mod lock;
 pub mod priority;
 pub mod refresh;
+pub mod rings;
 pub mod scan;
 pub mod send;
 pub mod spend;

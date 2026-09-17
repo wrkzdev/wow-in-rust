@@ -200,7 +200,8 @@ impl Session {
         let picker = GammaPicker::new(&distribution.offsets).map_err(SendError::Ring)?;
 
         // Every input's ring in one request of the reference's shape, checked
-        // member by member and then as a whole (`decoys::select_rings`).
+        // member by member and then as a whole, and the ring database
+        // consulted and kept (`decoys::select_rings`).
         let mut masks = Vec::with_capacity(plan.inputs.len());
         let mut reals = Vec::with_capacity(plan.inputs.len());
         for &i in &plan.inputs {
@@ -211,16 +212,19 @@ impl Session {
                 global_index: t.global_output_index,
                 public_key: t.public_key.0,
                 commitment: wow_crypto::rct::commit(t.amount, &mask).0,
+                key_image: t.key_image.ok_or(SendError::Damaged("no key image"))?,
             });
             masks.push(mask);
         }
+        // Rings are kept from the moment they are chosen, relayed or not.
+        self.dirty = true;
         let rings = decoys::select_rings(
             &distribution.offsets,
             &picker,
             &mut rng,
             &reals,
             request.ring_size,
-            None,
+            &mut self.state.rings,
             |indices| decoys::fetch_members(&client, indices),
         )
         .map_err(|e| match e {
