@@ -120,6 +120,9 @@ pub struct Config {
     pub offline: bool,
     pub ban_list: Option<PathBuf>,
     pub keep_alt_blocks: bool,
+    /// `--pad-transactions`: relayed transactions go out padded to a multiple
+    /// of a kilobyte. Off by default, as in the C++.
+    pub pad_transactions: bool,
 
     // -- logging (`specs/09` §8) --
     /// `0`-`4` or `category:LEVEL,...`.
@@ -240,6 +243,7 @@ impl Default for Config {
             offline: false,
             ban_list: None,
             keep_alt_blocks: false,
+            pad_transactions: false,
             log_level: None,
             log_file: None,
             max_log_file_size: 104_850_000,
@@ -407,6 +411,8 @@ PEER-TO-PEER (specs/08)
     --no-sync                 serve and relay, but download no blocks
     --offline                 no peer-to-peer at all
     --keep-alt-blocks         keep alternative blocks across restarts
+    --pad-transactions        pad relayed transactions to a multiple of 1 KiB,
+                              against traffic volume analysis
 
 LOGGING (specs/09 §8)
     --log-level <0-4 | category:LEVEL,...>                      (default: 0)
@@ -514,10 +520,6 @@ const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     (
         "--anonymous-inbound",
         "i2p/Tor inbound connections are not implemented",
-    ),
-    (
-        "--pad-transactions",
-        "transaction padding is not implemented",
     ),
     (
         "--enable-dns-blocklist",
@@ -716,6 +718,7 @@ const FLAGS: &[&str] = &[
     "no-sync",
     "offline",
     "keep-alt-blocks",
+    "pad-transactions",
     "non-interactive",
     "no-zmq",
     "disable-dns-checkpoints",
@@ -973,6 +976,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 cfg.ban_list = Some(PathBuf::from(take!(value(&mut it, &arg, "a file"))));
             }
             "--keep-alt-blocks" => cfg.keep_alt_blocks = true,
+            "--pad-transactions" => cfg.pad_transactions = true,
 
             "--log-level" => {
                 cfg.log_level = Some(take!(value(&mut it, &arg, "0-4 or category:LEVEL,...")));
@@ -1422,6 +1426,9 @@ mod tests {
         // The RPC options are real now, so they must *not* be refused.
         assert_eq!(run(&["--rpc-bind-port", "1234"]).rpc_bind_port, 1234);
         assert!(run(&["--restricted-rpc"]).restricted_rpc);
+        // Nor is transaction padding, which is off unless asked for.
+        assert!(run(&["--pad-transactions"]).pad_transactions);
+        assert!(!run(&[]).pad_transactions);
     }
 
     #[test]

@@ -446,6 +446,30 @@ fn a_local_transaction_is_stemmed_without_waiting_for_a_tick() {
     );
 }
 
+/// With `--pad-transactions` a transaction goes out in a message padded to a
+/// kilobyte boundary, and the peer takes it all the same.
+#[test]
+fn a_padded_transaction_reaches_the_peer() {
+    let t = template();
+    let genesis = make_block(&t, [0u8; 32], 0);
+    let a_core = MemCore::new(&genesis);
+    a_core.extend(3, &t);
+    let b_core = MemCore::new(&genesis);
+    let a = Node::start(config(Vec::new()), a_core.clone(), rng(1)).unwrap();
+    let mut cfg = config(vec![a.local_addr().unwrap()]);
+    cfg.pad_transactions = true;
+    let b = Node::start(cfg, b_core.clone(), rng(2)).unwrap();
+    wait_until("a synchronised peer", 60, || {
+        b.normal_connection_count() == 1
+    });
+
+    let blob = b"a transaction in a padded message".to_vec();
+    let id = tx_id(&blob);
+    b_core.pool.lock().unwrap().insert(id, blob.clone());
+    b.relay_transaction(id, blob);
+    wait_until("the transaction at the peer", 30, || a_core.has_tx(&id));
+}
+
 /// A transaction handed over before any peer is synchronised still reaches
 /// one. It went to nobody, so it is not marked relayed, and the pool offers it
 /// again once a peer can take it. It used to be marked relayed all the same,

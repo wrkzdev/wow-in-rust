@@ -823,16 +823,57 @@ impl NewTransactions {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        epee::to_bytes(&self.section(0)).unwrap_or_default()
+    }
+
+    /// `make_tx_message` with `pad` (`--pad-transactions`): the `_` field
+    /// filled with spaces so the message comes to a multiple of 1,024 bytes,
+    /// and its size says little about how many transactions it carries.
+    ///
+    /// The size is found the C++'s way, byte for byte, so a padded message is
+    /// the same length as a C++ node's would be. The first guess counts a
+    /// 9-byte header, the `txs` name and every blob with a base-128 length --
+    /// not quite epee's encoding, and without the fluff flag -- then takes off
+    /// what the `_` field itself costs. The message is then encoded with that
+    /// padding, and whatever it overshoots the boundary by is taken back out
+    /// of the padding, or all of the padding when there is not enough. A
+    /// length whose own encoding shrinks as the padding does can leave it a
+    /// byte short, which the C++ accepts too.
+    pub fn to_padded_bytes(&self) -> Vec<u8> {
+        use wow_serialize::varint::varint_len;
+        const GRANULARITY: usize = 1024;
+
+        let mut bytes = 9 + 4 + varint_len(self.txs.len() as u64);
+        for tx in &self.txs {
+            bytes += varint_len(tx.len() as u64) + tx.len();
+        }
+        let padding = GRANULARITY - bytes % GRANULARITY;
+        let overhead = 2 + varint_len(padding as u64);
+        let padding = padding.saturating_sub(overhead);
+
+        let guess = epee::to_bytes(&self.section(padding)).unwrap_or_default();
+        let remove = guess.len() % GRANULARITY;
+        let padding = if remove > padding {
+            0
+        } else {
+            padding - remove
+        };
+        epee::to_bytes(&self.section(padding)).unwrap_or_default()
+    }
+
+    /// The message with `padding` spaces in `_`, laid out as the C++ stores
+    /// it: no `txs` when there are none, `_` always, and `dandelionpp_fluff`
+    /// only when it is not the default, true (`KV_SERIALIZE_OPT`).
+    fn section(&self, padding: usize) -> Section {
         let mut s = Section::new();
-        s.insert("txs".into(), strings(&self.txs));
-        // The padding field exists for traffic analysis resistance; an empty
-        // one is what an unpadded message carries.
-        s.insert("_".into(), Value::String(Vec::new()));
-        s.insert(
-            "dandelionpp_fluff".into(),
-            Value::Bool(self.dandelionpp_fluff),
-        );
-        epee::to_bytes(&s).unwrap_or_default()
+        if !self.txs.is_empty() {
+            s.insert("txs".into(), strings(&self.txs));
+        }
+        s.insert("_".into(), Value::String(vec![b' '; padding]));
+        if !self.dandelionpp_fluff {
+            s.insert("dandelionpp_fluff".into(), Value::Bool(false));
+        }
+        s
     }
 }
 
@@ -1979,6 +2020,66 @@ mod tests {
             NewTransactions::parse(&body).unwrap().dandelionpp_fluff,
             "an absent flag is fluff"
         );
+    }
+
+    /// The fields a C++ node writes and no others: `dandelionpp_fluff` only
+    /// when false, since `KV_SERIALIZE_OPT(dandelionpp_fluff, true)` leaves
+    /// the default out, and `_` always, empty when unpadded.
+    #[test]
+    fn new_transactions_are_laid_out_as_the_cpp_stores_them() {
+        let fluff = NewTransactions {
+            txs: vec![vec![7; 40]],
+            dandelionpp_fluff: true,
+        };
+        let s = epee::from_bytes(&fluff.to_bytes()).unwrap();
+        assert!(
+            !s.contains_key("dandelionpp_fluff"),
+            "the default is left out"
+        );
+        assert_eq!(s.get("_").and_then(Value::as_bytes), Some(&[][..]));
+
+        let stem = NewTransactions {
+            dandelionpp_fluff: false,
+            ..fluff
+        };
+        let s = epee::from_bytes(&stem.to_bytes()).unwrap();
+        assert_eq!(
+            s.get("dandelionpp_fluff").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    /// `--pad-transactions` brings a message to a multiple of 1,024 bytes,
+    /// stem or fluff, one transaction or several, with spaces the other side
+    /// ignores.
+    #[test]
+    fn padded_transactions_come_to_a_multiple_of_a_kilobyte() {
+        for sizes in [vec![100], vec![1_500], vec![3_000, 20], vec![900; 3]] {
+            for fluff in [true, false] {
+                let m = NewTransactions {
+                    txs: sizes.iter().map(|n| vec![1u8; *n]).collect(),
+                    dandelionpp_fluff: fluff,
+                };
+                let padded = m.to_padded_bytes();
+                assert_eq!(padded.len() % 1024, 0, "{sizes:?}, fluff {fluff}");
+                assert!(padded.len() > m.to_bytes().len());
+                assert_eq!(NewTransactions::parse(&padded).unwrap(), m);
+                let s = epee::from_bytes(&padded).unwrap();
+                let pad = s.get("_").and_then(Value::as_bytes).unwrap();
+                assert!(pad.iter().all(|b| *b == b' '));
+            }
+        }
+
+        // One transaction of 100 bytes, worked through as the C++ works it:
+        // a guess of 115 bytes, 905 of padding less the 4 its field costs,
+        // 1,028 bytes encoded, and 4 taken back out.
+        let m = NewTransactions {
+            txs: vec![vec![1u8; 100]],
+            dandelionpp_fluff: true,
+        };
+        let s = epee::from_bytes(&m.to_padded_bytes()).unwrap();
+        let pad = s.get("_").and_then(Value::as_bytes).map(<[u8]>::len);
+        assert_eq!(pad, Some(901));
     }
 
     /// A socket address and its wire form convert both ways.

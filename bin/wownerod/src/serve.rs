@@ -413,6 +413,7 @@ fn start_p2p(cfg: &Config, core: Arc<NodeCore>) -> Result<Node, String> {
     p.exclusive_nodes = resolve_all(&cfg.exclusive_nodes, default_port)?;
     p.allow_local_ip = cfg.allow_local_ip;
     p.no_sync = cfg.no_sync;
+    p.pad_transactions = cfg.pad_transactions;
     // `--public-node` advertises the RPC peers may use: the restricted one.
     p.rpc_port = if cfg.public_node {
         cfg.rpc_restricted_bind_port.unwrap_or(cfg.rpc_bind_port)

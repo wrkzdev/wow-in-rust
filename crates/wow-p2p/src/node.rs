@@ -295,6 +295,9 @@ pub struct Config {
     pub ban_list: Vec<BanTarget>,
     /// The RPC port to advertise; zero unless the operator opted in.
     pub rpc_port: u16,
+    /// `--pad-transactions`: relay transactions in messages padded to a
+    /// multiple of a kilobyte, against traffic volume analysis.
+    pub pad_transactions: bool,
 }
 
 impl Config {
@@ -323,6 +326,7 @@ impl Config {
             state_file: None,
             ban_list: Vec::new(),
             rpc_port: 0,
+            pad_transactions: false,
         }
     }
 }
@@ -1315,11 +1319,8 @@ impl Shared {
         let Some(conn) = conn else {
             return false;
         };
-        let body = NewTransactions {
-            txs: fresh.iter().map(|(_, blob)| blob.clone()).collect(),
-            dandelionpp_fluff: false,
-        }
-        .to_bytes();
+        let blobs = fresh.iter().map(|(_, blob)| blob.clone()).collect();
+        let body = self.tx_message(blobs, false);
         if !conn.notify(command::NEW_TRANSACTIONS, &body) {
             return false;
         }
@@ -1370,6 +1371,21 @@ impl Shared {
         }
         drop(relay);
         self.core.tx_relayed(&ids, TxRelay::Fluff);
+    }
+
+    /// A `NOTIFY_NEW_TRANSACTIONS` body for a relay, padded with
+    /// `--pad-transactions` as `make_tx_message` pads it. Only relays are: an
+    /// answer to a complement request goes out as it is, as the C++ sends it.
+    fn tx_message(&self, txs: Vec<Vec<u8>>, fluff: bool) -> Vec<u8> {
+        let message = NewTransactions {
+            txs,
+            dandelionpp_fluff: fluff,
+        };
+        if self.cfg.pad_transactions {
+            message.to_padded_bytes()
+        } else {
+            message.to_bytes()
+        }
     }
 
     /// The outgoing connections a stem may use (`get_out_connections`):
@@ -1441,12 +1457,8 @@ impl Shared {
             for (id, mut txs) in due {
                 if let Some(c) = conns.get(&id) {
                     flush_order(&mut txs);
-                    let body = NewTransactions {
-                        txs: txs.into_iter().map(|(_, b)| b).collect(),
-                        dandelionpp_fluff: true,
-                    }
-                    .to_bytes();
-                    c.notify(command::NEW_TRANSACTIONS, &body);
+                    let blobs = txs.into_iter().map(|(_, b)| b).collect();
+                    c.notify(command::NEW_TRANSACTIONS, &self.tx_message(blobs, true));
                 }
             }
         }
