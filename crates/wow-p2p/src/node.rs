@@ -88,6 +88,12 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 const MAX_DIALING: usize = 8;
 /// How often the peer lists are written out while running.
 const SAVE_EVERY: Duration = Duration::from_secs(30 * 60);
+/// `P2P_DEFAULT_WHITELIST_CONNECTIONS_PERCENT`: the share of outgoing
+/// connections dialled from the white list before the gray list comes first.
+const WHITELIST_CONNECTIONS_PERCENT: usize = 70;
+/// How often one gray-list address is checked
+/// (`m_gray_peerlist_housekeeping_interval`).
+const GRAY_HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60);
 /// How long the applier first waits before retrying blocks that failed through
 /// no fault of their sender. The wait doubles each time the failure recurs.
 const STALL_RETRY: Duration = Duration::from_secs(1);
@@ -594,13 +600,16 @@ impl Node {
             None => AddressBook::new(cfg.allow_local_ip),
         };
         for addr in &cfg.add_peers {
-            book.add_white(PeerRecord {
-                addr: *addr,
-                id: 0,
-                last_seen: 0,
-                pruning_seed: 0,
-                rpc_port: 0,
-            });
+            book.add_white(
+                PeerRecord {
+                    addr: *addr,
+                    id: 0,
+                    last_seen: 0,
+                    pruning_seed: 0,
+                    rpc_port: 0,
+                },
+                false,
+            );
         }
         for target in &cfg.ban_list {
             book.ban(*target, u64::MAX, 0);
@@ -882,6 +891,26 @@ impl Shared {
         let conns = lock(&self.conns);
         let incoming = conns.values().filter(|c| c.incoming).count();
         (conns.len() - incoming, incoming)
+    }
+
+    /// `needs_new_sync_connections`: not known to be caught up, and short of
+    /// outgoing connections.
+    ///
+    /// The C++ compares its height with the target height peers have given it
+    /// over time. This node goes by the heights its connected peers report,
+    /// and with no peer to report one it is not known to be caught up.
+    fn needs_new_sync_connections(&self) -> bool {
+        let conns = self.snapshot();
+        let target = conns
+            .iter()
+            .map(|c| c.peer_sync().current_height)
+            .max()
+            .unwrap_or(0);
+        if target != 0 && target <= self.core.sync_data().current_height {
+            return false;
+        }
+        let outgoing = conns.iter().filter(|c| !c.incoming).count();
+        outgoing < self.out_peers.load(Ordering::Relaxed)
     }
 
     fn save_state(&self) {
@@ -1244,10 +1273,12 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
         return;
     }
     if !addr.ip().is_loopback() {
+        // Incoming connections only, as `has_too_many_connections` counts:
+        // this node dialling a host does not stop that host dialling back.
         let from_here = shared
             .snapshot()
             .iter()
-            .filter(|c| c.addr.ip() == addr.ip())
+            .filter(|c| c.incoming && c.addr.ip() == addr.ip())
             .count();
         if from_here >= shared.cfg.max_connections_per_ip {
             return;
@@ -1368,13 +1399,18 @@ fn ping_back(shared: Arc<Shared>, ip: IpAddr, node: BasicNodeData, pruning_seed:
     })();
 
     if let Ok(true) = confirmed {
-        lock(&shared.book).add_white(PeerRecord {
-            addr: target,
-            id: node.peer_id,
-            last_seen: unix_now() as i64,
-            pruning_seed,
-            rpc_port: node.rpc_port,
-        });
+        // Not `set_peer_just_seen`: an address already white keeps its
+        // `last_seen`, as `append_with_peer_white` leaves it after a ping.
+        lock(&shared.book).add_white(
+            PeerRecord {
+                addr: target,
+                id: node.peer_id,
+                last_seen: unix_now() as i64,
+                pruning_seed,
+                rpc_port: node.rpc_port,
+            },
+            false,
+        );
         wow_log::debug!(LOG, "{target} answered a ping-back; white-listed");
     }
 }
@@ -1596,8 +1632,14 @@ fn drain_queue(shared: &Shared, stall: &mut Stall) {
 
 fn maintenance(shared: Arc<Shared>) {
     let mut last_save = Instant::now();
+    // Due at once, as `once_a_time_seconds` is on its first call.
+    let mut last_gray_check: Option<Instant> = None;
     while !shared.stopping() {
         make_connections(&shared);
+        if last_gray_check.is_none_or(|t| t.elapsed() >= GRAY_HOUSEKEEPING_INTERVAL) {
+            last_gray_check = Some(Instant::now());
+            gray_housekeeping(&shared);
+        }
         shared.relay_tick();
         if last_save.elapsed() >= SAVE_EVERY {
             shared.save_state();
@@ -1648,7 +1690,7 @@ fn make_connections(shared: &Arc<Shared>) {
                 .filter(|a| !taken.contains(a) && fresh(a)),
         );
         if outgoing + dialing + wanted.len() < target {
-            if let Some(a) = pick_candidate(shared, &taken, outgoing) {
+            if let Some(a) = pick_candidate(shared, &taken, outgoing, target) {
                 wanted.push(a);
             }
         }
@@ -1672,19 +1714,19 @@ fn make_connections(shared: &Arc<Shared>) {
                 match result {
                     Ok((stream, reader, hs)) => {
                         {
+                            let now = unix_now();
                             let mut book = lock(&s.book);
-                            book.add_white(PeerRecord {
-                                addr,
-                                id: hs.node_data.peer_id,
-                                last_seen: unix_now() as i64,
-                                pruning_seed: hs.payload_data.pruning_seed,
-                                rpc_port: hs.node_data.rpc_port,
-                            });
-                            for p in &hs.peers {
-                                if let Some(r) = PeerRecord::from_entry(p) {
-                                    book.add_gray(r);
-                                }
-                            }
+                            book.merge_peerlist(&hs.peers, now);
+                            book.add_white(
+                                PeerRecord {
+                                    addr,
+                                    id: hs.node_data.peer_id,
+                                    last_seen: now as i64,
+                                    pruning_seed: hs.payload_data.pruning_seed,
+                                    rpc_port: hs.node_data.rpc_port,
+                                },
+                                true,
+                            );
                         }
                         run_connection(
                             s,
@@ -1698,8 +1740,11 @@ fn make_connections(shared: &Arc<Shared>) {
                         );
                     }
                     Err(e) => {
+                        // Not dropped from the lists: the C++ leaves a peer
+                        // it could not reach where it was, and does not try
+                        // the host from them again for an hour.
                         wow_log::debug!(LOG, "{addr}: {e}");
-                        lock(&s.book).failed_to_reach(&addr);
+                        lock(&s.book).record_addr_failed(addr.ip(), unix_now());
                     }
                 }
             });
@@ -1709,13 +1754,16 @@ fn make_connections(shared: &Arc<Shared>) {
     }
 }
 
-/// The next address to dial: an anchor while there are few connections, then
-/// the white list 70% of the time and the gray list otherwise, then the
-/// operator's `--add-peer` addresses, then the seed nodes.
+/// The next address to dial (`connections_maker`): an anchor while there are
+/// few connections; then the white list until 70% of the outgoing target is
+/// connected and the gray list first after that, choosing as
+/// [`AddressBook::pick`] does; then the operator's `--add-peer` addresses,
+/// then the seed nodes.
 fn pick_candidate(
     shared: &Arc<Shared>,
     taken: &HashSet<SocketAddr>,
     outgoing: usize,
+    target: usize,
 ) -> Option<SocketAddr> {
     let now = Instant::now();
     let unix = unix_now();
@@ -1726,34 +1774,35 @@ fn pick_candidate(
                 .get(a)
                 .is_none_or(|t| now.duration_since(*t) >= RETRY_AFTER)
     };
+    // `is_peer_used` also knows a node by its id on the same host, whatever
+    // the port.
+    let peers: HashSet<(IpAddr, u64)> = shared
+        .snapshot()
+        .iter()
+        .map(|c| (c.addr.ip(), c.peer_id))
+        .collect();
 
     let mut book = lock(&shared.book);
-    let ok = |a: &SocketAddr, book: &mut AddressBook| usable(a) && !book.is_banned(a.ip(), unix);
+    let bans = book.bans(unix);
+    let unusable = |r: &PeerRecord| {
+        !usable(&r.addr)
+            || r.id == shared.peer_id
+            || peers.contains(&(r.addr.ip(), r.id))
+            || bans.iter().any(|(t, _)| t.covers(r.addr.ip()))
+            || book.is_addr_recently_failed(r.addr.ip(), unix)
+    };
 
     if outgoing < ANCHOR_CONNECTIONS {
-        if let Some(a) = book
-            .anchors()
-            .into_iter()
-            .map(|r| r.addr)
-            .find(|a| ok(a, &mut book))
-        {
-            return Some(a);
+        if let Some(r) = book.anchors().into_iter().find(|r| !unusable(r)) {
+            return Some(r.addr);
         }
     }
 
-    let white_first = shared.rand_below(100) < 70;
-    let banned: HashSet<IpAddr> = book
-        .bans(unix)
-        .into_iter()
-        .filter_map(|(t, _)| match t {
-            BanTarget::Host(ip) => Some(ip),
-            BanTarget::Subnet(_) => None,
-        })
-        .collect();
-    let skip = |a: &SocketAddr| !usable(a) || banned.contains(&a.ip());
+    let white_first = outgoing < target * WHITELIST_CONNECTIONS_PERCENT / 100;
+    let connected: Vec<SocketAddr> = taken.iter().copied().collect();
     for from_white in [white_first, !white_first] {
         let mut rand = |n: usize| shared.rand_below(n);
-        if let Some(r) = book.pick(from_white, &mut rand, &skip) {
+        if let Some(r) = book.pick(from_white, &connected, &mut rand, &unusable) {
             return Some(r.addr);
         }
     }
@@ -1766,6 +1815,69 @@ fn pick_candidate(
         .chain(shared.cfg.seed_nodes.iter())
         .copied()
         .find(|a| usable(a))
+}
+
+/// Check one gray-list address, and promote or forget it
+/// (`gray_peerlist_housekeeping`).
+///
+/// A handshake, and a disconnect straight after. An address that answers is
+/// white-listed, with what the gray list knew of it, and its peer list is
+/// taken as any handshake's is; one that does not is dropped from the gray
+/// list. Without this the gray list only grows staler, and every outgoing
+/// connection dialled from it is a guess.
+///
+/// Not with exclusive nodes, and not while this node is still short of
+/// connections to sync from (`needs_new_sync_connections`): those dials go to
+/// connections it keeps.
+fn gray_housekeeping(shared: &Arc<Shared>) {
+    if !shared.cfg.exclusive_nodes.is_empty() || shared.needs_new_sync_connections() {
+        return;
+    }
+    let candidate = {
+        let book = lock(&shared.book);
+        let mut rand = |n: usize| shared.rand_below(n);
+        book.random_gray(&mut rand)
+    };
+    let Some(rec) = candidate else {
+        return;
+    };
+    let addr = rec.addr;
+    if !lock(&shared.dialing).insert(addr) {
+        return;
+    }
+    let s = shared.clone();
+    let spawned = std::thread::Builder::new()
+        .name("p2p-gray".into())
+        .spawn(move || {
+            let result = dial(&s, addr);
+            lock(&s.dialing).remove(&addr);
+            let now = unix_now();
+            let mut book = lock(&s.book);
+            match result {
+                Ok((stream, _, hs)) => {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    book.merge_peerlist(&hs.peers, now);
+                    // `set_peer_just_seen`, with the gray entry's id, pruning
+                    // seed and RPC port.
+                    book.add_white(
+                        PeerRecord {
+                            last_seen: now as i64,
+                            ..rec
+                        },
+                        true,
+                    );
+                    wow_log::debug!(LOG, "{addr}: answered; white-listed");
+                }
+                Err(e) => {
+                    book.record_addr_failed(addr.ip(), now);
+                    book.remove_gray(&addr);
+                    wow_log::debug!(LOG, "{addr}: {e}; dropped from the gray list");
+                }
+            }
+        });
+    if spawned.is_err() {
+        lock(&shared.dialing).remove(&addr);
+    }
 }
 
 /// Run a handshaken connection on the current thread until it ends.
@@ -1924,12 +2036,24 @@ fn handle_message(
         (Kind::Response, command::TIMED_SYNC) => {
             if header.return_code >= 0 {
                 let t = TimedSync::parse(body).map_err(|e| malformed("timed sync", e))?;
+                let pruning_seed = t.payload_data.pruning_seed;
                 *lock(&conn.sync) = t.payload_data;
+                let now = unix_now();
                 let mut book = lock(&shared.book);
-                for p in &t.peers {
-                    if let Some(r) = PeerRecord::from_entry(p) {
-                        book.add_gray(r);
-                    }
+                book.merge_peerlist(&t.peers, now);
+                // An outgoing peer that answers is seen just now
+                // (`set_peer_just_seen` in `do_peer_timed_sync`).
+                if !conn.incoming {
+                    book.add_white(
+                        PeerRecord {
+                            addr: conn.addr,
+                            id: conn.peer_id,
+                            last_seen: now as i64,
+                            pruning_seed,
+                            rpc_port: conn.rpc_port,
+                        },
+                        true,
+                    );
                 }
             }
         }
