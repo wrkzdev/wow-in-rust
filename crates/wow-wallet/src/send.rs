@@ -16,7 +16,7 @@ use crate::decoys::{self, DecoyError, GammaPicker, RandomSource};
 use crate::files::{now, Session};
 use crate::priority::{self, PrioritySettings};
 use crate::spend::{self, SpendError, SpendOptions, SpendPlan};
-use crate::transfer::{self, Destination, SettleError, SpendableOutput, TransferError};
+use crate::transfer::{self, Destination, Outputs, SettleError, SpendableOutput, TransferError};
 
 /// What to send.
 #[derive(Clone, Debug)]
@@ -132,10 +132,8 @@ impl Session {
             (Some(p), None) => Some(p),
             (None, other) => other,
         };
-        // A transaction paying a subaddress gives each output a key of its own,
-        // and the id is encrypted under the payee's; the payee decrypts under
-        // the transaction's main key. The C++ takes an id only in an integrated
-        // address, which is never a subaddress.
+        // The C++ takes an id only in an integrated address, which is never a
+        // subaddress: a subaddress is what replaced payment ids.
         if payment_id.is_some() && decoded.kind == AddressKind::Subaddress {
             return Err(SendError::PaymentIdToSubaddress);
         }
@@ -165,7 +163,8 @@ impl Session {
         let options = SpendOptions {
             ring_size: request.ring_size,
             fee_per_byte,
-            extra_size: spend::extra_size(2, payment_id.is_some(), subaddress),
+            // One payee and change: no per-output keys, even to a subaddress.
+            extra_size: spend::extra_size(2, payment_id.is_some(), false),
             chain_height: self.chain_height(),
             now: now(),
             ..Default::default()
@@ -258,11 +257,13 @@ impl Session {
             });
         }
 
-        // Outputs: the payee, then change back to the primary address.
+        // Outputs: the payee, and change back to the primary address, named
+        // as change. The builder shuffles them.
         let payee = decoded.keys;
         let change_to = self.keys_file.account.keys.account_address;
-        let destinations = |p: &SpendPlan| {
-            vec![
+        let view_secret_key = self.keys_file.account.keys.view_secret_key;
+        let outputs = |p: &SpendPlan| Outputs {
+            destinations: vec![
                 Destination {
                     address: payee,
                     is_subaddress: subaddress,
@@ -273,14 +274,16 @@ impl Session {
                     is_subaddress: false,
                     amount: p.change,
                 },
-            ]
+            ],
+            change: Some(change_to),
         };
         let settled = transfer::construct_settled(
             &inputs,
             &plan,
             fee_per_byte,
             payment_id,
-            &destinations,
+            &outputs,
+            &view_secret_key,
             &mut || random_scalar(&mut rng),
         )
         .map_err(|e| match e {

@@ -833,7 +833,7 @@ impl<P: Platform> Backend<P> {
     /// `spend::plan` estimates from the weight. Returns the amount it sends
     /// and the fee.
     fn estimate_fee(&self, form: &SendForm) -> Result<(u64, u64), String> {
-        use wow_types::address::{Address, AddressKind};
+        use wow_types::address::Address;
         use wow_wallet::{priority, spend};
 
         let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
@@ -849,16 +849,16 @@ impl<P: Platform> Backend<P> {
             &tiers,
         );
         // What the address says of itself, so the estimate's extra field is
-        // the size the transaction's will be. One not yet valid estimates as a
-        // plain address.
+        // the size the transaction's will be. One payee and change never need
+        // per-output keys, a subaddress included. One not yet valid estimates
+        // as a plain address.
         let address = Address::decode_for(form.address.trim(), w.session.network).ok();
-        let subaddress = address.is_some_and(|a| a.kind == AddressKind::Subaddress);
         let payment_id = address.is_some_and(|a| a.payment_id.is_some())
             || !form.payment_id.trim().is_empty();
         let options = spend::SpendOptions {
             ring_size: wow_wallet::decoys::RING_SIZE,
             fee_per_byte: priority::fee_per_byte(&tiers, tier),
-            extra_size: spend::extra_size(2, payment_id, subaddress),
+            extra_size: spend::extra_size(2, payment_id, false),
             chain_height: w.session.chain_height(),
             now: wow_wallet::clock::now(),
             ..Default::default()

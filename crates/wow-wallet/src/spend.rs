@@ -142,14 +142,19 @@ pub fn fee_from_weight(base_fee_per_byte: u64, weight: u64) -> u64 {
 ///
 /// The public key is 33. A payment id, real or the dummy that a two-output
 /// transaction carries in its place, is 11: the nonce tag, its length, the
-/// encrypted-id tag and eight bytes. Paying a subaddress adds a tag, a count
-/// and a key per output, and no dummy.
-pub fn extra_size(n_outputs: usize, payment_id: bool, any_subaddress: bool) -> usize {
+/// encrypted-id tag and eight bytes. `additional_keys` is whether per-output
+/// keys are written, which takes a subaddress paid alongside another payee:
+/// a tag, a count and a key per output. Two outputs with those are two payees
+/// and no change, with no one view key to encrypt a dummy to, so no dummy.
+///
+/// Paying one subaddress, with change, needs no per-output keys, and is the
+/// same size as paying a standard address.
+pub fn extra_size(n_outputs: usize, payment_id: bool, additional_keys: bool) -> usize {
     let mut size = 1 + 32;
-    if payment_id || (n_outputs == MIN_OUTPUTS && !any_subaddress) {
+    if payment_id || (n_outputs == MIN_OUTPUTS && !additional_keys) {
         size += 2 + 1 + 8;
     }
-    if any_subaddress {
+    if additional_keys {
         size += 2 + 32 * n_outputs;
     }
     size

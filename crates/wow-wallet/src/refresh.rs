@@ -1505,9 +1505,15 @@ mod tests {
             Scalar::from_bytes_mod_order(b)
         };
 
-        crate::transfer::construct(
+        // The sender's own output named as change, as a wallet names it: a
+        // payment id is encrypted to the one payee there is.
+        crate::transfer::construct_with_change(
             std::slice::from_ref(&input),
             &destinations,
+            Some(crate::transfer::Change {
+                address: sender.keys.account_address,
+                view_secret_key: &sender.keys.view_secret_key,
+            }),
             fee,
             payment_id,
             &mut rand,

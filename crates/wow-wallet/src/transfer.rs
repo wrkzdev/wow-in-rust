@@ -73,6 +73,31 @@ pub struct Destination {
     pub amount: u64,
 }
 
+/// Which output is change, and the key its derivation comes from:
+/// `change_addr` in `construct_tx_with_tx_key`.
+///
+/// Change is not a payee. It does not count when the builder decides whether
+/// the transaction key is `r*G` or `r*D` and whether per-output keys are
+/// needed, it is not whose view key encrypts the payment id, and its shared
+/// secret is the sender's own view key times the transaction key,
+/// `generate_output_ephemeral_keys`' "sending change to yourself; derivation =
+/// a*R", so the sender finds it whichever form `R` took.
+#[derive(Clone, Copy)]
+pub struct Change<'a> {
+    pub address: AccountPublicAddress,
+    pub view_secret_key: &'a SecretKey,
+}
+
+/// A transaction's outputs, in the order a caller lists them, before the
+/// builder shuffles them.
+pub struct Outputs {
+    /// Every output, change included.
+    pub destinations: Vec<Destination>,
+    /// The change address, which may be one of `destinations`' or, for zero
+    /// change, a throwaway one ([`Change`]).
+    pub change: Option<AccountPublicAddress>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
     #[error("no inputs")]
@@ -89,6 +114,8 @@ pub enum TransferError {
     BadRing(usize),
     #[error("a key does not decode")]
     BadKey,
+    #[error("destinations have to have exactly one output to support encrypted payment ids")]
+    PaymentIdNeedsOneDestination,
     #[error("the range proof could not be built: {0}")]
     RangeProof(#[from] bpp::BppError),
     #[error("a ring signature could not be made: {0}")]
@@ -105,6 +132,21 @@ type Result<T> = std::result::Result<T, TransferError>;
 /// valid one that reveals the spend.
 pub trait Rng {
     fn scalar(&mut self) -> Scalar;
+
+    /// Uniform below `n`, for shuffling the outputs.
+    ///
+    /// The low 64 bits of a uniform scalar are uniform to within a part in
+    /// 2^188, and the plain modulo after is `crypto::rand_idx`'s. A source
+    /// that has integers to hand can say so.
+    fn below(&mut self, n: u64) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let bytes = self.scalar().to_bytes();
+        let mut low = [0u8; 8];
+        low.copy_from_slice(&bytes[..8]);
+        u64::from_le_bytes(low) % n
+    }
 }
 
 impl<F: FnMut() -> Scalar> Rng for F {
@@ -119,18 +161,126 @@ pub struct BuiltTransaction {
     pub tx: Transaction,
     /// The transaction secret key, kept so the wallet can prove payments later.
     pub tx_secret_key: SecretKey,
-    /// Per-destination transaction secret keys, for subaddress destinations.
+    /// Per-output transaction secret keys, one for every output when a
+    /// subaddress is paid alongside another payee, and none otherwise.
     pub additional_tx_secret_keys: Vec<SecretKey>,
 }
 
-/// Build a transaction spending `inputs` to `destinations`.
+/// Build a transaction spending `inputs` to `destinations`, none of which is
+/// change.
 ///
-/// `destinations` must already include the change output. `fee` is the
-/// difference between the input and output totals and is checked, not derived
-/// — computing it needs the transaction's weight, which needs the transaction.
+/// [`construct_with_change`] with no change address: every output is derived
+/// as a payee's. A caller sending change back to itself should name it, which
+/// changes what the transaction key and `extra` look like.
 pub fn construct(
     inputs: &[SpendableOutput],
     destinations: &[Destination],
+    fee: u64,
+    payment_id: Option<Hash8>,
+    rng: &mut dyn Rng,
+) -> Result<BuiltTransaction> {
+    construct_with_change(inputs, destinations, None, fee, payment_id, rng)
+}
+
+/// How many distinct payees of each kind a transaction has, change left out:
+/// `classify_addresses`.
+struct Classified {
+    standard: usize,
+    subaddresses: usize,
+    /// The last subaddress counted, which is the only one when there is one.
+    single_subaddress: AccountPublicAddress,
+}
+
+fn classify_addresses(
+    destinations: &[Destination],
+    change: Option<AccountPublicAddress>,
+) -> Classified {
+    let mut unique: Vec<AccountPublicAddress> = Vec::new();
+    let mut c = Classified {
+        standard: 0,
+        subaddresses: 0,
+        single_subaddress: AccountPublicAddress::default(),
+    };
+    for d in destinations {
+        if change == Some(d.address) || unique.contains(&d.address) {
+            continue;
+        }
+        unique.push(d.address);
+        if d.is_subaddress {
+            c.subaddresses += 1;
+            c.single_subaddress = d.address;
+        } else {
+            c.standard += 1;
+        }
+    }
+    c
+}
+
+/// `get_destination_view_key_pub`: the view key a payment id is encrypted
+/// to, which is the one payee's.
+///
+/// Outputs of nothing and change do not count. More than one payee has no
+/// such key, and `None` says so; no payee but change has the change's.
+fn destination_view_key_pub(
+    destinations: &[Destination],
+    change: Option<AccountPublicAddress>,
+) -> Option<PublicKey> {
+    let mut payee: Option<AccountPublicAddress> = None;
+    for d in destinations {
+        if d.amount == 0 || change == Some(d.address) || payee == Some(d.address) {
+            continue;
+        }
+        if payee.is_some() {
+            return None;
+        }
+        payee = Some(d.address);
+    }
+    match (payee, change) {
+        (Some(p), _) => Some(p.view_public_key),
+        (None, Some(c)) => Some(c.view_public_key),
+        (None, None) => None,
+    }
+}
+
+/// `std::shuffle`, by Fisher-Yates: every order equally likely.
+fn shuffle<T>(items: &mut [T], rng: &mut dyn Rng) {
+    for i in (1..items.len()).rev() {
+        let j = rng.below(i as u64 + 1) as usize;
+        items.swap(i, j);
+    }
+}
+
+/// Build a transaction spending `inputs` to `destinations`:
+/// `construct_tx_and_get_tx_key` and `construct_tx_with_tx_key`.
+///
+/// `destinations` must already include the change output, and `change` says
+/// which address that is ([`Change`]). `fee` is the difference between the
+/// input and output totals and is checked, not derived -- computing it needs
+/// the transaction's weight, which needs the transaction.
+///
+/// # What `extra` and the outputs look like
+///
+/// As the reference builds them, rule for rule, because each rule is visible
+/// on chain and a wallet that departs from any of them is recognisable:
+///
+/// - the outputs are **shuffled** before they are given indices
+///   (`shuffle_outs`), so change is not always the last output and the payee
+///   not always the first;
+/// - one payee that is a subaddress, and no other payee, makes the
+///   transaction key `R = r*D` from that subaddress's spend key, with no
+///   per-output keys;
+/// - per-output keys are written only when a subaddress is paid alongside
+///   another payee (`need_additional_txkeys`), and even then a standard
+///   address's output is derived from `r`, not from its own key;
+/// - a payment id, and without one a dummy of zeros when there are at most
+///   two outputs, is encrypted to the payee's view key under `r` itself
+///   (`get_destination_view_key_pub`), wherever the payee's output landed. A
+///   transaction with no single payee to encrypt to gets no dummy, and
+///   cannot carry a real id.
+pub fn construct_with_change(
+    inputs: &[SpendableOutput],
+    destinations: &[Destination],
+    change: Option<Change<'_>>,
     fee: u64,
     payment_id: Option<Hash8>,
     rng: &mut dyn Rng,
@@ -142,7 +292,7 @@ pub fn construct(
         return Err(TransferError::NoDestinations);
     }
     // HF 15 onward: at least two outputs. A caller with one destination adds a
-    // zero-amount change output to itself.
+    // zero-amount change output.
     if destinations.len() < 2 {
         return Err(TransferError::TooFewOutputs);
     }
@@ -169,54 +319,86 @@ pub fn construct(
     }
 
     // ---- the transaction key, and the per-output keys a subaddress needs ----
+    let change_address = change.map(|c| c.address);
     let tx_secret = rng.scalar();
-    let any_subaddress = destinations.iter().any(|d| d.is_subaddress);
+    let classified = classify_addresses(destinations, change_address);
+    let need_additional_keys = classified.subaddresses > 0
+        && (classified.standard > 0 || classified.subaddresses > 1);
+    let additional_secrets: Vec<Scalar> = if need_additional_keys {
+        destinations.iter().map(|_| rng.scalar()).collect()
+    } else {
+        Vec::new()
+    };
 
-    // `TX_EXTRA_TAG_PUBKEY` is `r*G` unless *every* destination is a
-    // subaddress and there is only one, in which case the reference still
-    // writes `r*G`; the per-output keys carry the real work.
-    let tx_public = PublicKey(encode_point(&(tx_secret * ED25519_BASEPOINT_POINT)));
+    // ---- the payment id, real or dummy ----
+    let encrypt_to = destination_view_key_pub(destinations, change_address);
+    let encrypt = |pid: Hash8, view: &PublicKey| -> Result<Hash8> {
+        let derivation = wow_crypto::generate_key_derivation(view, &SecretKey(tx_secret.to_bytes()))
+            .ok_or(TransferError::BadKey)?;
+        Ok(wow_crypto::keys::encrypt_payment_id(&pid, &derivation))
+    };
+    let encrypted_id = match (payment_id, &encrypt_to) {
+        (Some(pid), Some(view)) => Some(encrypt(pid, view)?),
+        (Some(_), None) => return Err(TransferError::PaymentIdNeedsOneDestination),
+        // "we don't add one if we've got more than the usual 1 destination
+        // plus change", nor when there is no one payee to encrypt it to.
+        (None, Some(view)) if destinations.len() <= 2 => Some(encrypt([0u8; 8], view)?),
+        (None, _) => None,
+    };
 
-    let mut additional_secrets = Vec::new();
-    let mut additional_publics = Vec::new();
-    if any_subaddress {
-        for d in destinations {
-            // A fresh key per output. For a subaddress the public key is
-            // `r * D`, the recipient's subaddress spend key, not `r * G`.
-            let r = rng.scalar();
-            let pubkey = if d.is_subaddress {
-                let spend =
-                    decode_point(&d.address.spend_public_key.0).ok_or(TransferError::BadKey)?;
-                PublicKey(encode_point(&(r * spend)))
-            } else {
-                PublicKey(encode_point(&(r * ED25519_BASEPOINT_POINT)))
-            };
-            additional_secrets.push(SecretKey(r.to_bytes()));
-            additional_publics.push(pubkey);
-        }
-    }
+    // "if this is a single-destination transfer to a subaddress, we set the
+    // tx pubkey to R=s*D"
+    let tx_public = if classified.standard == 0 && classified.subaddresses == 1 {
+        let spend = decode_point(&classified.single_subaddress.spend_public_key.0)
+            .ok_or(TransferError::BadKey)?;
+        PublicKey(encode_point(&(tx_secret * spend)))
+    } else {
+        PublicKey(encode_point(&(tx_secret * ED25519_BASEPOINT_POINT)))
+    };
 
-    // ---- outputs ----
+    // ---- outputs, in a random order ----
+    let mut shuffled: Vec<&Destination> = destinations.iter().collect();
+    shuffle(&mut shuffled, rng);
+
     let mut vout = Vec::with_capacity(destinations.len());
     let mut ecdh_info = Vec::with_capacity(destinations.len());
     let mut out_masks = Vec::with_capacity(destinations.len());
     let mut amounts = Vec::with_capacity(destinations.len());
-    let mut first_derivation = None;
+    let mut additional_publics = Vec::with_capacity(additional_secrets.len());
 
-    for (j, d) in destinations.iter().enumerate() {
-        let r = if any_subaddress {
-            decode_scalar(&additional_secrets[j].0).ok_or(TransferError::BadKey)?
-        } else {
-            tx_secret
-        };
-
-        // The shared secret is `r * C`, the recipient's view key.
-        let view = decode_point(&d.address.view_public_key.0).ok_or(TransferError::BadKey)?;
-        let derivation =
-            wow_crypto::types::KeyDerivation(encode_point(&wow_crypto::ops::mul8(&(r * view))));
-        if j == 0 {
-            first_derivation = Some(derivation);
+    for (j, d) in shuffled.iter().enumerate() {
+        if need_additional_keys {
+            // A fresh key per output. For a subaddress the public key is
+            // `s * D`, the recipient's subaddress spend key, not `s * G`.
+            let s = additional_secrets[j];
+            additional_publics.push(if d.is_subaddress {
+                let spend =
+                    decode_point(&d.address.spend_public_key.0).ok_or(TransferError::BadKey)?;
+                PublicKey(encode_point(&(s * spend)))
+            } else {
+                PublicKey(encode_point(&(s * ED25519_BASEPOINT_POINT)))
+            });
         }
+
+        let derivation = match change {
+            // "sending change to yourself; derivation = a*R"
+            Some(c) if c.address == d.address => {
+                wow_crypto::generate_key_derivation(&tx_public, c.view_secret_key)
+                    .ok_or(TransferError::BadKey)?
+            }
+            // "sending to the recipient; derivation = r*A (or s*C in the
+            // subaddress scheme)"
+            _ => {
+                let r = if d.is_subaddress && need_additional_keys {
+                    additional_secrets[j]
+                } else {
+                    tx_secret
+                };
+                let view =
+                    decode_point(&d.address.view_public_key.0).ok_or(TransferError::BadKey)?;
+                wow_crypto::types::KeyDerivation(encode_point(&wow_crypto::ops::mul8(&(r * view))))
+            }
+        };
 
         let one_time =
             wow_crypto::derive_public_key(&derivation, j as u64, &d.address.spend_public_key)
@@ -252,32 +434,13 @@ pub fn construct(
 
     // ---- extra ----
     let mut extra = vec![TxExtraField::Pubkey(tx_public)];
-    if any_subaddress {
+    if need_additional_keys {
         extra.push(TxExtraField::AdditionalPubkeys(additional_publics));
     }
-    // `construct_tx_with_tx_key` gives every transaction of one destination
-    // plus change an encrypted payment id -- zeros when there is no real one --
-    // so a transaction with an id looks like one without. Past two outputs it
-    // adds no dummy.
-    //
-    // Nor when a subaddress is paid, where this builder parts from the C++: it
-    // gives such a transaction per-output keys, while the C++ makes the
-    // transaction key `r*D` for a single subaddress. The payee decrypts with
-    // that key, so under this layout a dummy would come out as eight random
-    // bytes -- a payment id the sender never gave.
-    let encrypted_id = match payment_id {
-        Some(pid) => Some(pid),
-        None if destinations.len() == 2 && !any_subaddress => Some([0u8; 8]),
-        None => None,
-    };
     if let Some(pid) = encrypted_id {
-        // Encrypted under the first output's derivation, the payee's, which is
-        // why it has to be computed above first.
-        let d = first_derivation.ok_or(TransferError::BadKey)?;
-        let enc = wow_crypto::keys::encrypt_payment_id(&pid, &d);
         let mut nonce = Vec::with_capacity(9);
         nonce.push(0x01);
-        nonce.extend_from_slice(&enc);
+        nonce.extend_from_slice(&pid);
         extra.push(TxExtraField::Nonce(nonce));
     }
 
@@ -379,7 +542,10 @@ pub fn construct(
     Ok(BuiltTransaction {
         tx,
         tx_secret_key: SecretKey(tx_secret.to_bytes()),
-        additional_tx_secret_keys: additional_secrets,
+        additional_tx_secret_keys: additional_secrets
+            .iter()
+            .map(|s| SecretKey(s.to_bytes()))
+            .collect(),
     })
 }
 
@@ -412,19 +578,23 @@ pub enum SettleError {
 /// estimate is not. The C++ rebuilds once even when the estimate was exact;
 /// this skips that, since it would only draw fresh randomness.
 ///
-/// `destinations` makes the outputs for a plan, so that a changed fee reaches
-/// the change output, or a sweep's amount.
+/// `outputs` makes the outputs for a plan, so that a changed fee reaches the
+/// change output, or a sweep's amount, and says which is change. A plan whose
+/// change a new fee took to nothing can move its change to another address.
+/// `view_secret_key` is the sender's, which change is derived from
+/// ([`Change`]).
 pub fn construct_settled(
     inputs: &[SpendableOutput],
     plan: &SpendPlan,
     fee_per_byte: u64,
     payment_id: Option<Hash8>,
-    destinations: &dyn Fn(&SpendPlan) -> Vec<Destination>,
+    outputs: &dyn Fn(&SpendPlan) -> Outputs,
+    view_secret_key: &SecretKey,
     rng: &mut dyn Rng,
 ) -> std::result::Result<Settled, SettleError> {
     let mut plan = plan.clone();
     let (mut built, mut blob, mut weight) =
-        build_measured(inputs, &plan, payment_id, destinations, rng)?;
+        build_measured(inputs, &plan, payment_id, outputs, view_secret_key, rng)?;
     let mut needed = fee_from_weight(fee_per_byte, weight);
 
     let mut rebuilds = 0;
@@ -433,7 +603,8 @@ pub fn construct_settled(
             return Err(SpendError::FeeDidNotSettle(FEE_CALCULATION_MAX_RETRIES).into());
         }
         plan = plan.with_fee(needed)?;
-        (built, blob, weight) = build_measured(inputs, &plan, payment_id, destinations, rng)?;
+        (built, blob, weight) =
+            build_measured(inputs, &plan, payment_id, outputs, view_secret_key, rng)?;
         needed = fee_from_weight(fee_per_byte, weight);
         rebuilds += 1;
     }
@@ -447,10 +618,23 @@ fn build_measured(
     inputs: &[SpendableOutput],
     plan: &SpendPlan,
     payment_id: Option<Hash8>,
-    destinations: &dyn Fn(&SpendPlan) -> Vec<Destination>,
+    outputs: &dyn Fn(&SpendPlan) -> Outputs,
+    view_secret_key: &SecretKey,
     rng: &mut dyn Rng,
 ) -> Result<(BuiltTransaction, Vec<u8>, u64)> {
-    let built = construct(inputs, &destinations(plan), plan.fee, payment_id, rng)?;
+    let outputs = outputs(plan);
+    let change = outputs.change.map(|address| Change {
+        address,
+        view_secret_key,
+    });
+    let built = construct_with_change(
+        inputs,
+        &outputs.destinations,
+        change,
+        plan.fee,
+        payment_id,
+        rng,
+    )?;
     let mut w = wow_serialize::binary::Writer::with_capacity(8192);
     built.tx.write(&mut w);
     let blob = w.into_vec();
@@ -596,6 +780,14 @@ mod tests {
     }
 
     impl Wallet {
+        /// This wallet's primary address as a transaction's change.
+        fn change(&self) -> Change<'_> {
+            Change {
+                address: self.address,
+                view_secret_key: &self.view,
+            }
+        }
+
         fn keys(&self) -> ScanKeys<'_> {
             ScanKeys {
                 address: &self.address,
@@ -931,9 +1123,10 @@ mod tests {
             },
         ];
 
-        let built = construct(
+        let built = construct_with_change(
             std::slice::from_ref(&input),
             &destinations,
+            Some(me.change()),
             fee,
             Some(pid),
             &mut Counter(5),
@@ -1133,9 +1326,10 @@ mod tests {
                 amount: input.amount - send - fee,
             },
         ];
-        let built = construct(
+        let built = construct_with_change(
             std::slice::from_ref(&input),
             &destinations,
+            Some(me.change()),
             fee,
             None,
             &mut Counter(11),
@@ -1159,9 +1353,10 @@ mod tests {
         );
     }
 
-    /// No dummy past two outputs, nor when a subaddress is paid.
+    /// No dummy past two outputs, and none when there is no one payee to
+    /// encrypt it to: two payees, with no change to tell apart from them.
     #[test]
-    fn no_dummy_past_two_outputs_or_to_a_subaddress() {
+    fn no_dummy_past_two_outputs_or_without_one_payee() {
         let me = wallet(73);
         let them = wallet(79);
         let input = spendable(9_000_000_000, 11, 0, 93);
@@ -1184,9 +1379,10 @@ mod tests {
                 amount: input.amount - 3_000_000_000 - fee,
             },
         ];
-        let built = construct(
+        let built = construct_with_change(
             std::slice::from_ref(&input),
             &three,
+            Some(me.change()),
             fee,
             None,
             &mut Counter(12),
@@ -1198,12 +1394,10 @@ mod tests {
             crate::spend::extra_size(3, false, false)
         );
 
-        let sub = wow_crypto::get_subaddress(&them.address, &them.view, SubaddressIndex::new(0, 1))
-            .expect("derivable");
-        let to_sub = vec![
+        let two_payees = vec![
             Destination {
-                address: sub,
-                is_subaddress: true,
+                address: them.address,
+                is_subaddress: false,
                 amount: 1_000_000_000,
             },
             Destination {
@@ -1214,16 +1408,193 @@ mod tests {
         ];
         let built = construct(
             std::slice::from_ref(&input),
-            &to_sub,
+            &two_payees,
             fee,
             None,
             &mut Counter(13),
         )
         .expect("construct");
         assert_eq!(encrypted_payment_id(&built.tx), None);
+
+        // And a real id cannot be carried at all, which the C++ refuses the
+        // same way.
+        assert!(matches!(
+            construct(
+                std::slice::from_ref(&input),
+                &two_payees,
+                fee,
+                Some([1; 8]),
+                &mut Counter(13),
+            ),
+            Err(TransferError::PaymentIdNeedsOneDestination)
+        ));
+    }
+
+    /// One payee that is a subaddress, plus change: the transaction key is
+    /// `r*D`, there are no per-output keys, and the dummy payment id is there,
+    /// as the C++ builds it. Both sides still find their output, the change
+    /// through the sender's own view key.
+    #[test]
+    fn a_single_subaddress_payee_takes_r_times_d_and_no_additional_keys() {
+        let me = wallet(107);
+        let them = wallet(109);
+        let index = SubaddressIndex::new(1, 2);
+        let sub = wow_crypto::get_subaddress(&them.address, &them.view, index).expect("derivable");
+        let input = spendable(9_000_000_000, 22, 3, 111);
+        let fee = 20_000_000u64;
+        let send = 1_000_000_000u64;
+
+        let destinations = vec![
+            Destination {
+                address: sub,
+                is_subaddress: true,
+                amount: send,
+            },
+            Destination {
+                address: me.address,
+                is_subaddress: false,
+                amount: input.amount - send - fee,
+            },
+        ];
+        let built = construct_with_change(
+            std::slice::from_ref(&input),
+            &destinations,
+            Some(me.change()),
+            fee,
+            None,
+            &mut Counter(17),
+        )
+        .expect("construct");
+        verify_as_a_node(&built.tx, &[&input]);
+
+        let extra = wow_types::tx_extra::parse_tx_extra(&built.tx.prefix.extra);
+        assert!(extra.additional_pubkeys().is_none(), "no per-output keys");
+        let r = Scalar::from_bytes_mod_order(built.tx_secret_key.0);
+        let d = decode_point(&sub.spend_public_key.0).expect("valid");
+        assert_eq!(
+            extra.tx_pubkey(),
+            Some(PublicKey(encode_point(&(r * d)))),
+            "R = r*D"
+        );
+        assert!(built.additional_tx_secret_keys.is_empty());
         assert_eq!(
             built.tx.prefix.extra.len(),
-            crate::spend::extra_size(2, false, true)
+            crate::spend::extra_size(2, false, false),
+            "a dummy payment id, and nothing else"
+        );
+
+        let got = scan_transaction(&built.tx, &them.keys()).expect("scan");
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].subaddress, got[0].amount), (index, send));
+        assert_eq!(crate::scan::payment_id(&built.tx, &them.view), None);
+        let enc = encrypted_payment_id(&built.tx).expect("a dummy");
+        assert_eq!(
+            wow_crypto::keys::encrypt_payment_id(&enc, &got[0].derivation),
+            [0u8; 8],
+            "encrypted to the payee, who reads zeros"
+        );
+
+        let mine = scan_transaction(&built.tx, &me.keys()).expect("scan");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].amount, input.amount - send - fee);
+    }
+
+    /// A subaddress paid alongside another payee needs per-output keys, one
+    /// for every output, and a standard address among them is still derived
+    /// from the transaction key.
+    #[test]
+    fn a_subaddress_among_payees_takes_additional_keys() {
+        let me = wallet(113);
+        let them = wallet(127);
+        let other = wallet(131);
+        let index = SubaddressIndex::new(0, 3);
+        let sub = wow_crypto::get_subaddress(&them.address, &them.view, index).expect("derivable");
+        let input = spendable(9_000_000_000, 11, 0, 117);
+        let fee = 10_000_000u64;
+
+        let destinations = vec![
+            Destination {
+                address: sub,
+                is_subaddress: true,
+                amount: 1_000_000_000,
+            },
+            Destination {
+                address: other.address,
+                is_subaddress: false,
+                amount: 2_000_000_000,
+            },
+            Destination {
+                address: me.address,
+                is_subaddress: false,
+                amount: input.amount - 3_000_000_000 - fee,
+            },
+        ];
+        let built = construct_with_change(
+            std::slice::from_ref(&input),
+            &destinations,
+            Some(me.change()),
+            fee,
+            None,
+            &mut Counter(19),
+        )
+        .expect("construct");
+        verify_as_a_node(&built.tx, &[&input]);
+
+        let extra = wow_types::tx_extra::parse_tx_extra(&built.tx.prefix.extra);
+        assert_eq!(extra.additional_pubkeys().map(|k| k.len()), Some(3));
+        assert_eq!(
+            built.tx.prefix.extra.len(),
+            crate::spend::extra_size(3, false, true)
+        );
+        for (w, amount) in [(&them, 1_000_000_000), (&other, 2_000_000_000)] {
+            let got = scan_transaction(&built.tx, &w.keys()).expect("scan");
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].amount, amount);
+        }
+        let mine = scan_transaction(&built.tx, &me.keys()).expect("scan");
+        assert_eq!(mine[0].amount, input.amount - 3_000_000_000 - fee);
+    }
+
+    /// The outputs are shuffled before they are numbered, so the payee is not
+    /// always output 0 and change not always the last.
+    #[test]
+    fn the_outputs_are_shuffled() {
+        let me = wallet(137);
+        let them = wallet(139);
+        let input = spendable(6_000_000_000, 11, 1, 141);
+        let fee = 15_000_000u64;
+        let send = 2_000_000_000u64;
+        let destinations = vec![
+            Destination {
+                address: them.address,
+                is_subaddress: false,
+                amount: send,
+            },
+            Destination {
+                address: me.address,
+                is_subaddress: false,
+                amount: input.amount - send - fee,
+            },
+        ];
+
+        let mut payee_at = std::collections::HashSet::new();
+        for seed in 0..16 {
+            let built = construct_with_change(
+                std::slice::from_ref(&input),
+                &destinations,
+                Some(me.change()),
+                fee,
+                None,
+                &mut Counter(1_000 + seed),
+            )
+            .expect("construct");
+            let got = scan_transaction(&built.tx, &them.keys()).expect("scan");
+            payee_at.insert(got[0].output_index);
+        }
+        assert_eq!(
+            payee_at,
+            [0u64, 1].into_iter().collect(),
+            "the payee lands at either index"
         );
     }
 
@@ -1231,9 +1602,9 @@ mod tests {
     fn pay(
         them: AccountPublicAddress,
         me: AccountPublicAddress,
-    ) -> impl Fn(&SpendPlan) -> Vec<Destination> {
-        move |p: &SpendPlan| {
-            vec![
+    ) -> impl Fn(&SpendPlan) -> Outputs {
+        move |p: &SpendPlan| Outputs {
+            destinations: vec![
                 Destination {
                     address: them,
                     is_subaddress: false,
@@ -1244,7 +1615,8 @@ mod tests {
                     is_subaddress: false,
                     amount: p.change,
                 },
-            ]
+            ],
+            change: Some(me),
         }
     }
 
@@ -1277,6 +1649,7 @@ mod tests {
             rate,
             None,
             &pay(them.address, me.address),
+            &me.view,
             &mut Counter(14),
         )
         .expect("settles");
@@ -1332,6 +1705,7 @@ mod tests {
             rate,
             None,
             &pay(them.address, me.address),
+            &me.view,
             &mut Counter(15),
         )
         .expect("settles");
