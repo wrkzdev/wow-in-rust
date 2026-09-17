@@ -92,6 +92,10 @@ pub struct Session {
     /// it, and never written to the wallet file: a node's password is not the
     /// wallet's to keep.
     pub daemon_login: Option<wow_daemon_client::digest::Credentials>,
+    /// How the node is reached, whatever its address: what `--daemon-ssl`
+    /// and the options beside it say. Kept on the session for the reason
+    /// `daemon_login` is, and never written to the wallet file.
+    pub daemon_options: wow_daemon_client::ConnectOptions,
     /// The daemon's height at the last refresh, for progress reporting.
     pub daemon_height: u64,
     /// Set when anything has changed since the last save.
@@ -172,6 +176,7 @@ impl Session {
             kdf_rounds,
             daemon: None,
             daemon_login: None,
+            daemon_options: Default::default(),
             daemon_height: 0,
             dirty: true,
             store,
@@ -264,6 +269,7 @@ impl Session {
             kdf_rounds,
             daemon: None,
             daemon_login: None,
+            daemon_options: Default::default(),
             daemon_height: 0,
             dirty: false,
             store,
@@ -469,13 +475,15 @@ impl Session {
     }
 
     /// A client for `address`, carrying this session's daemon login if it has
-    /// one.
+    /// one, and reaching the node as [`daemon_options`](Self::daemon_options)
+    /// say.
     ///
     /// Every place that points a wallet at a node goes through here, so a
     /// login survives `set_daemon` and is not something each front end has to
     /// remember to apply.
     pub fn client_for(&self, address: &str) -> DaemonClient {
-        let mut endpoint = wow_daemon_client::Endpoint::new(address);
+        let mut endpoint =
+            wow_daemon_client::Endpoint::new(address).with_options(&self.daemon_options);
         if let Some(c) = &self.daemon_login {
             endpoint = endpoint.with_login(c.clone());
         }

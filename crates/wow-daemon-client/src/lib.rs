@@ -41,15 +41,21 @@ pub mod types;
 /// browser's.
 #[cfg(target_arch = "wasm32")]
 mod tls {
-    use crate::http::{Certificates, HttpError};
+    use std::time::Duration;
+
+    use crate::http::{Certificates, ClientCertificate, HttpError};
 
     pub type Stream = std::net::TcpStream;
 
     pub fn connect(
         _tcp: std::net::TcpStream,
         _host: &str,
-        _certificates: Certificates,
-    ) -> Result<Stream, HttpError> {
+        _certificates: &Certificates,
+        _client_certificate: Option<&ClientCertificate>,
+        _strict: bool,
+        _handshake_timeout: Duration,
+        _timeout: Duration,
+    ) -> Result<(Stream, bool), HttpError> {
         Err(HttpError::Tls("this build has no TLS of its own".into()))
     }
 
@@ -63,7 +69,12 @@ use std::sync::Arc;
 use serde_json::{json, Value as Json};
 use wow_serialize::epee::{self, Section};
 
-pub use http::{Certificates, Endpoint, HttpError, Transport, BINARY_CONTENT_TYPE};
+pub use http::{
+    parse_fingerprint, Certificates, ClientCertificate, ConnectOptions, Endpoint, HttpError, Pins,
+    Security, SslFlags, TlsMode, Transport, BINARY_CONTENT_TYPE,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use tls::fingerprint;
 pub use types::*;
 
 /// What a JSON request says it is, as epee's `invoke_http_json` says it.
@@ -118,6 +129,12 @@ impl DaemonClient {
 
     pub fn address(&self) -> &str {
         self.transport.address()
+    }
+
+    /// How the connection to the daemon was last made, when the transport
+    /// knows.
+    pub fn security(&self) -> Option<Security> {
+        self.transport.security()
     }
 
     // -- transports ---------------------------------------------------------

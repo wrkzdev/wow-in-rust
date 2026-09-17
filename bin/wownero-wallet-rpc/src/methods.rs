@@ -150,6 +150,7 @@ pub fn dispatch(state: &State, method: &str, params: &Value) -> MethodResult {
             if let Some(a) = params.get("address").and_then(Value::as_str) {
                 state.set_daemon_address(a);
             }
+            state.set_daemon_options(session.daemon_options.clone());
             Ok(out)
         }
         "refresh" => refresh(session, params),
@@ -759,12 +760,33 @@ fn query_key(session: &Session, params: &Value) -> MethodResult {
 
 // -- chain -----------------------------------------------------------------
 
+/// `set_daemon`'s TLS parameters, by the C++'s names.
+const SSL_PARAMS: [&str; 6] = [
+    "ssl_support",
+    "ssl_private_key_path",
+    "ssl_certificate_path",
+    "ssl_ca_file",
+    "ssl_allowed_fingerprints",
+    "ssl_allow_any_cert",
+];
+
 fn set_daemon(session: &mut Session, params: &Value) -> MethodResult {
     let address = params
         .get("address")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::new(errors::NO_DAEMON_CONNECTION, "address is missing"))?;
+    // A request that names none of the TLS parameters keeps how the node is
+    // reached now: what the server was started with, which its own
+    // `set_daemon` at startup does not repeat. Taken on only once the node
+    // has answered, so a refused request changes nothing.
+    let options = if SSL_PARAMS.iter().any(|p| params.get(*p).is_some()) {
+        daemon_options(params, address)?
+    } else {
+        session.daemon_options.clone()
+    };
+    let kept = std::mem::replace(&mut session.daemon_options, options);
     let client = session.client_for(address);
+    let options = std::mem::replace(&mut session.daemon_options, kept);
     let info = client.get_info().map_err(|e| {
         Error::new(
             errors::NO_DAEMON_CONNECTION,
@@ -785,7 +807,49 @@ fn set_daemon(session: &mut Session, params: &Value) -> MethodResult {
 
     session.daemon_height = info.height;
     session.daemon = Some(client);
+    session.daemon_options = options;
     Ok(json!({}))
+}
+
+/// `on_set_daemon`'s TLS parameters, made sense of as it makes sense of them:
+/// `ssl_support` is `autodetect` unless given, and a CA file or fingerprints
+/// accept only what they name.
+fn daemon_options(
+    params: &Value,
+    address: &str,
+) -> Result<wow_daemon_client::ConnectOptions, Error> {
+    let text = |name: &str| {
+        params
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let path = |name: &str| text(name).map(std::path::PathBuf::from);
+    let flags = wow_daemon_client::SslFlags {
+        ssl: Some(text("ssl_support").unwrap_or("autodetect").to_string()),
+        private_key: path("ssl_private_key_path"),
+        certificate: path("ssl_certificate_path"),
+        ca_certificates: path("ssl_ca_file"),
+        allowed_fingerprints: params
+            .get("ssl_allowed_fingerprints")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default(),
+        allow_any_cert: params
+            .get("ssl_allow_any_cert")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        allow_chained: false,
+    };
+    let options = wow_daemon_client::ConnectOptions::from_flags(&flags)
+        .map_err(|e| Error::new(errors::NO_DAEMON_CONNECTION, e))?;
+    if options.lacks_strong_verification(address, false) {
+        return Err(Error::new(
+            errors::NO_DAEMON_CONNECTION,
+            "SSL is enabled but no user certificate or fingerprints were provided",
+        ));
+    }
+    Ok(options)
 }
 
 fn refresh(session: &mut Session, params: &Value) -> MethodResult {

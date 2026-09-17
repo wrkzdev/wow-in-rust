@@ -20,7 +20,7 @@ use wow_wallet::{AccountBase, EntryKind, RefreshEvent};
 use crate::format;
 use crate::nodes::NodeAddress;
 use crate::protocol::{
-    Bytes, Command, Event, Net, NewWallet, NodeReport, OpenWallet, Preview, Restore, Row,
+    Bytes, Command, Event, Link, Net, NewWallet, NodeReport, OpenWallet, Preview, Restore, Row,
     SendForm, Status, Summary,
 };
 
@@ -59,7 +59,7 @@ pub trait Platform {
     fn in_browser(&self) -> bool;
     /// Whether a browser loaded the wallet over https.
     fn secure_page(&self) -> bool;
-    /// A client for `node`. `any_certificate` accepts an https node's
+    /// A client for `node`. `any_certificate` accepts the node's TLS
     /// certificate whoever signed it, where the platform decides that.
     /// `login` is for a node started with `--rpc-login`, where the platform
     /// can send one.
@@ -97,8 +97,9 @@ pub struct Backend<P: Platform> {
     wallet: Option<Open>,
     /// Whether the command being handled said it was working.
     working: bool,
-    /// [`Command::AcceptAnyCertificate`], for the next connection.
-    any_certificate: bool,
+    /// [`Command::AcceptAnyCertificate`]: the nodes, as `host:port`, whose
+    /// certificate is accepted as it is, from the next connection.
+    any_certificate: Vec<String>,
     /// [`Command::SetNodeLogin`], for a node started with `--rpc-login`. In
     /// memory only, and never written with the settings.
     node_login: Option<wow_daemon_client::digest::Credentials>,
@@ -111,7 +112,7 @@ impl<P: Platform> Backend<P> {
             emit: Box::new(emit),
             wallet: None,
             working: false,
-            any_certificate: false,
+            any_certificate: Vec::new(),
             node_login: None,
         }
     }
@@ -183,8 +184,8 @@ impl<P: Platform> Backend<P> {
                 self.send(Event::NodeTested { address, result });
                 Ok(())
             }
-            Command::AcceptAnyCertificate(on) => {
-                self.any_certificate = on;
+            Command::AcceptAnyCertificate(nodes) => {
+                self.any_certificate = nodes;
                 Ok(())
             }
             Command::SetNodeLogin(login) => {
@@ -585,7 +586,7 @@ impl<P: Platform> Backend<P> {
         }
         let client = self
             .platform
-            .connect(&node, self.any_certificate, self.node_login.as_ref());
+            .connect(&node, self.accepts_any(&node), self.node_login.as_ref());
         let info = client
             .get_info()
             .map_err(|e| self.unanswered(&node, &e.to_string()))?;
@@ -610,7 +611,7 @@ impl<P: Platform> Backend<P> {
         let started = self.platform.millis();
         let info = self
             .platform
-            .connect(&node, self.any_certificate, self.node_login.as_ref())
+            .connect(&node, self.accepts_any(&node), self.node_login.as_ref())
             .get_info()
             .map_err(|e| self.unanswered(&node, &e.to_string()))?;
         let millis = (self.platform.millis() - started).max(0.0) as u64;
@@ -623,6 +624,11 @@ impl<P: Platform> Backend<P> {
             millis,
             right_network,
         })
+    }
+
+    /// Whether `node`'s certificate is accepted whoever signed it.
+    fn accepts_any(&self, node: &NodeAddress) -> bool {
+        self.any_certificate.contains(&node.host_port())
     }
 
     fn unanswered(&self, node: &NodeAddress, error: &str) -> String {
@@ -756,7 +762,7 @@ impl<P: Platform> Backend<P> {
                     return Err(why.to_string());
                 }
                 self.platform
-                    .connect(&address, self.any_certificate, self.node_login.as_ref())
+                    .connect(&address, self.accepts_any(&address), self.node_login.as_ref())
                     .get_info()
                     .map_err(|e| self.unanswered(&address, &e.to_string()))?
                     .height
@@ -1022,6 +1028,7 @@ impl<P: Platform> Backend<P> {
             scanned: w.session.state.scan_height(),
             chain,
             node: w.session.daemon.as_ref().map(|d| d.address().to_string()),
+            link: link(w.session.daemon.as_ref(), self.platform.in_browser()),
             node_error: w.node_error.clone(),
             syncing: w.syncing,
         };
@@ -1071,6 +1078,30 @@ fn save<P: Platform>(platform: &mut P, w: &mut Open) -> Result<(), String> {
     w.batches = 0;
     platform.saved(&w.name);
     Ok(())
+}
+
+/// How the node in use is reached, as far as is known.
+fn link(daemon: Option<&DaemonClient>, in_browser: bool) -> Link {
+    use wow_daemon_client::Security;
+    let Some(daemon) = daemon else {
+        return Link::Unknown;
+    };
+    match daemon.security() {
+        Some(Security::Tls { verified: true }) => Link::Tls,
+        Some(Security::Tls { verified: false }) => Link::TlsUnchecked,
+        Some(Security::Plain { fell_back: false }) => Link::Plain,
+        Some(Security::Plain { fell_back: true }) => Link::PlainFallback,
+        // A browser's own requests: TLS is what the address says, and the
+        // browser checks the certificate.
+        None if in_browser => {
+            if daemon.address().starts_with("https://") {
+                Link::Tls
+            } else {
+                Link::Plain
+            }
+        }
+        None => Link::Unknown,
+    }
 }
 
 fn summary(name: &str, session: &Session) -> Summary {

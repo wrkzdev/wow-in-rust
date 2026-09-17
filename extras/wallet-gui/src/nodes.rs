@@ -154,9 +154,11 @@ pub struct NodeAddress {
 
 impl NodeAddress {
     /// Read an address as typed: `host`, `host:port`, `http://host:port`,
-    /// `https://host:port` or `[::1]:34568`. No scheme means plain HTTP, as
-    /// wallet-cli's `--daemon-address` means it. No port means the scheme's,
-    /// 80 or 443, when a scheme was typed, and 34568 when none was.
+    /// `https://host:port` or `[::1]:34568`. No scheme means `http://`, as
+    /// wallet-cli's `--daemon-address` means it: on the desktop, TLS is tried
+    /// first and plain HTTP taken only if the node does not answer it. No port
+    /// means the scheme's, 80 or 443, when a scheme was typed, and 34568 when
+    /// none was.
     pub fn parse(text: &str) -> Result<NodeAddress, String> {
         let text = text.trim();
         if text.is_empty() {

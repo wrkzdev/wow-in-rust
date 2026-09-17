@@ -42,6 +42,18 @@ wownero-wallet-rpc — the Wownero wallet RPC (specs/14)
   --daemon-login <user>:<pass>      for a daemon started with --rpc-login
   --daemon-address <address>        host:port, or https://host:port for TLS;
                                     default 127.0.0.1:34568
+  --daemon-ssl <autodetect|enabled|disabled>
+                                    TLS to a daemon given without https://;
+                                    default autodetect: TLS if it speaks it,
+                                    plain HTTP with a warning if not
+  --daemon-ssl-allowed-fingerprints <sha256>
+                                    accept only this certificate; repeatable
+  --daemon-ssl-ca-certificates <path>
+                                    or one in this PEM file
+  --daemon-ssl-allow-chained        or one chained to a certificate in it
+  --daemon-ssl-allow-any-cert       accept any certificate
+  --daemon-ssl-certificate <path> --daemon-ssl-private-key <path>
+                                    a certificate to show a daemon that asks
   --testnet / --stagenet
   --kdf-rounds <n>                  default 1
   --no-initial-sync
@@ -70,6 +82,8 @@ struct Options {
     /// `--daemon-login <user>:<password>`, for a node started with
     /// `--rpc-login`.
     daemon_login: Option<String>,
+    /// `--daemon-ssl` and the options beside it, as given.
+    ssl: wow_daemon_client::SslFlags,
     network: Network,
     kdf_rounds: u64,
     no_initial_sync: bool,
@@ -99,6 +113,7 @@ impl std::fmt::Debug for Options {
             .field("disable_login", &self.disable_login)
             .field("daemon", &self.daemon)
             .field("daemon_login", &self.daemon_login.as_ref().map(|_| "<redacted>"))
+            .field("ssl", &self.ssl)
             .field("network", &self.network)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("no_initial_sync", &self.no_initial_sync)
@@ -123,6 +138,7 @@ impl Default for Options {
             disable_login: false,
             daemon: "127.0.0.1:34568".into(),
             daemon_login: None,
+            ssl: Default::default(),
             network: Network::Mainnet,
             kdf_rounds: 1,
             no_initial_sync: false,
@@ -171,6 +187,22 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             "--disable-rpc-login" => o.disable_login = true,
             "--daemon-address" => o.daemon = next("--daemon-address")?,
             "--daemon-login" => o.daemon_login = Some(next("--daemon-login")?),
+            "--daemon-ssl" => o.ssl.ssl = Some(next("--daemon-ssl")?),
+            "--daemon-ssl-private-key" => {
+                o.ssl.private_key = Some(PathBuf::from(next("--daemon-ssl-private-key")?))
+            }
+            "--daemon-ssl-certificate" => {
+                o.ssl.certificate = Some(PathBuf::from(next("--daemon-ssl-certificate")?))
+            }
+            "--daemon-ssl-ca-certificates" => {
+                o.ssl.ca_certificates = Some(PathBuf::from(next("--daemon-ssl-ca-certificates")?))
+            }
+            "--daemon-ssl-allowed-fingerprints" => o
+                .ssl
+                .allowed_fingerprints
+                .push(next("--daemon-ssl-allowed-fingerprints")?),
+            "--daemon-ssl-allow-any-cert" => o.ssl.allow_any_cert = true,
+            "--daemon-ssl-allow-chained" => o.ssl.allow_chained = true,
             "--testnet" => o.network = Network::Testnet,
             "--stagenet" => o.network = Network::Stagenet,
             "--kdf-rounds" => {
@@ -302,6 +334,16 @@ fn run(options: Options) -> Result<(), String> {
         ),
         None => None,
     };
+    // Refused where `make_basic` refuses it, before any wallet is opened.
+    let daemon_options = wow_daemon_client::ConnectOptions::from_flags(&options.ssl)?;
+    if daemon_options.lacks_strong_verification(&options.daemon, false) {
+        return Err(
+            "Enabling --daemon-ssl requires --daemon-ssl-allow-any-cert or \
+             --daemon-ssl-ca-certificates or --daemon-ssl-allowed-fingerprints or use of a \
+             .onion/.i2p domain"
+                .into(),
+        );
+    }
 
     let state = Arc::new(State::new(
         source,
@@ -314,6 +356,7 @@ fn run(options: Options) -> Result<(), String> {
         options.daemon.clone(),
         daemon_login,
     ));
+    state.set_daemon_options(daemon_options);
 
     state.open_at_startup()?;
 

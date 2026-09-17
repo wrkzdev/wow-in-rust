@@ -346,17 +346,36 @@ fn set_daemon(session: &mut Session, args: &[&str]) -> Result<(), String> {
     }
 
     eprintln!(
-        "Connected to {address}: height {}, {}",
+        "Connected to {address}: height {}, {}, {}",
         info.height,
         if info.synchronized {
             "synced"
         } else {
             "still syncing"
-        }
+        },
+        describe_security(client.security())
     );
     session.daemon_height = info.height;
     session.daemon = Some(client);
     Ok(())
+}
+
+/// How the node was reached, said where it is seen: a fallback to plain HTTP
+/// is also logged, but the log is not the terminal.
+fn describe_security(security: Option<wow_daemon_client::Security>) -> &'static str {
+    use wow_daemon_client::Security;
+    match security {
+        Some(Security::Tls { verified: true }) => "over TLS",
+        Some(Security::Tls { verified: false }) => {
+            "over TLS, though the node's certificate does not check out, so nothing says who \
+             is at the other end"
+        }
+        Some(Security::Plain { fell_back: false }) | None => "over plain HTTP",
+        Some(Security::Plain { fell_back: true }) => {
+            "over plain HTTP, because the node did not answer TLS: what this wallet asks it can \
+             be read on the way (--daemon-ssl enabled refuses that)"
+        }
+    }
 }
 
 fn refresh(session: &mut Session) -> Result<(), String> {

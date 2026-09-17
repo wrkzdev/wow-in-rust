@@ -7,7 +7,16 @@
 //! An address is `host:port`, as typed on a command line, or that with
 //! `http://` or `https://` in front. `https://` is TLS (`specs/11` §1.2), on
 //! the node's own pure-Rust provider, with the certificate checked as
-//! [`Certificates`] says.
+//! [`Certificates`] says, or no connection.
+//!
+//! Any other address is reached as [`TlsMode`] says, which is what
+//! `--daemon-ssl` says: by default TLS if the node speaks it and plain HTTP if
+//! not, as the C++'s autodetect does (`net_helper.h`, `connect`). The scheme
+//! only gives the port, as in the C++. Two things differ from it, both in the
+//! wallet's favour: falling back to plain HTTP is logged as a warning rather
+//! than as an error nobody sees, and a node that has spoken TLS once to an
+//! [`Endpoint`] is never spoken to in the clear by it again, so a connection
+//! cut during a handshake cannot quietly turn into a plain one.
 //!
 //! A reply may come back chunked. A daemon never sends one, but the reverse
 //! proxy §1.2 lets a node sit behind may: nginx and Cloudflare both re-frame a
@@ -27,6 +36,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// A cap on a response body.
@@ -171,6 +182,12 @@ pub trait Transport: std::fmt::Debug + Send + Sync {
 
     /// Where the daemon is, as it was given.
     fn address(&self) -> &str;
+
+    /// How the connection to the daemon was last made, when this transport
+    /// knows: `None` for one whose TLS is somebody else's, as a browser's is.
+    fn security(&self) -> Option<Security> {
+        None
+    }
 }
 
 impl Transport for Endpoint {
@@ -181,10 +198,54 @@ impl Transport for Endpoint {
     fn address(&self) -> &str {
         &self.address
     }
+
+    fn security(&self) -> Option<Security> {
+        Endpoint::security(self)
+    }
 }
 
-/// How an `https://` endpoint checks the certificate it is shown.
+/// `--daemon-ssl`: how a node given as `host:port`, or with `http://`, is
+/// reached. `https://` is always TLS, checked, whatever this says.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TlsMode {
+    /// TLS if the node speaks it, and plain HTTP if it does not, with a
+    /// warning: the C++'s default. A certificate that does not check out is
+    /// still taken, as the C++'s verify callback takes it under autodetect,
+    /// and [`Security`] says so: the connection is encrypted, but nothing
+    /// says who is at the other end of it.
+    #[default]
+    Autodetect,
+    /// TLS with the certificate checked, or no connection.
+    Enabled,
+    /// Plain HTTP.
+    Disabled,
+}
+
+impl TlsMode {
+    /// `ssl_support_from_string`.
+    pub fn parse(text: &str) -> Option<TlsMode> {
+        match text {
+            "autodetect" => Some(TlsMode::Autodetect),
+            "enabled" => Some(TlsMode::Enabled),
+            "disabled" => Some(TlsMode::Disabled),
+            _ => None,
+        }
+    }
+}
+
+/// How the connection to a node was made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Security {
+    /// TLS; `verified` when the node's certificate checked out as
+    /// [`Certificates`] says, and not when any was accepted.
+    Tls { verified: bool },
+    /// Plain HTTP; `fell_back` when TLS was tried and the node did not speak
+    /// it, or something on the way stopped it.
+    Plain { fell_back: bool },
+}
+
+/// How a TLS connection checks the certificate it is shown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Certificates {
     /// Against the Mozilla roots, for the host's name, as a browser checks it.
     #[default]
@@ -193,6 +254,148 @@ pub enum Certificates {
     /// `--daemon-ssl-allow-any-cert`. The connection is still encrypted, but
     /// nothing says who is at the other end of it.
     Any,
+    /// Only certificates named ahead: `--daemon-ssl-allowed-fingerprints` and
+    /// `--daemon-ssl-ca-certificates`.
+    Pinned(Pins),
+}
+
+/// The certificates a node may show, named ahead: the C++'s
+/// `ssl_verification_t::user_certificates`, and `user_ca` with
+/// `allow_chained`. No name is checked, as the C++ checks none for these.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pins {
+    /// SHA-256 fingerprints of certificates a node may show.
+    pub fingerprints: Vec<[u8; 32]>,
+    /// The CA file's certificates, as DER. A node's certificate that is one
+    /// of them is accepted.
+    pub ca: Vec<Vec<u8>>,
+    /// `--daemon-ssl-allow-chained`: and one that chains to one of them.
+    pub allow_chained: bool,
+}
+
+/// `--daemon-ssl-certificate` and `--daemon-ssl-private-key`: the certificate
+/// this wallet shows a node that asks for one, as PEM files. Read when a
+/// connection is made, as the C++ reads them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientCertificate {
+    pub certificate: PathBuf,
+    pub private_key: PathBuf,
+}
+
+/// How a node is reached, whatever its address: what the `--daemon-ssl`
+/// options say.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectOptions {
+    pub tls: TlsMode,
+    pub certificates: Certificates,
+    pub client_certificate: Option<ClientCertificate>,
+}
+
+/// The `--daemon-ssl` options as given, before they are made sense of.
+#[derive(Clone, Debug, Default)]
+pub struct SslFlags {
+    /// `--daemon-ssl`, `None` when not given.
+    pub ssl: Option<String>,
+    pub private_key: Option<PathBuf>,
+    pub certificate: Option<PathBuf>,
+    pub ca_certificates: Option<PathBuf>,
+    pub allowed_fingerprints: Vec<String>,
+    pub allow_any_cert: bool,
+    pub allow_chained: bool,
+}
+
+impl ConnectOptions {
+    /// Make sense of the `--daemon-ssl` options as `wallet2.cpp`'s
+    /// `make_basic` does.
+    ///
+    /// `--daemon-ssl-allow-any-cert` accepts any certificate; a CA file or
+    /// fingerprints accept only what they name, and make TLS required unless
+    /// `--daemon-ssl` says otherwise; anything else checks against the roots.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_flags(flags: &SslFlags) -> Result<ConnectOptions, String> {
+        let given = match flags.ssl.as_deref() {
+            None => None,
+            Some(text) => Some(TlsMode::parse(text).ok_or_else(|| {
+                format!("--daemon-ssl is enabled, disabled or autodetect, not `{text}`")
+            })?),
+        };
+        let pinned = !flags.allow_any_cert
+            && (flags.ca_certificates.is_some() || !flags.allowed_fingerprints.is_empty());
+        let certificates = if flags.allow_any_cert {
+            Certificates::Any
+        } else if pinned {
+            let fingerprints = flags
+                .allowed_fingerprints
+                .iter()
+                .map(|f| parse_fingerprint(f))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ca = match &flags.ca_certificates {
+                Some(path) => crate::tls::read_certificates(path)?,
+                None => Vec::new(),
+            };
+            Certificates::Pinned(Pins {
+                fingerprints,
+                ca,
+                allow_chained: flags.allow_chained,
+            })
+        } else {
+            Certificates::Checked
+        };
+        let tls = given.unwrap_or(if pinned {
+            TlsMode::Enabled
+        } else {
+            TlsMode::Autodetect
+        });
+        let client_certificate = match (&flags.certificate, &flags.private_key) {
+            (None, None) => None,
+            (Some(certificate), Some(private_key)) => Some(ClientCertificate {
+                certificate: certificate.clone(),
+                private_key: private_key.clone(),
+            }),
+            _ => {
+                return Err(
+                    "--daemon-ssl-certificate and --daemon-ssl-private-key go together".into(),
+                )
+            }
+        };
+        Ok(ConnectOptions {
+            tls,
+            certificates,
+            client_certificate,
+        })
+    }
+
+    /// Whether `address` needs a certificate named ahead that these options
+    /// do not give: `wallet2.cpp`'s `verification_required &&
+    /// !has_strong_verification`. Required TLS checked only against the roots
+    /// is not enough for the C++ wallet, nor is anything through a proxy
+    /// (`proxy`), unless the host is a `.onion` or `.i2p` one, whose name is
+    /// its key.
+    pub fn lacks_strong_verification(&self, address: &str, proxy: bool) -> bool {
+        let required = !matches!(self.certificates, Certificates::Any)
+            && (self.tls == TlsMode::Enabled || proxy);
+        let host = Target::parse(address)
+            .map(|t| t.host.to_ascii_lowercase())
+            .unwrap_or_default();
+        let strong = matches!(self.certificates, Certificates::Pinned(_))
+            || host.ends_with(".onion")
+            || host.ends_with(".i2p");
+        required && !strong
+    }
+}
+
+/// A SHA-256 fingerprint as `--daemon-ssl-allowed-fingerprints` takes it:
+/// hex, with spaces and colons ignored (`from_hex_locale`).
+pub fn parse_fingerprint(text: &str) -> Result<[u8; 32], String> {
+    let hex: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ':')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let bytes = wow_crypto::hex::decode(&hex).ok_or_else(|| format!("`{text}` is not hex"))?;
+    bytes
+        .try_into()
+        .map_err(|_| "a SHA-256 fingerprint should be 32 bytes long".to_string())
 }
 
 /// Where a daemon is, and how long to wait for it.
@@ -206,8 +409,11 @@ pub struct Endpoint {
     /// long `get_blocks.bin` is slow because it is large, not because it is
     /// stalled.
     pub timeout: Duration,
-    /// For an `https://` address.
+    /// For an address without `https://`.
+    pub tls: TlsMode,
+    /// For a TLS connection.
     pub certificates: Certificates,
+    pub client_certificate: Option<ClientCertificate>,
     /// For a node started with `--rpc-login`. Shared rather than owned so a
     /// cloned `Endpoint` keeps answering with the same nonce counter, which
     /// the daemon requires to rise.
@@ -218,6 +424,19 @@ pub struct Endpoint {
     /// a second one. One at a time: a wallet makes one call at a time, and a
     /// pool of several would need a policy for how many and for how long.
     idle: std::sync::Arc<std::sync::Mutex<Option<BufReader<Connection>>>>,
+    /// How the node was reached last, which decides how it is reached next:
+    /// autodetect does not try again once it has found out. Shared as `idle`
+    /// is.
+    security: Arc<Mutex<Option<Security>>>,
+}
+
+/// What [`Endpoint::connect`] tries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plan {
+    Plain,
+    /// `strict`: the certificate must check out. `fallback`: plain HTTP will
+    /// do if TLS does not.
+    Tls { strict: bool, fallback: bool },
 }
 
 impl Endpoint {
@@ -226,14 +445,30 @@ impl Endpoint {
             address: address.into(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             timeout: DEFAULT_TIMEOUT,
+            tls: TlsMode::Autodetect,
             certificates: Certificates::Checked,
+            client_certificate: None,
             login: None,
             idle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            security: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn with_certificates(mut self, certificates: Certificates) -> Endpoint {
         self.certificates = certificates;
+        self
+    }
+
+    pub fn with_tls(mut self, tls: TlsMode) -> Endpoint {
+        self.tls = tls;
+        self
+    }
+
+    /// Everything [`ConnectOptions`] says.
+    pub fn with_options(mut self, options: &ConnectOptions) -> Endpoint {
+        self.tls = options.tls;
+        self.certificates = options.certificates.clone();
+        self.client_certificate = options.client_certificate.clone();
         self
     }
 
@@ -243,13 +478,90 @@ impl Endpoint {
         self
     }
 
+    /// How the node was last reached, once it has been.
+    pub fn security(&self) -> Option<Security> {
+        *self.security.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn hold(&self, security: Security) {
+        *self.security.lock().unwrap_or_else(|e| e.into_inner()) = Some(security);
+    }
+
     fn connect(&self) -> Result<Connection, HttpError> {
         // The scheme comes off first. One that is neither http nor https is
         // named as the problem, rather than failing as "cannot resolve
         // `ftp://node:34568`", which sends whoever typed it looking at their
         // DNS instead.
         let target = Target::parse(&self.address)?;
+        let held = self.security();
+        let plan = if target.tls || self.tls == TlsMode::Enabled {
+            Plan::Tls {
+                strict: true,
+                fallback: false,
+            }
+        } else {
+            match (self.tls, held) {
+                (TlsMode::Disabled, _) | (_, Some(Security::Plain { .. })) => Plan::Plain,
+                // Spoken TLS once, so never plain HTTP again.
+                (_, Some(Security::Tls { .. })) => Plan::Tls {
+                    strict: false,
+                    fallback: false,
+                },
+                (_, None) => Plan::Tls {
+                    strict: false,
+                    fallback: true,
+                },
+            }
+        };
 
+        let tcp = self.open(&target)?;
+        let Plan::Tls { strict, fallback } = plan else {
+            if held.is_none() {
+                self.hold(Security::Plain { fell_back: false });
+            }
+            return Ok(Connection::Plain(tcp));
+        };
+        match crate::tls::connect(
+            tcp,
+            &target.host,
+            &self.certificates,
+            self.client_certificate.as_ref(),
+            strict,
+            self.connect_timeout,
+            self.timeout,
+        ) {
+            Ok((stream, verified)) => {
+                if !verified && !matches!(self.certificates, Certificates::Any) && held.is_none() {
+                    // `configure`'s "SSL peer has not been verified".
+                    wow_log::warn!(
+                        LOG,
+                        "{}: the node's certificate does not check out; the connection is \
+                         encrypted, but nothing says who is at the other end of it",
+                        self.address
+                    );
+                }
+                self.hold(Security::Tls { verified });
+                Ok(Connection::Tls(Box::new(stream)))
+            }
+            Err(e) if fallback => {
+                // `connect`'s "SSL handshake failed on an autodetect
+                // connection, reconnecting without SSL", where it is seen.
+                wow_log::warn!(
+                    LOG,
+                    "{}: no TLS ({e}); using plain HTTP, where what this wallet asks the node \
+                     and every answer can be read and changed on the way",
+                    self.address
+                );
+                let tcp = self.open(&target)?;
+                self.hold(Security::Plain { fell_back: true });
+                Ok(Connection::Plain(tcp))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A socket to the node, with the timeouts set.
+    fn open(&self, target: &Target) -> Result<TcpStream, HttpError> {
         let mut last = None;
         let addrs = target
             .host_port
@@ -261,11 +573,7 @@ impl Endpoint {
                     s.set_read_timeout(Some(self.timeout))?;
                     s.set_write_timeout(Some(self.timeout))?;
                     s.set_nodelay(true)?;
-                    if !target.tls {
-                        return Ok(Connection::Plain(s));
-                    }
-                    let tls = crate::tls::connect(s, &target.host, self.certificates)?;
-                    return Ok(Connection::Tls(Box::new(tls)));
+                    return Ok(s);
                 }
                 Err(e) => last = Some(e),
             }
@@ -891,6 +1199,12 @@ mod tests {
         (address, server)
     }
 
+    /// An endpoint that speaks plain HTTP, for a test server that does not
+    /// speak TLS: autodetect would try it first.
+    fn plain(address: String) -> Endpoint {
+        Endpoint::new(address).with_tls(TlsMode::Disabled)
+    }
+
     /// Answer one request with an empty `200`, and hand back the request's
     /// head as it arrived.
     fn capture_head() -> (String, std::thread::JoinHandle<String>) {
@@ -923,7 +1237,7 @@ mod tests {
     #[test]
     fn a_request_head_is_the_one_a_cpp_wallet_sends() {
         let (address, server) = capture_head();
-        Endpoint::new(address)
+        plain(address)
             .post("/getblocks.bin", BINARY_CONTENT_TYPE, b"")
             .expect("ok");
         assert_eq!(
@@ -932,7 +1246,7 @@ mod tests {
         );
 
         let (address, server) = capture_head();
-        Endpoint::new(address)
+        plain(address)
             .post("/json_rpc", crate::JSON_CONTENT_TYPE, b"")
             .expect("ok");
         assert_eq!(
@@ -1016,7 +1330,7 @@ mod tests {
                 // Dropped here: closed, with the client still keeping it.
             }
         });
-        let endpoint = Endpoint::new(address);
+        let endpoint = plain(address);
         for _ in 0..2 {
             assert_eq!(
                 endpoint.post("/get_info", "application/json", b"").expect("ok"),
@@ -1032,7 +1346,7 @@ mod tests {
     fn a_second_request_reuses_the_connection() {
         const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
         let (address, server) = answer_several(vec![OK, OK, OK]);
-        let endpoint = Endpoint::new(address);
+        let endpoint = plain(address);
         for _ in 0..3 {
             assert_eq!(
                 endpoint.post("/get_info", "application/json", b"").expect("ok"),
@@ -1049,7 +1363,7 @@ mod tests {
         const CLOSING: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi";
         let (address, server) = answer_several(vec![CLOSING, CLOSING]);
-        let endpoint = Endpoint::new(address);
+        let endpoint = plain(address);
         for _ in 0..2 {
             assert_eq!(
                 endpoint.post("/get_info", "application/json", b"").expect("ok"),
@@ -1067,7 +1381,7 @@ mod tests {
         const CHUNKED: &[u8] =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n";
         let (address, server) = answer_several(vec![CHUNKED, CHUNKED]);
-        let endpoint = Endpoint::new(address);
+        let endpoint = plain(address);
         for _ in 0..2 {
             assert_eq!(
                 endpoint.post("/get_info", "application/json", b"").expect("ok"),
@@ -1081,7 +1395,7 @@ mod tests {
     /// the headers.
     fn post_to(reply: &'static [u8]) -> Result<Vec<u8>, HttpError> {
         let (address, server) = answer_once(reply);
-        let result = Endpoint::new(address).post("/get_info", "application/json", b"");
+        let result = plain(address).post("/get_info", "application/json", b"");
         server.join().expect("the server");
         result
     }
@@ -1157,6 +1471,13 @@ mod tests {
     /// node's own provider, that answers one request with `reply`.
     #[cfg(not(target_arch = "wasm32"))]
     fn tls_answer_once(reply: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
+        let (port, _, server) = tls_server(reply);
+        (format!("https://127.0.0.1:{port}"), server)
+    }
+
+    /// [`tls_answer_once`], giving the port and the certificate's DER.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tls_server(reply: &'static [u8]) -> (u16, Vec<u8>, std::thread::JoinHandle<()>) {
         use rustls::pki_types::pem::PemObject;
         use rustls::pki_types::CertificateDer;
         use std::sync::Arc;
@@ -1169,6 +1490,7 @@ mod tests {
         params.serial_number = Some(rcgen::SerialNumber::from(1u64));
         let cert = params.self_signed(&signer).expect("a certificate");
         let der = CertificateDer::from_pem_slice(cert.pem().as_bytes()).expect("its PEM");
+        let der_bytes = der.as_ref().to_vec();
         let config =
             rustls::ServerConfig::builder_with_provider(Arc::new(wow_tls::provider::provider()))
                 .with_protocol_versions(rustls::DEFAULT_VERSIONS)
@@ -1198,7 +1520,7 @@ mod tests {
             tls.conn.send_close_notify();
             let _ = tls.flush();
         });
-        (format!("https://127.0.0.1:{port}"), server)
+        (port, der_bytes, server)
     }
 
     /// Over TLS, a self-signed certificate is refused unless accepted as it
@@ -1223,5 +1545,243 @@ mod tests {
             .expect("accepted as it is");
         server.join().expect("the server");
         assert_eq!(body, b"{\"height\":1}");
+    }
+
+    /// Autodetect speaks TLS to a node that does, and takes a certificate that
+    /// does not check out as the C++ takes it, saying it did not.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn autodetect_speaks_tls_where_it_is_spoken() {
+        const REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        let (port, _, server) = tls_server(REPLY);
+        let endpoint = Endpoint::new(format!("127.0.0.1:{port}"));
+        let body = endpoint
+            .post("/get_info", "application/json", b"")
+            .expect("over TLS");
+        server.join().expect("the server");
+        assert_eq!(body, b"hi");
+        assert_eq!(endpoint.security(), Some(Security::Tls { verified: false }));
+    }
+
+    /// A server that does not speak TLS: the first connection gets `400` for
+    /// the ClientHello it could not read, and the next ones are answered.
+    fn plain_only(replies: usize) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("an address").port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut hello = [0u8; 1024];
+            let _ = s.read(&mut hello);
+            let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+            drop(s);
+            for _ in 0..replies {
+                let (mut s, _) = listener.accept().expect("accept");
+                if read_request(&mut s) {
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+                }
+            }
+        });
+        (port, server)
+    }
+
+    /// Autodetect falls back to plain HTTP for a node that does not speak TLS,
+    /// and says it did.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn autodetect_falls_back_where_tls_is_not_spoken() {
+        let (port, server) = plain_only(1);
+        let endpoint = Endpoint::new(format!("127.0.0.1:{port}"));
+        let body = endpoint
+            .post("/get_info", "application/json", b"")
+            .expect("over plain HTTP");
+        server.join().expect("the server");
+        assert_eq!(body, b"hi");
+        assert_eq!(
+            endpoint.security(),
+            Some(Security::Plain { fell_back: true })
+        );
+    }
+
+    /// A node that has spoken TLS to an endpoint is never spoken to in the
+    /// clear by it: TLS failing later is an error, not a quiet downgrade.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_node_that_spoke_tls_is_not_spoken_to_in_the_clear() {
+        let (port, server) = plain_only(0);
+        let endpoint = Endpoint::new(format!("127.0.0.1:{port}"));
+        endpoint.hold(Security::Tls { verified: true });
+        let e = endpoint
+            .post("/get_info", "application/json", b"")
+            .expect_err("no plain HTTP");
+        server.join().expect("the server");
+        assert!(matches!(e, HttpError::Tls(_) | HttpError::Io(_)), "{e}");
+        assert_eq!(endpoint.security(), Some(Security::Tls { verified: true }));
+
+        // `disabled` never tries TLS at all.
+        let (address, server) = answer_once(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+        let endpoint = plain(address);
+        endpoint
+            .post("/get_info", "application/json", b"")
+            .expect("plain");
+        server.join().expect("the server");
+        assert_eq!(
+            endpoint.security(),
+            Some(Security::Plain { fell_back: false })
+        );
+    }
+
+    /// `enabled` takes only a certificate that checks out: here, one pinned by
+    /// its fingerprint or found in the CA file.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn enabled_takes_only_a_certificate_that_checks_out() {
+        const REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        let enabled = |port: u16, pins: Option<Pins>| {
+            let endpoint =
+                Endpoint::new(format!("127.0.0.1:{port}")).with_tls(TlsMode::Enabled);
+            match pins {
+                Some(pins) => endpoint.with_certificates(Certificates::Pinned(pins)),
+                None => endpoint,
+            }
+        };
+
+        let (port, _, server) = tls_server(REPLY);
+        let e = enabled(port, None)
+            .post("/get_info", "application/json", b"")
+            .expect_err("self-signed, against the roots");
+        server.join().expect("the server");
+        assert!(matches!(e, HttpError::Tls(_)), "{e}");
+
+        let (port, der, server) = tls_server(REPLY);
+        let endpoint = enabled(
+            port,
+            Some(Pins {
+                fingerprints: vec![crate::tls::fingerprint(&der)],
+                ..Default::default()
+            }),
+        );
+        endpoint
+            .post("/get_info", "application/json", b"")
+            .expect("pinned by its fingerprint");
+        server.join().expect("the server");
+        assert_eq!(endpoint.security(), Some(Security::Tls { verified: true }));
+
+        let (port, der, server) = tls_server(REPLY);
+        enabled(
+            port,
+            Some(Pins {
+                ca: vec![der],
+                ..Default::default()
+            }),
+        )
+        .post("/get_info", "application/json", b"")
+        .expect("in the CA file");
+        server.join().expect("the server");
+
+        let (port, _, server) = tls_server(REPLY);
+        let e = enabled(
+            port,
+            Some(Pins {
+                fingerprints: vec![[7u8; 32]],
+                ..Default::default()
+            }),
+        )
+        .post("/get_info", "application/json", b"")
+        .expect_err("another certificate");
+        server.join().expect("the server");
+        assert!(matches!(e, HttpError::Tls(_)), "{e}");
+    }
+
+    /// The `--daemon-ssl` options mean what `make_basic` makes of them.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_ssl_options_mean_what_the_cpp_makes_of_them() {
+        let o = ConnectOptions::from_flags(&SslFlags::default()).expect("none");
+        assert_eq!(o, ConnectOptions::default());
+        assert_eq!(o.tls, TlsMode::Autodetect);
+
+        let fp = "ab".repeat(32);
+        let pinned = SslFlags {
+            allowed_fingerprints: vec![fp.clone()],
+            ..Default::default()
+        };
+        let o = ConnectOptions::from_flags(&pinned).expect("pinned");
+        assert_eq!(o.tls, TlsMode::Enabled, "a fingerprint makes TLS required");
+        assert_eq!(
+            o.certificates,
+            Certificates::Pinned(Pins {
+                fingerprints: vec![[0xab; 32]],
+                ..Default::default()
+            })
+        );
+        let o = ConnectOptions::from_flags(&SslFlags {
+            ssl: Some("autodetect".into()),
+            ..pinned.clone()
+        })
+        .expect("said");
+        assert_eq!(o.tls, TlsMode::Autodetect, "unless --daemon-ssl says otherwise");
+
+        let o = ConnectOptions::from_flags(&SslFlags {
+            allow_any_cert: true,
+            ..pinned
+        })
+        .expect("any");
+        assert_eq!(o.certificates, Certificates::Any);
+        assert_eq!(o.tls, TlsMode::Autodetect);
+
+        for bad in [
+            SslFlags {
+                ssl: Some("sometimes".into()),
+                ..Default::default()
+            },
+            SslFlags {
+                allowed_fingerprints: vec!["abcd".into()],
+                ..Default::default()
+            },
+            SslFlags {
+                certificate: Some("client.crt".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(ConnectOptions::from_flags(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Required TLS, or a proxy, needs a certificate named ahead, unless the
+    /// host's name is its key (`has_strong_verification`).
+    #[test]
+    fn required_tls_and_a_proxy_need_a_named_certificate() {
+        let enabled = ConnectOptions {
+            tls: TlsMode::Enabled,
+            ..Default::default()
+        };
+        assert!(enabled.lacks_strong_verification("node.example:34568", false));
+        assert!(!enabled.lacks_strong_verification("http://abc.onion:34568", false));
+        assert!(!enabled.lacks_strong_verification("abc.i2p:34568", false));
+
+        let pinned = ConnectOptions {
+            certificates: Certificates::Pinned(Pins::default()),
+            ..enabled
+        };
+        assert!(!pinned.lacks_strong_verification("node.example:34568", true));
+
+        let auto = ConnectOptions::default();
+        assert!(!auto.lacks_strong_verification("node.example:34568", false));
+        assert!(auto.lacks_strong_verification("node.example:34568", true));
+
+        let any = ConnectOptions {
+            certificates: Certificates::Any,
+            ..Default::default()
+        };
+        assert!(!any.lacks_strong_verification("node.example:34568", true));
+    }
+
+    #[test]
+    fn fingerprints_parse_with_or_without_separators() {
+        let colons = ["ab"; 32].join(":");
+        assert_eq!(parse_fingerprint(&colons).expect("colons"), [0xab; 32]);
+        assert_eq!(parse_fingerprint(&"AB ".repeat(32)).expect("spaces"), [0xab; 32]);
+        assert!(parse_fingerprint("abcd").expect_err("short").contains("32 bytes"));
+        assert!(parse_fingerprint("zz").expect_err("not hex").contains("not hex"));
     }
 }

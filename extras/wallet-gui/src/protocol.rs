@@ -61,10 +61,12 @@ pub enum Command {
     UseNode(String),
     /// Ask a node what it is, without using it.
     TestNode { address: String, network: Net },
-    /// Whether an https node's certificate is accepted whoever signed it, as a
-    /// node with a self-signed certificate needs. The desktop only: a browser
-    /// decides that itself.
-    AcceptAnyCertificate(bool),
+    /// The nodes, as `host:port`, whose TLS certificate is accepted whoever
+    /// signed it, as a node with a self-signed certificate needs. One node at
+    /// a time, so trusting your own node does not also stop every other
+    /// node's certificate being checked. The desktop only: a browser decides
+    /// that itself.
+    AcceptAnyCertificate(Vec<String>),
     /// Log in to a node started with `--rpc-login`, or stop trying with
     /// `None`. The desktop only: a browser's `fetch` does not do HTTP Digest.
     ///
@@ -296,9 +298,46 @@ pub struct Status {
     pub chain: u64,
     /// The node in use.
     pub node: Option<String>,
+    /// How it is reached.
+    pub link: Link,
     /// Why the node could not be used, last time it was tried.
     pub node_error: Option<String>,
     pub syncing: bool,
+}
+
+/// How the wallet reaches its node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Link {
+    /// No node, or not reached yet.
+    #[default]
+    Unknown,
+    /// TLS, with the node's certificate checked.
+    Tls,
+    /// TLS, with a certificate that was not checked or did not check out:
+    /// encrypted, but nothing says who is at the other end.
+    TlsUnchecked,
+    /// Plain HTTP.
+    Plain,
+    /// Plain HTTP, because the node did not answer TLS.
+    PlainFallback,
+}
+
+impl Link {
+    /// In a few words, for the node's status.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Link::Unknown => "",
+            Link::Tls => "over TLS",
+            Link::TlsUnchecked => "over TLS, certificate not checked",
+            Link::Plain => "over plain HTTP",
+            Link::PlainFallback => "over plain HTTP: the node did not answer TLS",
+        }
+    }
+
+    /// Whether what the wallet asks can be read on the way.
+    pub fn is_plain(self) -> bool {
+        matches!(self, Link::Plain | Link::PlainFallback)
+    }
 }
 
 /// One line of the transfer history.

@@ -65,6 +65,8 @@ struct Options {
     /// `--daemon-login <user>:<password>`, for a node started with
     /// `--rpc-login`.
     daemon_login: Option<String>,
+    /// `--daemon-ssl` and the options beside it, as given.
+    ssl: wow_daemon_client::SslFlags,
     /// `None` when not given, so a restore knows to ask.
     restore_height: Option<u64>,
     kdf_rounds: u64,
@@ -95,6 +97,7 @@ impl std::fmt::Debug for Options {
             .field("spend_key", &redacted(&self.spend_key))
             .field("daemon", &self.daemon)
             .field("daemon_login", &redacted(&self.daemon_login))
+            .field("ssl", &self.ssl)
             .field("restore_height", &self.restore_height)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("language", &self.language)
@@ -121,6 +124,7 @@ impl Default for Options {
             spend_key: None,
             daemon: None,
             daemon_login: None,
+            ssl: Default::default(),
             restore_height: None,
             kdf_rounds: 1,
             language: None,
@@ -159,6 +163,18 @@ Whatever the options below leave out is asked for.
   --daemon-address <address>        host:port, or https://host:port for TLS;
                                     default 127.0.0.1:34568
   --daemon-login <user>:<pass>      for a daemon started with --rpc-login
+  --daemon-ssl <autodetect|enabled|disabled>
+                                    TLS to a daemon given without https://;
+                                    default autodetect: TLS if it speaks it,
+                                    plain HTTP with a warning if not
+  --daemon-ssl-allowed-fingerprints <sha256>
+                                    accept only this certificate; repeatable
+  --daemon-ssl-ca-certificates <path>
+                                    or one in this PEM file
+  --daemon-ssl-allow-chained        or one chained to a certificate in it
+  --daemon-ssl-allow-any-cert       accept any certificate
+  --daemon-ssl-certificate <path> --daemon-ssl-private-key <path>
+                                    a certificate to show a daemon that asks
   --testnet / --stagenet
   --restore-height <n>
   --mnemonic-language <lang>
@@ -225,6 +241,22 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             }
             "--daemon-address" => o.daemon = Some(next("--daemon-address")?),
             "--daemon-login" => o.daemon_login = Some(next("--daemon-login")?),
+            "--daemon-ssl" => o.ssl.ssl = Some(next("--daemon-ssl")?),
+            "--daemon-ssl-private-key" => {
+                o.ssl.private_key = Some(PathBuf::from(next("--daemon-ssl-private-key")?))
+            }
+            "--daemon-ssl-certificate" => {
+                o.ssl.certificate = Some(PathBuf::from(next("--daemon-ssl-certificate")?))
+            }
+            "--daemon-ssl-ca-certificates" => {
+                o.ssl.ca_certificates = Some(PathBuf::from(next("--daemon-ssl-ca-certificates")?))
+            }
+            "--daemon-ssl-allowed-fingerprints" => o
+                .ssl
+                .allowed_fingerprints
+                .push(next("--daemon-ssl-allowed-fingerprints")?),
+            "--daemon-ssl-allow-any-cert" => o.ssl.allow_any_cert = true,
+            "--daemon-ssl-allow-chained" => o.ssl.allow_chained = true,
             "--daemon-host" => {
                 let host = next("--daemon-host")?;
                 o.daemon = Some(format!("{host}:34568"));
@@ -374,9 +406,30 @@ fn start_logging(o: &Options) -> Result<(), String> {
     Ok(())
 }
 
+/// The `--daemon-ssl` options made sense of, and refused where `make_basic`
+/// refuses them: before any password is asked for.
+fn daemon_options(o: &Options, daemon: &str) -> Result<wow_daemon_client::ConnectOptions, String> {
+    let options = wow_daemon_client::ConnectOptions::from_flags(&o.ssl)?;
+    if options.lacks_strong_verification(daemon, false) {
+        return Err(
+            "Enabling --daemon-ssl requires --daemon-ssl-allow-any-cert or \
+             --daemon-ssl-ca-certificates or --daemon-ssl-allowed-fingerprints or use of a \
+             .onion/.i2p domain"
+                .into(),
+        );
+    }
+    Ok(options)
+}
+
 fn run(mut options: Options) -> Result<(), String> {
     start_logging(&options)?;
+    let daemon = options
+        .daemon
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:34568".to_string());
+    let connect = daemon_options(&options, &daemon)?;
     let mut session = startup::start(&mut options)?;
+    session.daemon_options = connect;
 
     // Before the first connection: a daemon with --rpc-login refuses
     // everything, including the get_info that `set_daemon` checks with.
@@ -388,10 +441,6 @@ fn run(mut options: Options) -> Result<(), String> {
     }
 
     // Connect, and sync unless told not to.
-    let daemon = options
-        .daemon
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1:34568".to_string());
     match commands::run_one(&mut session, &format!("set_daemon {daemon}")) {
         Err(e) => {
             // Diagnostics go to stderr, so `--command bc_height` prints a
@@ -668,6 +717,45 @@ mod tests {
             .is_err(),
             "the old list is not offered for new seeds"
         );
+    }
+
+    /// The `--daemon-ssl` options, by the C++'s names, and required TLS
+    /// refused without a certificate named ahead, as `make_basic` refuses it.
+    #[test]
+    fn the_ssl_options_parse() {
+        let o = opts(&[
+            "--wallet-file",
+            "w",
+            "--daemon-ssl",
+            "enabled",
+            "--daemon-ssl-allowed-fingerprints",
+            "aa",
+            "--daemon-ssl-allowed-fingerprints",
+            "bb",
+            "--daemon-ssl-ca-certificates",
+            "ca.pem",
+            "--daemon-ssl-allow-chained",
+            "--daemon-ssl-allow-any-cert",
+            "--daemon-ssl-certificate",
+            "wallet.crt",
+            "--daemon-ssl-private-key",
+            "wallet.key",
+        ])
+        .expect("parses");
+        assert_eq!(o.ssl.ssl.as_deref(), Some("enabled"));
+        assert_eq!(o.ssl.allowed_fingerprints, ["aa", "bb"]);
+        assert_eq!(o.ssl.ca_certificates, Some(PathBuf::from("ca.pem")));
+        assert!(o.ssl.allow_chained && o.ssl.allow_any_cert);
+        assert_eq!(o.ssl.certificate, Some(PathBuf::from("wallet.crt")));
+        assert_eq!(o.ssl.private_key, Some(PathBuf::from("wallet.key")));
+        assert!(opts(&["--wallet-file", "w", "--daemon-ssl"]).is_err());
+
+        let enabled = opts(&["--wallet-file", "w", "--daemon-ssl", "enabled"]).expect("parses");
+        let e = daemon_options(&enabled, "node.example:34568").expect_err("nothing named");
+        assert!(e.contains("--daemon-ssl-allowed-fingerprints"), "{e}");
+        assert!(daemon_options(&enabled, "abc.onion:34568").is_ok());
+        let plain = opts(&["--wallet-file", "w"]).expect("parses");
+        assert!(daemon_options(&plain, "node.example:34568").is_ok());
     }
 
     #[test]

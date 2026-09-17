@@ -16,8 +16,8 @@ use wow_crypto::mnemonic::{self, Language, WordList};
 use crate::format;
 use crate::nodes::{self, Node, NodeAddress};
 use crate::protocol::{
-    Bytes, Command, Event, Net, NewWallet, NodeReport, OpenWallet, Pick, Preview, Restore, Row,
-    SendForm, Status, Summary,
+    Bytes, Command, Event, Link, Net, NewWallet, NodeReport, OpenWallet, Pick, Preview, Restore,
+    Row, SendForm, Status, Summary,
 };
 
 /// Where the settings are kept between runs.
@@ -135,9 +135,11 @@ pub struct Settings {
     pub folder: String,
     pub accepted_risk: bool,
     pub last_wallet: String,
-    /// Accept an https node's certificate whoever signed it. The desktop
-    /// only.
-    pub any_certificate: bool,
+    /// The nodes, as `host:port`, whose TLS certificate is accepted whoever
+    /// signed it. The desktop only. A setting of all nodes at once, as this
+    /// was, is not read back: trusting one's own node's certificate should not
+    /// stop every other node's being checked.
+    pub any_certificate_nodes: Vec<String>,
     pub theme: Theme,
     /// The whole interface's zoom, 1 being this wallet's own text sizes.
     pub text_scale: f32,
@@ -171,7 +173,7 @@ impl Default for Settings {
             folder: String::new(),
             accepted_risk: false,
             last_wallet: String::new(),
-            any_certificate: false,
+            any_certificate_nodes: Vec::new(),
             theme: Theme::System,
             text_scale: 1.0,
             hide_notice: false,
@@ -567,7 +569,9 @@ fn log_level_label(level: Option<u8>) -> &'static str {
 
 impl WalletApp {
     pub fn new(settings: Settings, mut host: Box<dyn Host>) -> WalletApp {
-        host.send(Command::AcceptAnyCertificate(settings.any_certificate));
+        host.send(Command::AcceptAnyCertificate(
+            settings.any_certificate_nodes.clone(),
+        ));
         host.send(Command::SetLog {
             level: settings.log_level,
             to_file: settings.log_to_file,
@@ -1114,6 +1118,7 @@ impl WalletApp {
                             Some(n) => ui.label(format!("In use: {n}")),
                             None => ui.label("No node in use."),
                         };
+                        link_line(ui, w.status.link);
                         if let Some(e) = &w.status.node_error {
                             ui.colored_label(t.bad, e.as_str());
                         }
@@ -2979,24 +2984,37 @@ fn node_picker(
     }
     // A browser decides about certificates itself.
     if !cx.in_browser {
-        let mut any = settings.any_certificate;
-        let changed = ui
-            .checkbox(&mut any, "Accept an https node's certificate whoever signed it")
-            .on_hover_text(
-                "For a node you run yourself, with a self-signed certificate. The connection is \
-                 still encrypted, but nothing checks who is at the other end of it.",
-            )
-            .changed();
-        if changed {
-            settings.any_certificate = any;
-            host.send(Command::AcceptAnyCertificate(any));
-        }
-        if any {
-            ui.colored_label(
-                t.warn,
-                "Certificates are not checked, so someone between this computer and the node \
-                 could pose as it.",
-            );
+        // For the node in the address box, and for no other.
+        if let Ok(node) = NodeAddress::parse(&input) {
+            let key = node.host_port();
+            let mut any = settings.any_certificate_nodes.contains(&key);
+            let changed = ui
+                .checkbox(
+                    &mut any,
+                    format!("Accept {key}'s certificate whoever signed it"),
+                )
+                .on_hover_text(
+                    "For a node you run yourself, with a self-signed certificate. The connection \
+                     is still encrypted, but nothing checks who is at the other end of it. \
+                     Other nodes' certificates are still checked.",
+                )
+                .changed();
+            if changed {
+                settings.any_certificate_nodes.retain(|n| *n != key);
+                if any {
+                    settings.any_certificate_nodes.push(key);
+                }
+                host.send(Command::AcceptAnyCertificate(
+                    settings.any_certificate_nodes.clone(),
+                ));
+            }
+            if any {
+                ui.colored_label(
+                    t.warn,
+                    "This node's certificate is not checked, so someone between this computer \
+                     and the node could pose as it.",
+                );
+            }
         }
 
         // A node started with --rpc-login refuses everything, including the
@@ -3178,6 +3196,24 @@ fn test_line(ui: &mut Ui, test: Option<&Test>, full: bool) {
     }
 }
 
+/// How the node in use is reached, coloured by what that exposes.
+fn link_line(ui: &mut Ui, link: Link) {
+    let t = tones(ui);
+    let color = match link {
+        Link::Unknown => return,
+        Link::Tls => t.good,
+        Link::TlsUnchecked | Link::Plain => t.warn,
+        Link::PlainFallback => t.bad,
+    };
+    ui.colored_label(color, format!("Reached {}.", link.describe()));
+    if link.is_plain() {
+        ui.label(
+            "What this wallet asks the node, and every answer, can be read and changed on the \
+             way. An https:// node, or one that answers TLS, keeps that between the two.",
+        );
+    }
+}
+
 /// The node's state in a word or two, which opens the node settings when
 /// clicked.
 fn node_chip(ui: &mut Ui, status: &Status) -> egui::Response {
@@ -3201,7 +3237,7 @@ fn node_chip(ui: &mut Ui, status: &Status) -> egui::Response {
     };
     let hover = match (&status.node_error, &status.node) {
         (Some(e), _) => e.clone(),
-        (None, Some(node)) => node.clone(),
+        (None, Some(node)) => format!("{node} {}", status.link.describe()),
         (None, None) => "No node in use.".to_string(),
     };
     ui.add(

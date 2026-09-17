@@ -61,6 +61,9 @@ pub struct State {
     /// `--daemon-login`, for a node started with `--rpc-login`. Applied to
     /// every wallet this server points at a daemon.
     daemon_login: Option<wow_daemon_client::digest::Credentials>,
+    /// `--daemon-ssl` and the options beside it, or what `set_daemon` last
+    /// said instead: applied as `daemon_login` is.
+    daemon_options: Mutex<wow_daemon_client::ConnectOptions>,
     stop: AtomicBool,
 }
 
@@ -81,8 +84,25 @@ impl State {
             login,
             daemon_address: Mutex::new(daemon_address),
             daemon_login,
+            daemon_options: Mutex::new(Default::default()),
             stop: AtomicBool::new(false),
         }
+    }
+
+    /// How newly opened wallets reach the daemon.
+    pub fn daemon_options(&self) -> wow_daemon_client::ConnectOptions {
+        self.daemon_options
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Remember how to reach the daemon, for wallets opened later too.
+    pub fn set_daemon_options(&self, options: wow_daemon_client::ConnectOptions) {
+        *self
+            .daemon_options
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = options;
     }
 
     /// The daemon address newly opened wallets are pointed at.
@@ -114,6 +134,7 @@ impl State {
             return;
         }
         session.daemon_login = self.daemon_login.clone();
+        session.daemon_options = self.daemon_options();
         let client = session.client_for(&address);
         match client.get_info() {
             Ok(info) => {
