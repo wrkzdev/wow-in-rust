@@ -13,6 +13,13 @@
 //!
 //! `--restricted-zmq-rpc` refuses the methods in `zmq_restricted_methods.h` by
 //! name, before looking them up, and caps what the others may ask for.
+//!
+//! # The pool, as the C++ shows it here
+//!
+//! Restricted or not, every pool method answers from the public transactions
+//! only -- fluffed or mined -- as `DaemonHandler` asks the pool without
+//! sensitive data. Only `get_info`'s count includes the private ones, and only
+//! when unrestricted.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -32,7 +39,7 @@ use wow_types::tx::{Transaction, TxIn};
 use wow_types::Network;
 
 use super::json::{self, field, JsonError};
-use crate::mempool::Rejection;
+use crate::mempool::{Rejection, RelayMethod};
 use crate::rpc::binary::supplement_start;
 use crate::rpc::Server;
 
@@ -369,11 +376,7 @@ impl Handler {
                 (w.len(), g.len())
             })
             .unwrap_or((0, 0));
-        let pool_size = server
-            .pool()
-            .entries()
-            .filter(|(_, e)| !restricted || !e.do_not_relay)
-            .count();
+        let pool_size = server.pool().count(!restricted);
 
         let info = json::object_of([
             ("height", json!(height)),
@@ -644,6 +647,7 @@ impl Handler {
                 );
             } else if let Some(tx) = pool
                 .get(id)
+                .filter(|e| e.is_public())
                 .and_then(|e| Transaction::from_blob(&e.blob).ok())
             {
                 txs.insert(
@@ -674,7 +678,7 @@ impl Handler {
                 let ki = KeyImage(ki);
                 if db.has_key_image(&ki).unwrap_or(false) {
                     1
-                } else if pool.spends(&ki) {
+                } else if pool.spends(&ki, false) {
                     2
                 } else {
                     0
@@ -689,6 +693,7 @@ impl Handler {
         let zero = json::hex(&[0u8; 32]);
         let transactions: Vec<Value> = pool
             .entries()
+            .filter(|(_, e)| e.is_public())
             .filter_map(|(id, e)| {
                 let tx = Transaction::from_blob(&e.blob).ok()?;
                 Some(json::object_of([
@@ -699,19 +704,19 @@ impl Handler {
                     ("fee", json!(e.fee)),
                     ("max_used_block_hash", zero.clone()),
                     ("max_used_block_height", json!(0)),
-                    ("kept_by_block", json!(e.kept_by_block)),
+                    ("kept_by_block", json!(e.kept_by_block())),
                     ("last_failed_block_hash", zero.clone()),
                     ("last_failed_block_height", json!(0)),
                     ("receive_time", json!(e.receive_time)),
                     ("last_relayed_time", json!(0)),
                     ("relayed", json!(e.relayed)),
-                    ("do_not_relay", json!(e.do_not_relay)),
+                    ("do_not_relay", json!(e.do_not_relay())),
                     ("double_spend_seen", json!(e.double_spend_seen)),
                 ]))
             })
             .collect();
         let mut key_images: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-        for (ki, id) in pool.spent_key_images() {
+        for (ki, id) in pool.spent_key_images(false) {
             key_images
                 .entry(wow_crypto::hex::encode(&ki.0))
                 .or_default()
@@ -745,25 +750,34 @@ impl Handler {
             return failed("Not ready to accept transactions; try again later");
         }
         let fee = server.fee_context();
+        let method = if relay {
+            RelayMethod::Local
+        } else {
+            RelayMethod::None
+        };
         // The pool guard ends with this statement: relaying takes it again.
         let added = server
             .pool()
-            .add(server.db(), &blob, &fee, unix_now(), !relay);
-        let id = match added {
-            Ok(id) => id,
+            .add(server.db(), &blob, &fee, unix_now(), method);
+        let admitted = match added {
+            Ok(admitted) => admitted,
             // Known already: not a failure in the C++, only nothing to relay.
+            // Asked before the key images, as `add_new_tx` asks, so a
+            // transaction sent twice is not its own double spend.
             Err(Rejection::AlreadyInPool) => return Ok(fields(json!({"relayed": false}))),
             Err(r) => return failed(rejection_details(&r)),
         };
-        if !relay {
-            return Ok(fields(json!({"relayed": false})));
-        }
+        // As the C++ announces (`core::add_new_tx`): one kept from relay now,
+        // one going out once it is public.
         if let Some(core) = server.core() {
-            core.announce_pool_txs(&[id]);
+            core.announce_pool_txs(&[admitted.id]);
+        }
+        if admitted.relay == RelayMethod::None {
+            return Ok(fields(json!({"relayed": false})));
         }
         let relayed = match server.p2p() {
             Some(p2p) => {
-                p2p.relay_transaction(id, blob);
+                p2p.relay_transaction(admitted.id, blob);
                 true
             }
             None => false,
@@ -1134,10 +1148,7 @@ mod tests {
     #[test]
     fn a_rejection_names_every_rule_broken() {
         assert_eq!(
-            rejection_details(&Rejection::DoubleSpend {
-                key_image: KeyImage([0; 32]),
-                in_pool: None,
-            }),
+            rejection_details(&Rejection::DoubleSpend),
             "double spend"
         );
         assert_eq!(

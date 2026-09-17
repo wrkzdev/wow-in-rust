@@ -318,7 +318,7 @@ pub fn run(server: &Server, cmd: Cmd) -> Result<String, String> {
                 .join("\n")
         }
         Cmd::Diff => {
-            let i = methods::get_info(server).map_err(err)?;
+            let i = methods::get_info(server, false).map_err(err)?;
             let d = i["difficulty"].as_u64().unwrap_or(0);
             format!(
                 "BH: {}, TH: {}, DIFF: {}, CUM_DIFF: {}, HR: {:.2} H/s",
@@ -344,7 +344,7 @@ pub fn run(server: &Server, cmd: Cmd) -> Result<String, String> {
             )
         }
         Cmd::PrintPool => {
-            let v = admin::get_transaction_pool(server).map_err(err)?;
+            let v = admin::get_transaction_pool(server, false).map_err(err)?;
             let txs = v["transactions"].as_array().cloned().unwrap_or_default();
             if txs.is_empty() {
                 return Ok("the pool is empty".into());
@@ -456,7 +456,7 @@ pub fn run(server: &Server, cmd: Cmd) -> Result<String, String> {
 /// `status`: what `get_info` says, and what the node knows beside it, as a
 /// table.
 fn status(server: &Server) -> Result<String, String> {
-    let i = methods::get_info(server).map_err(err)?;
+    let i = methods::get_info(server, false).map_err(err)?;
     let height = i["height"].as_u64().unwrap_or(0);
     let target = i["target_height"].as_u64().unwrap_or(0).max(height);
     let difficulty = i["difficulty"].as_u64().unwrap_or(0);

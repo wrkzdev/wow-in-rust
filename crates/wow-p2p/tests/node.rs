@@ -24,7 +24,7 @@ use wow_crypto::random::Rng;
 use wow_crypto::types::Hash256;
 use wow_p2p::addressbook::{AddressBook, BanTarget, STATE_FILENAME};
 use wow_p2p::messages::{BlockEntry, CoreSyncData};
-use wow_p2p::node::{BlockVerdict, ChainReply, Config, Core, Node, TxVerdict};
+use wow_p2p::node::{BlockVerdict, ChainReply, Config, Core, Node, TxRelay, TxVerdict};
 use wow_p2p::sync::{self, ChainTip};
 use wow_p2p::{NodeIdentity, Peer};
 use wow_types::{Block, Network};
@@ -230,8 +230,13 @@ impl Core for MemCore {
             })
     }
 
-    fn incoming_txs(&self, txs: &[Vec<u8>]) -> Vec<TxVerdict> {
+    fn incoming_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
         let mut pool = self.pool.lock().unwrap();
+        // As the message says: this pool has no stem of its own to loop.
+        let how = match fluff {
+            true => TxRelay::Fluff,
+            false => TxRelay::Stem,
+        };
         txs.iter()
             .map(|blob| {
                 let id = tx_id(blob);
@@ -239,7 +244,7 @@ impl Core for MemCore {
                     std::collections::hash_map::Entry::Occupied(_) => TxVerdict::Known { id },
                     std::collections::hash_map::Entry::Vacant(slot) => {
                         slot.insert(blob.clone());
-                        TxVerdict::Accepted { id, relay: true }
+                        TxVerdict::Accepted { id, how: Some(how) }
                     }
                 }
             })
@@ -260,19 +265,19 @@ impl Core for MemCore {
         self.pool.lock().unwrap().keys().copied().collect()
     }
 
-    fn tx_relayed(&self, ids: &[Hash256]) {
+    fn tx_relayed(&self, ids: &[Hash256], _how: TxRelay) {
         self.relayed.lock().unwrap().extend(ids);
     }
 
-    /// Everything in the pool that has not gone out yet.
-    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>)> {
+    /// Everything in the pool that has not gone out yet, as this node's own.
+    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>, TxRelay)> {
         let relayed = self.relayed.lock().unwrap();
         self.pool
             .lock()
             .unwrap()
             .iter()
             .filter(|(id, _)| !relayed.contains(*id))
-            .map(|(id, blob)| (*id, blob.clone()))
+            .map(|(id, blob)| (*id, blob.clone(), TxRelay::Local))
             .collect()
     }
 }
@@ -422,6 +427,32 @@ fn a_transaction_sent_before_any_peer_is_ready_still_goes_out() {
 
     wait_until("the transaction at the peer", 60, || a_core.has_tx(&id));
     assert!(b_core.relayed.lock().unwrap().contains(&id));
+}
+
+/// A node that has caught up asks a peer, once, for the pool transactions it
+/// missed -- here one the peer holds and has no reason to send again, so the
+/// complement is the only way it arrives.
+#[test]
+fn a_synchronised_node_catches_up_with_its_peers_pool() {
+    let t = template();
+    let genesis = make_block(&t, [0u8; 32], 0);
+    let a_core = MemCore::new(&genesis);
+    a_core.extend(3, &t);
+    let blob = b"a transaction that went out before this node arrived".to_vec();
+    let id = tx_id(&blob);
+    a_core.pool.lock().unwrap().insert(id, blob);
+    a_core.relayed.lock().unwrap().insert(id);
+    let b_core = MemCore::new(&genesis);
+
+    let a = Node::start(config(Vec::new()), a_core.clone(), rng(1)).unwrap();
+    let b = Node::start(
+        config(vec![a.local_addr().unwrap()]),
+        b_core.clone(),
+        rng(2),
+    )
+    .unwrap();
+    wait_until("the sync", 60, || b.sync_status().synchronized);
+    wait_until("the pool's complement", 30, || b_core.has_tx(&id));
 }
 
 /// The network id is the fork guard: a testnet node gets no connection to a

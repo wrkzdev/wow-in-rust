@@ -160,12 +160,25 @@ pub enum BlockVerdict {
     },
 }
 
+/// How a transaction goes on through the network: the part of the C++'s
+/// `relay_method` this layer acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxRelay {
+    /// Submitted to this node. Always through a stem, whatever the epoch.
+    Local,
+    /// Received through a stem: on through one, unless this epoch fluffs.
+    Stem,
+    /// To every peer.
+    Fluff,
+}
+
 /// What happened to a transaction a peer sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TxVerdict {
-    /// New to the pool. `relay` is false for one that must not be passed on.
-    Accepted { id: Hash256, relay: bool },
-    /// Already in the pool or the chain.
+    /// Taken by the pool: new to it, or held privately until now and moved
+    /// on by this copy. `how` it goes on, `None` for not at all.
+    Accepted { id: Hash256, how: Option<TxRelay> },
+    /// Already held publicly, or on the chain.
     Known { id: Hash256 },
     /// Refused. `ban` only for a transaction that could not be honest;
     /// relay-policy refusals never ban (`specs/08` §8.2).
@@ -208,19 +221,24 @@ pub trait Core: Send + Sync {
     /// A block on the main chain with only the transactions at `indices`, for
     /// a peer reconstructing a fluffy block.
     fn block_with_txs(&self, id: &Hash256, indices: &[u64]) -> Option<BlockEntry>;
-    /// Transactions a peer sent, one verdict each.
-    fn incoming_txs(&self, txs: &[Vec<u8>]) -> Vec<TxVerdict>;
-    /// Relayable pool transactions whose hashes are not in `known`.
+    /// Transactions a peer sent, one verdict each. `fluff` is the message's
+    /// `dandelionpp_fluff`: false for a stem.
+    fn incoming_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict>;
+    /// Public pool transactions -- fluffed or mined -- whose hashes are not in
+    /// `known` (`get_complement`). Never one still private: a peer asking is
+    /// not a peer the stem chose.
     fn pool_txs_except(&self, known: &HashSet<Hash256>) -> Vec<Vec<u8>>;
-    /// The hashes of relayable pool transactions.
+    /// The hashes of the public pool transactions, for this node's own
+    /// complement request.
     fn pool_hashes(&self) -> Vec<Hash256>;
-    /// These transactions have gone out to at least one peer.
-    fn tx_relayed(&self, ids: &[Hash256]);
-    /// Pool transactions due to go out again: never sent, or sent long enough
-    /// ago (`tx_memory_pool::get_relayable_transactions`). Asked on every
-    /// maintenance tick, so an implementation keeps its own pace; the default
-    /// is a core with nothing to send again.
-    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>)> {
+    /// These transactions have gone out to at least one peer: `Stem` when
+    /// through a stem, `Fluff` otherwise (`on_transactions_relayed`).
+    fn tx_relayed(&self, ids: &[Hash256], how: TxRelay);
+    /// Pool transactions due to go out again, and how: never sent, or sent
+    /// long enough ago (`tx_memory_pool::get_relayable_transactions`). Asked
+    /// on every maintenance tick, so an implementation keeps its own pace; the
+    /// default is a core with nothing to send again.
+    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>, TxRelay)> {
         Vec::new()
     }
 }
@@ -491,7 +509,6 @@ struct Proto {
     /// When a peer whose chain entry offered nothing new may be asked again.
     chain_again_at: Instant,
     next_housekeeping: Instant,
-    asked_complement: bool,
     /// The addresses this peer has been given in a peer list
     /// (`sent_addresses` in the C++'s connection context).
     sent_addresses: HashSet<SocketAddr>,
@@ -508,7 +525,6 @@ impl Proto {
             batch: BatchSize::default(),
             chain_again_at: now,
             next_housekeeping: now,
-            asked_complement: false,
             sent_addresses,
         }
     }
@@ -551,6 +567,10 @@ struct Shared {
     /// Set, with a notification, when a span arrives for the applier.
     apply_wake: (Mutex<bool>, Condvar),
     ever_synced: AtomicBool,
+    /// Whether the next connection to settle once the node is synchronised
+    /// asks its peer for the pool's complement (`m_ask_for_txpool_complement`):
+    /// set at start, and again when the last connection goes.
+    ask_complement: AtomicBool,
     stopping: AtomicBool,
     rng: Mutex<Rng>,
     relay: Mutex<Relay>,
@@ -637,6 +657,7 @@ impl Node {
             generation: AtomicU64::new(0),
             apply_wake: (Mutex::new(false), Condvar::new()),
             ever_synced: AtomicBool::new(false),
+            ask_complement: AtomicBool::new(true),
             stopping: AtomicBool::new(false),
             rng: Mutex::new(rng),
             relay: Mutex::new(Relay {
@@ -803,7 +824,14 @@ impl Node {
     /// Send a transaction this node originated. It starts in the Dandelion++
     /// stem phase (`specs/08` §7.2).
     pub fn relay_transaction(&self, id: Hash256, blob: Vec<u8>) {
-        self.shared.relay_tx(None, id, blob, true);
+        self.shared.relay_tx(None, id, blob, TxRelay::Local);
+    }
+
+    /// Send a transaction the network already has to every peer, as the
+    /// `relay_tx` RPC does for a public one: stemming it again would only
+    /// look like a loop to the stem.
+    pub fn fluff_transaction(&self, id: Hash256, blob: Vec<u8>) {
+        self.shared.relay_tx(None, id, blob, TxRelay::Fluff);
     }
 
     /// Announce a block this node added itself, such as one submitted over
@@ -1002,13 +1030,11 @@ impl Shared {
     /// not been seen fluffed when the embargo ends, this node fluffs it. A
     /// fluff transaction is queued to every other peer and flushed on each
     /// one's Poisson timer.
-    fn relay_tx(&self, from: Option<u64>, id: Hash256, blob: Vec<u8>, stem: bool) {
-        let fluff_now = if from.is_none() {
-            false
-        } else if stem {
-            self.rand_below(100) < DANDELION_FLUFF_PERCENT
-        } else {
-            true
+    fn relay_tx(&self, from: Option<u64>, id: Hash256, blob: Vec<u8>, how: TxRelay) {
+        let fluff_now = match how {
+            TxRelay::Local => false,
+            TxRelay::Stem => self.rand_below(100) < DANDELION_FLUFF_PERCENT,
+            TxRelay::Fluff => true,
         };
 
         if !fluff_now {
@@ -1021,7 +1047,7 @@ impl Shared {
                 if target.notify(command::NEW_TRANSACTIONS, &body) {
                     let deadline = Instant::now() + self.exp_delay(DANDELION_EMBARGO_AVERAGE);
                     lock(&self.relay).embargo.insert(id, (deadline, blob));
-                    self.core.tx_relayed(&[id]);
+                    self.core.tx_relayed(&[id], TxRelay::Stem);
                     return;
                 }
             }
@@ -1057,7 +1083,7 @@ impl Shared {
             }
         }
         drop(relay);
-        self.core.tx_relayed(&[id]);
+        self.core.tx_relayed(&[id], TxRelay::Fluff);
     }
 
     /// The stem peer for a transaction: for one received from `from`, the
@@ -1159,9 +1185,13 @@ impl Shared {
         // A transaction sent once can still have reached no one: a peer that
         // dropped it, a connection that closed before its flush. The pool says
         // what is due to go again, as `relay_txpool_transactions` asks it in
-        // the C++, and it goes as fluff.
-        for (id, blob) in self.core.due_for_relay() {
-            self.fluff(None, id, blob);
+        // the C++: one submitted here and never stemmed through the stem, the
+        // rest as fluff.
+        for (id, blob, how) in self.core.due_for_relay() {
+            match how {
+                TxRelay::Local => self.relay_tx(None, id, blob, TxRelay::Local),
+                TxRelay::Stem | TxRelay::Fluff => self.fluff(None, id, blob),
+            }
         }
     }
 
@@ -1979,7 +2009,15 @@ fn run_connection(
         }
     };
 
-    lock(&shared.conns).remove(&conn.id);
+    {
+        let mut conns = lock(&shared.conns);
+        conns.remove(&conn.id);
+        // Cut off from the network: whatever the pool missed meanwhile is
+        // asked for again once back.
+        if conns.is_empty() {
+            shared.ask_complement.store(true, Ordering::Relaxed);
+        }
+    }
     lock(&shared.queue).flush(conn.id, false);
     conn.close();
     match fault {
@@ -2148,7 +2186,8 @@ fn handle_message(
         (Kind::Notification, command::NEW_TRANSACTIONS) => {
             on_new_transactions(shared, conn, body)?;
         }
-        (Kind::Notification, command::GET_TXPOOL_COMPLEMENT) => {
+        // Only from a peer in the normal state, as the C++ answers.
+        (Kind::Notification, command::GET_TXPOOL_COMPLEMENT) if conn.state() == STATE_NORMAL => {
             let c = TxpoolComplement::parse(body).map_err(|e| malformed("pool complement", e))?;
             let known: HashSet<Hash256> = c.hashes.into_iter().collect();
             let txs = core.pool_txs_except(&known);
@@ -2238,7 +2277,7 @@ fn advance(shared: &Shared, conn: &Conn, proto: &mut Proto) {
         proto.chain.clear();
     }
     if shared.cfg.no_sync {
-        settle(shared, conn, proto);
+        settle(shared, conn);
         return;
     }
 
@@ -2263,7 +2302,7 @@ fn advance(shared: &Shared, conn: &Conn, proto: &mut Proto) {
         if peer.cumulative_difficulty <= ours.cumulative_difficulty
             || shared.core.have_block(&peer.top_id)
         {
-            settle(shared, conn, proto);
+            settle(shared, conn);
         } else if Instant::now() >= proto.chain_again_at {
             request_chain(shared, conn, proto);
         } else {
@@ -2348,12 +2387,28 @@ fn offers(proto: &Proto, start: u64, ids: &[Hash256]) -> bool {
 
 /// The peer is not ahead: the connection is in the normal state, and a sync
 /// it took part in has ended.
-fn settle(shared: &Shared, conn: &Conn, proto: &mut Proto) {
+fn settle(shared: &Shared, conn: &Conn) {
     // A handshaken peer that is not ahead means this node is caught up with at
     // least one of the network's views.
     shared.ever_synced.store(true, Ordering::Relaxed);
     let was_syncing = matches!(conn.state(), STATE_SYNCHRONIZING | STATE_STANDBY);
     conn.set_state(STATE_NORMAL);
+    // Catch the pool up with the network's (`specs/08` §6.3), once, from the
+    // first connection to settle after the node is synchronised
+    // (`on_connection_synchronized`). Asking every connection that finished a
+    // sync fetched the same pool a dozen times over, and it offered the
+    // peers this node's private transactions' hashes too: only public ones
+    // are listed, since a hash is all it takes to tell a stem holds one.
+    if shared.ask_complement.load(Ordering::Relaxed)
+        && shared.sync_status().synchronized
+        && shared.ask_complement.swap(false, Ordering::SeqCst)
+    {
+        let body = TxpoolComplement {
+            hashes: shared.core.pool_hashes(),
+        }
+        .to_bytes();
+        conn.notify(command::GET_TXPOOL_COMPLEMENT, &body);
+    }
     if !was_syncing {
         return;
     }
@@ -2363,15 +2418,6 @@ fn settle(shared: &Shared, conn: &Conn, proto: &mut Proto) {
         conn.addr,
         shared.core.sync_data().current_height
     );
-    // Catch the pool up with what the peer holds (`specs/08` §6.3).
-    if !proto.asked_complement {
-        proto.asked_complement = true;
-        let body = TxpoolComplement {
-            hashes: shared.core.pool_hashes(),
-        }
-        .to_bytes();
-        conn.notify(command::GET_TXPOOL_COMPLEMENT, &body);
-    }
 }
 
 fn request_chain(shared: &Shared, conn: &Conn, proto: &mut Proto) {
@@ -2545,11 +2591,15 @@ fn on_new_transactions(shared: &Shared, conn: &Conn, body: &[u8]) -> Result<(), 
         return Ok(());
     }
     let m = NewTransactions::parse(body).map_err(|e| malformed("transactions", e))?;
-    let verdicts = shared.core.incoming_txs(&m.txs);
+    let verdicts = shared.core.incoming_txs(&m.txs, m.dandelionpp_fluff);
     for (blob, verdict) in m.txs.iter().zip(verdicts) {
         match verdict {
-            TxVerdict::Accepted { id, relay: true } => {
-                shared.relay_tx(Some(conn.id), id, blob.clone(), !m.dandelionpp_fluff);
+            // As the pool says, not as the message says: a stem copy of a
+            // transaction this node already holds in its stem is a loop, and
+            // is fluffed -- where answering "known" left it to sit out the
+            // embargo while the stem went quiet.
+            TxVerdict::Accepted { id, how: Some(how) } => {
+                shared.relay_tx(Some(conn.id), id, blob.clone(), how);
             }
             TxVerdict::Accepted { .. } => {}
             TxVerdict::Known { id } => {

@@ -202,8 +202,10 @@ impl Server {
         self.pool.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn pool_size(&self) -> usize {
-        self.pool().len()
+    /// The pool's size as a caller may see it: every transaction with
+    /// `include_sensitive`, the public ones otherwise.
+    pub fn pool_size(&self, include_sensitive: bool) -> usize {
+        self.pool().count(include_sensitive)
     }
 
     pub fn core(&self) -> Option<&NodeCore> {
@@ -558,7 +560,7 @@ fn respond(server: &Server, stream: &mut tls::Stream, restricted: bool, ip: IpAd
     // The binary endpoints answer in epee, not JSON, so they branch before the
     // JSON writer (`specs/11` §5).
     if path.ends_with(".bin") {
-        let body = match binary::dispatch(server, path, &req.body) {
+        let body = match binary::dispatch(server, path, &req.body, restricted) {
             Ok(section) => wow_serialize::epee::to_bytes(&section).unwrap_or_else(|e| {
                 binary::error_response(&RpcError::new(
                     methods::error::INTERNAL_ERROR,
@@ -601,7 +603,7 @@ fn json_rpc(server: &Server, body: &[u8], restricted: bool) -> String {
         return error_envelope(&id, &RpcError::unsupported(method));
     }
 
-    match dispatch(server, method, &params) {
+    match dispatch(server, method, &params, restricted) {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
         Err(e) => error_envelope(&id, &e),
     }
@@ -616,12 +618,18 @@ fn error_envelope(id: &Value, e: &RpcError) -> String {
     .to_string()
 }
 
-fn dispatch(server: &Server, method: &str, params: &Value) -> RpcResult {
+/// A JSON-RPC method, for a caller on a listener that is `restricted` or not.
+///
+/// What is marked **R** never gets here on a restricted listener. The rest
+/// is still asked whether it is: the C++ answers several of them with less
+/// on a restricted listener -- no private pool transactions, no node
+/// counters -- and so does this node.
+fn dispatch(server: &Server, method: &str, params: &Value, restricted: bool) -> RpcResult {
     let db = server.db();
     let cfg = server.config();
     match method {
         // `specs/11` §4, with the C++'s aliases.
-        "get_info" => methods::get_info(server),
+        "get_info" => methods::get_info(server, restricted),
         "get_version" => methods::get_version(server),
         "hard_fork_info" => methods::hard_fork_info(db, cfg, params),
         "get_fee_estimate" => methods::get_fee_estimate(server, params),
@@ -676,16 +684,20 @@ fn direct(server: &Server, path: &str, body: &[u8], restricted: bool) -> String 
     } else {
         match path {
             "/get_height" | "/getheight" => methods::get_height(db),
-            "/get_info" | "/getinfo" => methods::get_info(server),
+            "/get_info" | "/getinfo" => methods::get_info(server, restricted),
             "/get_checkpoints" => methods::get_checkpoints(db, cfg),
             "/send_raw_transaction" | "/sendrawtransaction" => {
                 return methods::send_raw_transaction(server, body);
             }
-            "/get_transactions" | "/gettransactions" => methods::get_transactions(server, body),
-            "/is_key_image_spent" => admin::is_key_image_spent(server, body),
-            "/get_transaction_pool" => admin::get_transaction_pool(server),
-            "/get_transaction_pool_hashes" => admin::get_transaction_pool_hashes(server),
-            "/get_transaction_pool_stats" => admin::get_transaction_pool_stats(server),
+            "/get_transactions" | "/gettransactions" => {
+                methods::get_transactions(server, body, restricted)
+            }
+            "/is_key_image_spent" => admin::is_key_image_spent(server, body, restricted),
+            "/get_transaction_pool" => admin::get_transaction_pool(server, restricted),
+            "/get_transaction_pool_hashes" => {
+                admin::get_transaction_pool_hashes(server, restricted)
+            }
+            "/get_transaction_pool_stats" => admin::get_transaction_pool_stats(server, restricted),
             "/get_peer_list" => admin::get_peer_list(server),
             "/get_public_nodes" => admin::get_public_nodes(server, body),
             "/in_peers" => admin::in_peers(server, body),

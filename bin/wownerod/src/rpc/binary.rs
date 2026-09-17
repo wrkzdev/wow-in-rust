@@ -47,6 +47,7 @@ use wow_storage::db::BlockchainDb;
 use wow_storage::lmdb::LmdbDb;
 
 use super::methods::{error, RpcError};
+use super::Server;
 
 /// `COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT`.
 const MAX_BLOCK_COUNT: usize = 1_000;
@@ -61,8 +62,9 @@ const MAX_BLOCK_IDS: usize = 256;
 
 pub type BinaryResult = Result<Section, RpcError>;
 
-/// Dispatch a binary endpoint.
-pub fn dispatch(server: &super::Server, path: &str, body: &[u8]) -> BinaryResult {
+/// Dispatch a binary endpoint, for a caller on a listener that is
+/// `restricted` or not.
+pub fn dispatch(server: &Server, path: &str, body: &[u8], restricted: bool) -> BinaryResult {
     let request = epee::from_bytes(body)
         .map_err(|e| RpcError::new(error::WRONG_PARAM, format!("malformed epee request: {e}")))?;
     let db = server.db();
@@ -73,7 +75,7 @@ pub fn dispatch(server: &super::Server, path: &str, body: &[u8]) -> BinaryResult
         "/get_o_indexes.bin" => get_o_indexes(db, &request),
         "/get_outs.bin" => get_outs(db, &request),
         "/get_output_distribution.bin" => get_output_distribution(db, &request),
-        "/get_transaction_pool_hashes.bin" => get_pool_hashes(server),
+        "/get_transaction_pool_hashes.bin" => get_pool_hashes(server, restricted),
         other => Err(RpcError::unsupported(other)),
     }
 }
@@ -502,12 +504,14 @@ fn get_output_distribution(db: &LmdbDb, request: &Section) -> BinaryResult {
     Ok(res)
 }
 
-/// `/get_transaction_pool_hashes.bin`.
-fn get_pool_hashes(server: &super::Server) -> BinaryResult {
+/// `/get_transaction_pool_hashes.bin`: on a restricted listener, the public
+/// transactions only. A wallet polls this; listing a stem transaction to
+/// whoever asks is the one thing a stem must not do.
+fn get_pool_hashes(server: &Server, restricted: bool) -> BinaryResult {
     // `CONTAINER_POD_AS_BLOB`: one string of packed 32-byte hashes, not an
     // array (`specs/04` §2).
     let mut packed = Vec::new();
-    for id in server.pool().ids() {
+    for id in server.pool().ids(!restricted) {
         packed.extend_from_slice(&id);
     }
 

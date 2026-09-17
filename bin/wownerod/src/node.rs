@@ -29,7 +29,7 @@ use wow_core::{Added, BlockError, Blockchain, PowError, Rejection};
 use wow_crypto::random::Rng;
 use wow_crypto::types::{Hash256, KeyImage};
 use wow_p2p::messages::{BlockEntry, CoreSyncData, BLOCK_IDS_DEFAULT_COUNT};
-use wow_p2p::node::{BlockVerdict, ChainReply, Core, TxVerdict};
+use wow_p2p::node::{BlockVerdict, ChainReply, Core, TxRelay, TxVerdict};
 use wow_storage::db::BlockchainDb;
 use wow_storage::lmdb::LmdbDb;
 use wow_types::address::Address;
@@ -37,7 +37,7 @@ use wow_types::block::Block;
 use wow_types::tx::{Transaction, TxIn};
 use wow_types::Network;
 
-use crate::mempool::{Rejection as PoolRejection, TxPool};
+use crate::mempool::{Rejection as PoolRejection, RelayMethod, TxPool};
 use crate::netsync::{ChainPow, ChainTxs, LocalChain, PendingTx, Refusal, Submitted};
 use crate::template::{ExtraNonce, NextBlock, Template, TemplateError};
 
@@ -161,9 +161,14 @@ impl NodeCore {
         self.listener.get().map(|l| &**l).filter(|l| l.wants(event))
     }
 
-    /// Transactions just admitted to the pool, announced. One kept from relay
-    /// is not: a subscriber hears what goes out to the network, as the C++'s
-    /// `relay_category::legacy` has it.
+    /// Transactions just admitted to the pool, or just made public, announced.
+    ///
+    /// Only those the pool holds as `relay_category::legacy`, as the C++
+    /// notifies (`core::add_new_tx`): public, or kept from relay by whoever
+    /// submitted them. One submitted here to go out, or arriving through a
+    /// stem, is announced when it goes public and not before
+    /// ([`Core::tx_relayed`]); a subscriber that heard of it on admission
+    /// learned what the stem was there to hide.
     pub fn announce_pool_txs(&self, ids: &[Hash256]) {
         let Some(listener) = self.listening(Event::TxpoolAdd) else {
             return;
@@ -172,7 +177,7 @@ impl NodeCore {
             let pool = lock(&self.pool);
             ids.iter()
                 .filter_map(|id| {
-                    let e = pool.get(id).filter(|e| !e.do_not_relay)?;
+                    let e = pool.get(id).filter(|e| e.is_legacy())?;
                     Some((*id, e.blob.clone(), e.weight, e.fee))
                 })
                 .collect()
@@ -407,10 +412,11 @@ impl NodeCore {
 
     /// `send_miner_notifications`, for the tip `chain` has now.
     ///
-    /// The backlog is `get_block_template_backlog`'s: what may be relayed,
-    /// best paying first, up to 112.5% of the median weight -- enough for a
-    /// full block. The C++ also drops transactions whose key images collide;
-    /// the pool here admits no such pair in the first place.
+    /// The backlog is `get_block_template_backlog`'s without sensitive
+    /// transactions: public ones only, best paying first, up to 112.5% of the
+    /// median weight -- enough for a full block. The C++ also drops
+    /// transactions whose key images collide; the pool here admits no such
+    /// pair in the first place.
     fn miner_data(&self, chain: &LocalChain) -> Option<MinerData> {
         let next = next_block_of(chain.blockchain()).ok()?;
         let (seed_height, _) = wow_randomwow::seed::rx_seedheights(next.height);
@@ -423,7 +429,7 @@ impl NodeCore {
         let mut tx_backlog = Vec::new();
         let mut weight = 0u64;
         for (id, e) in lock(&self.pool).by_fee() {
-            if e.do_not_relay {
+            if !e.is_public() {
                 continue;
             }
             tx_backlog.push((id, e.weight, e.fee));
@@ -585,6 +591,17 @@ fn verdict(r: Rejection) -> BlockVerdict {
     BlockVerdict::Rejected {
         reason: r.to_string(),
         ban,
+    }
+}
+
+/// A pool relay method as the network layer acts on it, or `None` for one
+/// that goes nowhere.
+fn relay_of(method: RelayMethod) -> Option<TxRelay> {
+    match method {
+        RelayMethod::Local => Some(TxRelay::Local),
+        RelayMethod::Stem => Some(TxRelay::Stem),
+        RelayMethod::Fluff | RelayMethod::Block => Some(TxRelay::Fluff),
+        RelayMethod::None | RelayMethod::Forward => None,
     }
 }
 
@@ -753,8 +770,8 @@ impl Core for NodeCore {
         })
     }
 
-    fn incoming_txs(&self, txs: &[Vec<u8>]) -> Vec<TxVerdict> {
-        let verdicts = self.admit_txs(txs);
+    fn incoming_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
+        let verdicts = self.admit_txs(txs, fluff);
         let accepted: Vec<Hash256> = verdicts
             .iter()
             .filter_map(|v| match v {
@@ -769,18 +786,27 @@ impl Core for NodeCore {
     }
 
     fn pool_txs_except(&self, known: &HashSet<Hash256>) -> Vec<Vec<u8>> {
-        lock(&self.pool).public_txs_except(known, unix_now())
+        lock(&self.pool).public_txs_except(known)
     }
 
     fn pool_hashes(&self) -> Vec<Hash256> {
-        lock(&self.pool).relayable_ids()
+        lock(&self.pool).ids(false)
     }
 
-    fn tx_relayed(&self, ids: &[Hash256]) {
-        lock(&self.pool).mark_relayed(ids, unix_now());
+    /// Marked in the pool, and announced for whatever that made public.
+    fn tx_relayed(&self, ids: &[Hash256], how: TxRelay) {
+        let method = match how {
+            TxRelay::Stem => RelayMethod::Stem,
+            TxRelay::Local | TxRelay::Fluff => RelayMethod::Fluff,
+        };
+        // The guard ends with the statement: announcing reads the pool again.
+        let public = lock(&self.pool).set_relayed(ids, method, unix_now());
+        if !public.is_empty() {
+            self.announce_pool_txs(&public);
+        }
     }
 
-    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>)> {
+    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>, TxRelay)> {
         use std::sync::atomic::Ordering::Relaxed;
         // Asked every tick; the pool is walked every two minutes.
         let now = unix_now();
@@ -789,7 +815,11 @@ impl Core for NodeCore {
         }
         self.next_relay_check
             .store(now + crate::mempool::RELAY_CHECK_SECS, Relaxed);
-        lock(&self.pool).due_for_relay(now)
+        lock(&self.pool)
+            .due_for_relay(now)
+            .into_iter()
+            .map(|(id, blob, method)| (id, blob, relay_of(method).unwrap_or(TxRelay::Fluff)))
+            .collect()
     }
 }
 
@@ -903,10 +933,19 @@ impl NodeCore {
         work
     }
 
-    /// Transactions from a peer, into the pool.
-    fn admit_txs(&self, txs: &[Vec<u8>]) -> Vec<TxVerdict> {
+    /// Transactions from a peer, into the pool: through a stem, or fluffed.
+    ///
+    /// One the pool holds privately is not "known" here. It goes to the pool
+    /// again, which moves it on as far as this copy takes it -- to fluff, for
+    /// a fluffed copy or a stem that looped back (`tx_memory_pool::add_tx`).
+    fn admit_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
         let ctx = self.fee_context();
         let now = unix_now();
+        let method = if fluff {
+            RelayMethod::Fluff
+        } else {
+            RelayMethod::Stem
+        };
         let mut pool = lock(&self.pool);
         txs.iter()
             .map(|blob| {
@@ -919,11 +958,11 @@ impl NodeCore {
                         ban: true,
                     };
                 };
-                if pool.contains(&id) || self.db.tx_exists(&id).unwrap_or(false) {
-                    return TxVerdict::Known { id };
-                }
-                match pool.add(&self.db, blob, &ctx, now, false) {
-                    Ok(id) => TxVerdict::Accepted { id, relay: true },
+                match pool.add(&self.db, blob, &ctx, now, method) {
+                    Ok(admitted) => TxVerdict::Accepted {
+                        id: admitted.id,
+                        how: relay_of(admitted.relay),
+                    },
                     Err(PoolRejection::AlreadyInPool) => TxVerdict::Known { id },
                     // A refusal here is policy, or a ring this node cannot
                     // resolve yet while it catches up; neither is proof the
@@ -947,6 +986,18 @@ mod tests {
             step: wow_core::Step::Transactions,
             error,
         }
+    }
+
+    /// The pool's relay method reaches the network layer as the way a
+    /// transaction goes on: kept from relay goes nowhere, and one that came
+    /// back out of a block goes as fluff.
+    #[test]
+    fn a_relay_method_says_how_a_transaction_goes_on() {
+        assert_eq!(relay_of(RelayMethod::None), None);
+        assert_eq!(relay_of(RelayMethod::Local), Some(TxRelay::Local));
+        assert_eq!(relay_of(RelayMethod::Stem), Some(TxRelay::Stem));
+        assert_eq!(relay_of(RelayMethod::Fluff), Some(TxRelay::Fluff));
+        assert_eq!(relay_of(RelayMethod::Block), Some(TxRelay::Fluff));
     }
 
     /// Only evidence of misbehaviour bans; this node's own limits do not.

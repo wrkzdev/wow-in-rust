@@ -79,7 +79,7 @@ Statuses:
 
 | Item | Status | Notes |
 |---|---|---|
-| Relay transactions from `send_raw_transaction` and from peers | Done | Dandelion++ from the start rather than broadcast-first: 2 stems, 20% fluff, 39 s embargo, 10-minute epochs |
+| Relay transactions from `send_raw_transaction` and from peers | Done | Dandelion++ from the start rather than broadcast-first: 2 stems, 20% fluff, 39 s embargo, 10-minute epochs. The pool keeps each transaction's relay method as the C++ does (saved in its `txpool_meta` flags), and only fluffed or mined ones reach the restricted RPC, the ZMQ RPC, a peer's complement request, block templates, miner data and ZMQ `txpool_add` |
 | Fluffy block announcements; requests for missing transactions | Done | |
 | Keep the pool across restarts | Done | Saved on shutdown and by `save_bc`, loaded at start |
 

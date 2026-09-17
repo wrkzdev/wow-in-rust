@@ -21,6 +21,7 @@ use wow_storage::lmdb::LmdbDb;
 use wow_types::Network;
 
 use crate::cli::Config;
+use crate::mempool::{Rejection, RelayMethod};
 
 /// `specs/11` §6. Note there is no `-8`.
 pub mod error {
@@ -188,7 +189,10 @@ pub(crate) fn internal(e: impl std::fmt::Display) -> RpcError {
 /// Every field clients depend on is emitted. The ones this node cannot know
 /// -- bootstrap state, update checks -- are zero or false, which is accurate
 /// for a node with neither, not a placeholder.
-pub fn get_info(server: &super::Server) -> RpcResult {
+///
+/// `restricted` is the listener's: a restricted one counts only the public
+/// pool transactions, as the C++ does.
+pub fn get_info(server: &super::Server, restricted: bool) -> RpcResult {
     let db = server.db();
     let cfg = server.config();
     let height = db.height();
@@ -233,7 +237,7 @@ pub fn get_info(server: &super::Server) -> RpcResult {
 
     // The store keeps no transaction count this node can read cheaply.
     m.insert("tx_count".into(), json!(0));
-    m.insert("tx_pool_size".into(), json!(server.pool_size()));
+    m.insert("tx_pool_size".into(), json!(server.pool_size(!restricted)));
     m.insert(
         "alt_blocks_count".into(),
         json!(db.get_alt_block_count().unwrap_or(0)),
@@ -660,39 +664,62 @@ pub fn send_raw_transaction(server: &super::Server, body: &[u8]) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // Marked as this node's own from the moment it is in the pool, so nothing
+    // that walks the pool before the relay below can take it for public.
+    let method = if do_not_relay {
+        RelayMethod::None
+    } else {
+        RelayMethod::Local
+    };
     // The pool guard ends with this statement: relaying marks the entry, which
     // takes the pool lock again.
-    let added = server
-        .pool()
-        .add(db, &blob, &fee_context, now, do_not_relay);
+    let added = server.pool().add(db, &blob, &fee_context, now, method);
     match added {
-        Ok(id) => {
-            // Announced as the C++ announces it: accepted, and allowed out.
-            if let Some(core) = server.core().filter(|_| !do_not_relay) {
-                core.announce_pool_txs(&[id]);
+        Ok(admitted) => {
+            // Announced as the C++ announces it (`core::add_new_tx`): one kept
+            // from relay now, one going out once it is public.
+            if let Some(core) = server.core() {
+                core.announce_pool_txs(&[admitted.id]);
+            }
+            if admitted.relay == RelayMethod::None {
+                return not_relayed();
             }
             // Handed to the peer-to-peer layer whenever the caller allows it,
             // whether or not a peer can take it this moment. One that reaches
             // nobody stays unrelayed in the pool, which offers it again until
             // one does; `not_relayed` still says whether it went out now.
-            if !do_not_relay {
-                if let Some(p) = server.p2p() {
-                    p.relay_transaction(id, blob.clone());
-                }
+            if let Some(p) = server.p2p() {
+                p.relay_transaction(admitted.id, blob.clone());
             }
-            let relayed = !do_not_relay && server.relays();
             let mut m = relay_flags(None);
             m.insert("status".into(), json!("OK"));
             m.insert("reason".into(), json!(""));
-            m.insert("not_relayed".into(), json!(!relayed));
-            m.insert("tx_hash".into(), json!(wow_crypto::hex::encode(&id)));
+            m.insert("not_relayed".into(), json!(!server.relays()));
+            m.insert(
+                "tx_hash".into(),
+                json!(wow_crypto::hex::encode(&admitted.id)),
+            );
             Value::Object(m).to_string()
         }
+        // Held already, publicly or kept from relay, or on the chain. Not a
+        // failure: the C++ answers OK and relays nothing. Checked before the
+        // key images, a transaction sent twice was answered as a double spend
+        // of its own inputs, naming itself as the spender.
+        Err(Rejection::AlreadyInPool) => not_relayed(),
         Err(rejection) => failed_relay(&rejection.reason(), Some(&rejection)),
     }
 }
 
-fn failed_relay(reason: &str, rejection: Option<&crate::mempool::Rejection>) -> String {
+/// Accepted, and going nowhere: kept back as asked, or known already.
+fn not_relayed() -> String {
+    let mut m = relay_flags(None);
+    m.insert("status".into(), json!("OK"));
+    m.insert("reason".into(), json!("Not relayed"));
+    m.insert("not_relayed".into(), json!(true));
+    Value::Object(m).to_string()
+}
+
+fn failed_relay(reason: &str, rejection: Option<&Rejection>) -> String {
     let mut m = relay_flags(rejection);
     m.insert("status".into(), json!("Failed"));
     m.insert("reason".into(), json!(reason));
@@ -701,7 +728,7 @@ fn failed_relay(reason: &str, rejection: Option<&crate::mempool::Rejection>) -> 
 }
 
 /// Every rejection flag `specs/11` §3.1 requires, present whether set or not.
-fn relay_flags(rejection: Option<&crate::mempool::Rejection>) -> serde_json::Map<String, Value> {
+fn relay_flags(rejection: Option<&Rejection>) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
     match rejection {
         Some(r) => {
@@ -736,7 +763,12 @@ fn relay_flags(rejection: Option<&crate::mempool::Rejection>) -> serde_json::Map
 }
 
 /// `/get_transactions` — pool and chain transactions by hash.
-pub fn get_transactions(server: &super::Server, body: &[u8]) -> RpcResult {
+///
+/// On a restricted listener a private pool transaction is not there at all,
+/// and a public one's receive time is zero, as the C++ answers
+/// (`get_transaction_info` without sensitive data): when a node first saw a
+/// transaction is a timing leak about where it came from.
+pub fn get_transactions(server: &super::Server, body: &[u8], restricted: bool) -> RpcResult {
     let request: Value = serde_json::from_slice(body)
         .map_err(|e| RpcError::new(error::WRONG_PARAM, format!("invalid JSON: {e}")))?;
     let wanted = request
@@ -762,14 +794,15 @@ pub fn get_transactions(server: &super::Server, body: &[u8]) -> RpcResult {
 
         // The pool first: an unconfirmed transaction is the one a wallet is
         // usually asking after.
-        if let Some(entry) = pool.get(&id) {
+        if let Some(entry) = pool.get(&id).filter(|e| !restricted || e.is_public()) {
+            let received = if restricted { 0 } else { entry.receive_time };
             found.push(json!({
                 "tx_hash": text,
                 "as_hex": wow_crypto::hex::encode(&entry.blob),
                 "in_pool": true,
                 "double_spend_seen": entry.double_spend_seen,
                 "block_height": 0,
-                "received_timestamp": entry.receive_time,
+                "received_timestamp": received,
                 "relayed": entry.relayed,
             }));
             continue;

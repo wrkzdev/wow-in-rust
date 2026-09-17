@@ -18,6 +18,7 @@ use wow_storage::db::BlockchainDb;
 
 use super::methods::{base, error, hex, internal, untrusted, RpcError, RpcResult};
 use super::Server;
+use crate::mempool::PoolEntry;
 
 pub(crate) fn body_json(body: &[u8]) -> Result<Value, RpcError> {
     if body.iter().all(u8::is_ascii_whitespace) {
@@ -373,6 +374,11 @@ pub fn flush_txpool(server: &Server, params: &Value) -> RpcResult {
 }
 
 /// `relay_tx` **R**: send pooled transactions out again.
+///
+/// As the C++ does: one the network already has as fluff, and one still
+/// private through the stem. Stemming a public one again showed its stem
+/// peer what looks like a loop, and fluffing a private one would publish it
+/// from this node.
 pub fn relay_tx(server: &Server, params: &Value) -> RpcResult {
     let node = p2p(server)?;
     let ids = hashes_of(params, "txids")?;
@@ -382,24 +388,36 @@ pub fn relay_tx(server: &Server, params: &Value) -> RpcResult {
     for id in ids {
         // The guard is dropped before relaying: relaying marks the pool entry,
         // which takes the pool lock again.
-        let blob = server.pool().get(&id).map(|e| e.blob.clone());
-        let blob = blob.ok_or_else(|| {
+        let found = server
+            .pool()
+            .get(&id)
+            .map(|e| (e.blob.clone(), e.is_public()));
+        let (blob, public) = found.ok_or_else(|| {
             RpcError::new(
                 error::WRONG_PARAM,
                 format!("transaction {} is not in the pool", hex(&id)),
             )
         })?;
-        node.relay_transaction(id, blob);
+        if public {
+            node.fluff_transaction(id, blob);
+        } else {
+            node.relay_transaction(id, blob);
+        }
     }
     Ok(Value::Object(base("OK", untrusted())))
 }
 
 /// `/get_transaction_pool`.
-pub fn get_transaction_pool(server: &Server) -> RpcResult {
+///
+/// On a restricted listener, the public transactions only, their receive
+/// times zeroed, and only the key images they spend -- the C++'s answer
+/// without sensitive data.
+pub fn get_transaction_pool(server: &Server, restricted: bool) -> RpcResult {
     let pool = server.pool();
     let zero = hex(&[0u8; 32]);
     let txs: Vec<Value> = pool
         .entries()
+        .filter(|(_, e)| !restricted || e.is_public())
         .map(|(id, e)| {
             json!({
                 "id_hash": hex(id),
@@ -409,20 +427,20 @@ pub fn get_transaction_pool(server: &Server) -> RpcResult {
                 "fee": e.fee,
                 "max_used_block_id_hash": zero,
                 "max_used_block_height": 0,
-                "kept_by_block": e.kept_by_block,
+                "kept_by_block": e.kept_by_block(),
                 "last_failed_height": 0,
                 "last_failed_id_hash": zero,
-                "receive_time": e.receive_time,
+                "receive_time": if restricted { 0 } else { e.receive_time },
                 "relayed": e.relayed,
                 "last_relayed_time": 0,
-                "do_not_relay": e.do_not_relay,
+                "do_not_relay": e.do_not_relay(),
                 "double_spend_seen": e.double_spend_seen,
                 "tx_blob": hex(&e.blob),
             })
         })
         .collect();
     let spent: Vec<Value> = pool
-        .spent_key_images()
+        .spent_key_images(!restricted)
         .into_iter()
         .map(|(ki, id)| json!({"id_hash": hex(&ki.0), "txs_hashes": [hex(&id)]}))
         .collect();
@@ -432,19 +450,31 @@ pub fn get_transaction_pool(server: &Server) -> RpcResult {
     Ok(Value::Object(m))
 }
 
-/// `/get_transaction_pool_hashes`.
-pub fn get_transaction_pool_hashes(server: &Server) -> RpcResult {
-    let ids: Vec<String> = server.pool().ids().iter().map(|h| hex(h)).collect();
+/// `/get_transaction_pool_hashes`: the public ones only, on a restricted
+/// listener.
+pub fn get_transaction_pool_hashes(server: &Server, restricted: bool) -> RpcResult {
+    let ids: Vec<String> = server
+        .pool()
+        .ids(!restricted)
+        .iter()
+        .map(|h| hex(h))
+        .collect();
     let mut m = base("OK", untrusted());
     m.insert("tx_hashes".into(), json!(ids));
     Ok(Value::Object(m))
 }
 
-/// `/get_transaction_pool_stats`.
-pub fn get_transaction_pool_stats(server: &Server) -> RpcResult {
+/// `/get_transaction_pool_stats`: over the public transactions only, on a
+/// restricted listener.
+pub fn get_transaction_pool_stats(server: &Server, restricted: bool) -> RpcResult {
     let pool = server.pool();
     let now = unix_now();
-    let mut sizes: Vec<u64> = pool.entries().map(|(_, e)| e.blob.len() as u64).collect();
+    let visible: Vec<&PoolEntry> = pool
+        .entries()
+        .map(|(_, e)| e)
+        .filter(|e| !restricted || e.is_public())
+        .collect();
+    let mut sizes: Vec<u64> = visible.iter().map(|e| e.blob.len() as u64).collect();
     sizes.sort_unstable();
     let median = wow_consensus::emission::median(&mut sizes.clone());
     let stats = json!({
@@ -452,23 +482,24 @@ pub fn get_transaction_pool_stats(server: &Server) -> RpcResult {
         "bytes_min": sizes.first().copied().unwrap_or(0),
         "bytes_max": sizes.last().copied().unwrap_or(0),
         "bytes_med": median,
-        "fee_total": pool.entries().map(|(_, e)| e.fee).sum::<u64>(),
-        "oldest": pool.entries().map(|(_, e)| e.receive_time).min().unwrap_or(0),
-        "txs_total": pool.len(),
+        "fee_total": visible.iter().map(|e| e.fee).sum::<u64>(),
+        "oldest": visible.iter().map(|e| e.receive_time).min().unwrap_or(0),
+        "txs_total": visible.len(),
         "num_failing": 0,
-        "num_10m": pool.entries().filter(|(_, e)| now.saturating_sub(e.receive_time) > 600).count(),
-        "num_not_relayed": pool.entries().filter(|(_, e)| !e.relayed).count(),
+        "num_10m": visible.iter().filter(|e| now.saturating_sub(e.receive_time) > 600).count(),
+        "num_not_relayed": visible.iter().filter(|e| !e.relayed).count(),
         "histo_98pc": 0,
         "histo": [],
-        "num_double_spends": pool.entries().filter(|(_, e)| e.double_spend_seen).count(),
+        "num_double_spends": visible.iter().filter(|e| e.double_spend_seen).count(),
     });
     let mut m = base("OK", untrusted());
     m.insert("pool_stats".into(), stats);
     Ok(Value::Object(m))
 }
 
-/// `/is_key_image_spent`: 0 unspent, 1 spent on chain, 2 spent in the pool.
-pub fn is_key_image_spent(server: &Server, body: &[u8]) -> RpcResult {
+/// `/is_key_image_spent`: 0 unspent, 1 spent on chain, 2 spent in the pool --
+/// by a public transaction, on a restricted listener.
+pub fn is_key_image_spent(server: &Server, body: &[u8], restricted: bool) -> RpcResult {
     let req = body_json(body)?;
     let images = req
         .get("key_images")
@@ -487,7 +518,7 @@ pub fn is_key_image_spent(server: &Server, body: &[u8]) -> RpcResult {
             let ki = KeyImage(ki);
             if db.has_key_image(&ki).unwrap_or(false) {
                 1
-            } else if pool.spends(&ki) {
+            } else if pool.spends(&ki, !restricted) {
                 2
             } else {
                 0
