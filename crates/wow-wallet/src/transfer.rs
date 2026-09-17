@@ -1555,6 +1555,60 @@ mod tests {
         assert_eq!(mine[0].amount, input.amount - 3_000_000_000 - fee);
     }
 
+    /// No change goes as nothing to a throwaway address, derived as change is:
+    /// the payee finds their payment and the dummy payment id, and the sender
+    /// finds nothing to hold.
+    #[test]
+    fn zero_change_to_a_throwaway_address_is_nobodys() {
+        let me = wallet(149);
+        let them = wallet(151);
+        let throwaway = wallet(157);
+        let input = spendable(6_000_000_000, 11, 4, 153);
+        let fee = 15_000_000u64;
+
+        let destinations = vec![
+            Destination {
+                address: them.address,
+                is_subaddress: false,
+                amount: input.amount - fee,
+            },
+            Destination {
+                address: throwaway.address,
+                is_subaddress: false,
+                amount: 0,
+            },
+        ];
+        let built = construct_with_change(
+            std::slice::from_ref(&input),
+            &destinations,
+            Some(Change {
+                address: throwaway.address,
+                view_secret_key: &me.view,
+            }),
+            fee,
+            None,
+            &mut Counter(23),
+        )
+        .expect("construct");
+        verify_as_a_node(&built.tx, &[&input]);
+
+        let got = scan_transaction(&built.tx, &them.keys()).expect("scan");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].amount, input.amount - fee);
+        let enc = encrypted_payment_id(&built.tx).expect("a dummy payment id");
+        assert_eq!(
+            wow_crypto::keys::encrypt_payment_id(&enc, &got[0].derivation),
+            [0u8; 8]
+        );
+
+        assert!(scan_transaction(&built.tx, &me.keys())
+            .expect("scan")
+            .is_empty());
+        assert!(scan_transaction(&built.tx, &throwaway.keys())
+            .expect("scan")
+            .is_empty());
+    }
+
     /// The outputs are shuffled before they are numbered, so the payee is not
     /// always output 0 and change not always the last.
     #[test]

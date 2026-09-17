@@ -7,7 +7,7 @@
 //! between, wallet-rpc does not, and a GUI shows a dialog.
 
 use curve25519_dalek::scalar::Scalar;
-use wow_crypto::types::{Hash256, KeyImage};
+use wow_crypto::types::{AccountPublicAddress, Hash256, KeyImage};
 use wow_daemon_client::{DaemonError, SendResult};
 use wow_types::address::{Address, AddressKind};
 use wow_types::Network;
@@ -259,24 +259,26 @@ impl Session {
 
         // Outputs: the payee, and change back to the primary address, named
         // as change. The builder shuffles them.
+        //
+        // A transaction still needs two outputs when there is no change, as
+        // after a sweep or a send of exactly what an output holds, and
+        // `transfer_selected_rct` sends that zero "to a random address, to
+        // avoid confusing the sender with a 0 amount output". An output of
+        // nothing back to this wallet would be one more thing on chain that
+        // is always the sender's. The address is a throwaway account's, and
+        // the output is derived from this wallet's view key as change is, so
+        // nobody holds the key to it.
         let payee = decoded.keys;
         let change_to = self.keys_file.account.keys.account_address;
         let view_secret_key = self.keys_file.account.keys.view_secret_key;
-        let outputs = |p: &SpendPlan| Outputs {
-            destinations: vec![
-                Destination {
-                    address: payee,
-                    is_subaddress: subaddress,
-                    amount: p.amounts[0],
-                },
-                Destination {
-                    address: change_to,
-                    is_subaddress: false,
-                    amount: p.change,
-                },
-            ],
-            change: Some(change_to),
-        };
+        let dummy = crate::account::AccountBase::from_spend_key(
+            wow_crypto::types::SecretKey(rng.random_scalar()),
+            0,
+        )
+        .ok_or_else(|| SendError::Entropy("cannot make an address for zero change".into()))?
+        .keys
+        .account_address;
+        let outputs = |p: &SpendPlan| outputs_for(p, (payee, subaddress), change_to, dummy);
         let settled = transfer::construct_settled(
             &inputs,
             &plan,
@@ -356,6 +358,38 @@ impl Session {
             result,
             noted_in_pool: Vec::new(),
         })
+    }
+}
+
+/// The outputs of a plan paying one address: the payee, and change to
+/// `change_to`, or, when there is no change, nothing to `dummy`
+/// (`transfer_selected_rct`). Whichever of the two takes the change is named
+/// as change, so its output is derived from the sender's view key.
+fn outputs_for(
+    plan: &SpendPlan,
+    (payee, payee_is_subaddress): (AccountPublicAddress, bool),
+    change_to: AccountPublicAddress,
+    dummy: AccountPublicAddress,
+) -> Outputs {
+    let (change, amount) = if plan.change > 0 {
+        (change_to, plan.change)
+    } else {
+        (dummy, 0)
+    };
+    Outputs {
+        destinations: vec![
+            Destination {
+                address: payee,
+                is_subaddress: payee_is_subaddress,
+                amount: plan.amounts[0],
+            },
+            Destination {
+                address: change,
+                is_subaddress: false,
+                amount,
+            },
+        ],
+        change: Some(change),
     }
 }
 
@@ -448,5 +482,41 @@ mod tests {
             s.prepare_send(&request(&own)),
             Err(SendError::ViewOnly)
         ));
+    }
+
+    /// Change goes back to this wallet, and no change goes, as nothing, to
+    /// the throwaway address, named as change either way.
+    #[test]
+    fn zero_change_goes_to_a_throwaway_address() {
+        let payee = wallet(5).keys_file.account.keys.account_address;
+        let me = wallet(6).keys_file.account.keys.account_address;
+        let dummy = wallet(7).keys_file.account.keys.account_address;
+        let mut plan = SpendPlan {
+            inputs: vec![0],
+            amounts: vec![700],
+            change: 250,
+            fee: 50,
+            estimated_weight: 0,
+            sweep: false,
+            left_behind: 0,
+        };
+
+        let o = outputs_for(&plan, (payee, true), me, dummy);
+        assert_eq!(o.change, Some(me));
+        assert_eq!(o.destinations[0].address, payee);
+        assert!(o.destinations[0].is_subaddress);
+        assert_eq!(
+            (o.destinations[1].address, o.destinations[1].amount),
+            (me, 250)
+        );
+
+        plan.change = 0;
+        let o = outputs_for(&plan, (payee, false), me, dummy);
+        assert_eq!(o.change, Some(dummy));
+        assert_eq!(
+            (o.destinations[1].address, o.destinations[1].amount),
+            (dummy, 0)
+        );
+        assert_eq!(o.destinations.len(), 2, "still two outputs");
     }
 }

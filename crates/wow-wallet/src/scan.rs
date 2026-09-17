@@ -179,6 +179,13 @@ pub fn scan_transaction_with(
 
             // Step 4: it is ours. Now the expensive part, once.
             let (amount, mask) = decode_amount(tx, index, &d, out.amount)?;
+            // An output of nothing is not money received: `scan_output`
+            // skips it, "Invalid output amount". It is what a sender's
+            // zero change looks like, and a wallet that kept one would offer
+            // it as an input, spending a fee to move nothing.
+            if amount == 0 {
+                break;
+            }
             let key_image = keys
                 .spend_secret_key
                 .and_then(|s| output_key_image(&out_key, &d, index, subaddress, keys, s));
@@ -652,6 +659,26 @@ mod tests {
             RctType::BulletproofPlusFullCommit,
         );
         assert!(scan_transaction(&tx, &w.keys()).expect("scan").is_empty());
+    }
+
+    /// An output of nothing to this wallet is not recorded, as `scan_output`
+    /// skips it, so it can never be picked to spend. The paying output beside
+    /// it is found as usual.
+    #[test]
+    fn an_output_of_nothing_is_not_received() {
+        let w = wallet(7);
+        let (r, big_r) = tx_key(3);
+        let tx = transaction(
+            vec![
+                send_to(&r, &w.address, 0, 0, true),
+                send_to(&r, &w.address, 1, 5_000, true),
+            ],
+            vec![TxExtraField::Pubkey(big_r)],
+            RctType::BulletproofPlusFullCommit,
+        );
+        let found = scan_transaction(&tx, &w.keys()).expect("scan");
+        assert_eq!(found.len(), 1, "only the output that pays");
+        assert_eq!((found[0].output_index, found[0].amount), (1, 5_000));
     }
 
     /// An untagged output — a pre-HF-20 transaction — is still found, just
