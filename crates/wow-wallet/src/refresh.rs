@@ -513,7 +513,10 @@ impl WalletState {
     /// scanning, which only ever holds outputs that have one. The message is
     /// the one `wallet2` throws, because `simple_wallet::freeze_thaw` prints
     /// it as it comes.
-    pub fn transfer_details(&self, key_image: &KeyImage) -> Result<usize, &'static str> {
+    pub fn transfer_details(
+        &self,
+        key_image: &KeyImage,
+    ) -> std::result::Result<usize, &'static str> {
         self.by_key_image
             .get(key_image)
             .copied()
@@ -526,21 +529,21 @@ impl WalletState {
     /// The defence against a dust attack: a stranger pays a wallet a tiny
     /// output in the hope of seeing it spent alongside real ones, and so
     /// learning what belongs together.
-    pub fn freeze(&mut self, key_image: &KeyImage) -> Result<(), &'static str> {
+    pub fn freeze(&mut self, key_image: &KeyImage) -> std::result::Result<(), &'static str> {
         let i = self.transfer_details(key_image)?;
         self.transfers[i].frozen = true;
         Ok(())
     }
 
     /// `wallet2::thaw(const key_image&)`: let it be spent again.
-    pub fn thaw(&mut self, key_image: &KeyImage) -> Result<(), &'static str> {
+    pub fn thaw(&mut self, key_image: &KeyImage) -> std::result::Result<(), &'static str> {
         let i = self.transfer_details(key_image)?;
         self.transfers[i].frozen = false;
         Ok(())
     }
 
     /// `wallet2::frozen(const key_image&)`.
-    pub fn frozen(&self, key_image: &KeyImage) -> Result<bool, &'static str> {
+    pub fn frozen(&self, key_image: &KeyImage) -> std::result::Result<bool, &'static str> {
         let i = self.transfer_details(key_image)?;
         Ok(self.transfers[i].frozen)
     }

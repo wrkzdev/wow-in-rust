@@ -80,7 +80,11 @@ fn the_decoy_endpoints_answer() {
     for n in &answer.distribution {
         total = total.checked_add(*n).expect("the counts do not overflow");
     }
-    eprintln!("{} RingCT outputs over {} entries", total, dist.len());
+    eprintln!(
+        "{} RingCT outputs over {} entries",
+        total,
+        answer.distribution.len()
+    );
     assert!(total > 1_000_000, "a chain this old has millions");
 
     // Fetch a handful spread across the pool. These are what a ring is made
