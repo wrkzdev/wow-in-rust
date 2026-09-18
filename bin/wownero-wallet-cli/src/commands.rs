@@ -39,12 +39,6 @@ const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("check_reserve_proof", "reserve proofs are not built yet"),
     ("sign", "message signing is not built yet"),
     ("verify", "message signing is not built yet"),
-    ("export_outputs", "import/export is not built yet"),
-    ("import_outputs", "import/export is not built yet"),
-    ("export_key_images", "import/export is not built yet"),
-    ("import_key_images", "import/export is not built yet"),
-    ("sign_transfer", "cold signing is not built yet"),
-    ("submit_transfer", "cold signing is not built yet"),
     ("start_mining", "this wallet does not drive a miner"),
     ("stop_mining", "this wallet does not drive a miner"),
     (
@@ -146,6 +140,13 @@ pub fn run_one(session: &mut Session, line: &str) -> Result<Outcome, String> {
         "transfer" => transfer_cmd(session, &args),
         "sweep_all" => sweep_all(session, &args),
         "sweep_single" => sweep_single(session, &args),
+        "export_outputs" => export_outputs(session, &args),
+        "import_outputs" => import_outputs(session, &args),
+        "export_key_images" => export_key_images(session, &args),
+        "import_key_images" => import_key_images(session, &args),
+        "sign_transfer" => sign_transfer(session, &args),
+        "submit_transfer" => submit_transfer(session),
+
         "print_ring" => print_ring(session, &args),
         "set_ring" => set_ring(session, &args),
         "unset_ring" => unset_ring(session, &args),
@@ -193,6 +194,23 @@ Sending
   sweep_single <key_image> <address>
                                 send one output, by the key image
                                 unspent_outputs prints
+
+Cold signing (the spend key on a machine with no network)
+  export_outputs [all] <filename>
+                                on the watch-only half: its outputs, for the
+                                half that can compute their key images
+  import_outputs <filename>     on the cold half
+  export_key_images [all] <filename>
+                                on the cold half: the key images, signed
+  import_key_images <filename>  on the watch-only half; needs a trusted daemon
+  sign_transfer [export_raw] [<filename>]
+                                on the cold half: sign an unsigned transfer
+                                set, default `unsigned_wownero_tx`, and write
+                                `signed_wownero_tx`
+  submit_transfer               on the watch-only half: relay
+                                `signed_wownero_tx`
+                                A watch-only wallet's `transfer` writes
+                                `unsigned_wownero_tx` instead of sending
 
 Rings
   print_ring <key_image> | <txid>
@@ -252,6 +270,15 @@ fn integrated_address(session: &mut Session, args: &[&str]) -> Result<(), String
 fn balance(session: &mut Session) -> Result<(), String> {
     let (balance, unlocked) = session.balances();
     println!("{}", balance_line(balance, unlocked));
+    // `simplewallet`'s own note: a wallet that cannot compute key images
+    // cannot tell a spent output from an unspent one, so its balance is
+    // whatever it has ever received until the exchange below has happened.
+    if session.state.transfers.iter().any(|t| t.key_image.is_none()) {
+        println!(
+            " (Some owned outputs have missing key images - export_outputs, import_outputs, \
+             export_key_images, and import_key_images needed)"
+        );
+    }
     println!("{}", session.describe_progress());
     if session.state.scan_height() < session.chain_height() {
         println!("(not fully synced; run `refresh`)");
@@ -268,11 +295,15 @@ fn status(session: &mut Session) -> Result<(), String> {
     println!("{}", session.describe_progress());
     match &session.daemon {
         Some(d) => println!("daemon: {}", d.address()),
+        None if session.offline => println!("daemon: none, and none will be used (--offline)"),
         None => println!("daemon: none set (`set_daemon <host:port>`)"),
     }
     println!("network: {}", session.network.name());
     if session.is_view_only() {
-        println!("this is a view-only wallet: it can watch, not spend");
+        println!(
+            "this is a view-only wallet: it can watch, and it can write an unsigned transfer \
+             for a wallet that holds the spend key (`transfer`, then `sign_transfer` there)"
+        );
     }
     Ok(())
 }
@@ -338,6 +369,13 @@ fn save(session: &mut Session) -> Result<(), String> {
 // -- chain -----------------------------------------------------------------
 
 fn set_daemon(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    if session.offline {
+        // `simplewallet`'s own wording when a connection is asked for and
+        // `--offline` was given.
+        return Err(
+            "wallet failed to connect to daemon, because it is set to offline mode".into(),
+        );
+    }
     let address = args
         .first()
         .ok_or("usage: set_daemon <host:port> [trusted|untrusted] [<user>:<password>]")?;
@@ -419,6 +457,12 @@ fn describe_security(security: Option<wow_daemon_client::Security>) -> &'static 
 }
 
 fn refresh(session: &mut Session) -> Result<(), String> {
+    // `wallet2::refresh` returns straight away when `m_offline` is set, rather
+    // than failing: there is nothing to scan and nothing went wrong.
+    if session.offline {
+        println!("This wallet is offline (--offline); there is nothing to refresh.");
+        return Ok(());
+    }
     let client = session
         .daemon
         .clone()
@@ -928,9 +972,6 @@ fn send(
     sweep: bool,
     sweep_output: Option<wow_crypto::types::KeyImage>,
 ) -> Result<(), String> {
-    if session.is_view_only() {
-        return Err("a view-only wallet cannot spend: it has no spend key".into());
-    }
     if session.daemon.is_none() {
         return Err("no daemon set; use `set_daemon <host:port>`".into());
     }
@@ -960,6 +1001,15 @@ fn send(
         subaddr_indices: Vec::new(),
         below_amount: 0,
     };
+
+    // A watch-only wallet writes the transaction out instead of sending it,
+    // for the half that holds the spend key to sign: `simplewallet::transfer`
+    // does `if (m_wallet->watch_only()) { save_tx(ptx_vector,
+    // "unsigned_wownero_tx"); }` and never calls `commit_tx`.
+    if session.is_view_only() {
+        return write_unsigned(session, &request, address_text, ring_size);
+    }
+
     let prepared = session.prepare_send(&request).map_err(|e| e.to_string())?;
 
     // Spends of this wallet's outputs that preparing found in the pool.
@@ -1121,6 +1171,402 @@ fn explain_double_spend(
             ),
             KeyImageStatus::Unspent => {}
         }
+    }
+}
+
+// -- cold signing ----------------------------------------------------------
+
+/// The file a watch-only `transfer` writes, which the reference hard-codes.
+const UNSIGNED_FILENAME: &str = "unsigned_wownero_tx";
+
+/// The file both halves agree on for the signed set, likewise.
+const SIGNED_FILENAME: &str = "signed_wownero_tx";
+
+/// A watch-only wallet's `transfer`: plan it, show it, and write it out for
+/// the half that can sign.
+///
+/// Nothing is recorded as spent. The reference does not either: the inputs are
+/// marked when the signed set comes back and `submit_transfer` relays it, so a
+/// set that is never signed leaves the wallet as it was.
+fn write_unsigned(
+    session: &mut Session,
+    request: &SendRequest<'_>,
+    address_text: &str,
+    ring_size: usize,
+) -> Result<(), String> {
+    let unsigned = session
+        .prepare_unsigned(request)
+        .map_err(|e| e.to_string())?;
+
+    if let Some(e) = &unsigned.pool_unread {
+        eprintln!("{e}");
+    }
+    report_pool(
+        session,
+        &PoolCheck {
+            noted: unsigned.noted_in_pool.clone(),
+            failed: Vec::new(),
+        },
+    );
+
+    let plan = &unsigned.plan;
+    println!();
+    println!("Sending  {}", fmt::amount(plan.amounts[0]));
+    println!("     to  {address_text}");
+    println!(
+        "    fee  {} ({})",
+        fmt::amount(plan.fee),
+        tier_name(unsigned.priority)
+    );
+    if plan.change > 0 {
+        println!(" change  {}", fmt::amount(plan.change));
+    }
+    println!(
+        " inputs  {}, ring size {ring_size}, {} bytes",
+        plan.inputs.len(),
+        plan.estimated_weight
+    );
+    if let Some(p) = unsigned.payment_id {
+        println!("payment id  {}", wow_crypto::hex::encode(&p));
+    }
+    println!();
+    println!(
+        "This is a watch-only wallet: it cannot sign. The transaction will be written to \
+         {UNSIGNED_FILENAME} for the wallet that holds the spend key."
+    );
+    if !term::confirm("Write it?") {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    write_file(UNSIGNED_FILENAME, &unsigned.blob)?;
+    // The rings chosen while planning are kept, so a second attempt at the
+    // same outputs hides them among the same decoys.
+    save_after(session);
+    println!("Unsigned transaction(s) successfully written to file: {UNSIGNED_FILENAME}");
+    Ok(())
+}
+
+/// `export_outputs [all] <filename>`.
+fn export_outputs(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    const USAGE: &str = "usage: export_outputs [all] <filename>";
+    let (all, rest) = leading_all(args);
+    let filename = one_file(&rest, USAGE)?;
+
+    let blob = session
+        .export_outputs_to_file(all, 0, u32::MAX)
+        .map_err(|e| format!("Error exporting outputs: {e}"))?;
+    write_file(&filename, &blob)?;
+    println!("Outputs exported to {filename}");
+    Ok(())
+}
+
+/// `import_outputs <filename>`.
+fn import_outputs(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    let filename = one_file(args, "usage: import_outputs <filename>")?;
+    let blob = read_file(&filename)?;
+    let n = session
+        .import_outputs_from_file(&blob)
+        .map_err(|e| format!("Failed to import outputs {filename}: {e}"))?;
+    save_after(session);
+    println!("{n} outputs imported");
+    Ok(())
+}
+
+/// `export_key_images [all] <filename>`.
+fn export_key_images(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    const USAGE: &str = "usage: export_key_images [all] <filename>";
+    let (all, rest) = leading_all(args);
+    let filename = one_file(&rest, USAGE)?;
+
+    let blob = session
+        .export_key_images_to_file(all)
+        .map_err(|e| format!("Error exporting key images: {e}"))?;
+    write_file(&filename, &blob)?;
+    println!("Signed key images exported to {filename}");
+    Ok(())
+}
+
+/// `import_key_images <filename>`.
+///
+/// Gated on a trusted daemon, as `simplewallet` gates it: importing asks the
+/// node whether each of this wallet's key images is spent, which hands it the
+/// wallet's whole output set.
+fn import_key_images(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    if !session.state.trusted_daemon {
+        return Err(
+            "this command requires a trusted daemon. Enable with --trusted-daemon".into(),
+        );
+    }
+    let filename = one_file(args, "usage: import_key_images <filename>")?;
+    let blob = read_file(&filename)?;
+    let imported = session
+        .import_key_images_from_file(&blob, true)
+        .map_err(|e| format!("Failed to import key images: {e}"))?;
+    save_after(session);
+    println!(
+        "Signed key images imported to height {}, {} spent, {} unspent",
+        imported.height,
+        fmt::amount(imported.spent),
+        fmt::amount(imported.unspent)
+    );
+    Ok(())
+}
+
+/// `sign_transfer [export_raw] [<filename>]`.
+///
+/// Reads `unsigned_wownero_tx` unless told otherwise and always writes
+/// `signed_wownero_tx`, as `simplewallet` does. `export_raw` also writes the
+/// transaction as hex, for `/sendrawtransaction`.
+fn sign_transfer(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    const USAGE: &str = "usage: sign_transfer [export_raw] [<filename>]";
+    if session.is_view_only() {
+        return Err("This is a watch only wallet".into());
+    }
+
+    let mut export_raw = false;
+    let mut unsigned_filename = UNSIGNED_FILENAME.to_string();
+    match args {
+        [] => {}
+        ["export_raw"] => export_raw = true,
+        [one] => unsigned_filename = (*one).to_string(),
+        ["export_raw", name] => {
+            export_raw = true;
+            unsigned_filename = (*name).to_string();
+        }
+        _ => return Err(USAGE.into()),
+    }
+
+    let blob = read_file(&unsigned_filename)?;
+    let set = session
+        .load_unsigned(&blob)
+        .map_err(|e| format!("Failed to sign transaction: {e}"))?;
+
+    // `accept_loaded_tx`: what is being signed, before the spend key is used.
+    let extra = if set.new_transfers.outputs.is_empty() {
+        String::new()
+    } else {
+        format!("{} outputs to import. ", set.new_transfers.outputs.len())
+    };
+    if !accept_loaded(session, &set.txes, &extra)? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let signed = session
+        .sign_unsigned(&set)
+        .map_err(|e| format!("Failed to sign transaction: {e}"))?;
+    write_file(SIGNED_FILENAME, &signed.blob)?;
+    save_after(session);
+
+    let txids: Vec<String> = signed
+        .txids
+        .iter()
+        .map(|t| wow_crypto::hex::encode(t))
+        .collect();
+    println!(
+        "Transaction successfully signed to file {SIGNED_FILENAME}, txid {}",
+        txids.join(", ")
+    );
+    if export_raw {
+        let mut names = Vec::with_capacity(signed.raw.len());
+        for (i, blob) in signed.raw.iter().enumerate() {
+            let name = if signed.raw.len() == 1 {
+                format!("{SIGNED_FILENAME}_raw")
+            } else {
+                format!("{SIGNED_FILENAME}_raw_{i}")
+            };
+            write_file(&name, wow_crypto::hex::encode(blob).as_bytes())?;
+            names.push(name);
+        }
+        println!("Transaction raw hex data exported to {}", names.join(", "));
+    }
+    Ok(())
+}
+
+/// `submit_transfer`.
+///
+/// Takes no arguments and always reads `signed_wownero_tx`, as
+/// `simplewallet::submit_transfer` does — it ignores its arguments entirely.
+fn submit_transfer(session: &mut Session) -> Result<(), String> {
+    if session.daemon.is_none() {
+        return Err("no daemon set; use `set_daemon <host:port>`".into());
+    }
+    let blob = read_file(SIGNED_FILENAME)?;
+    let set = session
+        .load_signed(&blob)
+        .map_err(|e| format!("Failed to load transaction from file: {e}"))?;
+
+    let txes: Vec<wow_wallet::cold::TxConstructionData> = set
+        .ptx
+        .iter()
+        .map(|p| p.construction_data.clone())
+        .collect();
+    let extra = if set.key_images.is_empty() {
+        String::new()
+    } else {
+        format!("{} key images to import. ", set.key_images.len())
+    };
+    if !accept_loaded(session, &txes, &extra)? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let submitted = session
+        .submit_signed(&set)
+        .map_err(|e| format!("Failed to submit signed tx: {e}"))?;
+    save_after(session);
+
+    for (txid, result) in submitted.txids.iter().zip(&submitted.results) {
+        let txid = wow_crypto::hex::encode(txid);
+        if result.accepted() {
+            println!("Transaction successfully submitted, transaction {txid}");
+            println!("You can check its status by using the `show_transfers` command.");
+        } else {
+            println!("The daemon rejected transaction {txid}.");
+            if !result.reason.is_empty() {
+                println!("  reason: {}", result.reason);
+            }
+            println!("  status: {}", result.status);
+        }
+    }
+    Ok(())
+}
+
+/// `simple_wallet::accept_loaded_tx`: describe the set and ask.
+///
+/// The prompt is the reference's, field for field, because it is the one thing
+/// standing between a user and signing something they did not mean to:
+/// "Loaded N transactions, for <in>, fee <fee>, <destinations>, <change>, with
+/// min ring size N, <payment id>. <extra>Is this okay?". Note that "for" is
+/// what the *inputs* hold, not what is being sent — `print_money(amount)`
+/// where `amount` is the sum of `cd.sources[s].amount`.
+fn accept_loaded(
+    session: &Session,
+    txes: &[wow_wallet::cold::TxConstructionData],
+    extra_message: &str,
+) -> Result<bool, String> {
+    let described = session.describe(txes).map_err(|e| e.to_string())?;
+    let summary = &described.summary;
+
+    // The destinations and then the outputs of nothing, both, as the reference
+    // appends them; "with no destinations" only when there is neither.
+    let mut parts: Vec<String> = summary
+        .recipients
+        .iter()
+        .map(|r| format!("sending {} to {}", fmt::amount(r.amount), r.address))
+        .collect();
+    let dummies: u32 = described.txs.iter().map(|t| t.dummy_outputs).sum();
+    if dummies > 0 {
+        parts.push(format!("{dummies} dummy output(s)"));
+    }
+    let dest_string = if parts.is_empty() {
+        "with no destinations".to_string()
+    } else {
+        parts.join(", ")
+    };
+
+    let change_string = if summary.change_amount > 0 {
+        format!(
+            "{} change to {}",
+            fmt::amount(summary.change_amount),
+            summary.change_address
+        )
+    } else {
+        "no change".to_string()
+    };
+
+    // A payment id with no integrated destination to have come from is the
+    // dummy every transaction carries, and is named as one rather than shown.
+    let mut ids: Vec<String> = Vec::new();
+    for cd in txes {
+        if let Some(id) = wow_wallet::offline::payment_id_from_extra(&cd.extra) {
+            if cd.dests.iter().any(|d| d.is_integrated) {
+                ids.push(format!(
+                    "encrypted payment ID {}",
+                    wow_crypto::hex::encode(&id)
+                ));
+            } else {
+                ids.push("dummy encrypted payment ID".to_string());
+            }
+        }
+    }
+    let payment_id_string = if ids.is_empty() {
+        "no payment ID".to_string()
+    } else {
+        ids.join(", ")
+    };
+
+    let min_ring_size = described
+        .txs
+        .iter()
+        .map(|t| t.ring_size)
+        .min()
+        .unwrap_or(u32::MAX);
+
+    let prompt = format!(
+        "Loaded {} transactions, for {}, fee {}, {dest_string}, {change_string}, with min ring \
+         size {min_ring_size}, {payment_id_string}. {extra_message}Is this okay?",
+        described.txs.len(),
+        fmt::amount(summary.amount_in),
+        fmt::amount(summary.fee),
+    );
+    Ok(term::confirm(&prompt))
+}
+
+/// A leading `all`, as `export_outputs` and `export_key_images` take it.
+///
+/// It counts only when something follows it: `if (args.size() >= 2 && args[0]
+/// == "all")`. So `export_outputs all` on its own exports incrementally to a
+/// file called "all", which is the reference's behaviour and not worth
+/// departing from.
+fn leading_all<'a>(args: &[&'a str]) -> (bool, Vec<&'a str>) {
+    if args.len() >= 2 && args[0] == "all" {
+        (true, args[1..].to_vec())
+    } else {
+        (false, args.to_vec())
+    }
+}
+
+fn one_file(args: &[&str], usage: &str) -> Result<String, String> {
+    match args {
+        [name] => Ok((*name).to_string()),
+        _ => Err(usage.to_string()),
+    }
+}
+
+fn read_file(path: &str) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("failed to read file {path}: {e}"))
+}
+
+/// Write a file, refusing to overwrite one: `check_file_overwrite` asks, and a
+/// wallet driven by `--command` has nobody to ask.
+fn write_file(path: &str, data: &[u8]) -> Result<(), String> {
+    if std::path::Path::new(path).exists() {
+        if !term::interactive() {
+            return Err(format!("File {path} already exists."));
+        }
+        if path.ends_with(".keys") {
+            return Err(format!(
+                "File {path} likely stores wallet private keys! Use a different file name."
+            ));
+        }
+        if !term::confirm(&format!(
+            "File {path} already exists. Are you sure to overwrite it?"
+        )) {
+            return Err("Cancelled.".into());
+        }
+    }
+    std::fs::write(path, data).map_err(|e| format!("failed to save file {path}: {e}"))
+}
+
+/// Save at once after anything that changed what the wallet knows about its
+/// own outputs: a wallet that forgot an import would ask for the same key
+/// images again.
+fn save_after(session: &mut Session) {
+    match session.save() {
+        Ok(()) => session.dirty = false,
+        Err(e) => eprintln!("The wallet could not be saved: {e}"),
     }
 }
 
@@ -1487,5 +1933,33 @@ mod tests {
         for (_, why) in NOT_IMPLEMENTED {
             assert!(!why.is_empty(), "every refusal gives a reason");
         }
+        // The cold-signing commands are built now, so none of them is here.
+        for name in [
+            "export_outputs",
+            "import_outputs",
+            "export_key_images",
+            "import_key_images",
+            "sign_transfer",
+            "submit_transfer",
+        ] {
+            assert!(
+                !NOT_IMPLEMENTED.iter().any(|(n, _)| *n == name),
+                "{name} is built"
+            );
+        }
+    }
+
+    /// `export_outputs [all] <filename>`: `all` counts only when something
+    /// follows it, as `args.size() >= 2 && args[0] == "all"` says, so
+    /// `export_outputs all` names a file called "all".
+    #[test]
+    fn a_leading_all_needs_something_after_it() {
+        assert_eq!(leading_all(&["all", "outs"]), (true, vec!["outs"]));
+        assert_eq!(leading_all(&["outs"]), (false, vec!["outs"]));
+        assert_eq!(leading_all(&["all"]), (false, vec!["all"]));
+
+        assert_eq!(one_file(&["outs"], "usage"), Ok("outs".to_string()));
+        assert!(one_file(&["a", "b"], "usage").is_err());
+        assert!(one_file(&[], "usage").is_err());
     }
 }

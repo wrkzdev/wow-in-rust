@@ -72,6 +72,9 @@ struct Options {
     /// `--trusted-daemon` and `--untrusted-daemon`: `None` when neither was
     /// given, and a daemon on this machine is trusted.
     trusted_daemon: Option<bool>,
+    /// `--offline`: talk to no node at all. What the cold half of a
+    /// cold-signing pair is run with.
+    offline: bool,
     /// `None` when not given, so a restore knows to ask.
     restore_height: Option<u64>,
     kdf_rounds: u64,
@@ -105,6 +108,7 @@ impl std::fmt::Debug for Options {
             .field("ssl", &self.ssl)
             .field("proxy", &redacted(&self.proxy))
             .field("trusted_daemon", &self.trusted_daemon)
+            .field("offline", &self.offline)
             .field("restore_height", &self.restore_height)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("language", &self.language)
@@ -134,6 +138,7 @@ impl Default for Options {
             ssl: Default::default(),
             proxy: None,
             trusted_daemon: None,
+            offline: false,
             restore_height: None,
             kdf_rounds: 1,
             language: None,
@@ -191,6 +196,9 @@ Whatever the options below leave out is asked for.
                                     whether the daemon may see what reveals
                                     this wallet; default: trusted only on
                                     this machine
+  --offline                         do not connect to a daemon, nor use DNS.
+                                    How the half of a cold-signing pair that
+                                    holds the spend key is run
   --testnet / --stagenet
   --restore-height <n>
   --mnemonic-language <lang>
@@ -314,6 +322,7 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
                     _ => return Err(format!("`{name}` is not a seed language")),
                 }
             }
+            "--offline" => o.offline = true,
             "--no-initial-sync" => o.no_initial_sync = true,
             "--log-level" => o.log_level = Some(next("--log-level")?),
             "--log-file" => o.log_file = Some(PathBuf::from(next("--log-file")?)),
@@ -495,6 +504,16 @@ fn run(mut options: Options) -> Result<(), String> {
         }
     }
 
+    // `--offline`, `wallet2::set_offline`: no node is contacted, so none is
+    // named. The reference makes every HTTP call fail without trying; here
+    // there is simply nothing to fail. This is how the cold half of a
+    // cold-signing pair is run, and it is the whole point of the flag.
+    if options.offline {
+        session.offline = true;
+        eprintln!("Offline: this wallet will not contact a daemon.");
+        return interactive_or_commands(session, &options);
+    }
+
     // Connect, and sync unless told not to. `set_daemon` trusts a daemon on
     // this machine unless told otherwise, as `make_basic` does.
     let trust = match options.trusted_daemon {
@@ -543,6 +562,17 @@ fn run(mut options: Options) -> Result<(), String> {
         }
     }
 
+    interactive_or_commands(session, &options)
+}
+
+/// Run the `--command` lines and exit, or prompt.
+///
+/// Split out so that `--offline` can reach it without a daemon: there is no
+/// node to name, nothing to connect to, and nothing to sync.
+fn interactive_or_commands(
+    mut session: crate::session::Session,
+    options: &Options,
+) -> Result<(), String> {
     // `--command` runs and exits.
     if !options.commands.is_empty() {
         let mut failed = false;
