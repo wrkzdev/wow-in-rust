@@ -464,6 +464,34 @@ pub fn get_transaction_pool_hashes(server: &Server, restricted: bool) -> RpcResu
     Ok(Value::Object(m))
 }
 
+/// The one `.bin` path the reference does **not** serve as epee.
+pub const POOL_HASHES_BIN_PATH: &str = "/get_transaction_pool_hashes.bin";
+
+/// `/get_transaction_pool_hashes.bin` — JSON, despite the suffix.
+///
+/// Of every path ending in `.bin`, this is the only one `core_rpc_server.h`
+/// maps with `MAP_URI_AUTO_JON2` instead of `MAP_URI_AUTO_BIN2`, and `wallet2`
+/// matches it with `invoke_http_json` rather than `invoke_http_bin`
+/// (`update_pool_state_by_pool_query`). A wallet reaches this on every refresh
+/// whose `/getblocks.bin` answer carried no pool info.
+///
+/// The difference from [`get_transaction_pool_hashes`] above is the encoding,
+/// not the content: `tx_hashes` here is a
+/// `KV_SERIALIZE_CONTAINER_POD_AS_BLOB`, so it is one JSON string holding the
+/// packed 32-byte hashes as raw bytes rather than an array of hex
+/// ([`super::methods::object_with_blob`]).
+///
+/// Restricted listeners see the public transactions only, as everywhere else:
+/// a wallet polls this, and naming a stem transaction to whoever asks is the
+/// one thing a stem must not do.
+pub fn pool_hashes_as_json(server: &Server, restricted: bool) -> Vec<u8> {
+    let mut packed = Vec::new();
+    for id in server.pool().ids(!restricted) {
+        packed.extend_from_slice(&id);
+    }
+    super::methods::object_with_blob(&base("OK", untrusted()), "tx_hashes", &packed)
+}
+
 /// `/get_transaction_pool_stats`: over the public transactions only, on a
 /// restricted listener.
 pub fn get_transaction_pool_stats(server: &Server, restricted: bool) -> RpcResult {

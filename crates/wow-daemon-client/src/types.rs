@@ -455,18 +455,37 @@ impl DaemonClient {
         parse_output_distributions(&res)
     }
 
-    /// `/get_transaction_pool_hashes.bin`.
+    /// `/get_transaction_pool_hashes`: the pool's transaction ids, as hex.
+    ///
+    /// **Not `/get_transaction_pool_hashes.bin`**, which this asked for until
+    /// it was pointed at a C++ node. That path looks like the other binary
+    /// endpoints and is not one: `core_rpc_server.h` maps it with
+    /// `MAP_URI_AUTO_JON2` where every other `.bin` path gets
+    /// `MAP_URI_AUTO_BIN2`, so a C++ node answers it in JSON and fails to parse
+    /// an epee request at all. `wallet2` sends JSON to it for that reason
+    /// (`invoke_http_json`, in `update_pool_state_by_pool_query`).
+    ///
+    /// This endpoint is the plainer way to the same list: both are served by
+    /// every node, and this one sends hex strings in ordinary JSON where the
+    /// `.bin` path packs the hashes into a JSON string as raw bytes, which no
+    /// general JSON parser can read back.
     pub fn get_pool_hashes(&self) -> Result<Vec<Hash256>> {
-        let res = self.binary("/get_transaction_pool_hashes.bin", &Section::new())?;
-        // CONTAINER_POD_AS_BLOB: packed 32-byte hashes.
-        let blob = res
-            .get("tx_hashes")
-            .and_then(Value::as_bytes)
-            .unwrap_or(&[]);
-        if !blob.len().is_multiple_of(32) {
-            return Err(DaemonError::BadField("tx_hashes"));
-        }
-        Ok(blob.as_chunks::<32>().0.to_vec())
+        let v = self.direct("/get_transaction_pool_hashes", json!({}))?;
+        // Left out entirely when the pool is empty, as epee leaves out an
+        // empty container.
+        let Some(hashes) = v.get("tx_hashes") else {
+            return Ok(Vec::new());
+        };
+        hashes
+            .as_array()
+            .ok_or(DaemonError::BadField("tx_hashes"))?
+            .iter()
+            .map(|h| {
+                h.as_str()
+                    .and_then(wow_crypto::hex::decode_array::<32>)
+                    .ok_or(DaemonError::BadField("tx_hashes"))
+            })
+            .collect()
     }
 
     /// `/get_transaction_pool`: every transaction in the pool, with its blob.

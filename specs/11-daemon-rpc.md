@@ -354,7 +354,12 @@ These are the wallet sync path and the performance-critical ones.
 | `/get_o_indexes.bin` | global output indices for a tx |
 | `/get_outs.bin` | output keys by `(amount, index)` |
 | `/get_output_distribution.bin` | output distribution, compressed form |
-| `/get_transaction_pool_hashes.bin` | pool hashes |
+
+`/get_transaction_pool_hashes.bin` is **not** in that list, despite the suffix:
+the reference maps it with `MAP_URI_AUTO_JON2`, so it is served as JSON and an
+epee request to it is refused. Its `tx_hashes` field is still a
+`CONTAINER_POD_AS_BLOB`, which in JSON means a string of raw bytes. See
+[spec-deltas §28](../docs/spec-deltas.md).
 
 ### 5.1 `get_blocks.bin`
 

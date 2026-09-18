@@ -114,8 +114,11 @@ fn wait_listening(d: &mut Daemon, addr: SocketAddr) {
 fn get_height(addr: SocketAddr) -> String {
     let mut s = TcpStream::connect(addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-    s.write_all(b"POST /get_height HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
-        .unwrap();
+    s.write_all(
+        b"POST /get_height HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\
+          Connection: close\r\n\r\n{}",
+    )
+    .unwrap();
     let mut raw = String::new();
     s.read_to_string(&mut raw).unwrap();
     raw.split_once("\r\n\r\n")

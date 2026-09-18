@@ -36,12 +36,10 @@ pub mod error {
     pub const UNSUPPORTED_RPC: i32 = -11;
     pub const MINING_TO_SUBADDRESS: i32 = -12;
     pub const REGTEST_REQUIRED: i32 = -13;
-    /// Restricted endpoints are not routed at all (`specs/11` §1.3), so they
-    /// answer as unsupported; the code is kept for the table's sake.
-    #[allow(
-        dead_code,
-        reason = "specs/11 §6 lists it; restricted routes answer UNSUPPORTED_RPC"
-    )]
+    /// Most restricted endpoints are not routed at all (`specs/11` §1.3) and so
+    /// answer as unsupported. This code is for the ones that *are* routed and
+    /// refuse only some arguments, such as `get_output_distribution` for an
+    /// amount other than 0.
     pub const RESTRICTED: i32 = -19;
 }
 
@@ -423,6 +421,270 @@ pub fn get_fee_estimate(server: &super::Server, params: &Value) -> RpcResult {
         json!(fee::FEE_QUANTIZATION_MASK),
     );
     Ok(Value::Object(m))
+}
+
+/// `rpc_access_info` (`specs/11` §4).
+///
+/// RPC payment is not built here, and the reference answers this method
+/// whether or not it has one: with `m_rpc_payment == NULL` it returns `OK` and
+/// zeroes (`core_rpc_server.cpp`, `on_rpc_access_info`). Answering "no such
+/// method" was not a missing feature but a broken connection -- **any**
+/// `error.code` makes epee's `invoke_http_json_rpc` return false, and
+/// `wallet2` reports that as "Failed to connect to daemon".
+///
+/// The wallet reads `diff == 0` as "no payment required" and then leaves the
+/// hashing blob and both seed hashes alone, so the empty strings here are what
+/// it expects (`node_rpc_proxy.cpp`, `get_rpc_payment_info`).
+pub fn rpc_access_info() -> RpcResult {
+    let mut m = base("OK", untrusted());
+    m.insert("hashing_blob".into(), json!(""));
+    m.insert("seed_height".into(), json!(0));
+    m.insert("seed_hash".into(), json!(""));
+    m.insert("next_seed_hash".into(), json!(""));
+    m.insert("cookie".into(), json!(0));
+    m.insert("diff".into(), json!(0));
+    m.insert("credits_per_hash_found".into(), json!(0));
+    m.insert("height".into(), json!(0));
+    Ok(Value::Object(m))
+}
+
+/// `OUTPUT_HISTOGRAM_RECENT_CUTOFF_RESTRICTION`: three days.
+const HISTOGRAM_RECENT_CUTOFF_RESTRICTION: u64 = 3 * 86_400;
+
+/// `get_output_histogram` (`specs/11` §4).
+///
+/// A wallet asks for this only when a ring it is building has pre-RingCT
+/// amounts in it; for a wallet whose outputs are all RingCT the amount list
+/// comes out empty and the method is never called. The restricted limits are
+/// `on_get_output_histogram`'s own.
+pub fn get_output_histogram(db: &LmdbDb, params: &Value, restricted: bool) -> RpcResult {
+    let amounts: Vec<u64> = params
+        .get("amounts")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default();
+    if restricted && amounts.is_empty() {
+        return Err(RpcError::new(
+            error::WRONG_PARAM,
+            "Restricted RPC will not serve histograms on the whole blockchain. Use your own node.",
+        ));
+    }
+
+    let number = |name: &str| params.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
+    let unlocked = params
+        .get("unlocked")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let recent_cutoff = number("recent_cutoff");
+    if restricted
+        && recent_cutoff > 0
+        && recent_cutoff < now().saturating_sub(HISTOGRAM_RECENT_CUTOFF_RESTRICTION)
+    {
+        return Err(RpcError::new(
+            error::WRONG_PARAM,
+            "Recent cutoff is too old",
+        ));
+    }
+    let min_count = number("min_count");
+    let max_count = number("max_count");
+
+    let rows = db
+        .get_output_histogram(&amounts, unlocked, recent_cutoff, min_count)
+        .map_err(internal)?;
+
+    // The reference filters again after the lookup, on both bounds, with
+    // `max_count == 0` meaning no upper bound at all.
+    let histogram: Vec<Value> = rows
+        .into_iter()
+        .filter(|(_, (total, _, _))| *total >= min_count && (max_count == 0 || *total <= max_count))
+        .map(|(amount, (total, unlocked, recent))| {
+            json!({
+                "amount": amount,
+                "total_instances": total,
+                "unlocked_instances": unlocked,
+                "recent_instances": recent,
+            })
+        })
+        .collect();
+
+    let mut m = base("OK", untrusted());
+    m.insert("histogram".into(), json!(histogram));
+    Ok(Value::Object(m))
+}
+
+/// `get_txpool_backlog` (`specs/11` §4), as rendered JSON.
+///
+/// `backlog` is a `KV_SERIALIZE_CONTAINER_POD_AS_BLOB` of
+/// `{ uint64 weight; uint64 fee; uint64 time_in_pool; }`, so the answer puts
+/// raw bytes inside a JSON string and no `serde_json::Value` can hold it. The
+/// result object is therefore rendered here and the router wraps it
+/// ([`object_with_blob`]).
+///
+/// `time_in_pool` is `now - receive_time`, as `get_transaction_backlog`
+/// computes it.
+pub fn txpool_backlog(server: &super::Server, restricted: bool) -> Vec<u8> {
+    let now = now();
+    let pool = server.pool();
+    let mut packed = Vec::new();
+    for (_, e) in pool.entries() {
+        if restricted && !e.is_public() {
+            continue;
+        }
+        packed.extend_from_slice(&e.weight.to_le_bytes());
+        packed.extend_from_slice(&e.fee.to_le_bytes());
+        packed.extend_from_slice(&now.saturating_sub(e.receive_time).to_le_bytes());
+    }
+    object_with_blob(&base("OK", untrusted()), "backlog", &packed)
+}
+
+/// `get_output_distribution` over JSON-RPC (`specs/11` §4), as rendered JSON.
+///
+/// The same answer as `/get_output_distribution.bin`, which is where a wallet
+/// usually asks for it; the counts come from one shared computation
+/// ([`super::binary::distribution_for`]) so the two forms cannot drift. Only
+/// the packing differs: `binary` -- the default, as `KV_SERIALIZE_OPT(binary,
+/// true)` makes it -- puts the counts in a string of little-endian `u64`s, and
+/// `binary: false` sends a plain JSON array. The binary form is why this is
+/// rendered rather than built: the raw bytes sit inside the array, nested one
+/// deeper than [`object_with_blob`] alone can reach.
+pub fn output_distribution_json(
+    db: &LmdbDb,
+    cfg: &Config,
+    params: &Value,
+    restricted: bool,
+) -> Result<Vec<u8>, RpcError> {
+    let amounts: Vec<u64> = params
+        .get("amounts")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default();
+    // "Restricted RPC can only get output distribution for rct outputs."
+    if restricted && amounts != [0u64] {
+        return Err(RpcError::new(
+            error::RESTRICTED,
+            "Restricted RPC can only get output distribution for rct outputs. Use your own node.",
+        ));
+    }
+
+    let flag = |name: &str, default: bool| {
+        params
+            .get(name)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default)
+    };
+    let binary = flag("binary", true);
+    let compress = flag("compress", false);
+    let cumulative = flag("cumulative", false);
+    let number = |name: &str| params.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
+    let from = number("from_height");
+    let height = db.height();
+    // "0 is placeholder for the whole chain".
+    let to = match number("to_height") {
+        0 => height.saturating_sub(1),
+        t => t,
+    };
+
+    // Each entry is its ordinary fields and, for a binary answer, the one
+    // field that is a string of bytes.
+    let mut entries: Vec<(
+        serde_json::Map<String, Value>,
+        &'static str,
+        Option<Vec<u8>>,
+    )> = Vec::with_capacity(amounts.len());
+    for amount in amounts {
+        let d = super::binary::distribution_for(db, cfg.network, amount, from, to, cumulative)?;
+        let mut fields = serde_json::Map::new();
+        fields.insert("amount".into(), json!(amount));
+        fields.insert("start_height".into(), json!(d.start_height));
+        fields.insert("binary".into(), json!(binary));
+        fields.insert("compress".into(), json!(compress));
+        fields.insert("base".into(), json!(d.base));
+        if !binary {
+            fields.insert("distribution".into(), json!(d.data));
+            entries.push((fields, "", None));
+            continue;
+        }
+        let packed: Vec<u8> = if compress {
+            // `compress_integer_array`: base-128 varints back to back.
+            let mut p = Vec::with_capacity(d.data.len());
+            for v in &d.data {
+                wow_serialize::varint::write_varint(&mut p, *v);
+            }
+            p
+        } else {
+            d.data.iter().flat_map(|v| v.to_le_bytes()).collect()
+        };
+        let name = if compress {
+            "compressed_data"
+        } else {
+            "distribution"
+        };
+        entries.push((fields, name, Some(packed)));
+    }
+
+    let mut out = Vec::new();
+    out.push(b'{');
+    for (key, value) in base("OK", untrusted()) {
+        out.extend_from_slice(Value::String(key).to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(value.to_string().as_bytes());
+        out.push(b',');
+    }
+    out.extend_from_slice(b"\"distributions\":[");
+    for (n, (fields, name, blob)) in entries.iter().enumerate() {
+        if n > 0 {
+            out.push(b',');
+        }
+        match blob {
+            Some(bytes) => out.extend_from_slice(&object_with_blob(fields, name, &bytes[..])),
+            None => out.extend_from_slice(Value::Object(fields.clone()).to_string().as_bytes()),
+        }
+    }
+    out.extend_from_slice(b"]}");
+    Ok(out)
+}
+
+/// A JSON object: `fields` as `serde_json` renders them, plus one more whose
+/// value is a string of **raw bytes**.
+///
+/// This is what a `KV_SERIALIZE_CONTAINER_POD_AS_BLOB` looks like once epee
+/// writes it as JSON. epee escapes only `\b \f \n \r \t \v " \ /` and puts
+/// every other byte in as it stands
+/// (`contrib/epee/src/parserse_base_utils.cpp`, `transform_to_escape_sequence`),
+/// and its reader is the mirror of that. A `\u00XX` escape would not do:
+/// epee's `match_string2` decodes one into **UTF-8**, so any byte above `0x7f`
+/// would come back as two.
+pub(crate) fn object_with_blob(
+    fields: &serde_json::Map<String, Value>,
+    name: &str,
+    blob: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(blob.len() * 2 + 128);
+    out.push(b'{');
+    for (key, value) in fields {
+        out.extend_from_slice(Value::String(key.clone()).to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(value.to_string().as_bytes());
+        out.push(b',');
+    }
+    out.extend_from_slice(Value::String(name.to_string()).to_string().as_bytes());
+    out.extend_from_slice(b":\"");
+    for &b in blob {
+        match b {
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x0b => out.extend_from_slice(b"\\v"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'/' => out.extend_from_slice(b"\\/"),
+            other => out.push(other),
+        }
+    }
+    out.extend_from_slice(b"\"}");
+    out
 }
 
 /// `get_block_hash` (`specs/11` §4).
@@ -875,6 +1137,62 @@ pub fn get_transactions(server: &super::Server, body: &[u8], restricted: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blob field is a JSON string of **raw bytes**, escaped exactly as
+    /// epee's writer escapes one, because epee's reader is the only thing that
+    /// reads it back. Anything else here is a wallet that cannot parse the
+    /// answer, which `wallet2` reports as no connection at all.
+    #[test]
+    fn a_blob_field_is_escaped_the_way_epee_escapes_one() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("status".into(), json!("OK"));
+
+        // One of every byte epee escapes, and two it leaves alone: `0x80` is
+        // above ASCII, and `0x01` is a control byte epee still passes through.
+        let blob = [0x08, 0x0c, b'\n', b'\r', b'\t', 0x0b, b'"', b'\\', b'/'];
+        let out = object_with_blob(&fields, "tx_hashes", &blob);
+        assert_eq!(
+            String::from_utf8(out).expect("ASCII here"),
+            r#"{"status":"OK","tx_hashes":"\b\f\n\r\t\v\"\\\/"}"#
+        );
+
+        let out = object_with_blob(&fields, "tx_hashes", &[0x80, 0xff, 0x01]);
+        assert!(
+            out.ends_with(&[b'"', 0x80, 0xff, 0x01, b'"', b'}']),
+            "bytes above ASCII go in as they stand: {out:?}"
+        );
+        assert!(
+            std::str::from_utf8(&out).is_err(),
+            "which is why this cannot be a String"
+        );
+    }
+
+    /// An empty pool still gives a whole object, not a truncated one.
+    #[test]
+    fn a_blob_field_with_nothing_in_it_is_an_empty_string() {
+        let out = object_with_blob(&base("OK", false), "tx_hashes", &[]);
+        let text = String::from_utf8(out).expect("ASCII here");
+        assert!(text.ends_with(r#""tx_hashes":""}"#), "{text}");
+        assert!(text.starts_with('{'), "{text}");
+        // And it is ordinary JSON as long as the blob is empty, so a general
+        // parser agrees with epee about this case at least.
+        let back: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(back["status"], json!("OK"));
+        assert_eq!(back["tx_hashes"], json!(""));
+    }
+
+    /// `rpc_access_info` has to answer `OK` rather than an error: `wallet2`
+    /// turns any `error.code` into "Failed to connect to daemon".
+    #[test]
+    fn rpc_access_info_answers_ok_with_no_payment_required() {
+        let v = rpc_access_info().expect("answers");
+        assert_eq!(v["status"], json!("OK"));
+        assert_eq!(v["diff"], json!(0), "zero means no payment required");
+        assert_eq!(v["credits_per_hash_found"], json!(0));
+        assert_eq!(v["hashing_blob"], json!(""));
+        assert_eq!(v["seed_hash"], json!(""));
+        assert_eq!(v["next_seed_hash"], json!(""));
+    }
 
     /// `specs/11` §2.1: three fields per difficulty, and the wide one is the
     /// full 128-bit value as hex.

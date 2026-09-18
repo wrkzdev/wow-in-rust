@@ -2,8 +2,23 @@
 //!
 //! `specs/11-daemon-rpc.md` §1. Only what the RPC surface needs: `POST` with a
 //! `Content-Length` body, and a JSON response. No chunked encoding and no
-//! keep-alive pipelining. TLS is below this layer: it reads and writes
-//! whatever stream it is handed, plain or `super::tls`'s.
+//! pipelining. TLS is below this layer: it reads and writes whatever stream it
+//! is handed, plain or `super::tls`'s.
+//!
+//! # Keep-alive
+//!
+//! A connection serves request after request until one side ends it, which is
+//! what the reference daemon does and what `wallet2` needs. epee's client
+//! retries a `401` **on the same socket** without reconnecting
+//! (`contrib/epee/include/net/http_client.h`, the `for (sends = 0; sends < 2;)`
+//! loop in `invoke`), so a `Connection: close` on the Digest challenge leaves
+//! the retry writing to a closed socket and makes HTTP Digest impossible. It
+//! also spares a TCP -- and, under `--rpc-ssl autodetect`, a TLS -- handshake
+//! per call, and a wallet's refresh makes thousands of calls.
+//!
+//! The rules are RFC 7230 §6.3: HTTP/1.1 keeps the connection unless
+//! `Connection: close` says otherwise, HTTP/1.0 closes it unless
+//! `Connection: keep-alive` says otherwise.
 //!
 //! # This faces the network
 //!
@@ -28,6 +43,9 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 /// How long a single request may take to arrive, and its answer to leave. Set
 /// on the socket by the caller, since a TLS stream has no socket of its own.
+///
+/// On a kept-alive connection this is also how long an idle client holds its
+/// thread and its slot under the connection caps.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -36,6 +54,10 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Request {
     pub method: String,
     pub path: String,
+    /// The minor version of `HTTP/1.<n>`, which decides what happens to the
+    /// connection when no `Connection` header says. Anything that is not
+    /// `HTTP/1.<n>` counts as 0, the version that closes.
+    pub http_minor: u8,
     /// Names as sent; look them up with [`Request::header`].
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -48,6 +70,32 @@ impl Request {
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// Whether the connection stays open once this request is answered
+    /// (RFC 7230 §6.3).
+    ///
+    /// `Connection` is a comma-separated list of tokens, and `close` anywhere
+    /// in it wins over anything else there.
+    pub fn keep_alive(&self) -> bool {
+        let by_version = self.http_minor >= 1;
+        match self.header("connection") {
+            None => by_version,
+            Some(value) => {
+                let has = |want: &str| {
+                    value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case(want))
+                };
+                if has("close") {
+                    false
+                } else if has("keep-alive") {
+                    true
+                } else {
+                    by_version
+                }
+            }
+        }
     }
 }
 
@@ -87,17 +135,48 @@ impl From<std::io::Error> for HttpError {
     }
 }
 
+/// Whether a read that had nothing to read failed because the client simply
+/// stopped talking.
+///
+/// A read timeout arrives as `WouldBlock` where `SO_RCVTIMEO` is what expired
+/// and as `TimedOut` on Windows, and a client that went away without a clean
+/// close gives one of the reset kinds.
+fn went_quiet(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionReset, TimedOut, UnexpectedEof, WouldBlock,
+    };
+    matches!(
+        e.kind(),
+        WouldBlock | TimedOut | ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof
+    )
+}
+
 /// Read one request from a connection whose timeouts are already set.
-pub fn read_request<S: Read>(stream: &mut S) -> Result<Request, HttpError> {
-    let mut reader = BufReader::new(stream);
+///
+/// The reader is the caller's and outlives the request, because on a
+/// kept-alive connection it may already hold the first bytes of the next one.
+pub fn read_request<S: Read>(reader: &mut BufReader<S>) -> Result<Request, HttpError> {
     let mut header_bytes = 0usize;
 
     // Request line.
+    //
+    // Nothing has been read yet, so anything other than a request here is the
+    // client having finished rather than a client getting it wrong. A kept-alive
+    // connection that goes quiet times out on this very read, and answering
+    // that with `400` would leave a reply sitting in the stream for whatever
+    // the client sends next -- which it would then read as the answer to *that*
+    // request, one call out of step for the rest of the connection.
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Err(HttpError::Closed);
+    match reader.read_line(&mut line) {
+        Ok(0) => return Err(HttpError::Closed),
+        Ok(_) => {}
+        Err(e) if went_quiet(&e) => return Err(HttpError::Closed),
+        Err(e) => return Err(e.into()),
     }
     header_bytes += line.len();
+    if header_bytes > MAX_HEADER_BYTES {
+        return Err(HttpError::HeadersTooLarge);
+    }
 
     let mut parts = line.split_whitespace();
     let method = parts
@@ -108,6 +187,13 @@ pub fn read_request<S: Read>(stream: &mut S) -> Result<Request, HttpError> {
         .next()
         .ok_or(HttpError::Malformed("no path"))?
         .to_string();
+    // A version this server does not know is read as the one that closes the
+    // connection afterwards, which is the safe end of the guess.
+    let http_minor = parts
+        .next()
+        .and_then(|v| v.strip_prefix("HTTP/1."))
+        .and_then(|minor| minor.trim().parse::<u8>().ok())
+        .unwrap_or(0);
 
     // Headers. `Content-Length` is acted on here; the rest are kept for the
     // router, bounded by the same byte cap.
@@ -149,14 +235,20 @@ pub fn read_request<S: Read>(stream: &mut S) -> Result<Request, HttpError> {
     Ok(Request {
         method,
         path,
+        http_minor,
         headers,
         body,
     })
 }
 
 /// Write a JSON response.
-pub fn write_json(stream: &mut impl Write, status: u16, body: &str) -> std::io::Result<()> {
-    write_response(stream, status, "application/json", body.as_bytes(), &[])
+pub fn write_json(
+    stream: &mut impl Write,
+    status: u16,
+    body: &str,
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    write_json_bytes_with(stream, status, body.as_bytes(), &[], keep_alive)
 }
 
 /// Write a JSON response with extra headers, such as a Digest challenge or a
@@ -166,8 +258,33 @@ pub fn write_json_with(
     status: u16,
     body: &str,
     headers: &[(&str, String)],
+    keep_alive: bool,
 ) -> std::io::Result<()> {
-    write_response(stream, status, "application/json", body.as_bytes(), headers)
+    write_json_bytes_with(stream, status, body.as_bytes(), headers, keep_alive)
+}
+
+/// Write a JSON response whose body is not necessarily valid UTF-8.
+///
+/// `/get_transaction_pool_hashes.bin` needs this: it is a JSON endpoint whose
+/// `tx_hashes` field is a `KV_SERIALIZE_CONTAINER_POD_AS_BLOB`, so the packed
+/// 32-byte hashes go inside a JSON string as **raw bytes**
+/// (`super::admin::pool_hashes_as_json`). `serde_json` cannot hold such a
+/// string, so that one body is assembled as bytes and handed here.
+pub fn write_json_bytes_with(
+    stream: &mut impl Write,
+    status: u16,
+    body: &[u8],
+    headers: &[(&str, String)],
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    write_response(
+        stream,
+        status,
+        "application/json",
+        body,
+        headers,
+        keep_alive,
+    )
 }
 
 /// Write an epee portable-storage response, for the binary endpoints
@@ -181,8 +298,16 @@ pub fn write_binary_with(
     status: u16,
     body: &[u8],
     headers: &[(&str, String)],
+    keep_alive: bool,
 ) -> std::io::Result<()> {
-    write_response(stream, status, "application/octet-stream", body, headers)
+    write_response(
+        stream,
+        status,
+        "application/octet-stream",
+        body,
+        headers,
+        keep_alive,
+    )
 }
 
 fn write_response(
@@ -191,6 +316,7 @@ fn write_response(
     content_type: &str,
     body: &[u8],
     headers: &[(&str, String)],
+    keep_alive: bool,
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
@@ -213,8 +339,9 @@ fn write_response(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n",
-        body.len()
+         Connection: {}\r\n",
+        body.len(),
+        if keep_alive { "keep-alive" } else { "close" }
     );
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -244,9 +371,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
 
-        let (mut stream, _) = listener.accept().unwrap();
+        let (stream, _) = listener.accept().unwrap();
         stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-        let out = read_request(&mut stream);
+        let mut reader = BufReader::new(stream);
+        let out = read_request(&mut reader);
         let _ = client.join();
         out
     }
@@ -262,6 +390,7 @@ mod tests {
         assert_eq!(req.header("host"), Some("x"), "headers are kept");
         assert_eq!(req.header("HOST"), Some("x"), "and found by any case");
         assert_eq!(req.header("origin"), None);
+        assert_eq!(req.http_minor, 1);
     }
 
     #[test]
@@ -335,9 +464,56 @@ mod tests {
         std::thread::spawn(move || {
             let _ = TcpStream::connect(addr);
         });
-        let (mut stream, _) = listener.accept().unwrap();
+        let (stream, _) = listener.accept().unwrap();
         stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-        assert!(matches!(read_request(&mut stream), Err(HttpError::Closed)));
+        let mut reader = BufReader::new(stream);
+        assert!(matches!(read_request(&mut reader), Err(HttpError::Closed)));
+    }
+
+    /// A kept-alive connection that goes quiet reads as closed, not as a bad
+    /// request. Answering an idle timeout would put a reply in the stream that
+    /// the client reads as the answer to whatever it sends next.
+    #[test]
+    fn a_connection_that_goes_quiet_is_closed_not_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let s = TcpStream::connect(addr).unwrap();
+            // Connected, and then nothing at all.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            drop(s);
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        assert!(matches!(read_request(&mut reader), Err(HttpError::Closed)));
+        let _ = client.join();
+    }
+
+    /// RFC 7230 §6.3, which is also what `wallet2` relies on: an HTTP/1.1
+    /// request without a `Connection` header keeps the connection, and that is
+    /// what lets epee retry a `401` on the same socket.
+    #[test]
+    fn the_connection_rules_are_the_version_defaults() {
+        let keeps = |raw: &[u8]| round_trip(raw).expect("parse").keep_alive();
+
+        assert!(keeps(b"POST /x HTTP/1.1\r\nHost: x\r\n\r\n"), "1.1 keeps");
+        assert!(!keeps(b"POST /x HTTP/1.0\r\nHost: x\r\n\r\n"), "1.0 closes");
+        assert!(
+            !keeps(b"POST /x HTTP/1.1\r\nConnection: close\r\n\r\n"),
+            "1.1 closes when asked"
+        );
+        assert!(
+            keeps(b"POST /x HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n"),
+            "1.0 keeps when asked, whatever the case"
+        );
+        assert!(
+            !keeps(b"POST /x HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n"),
+            "close anywhere in the list wins"
+        );
     }
 
     #[test]
@@ -347,7 +523,7 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            write_json(&mut stream, 200, "{\"a\":1}").unwrap();
+            write_json(&mut stream, 200, "{\"a\":1}", false).unwrap();
         });
 
         let mut s = TcpStream::connect(addr).unwrap();
@@ -358,10 +534,35 @@ mod tests {
         assert!(out.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(out.contains("Content-Type: application/json"));
         assert!(out.contains("Content-Length: 7"));
+        assert!(out.contains("Connection: close"));
         assert!(out.ends_with("{\"a\":1}"));
         assert!(
             !out.contains("Access-Control-Allow-Origin"),
             "no wildcard CORS header: {out}"
         );
+    }
+
+    /// A kept-alive answer says so, and a body that is not UTF-8 goes out
+    /// whole -- `/get_transaction_pool_hashes.bin` sends packed hashes inside
+    /// a JSON string.
+    #[test]
+    fn a_kept_alive_answer_says_so_and_carries_raw_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            write_json_bytes_with(&mut stream, 200, &[0x80, 0xff, 0x00], &[], true).unwrap();
+        });
+
+        let mut s = TcpStream::connect(addr).unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        server.join().unwrap();
+
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("Connection: keep-alive"), "{text}");
+        assert!(text.contains("Content-Length: 3"), "{text}");
+        assert!(out.ends_with(&[0x80, 0xff, 0x00]));
     }
 }

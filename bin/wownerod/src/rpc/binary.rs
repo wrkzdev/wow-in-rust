@@ -59,6 +59,12 @@ const MAX_OUTPUTS_COUNT: usize = 5_000;
 /// A cap on how many hashes a wallet's history may contain, so a hostile
 /// request cannot make the node search forever.
 const MAX_BLOCK_IDS: usize = 256;
+/// `RESTRICTED_BLOCK_COUNT` — how many blocks `/getblocks_by_height.bin` will
+/// fetch at once for a caller on the restricted listener.
+const RESTRICTED_BLOCK_COUNT: usize = 1_000;
+/// `RESTRICTED_TRANSACTIONS_COUNT` — how many pool transactions a restricted
+/// listener sends whole in one `/getblocks.bin` answer.
+const RESTRICTED_TRANSACTIONS_COUNT: usize = 100;
 
 pub type BinaryResult = Result<Section, RpcError>;
 
@@ -70,7 +76,10 @@ pub fn dispatch(server: &Server, path: &str, body: &[u8], restricted: bool) -> B
     let db = server.db();
 
     match path {
-        "/get_blocks.bin" | "/getblocks.bin" => get_blocks(db, &request),
+        "/get_blocks.bin" | "/getblocks.bin" => get_blocks(server, &request, restricted),
+        "/get_blocks_by_height.bin" | "/getblocks_by_height.bin" => {
+            get_blocks_by_height(db, &request, restricted)
+        }
         "/get_hashes.bin" | "/gethashes.bin" => get_hashes(db, &request),
         "/get_o_indexes.bin" => get_o_indexes(db, &request),
         "/get_outs.bin" => get_outs(db, &request),
@@ -83,7 +92,9 @@ pub fn dispatch(server: &Server, path: &str, body: &[u8], restricted: bool) -> B
             }
             get_output_distribution(db, server.config().network, &request)
         }
-        "/get_transaction_pool_hashes.bin" => get_pool_hashes(server, restricted),
+        // `/get_transaction_pool_hashes.bin` is **not** here: the reference
+        // serves it as JSON (`super::admin::pool_hashes_as_json`), and the
+        // router sends it there before anything reaches this table.
         other => Err(RpcError::unsupported(other)),
     }
 }
@@ -164,7 +175,8 @@ fn failed() -> RpcError {
 }
 
 /// `/get_blocks.bin` (`specs/11` §5.1).
-fn get_blocks(db: &LmdbDb, request: &Section) -> BinaryResult {
+fn get_blocks(server: &Server, request: &Section, restricted: bool) -> BinaryResult {
+    let db = server.db();
     let ids = block_ids(request)?;
     let start_height = request
         .get("start_height")
@@ -174,18 +186,56 @@ fn get_blocks(db: &LmdbDb, request: &Section) -> BinaryResult {
         .get("no_miner_tx")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // `wallet2` always sends this, and it is the difference between a batch of
+    // 42 MB and one of under 2 MB on the early chain.
+    let prune = request
+        .get("prune")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // `KV_SERIALIZE_OPT(requested_info, (uint8_t)0)`: blocks only unless asked.
+    let (want_blocks, want_pool) = match request
+        .get("requested_info")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+    {
+        0 => (true, false), // BLOCKS_ONLY
+        1 => (true, true),  // BLOCKS_AND_POOL
+        2 => (false, true), // POOL_ONLY
+        _ => {
+            return Err(RpcError::new(
+                error::WRONG_PARAM,
+                "Failed, wrong requested info",
+            ))
+        }
+    };
+    let max_blocks = match request.get("max_block_count").and_then(Value::as_u64) {
+        Some(n) if n > 0 => (n as usize).min(MAX_BLOCK_COUNT),
+        _ => MAX_BLOCK_COUNT,
+    };
 
     let height = db.height();
+
+    let mut res = base_response();
+    // "Always set daemon time, and set it early rather than late, as delivering
+    // some incremental pool info twice because of slightly overlapping time
+    // intervals is no problem, whereas producing gaps ... is."
+    res.insert("daemon_time".into(), Value::U64(now()));
+    res.insert("pool_info_extent".into(), Value::U8(POOL_INFO_NONE));
+    if want_pool {
+        add_pool_info(server, &mut res, restricted, prune);
+    }
+    if !want_blocks {
+        res.insert("start_height".into(), Value::U64(0));
+        res.insert("current_height".into(), Value::U64(height));
+        return Ok(res);
+    }
 
     // `on_get_blocks`' "quick check for noop": the wallet already has the top
     // block, so there is nothing to send.
     if let Some(newest) = ids.first() {
         if height > 0 && db.get_block_hash(height - 1).ok().as_ref() == Some(newest) {
-            let mut res = base_response();
             res.insert("start_height".into(), Value::U64(0));
             res.insert("current_height".into(), Value::U64(height));
-            res.insert("daemon_time".into(), Value::U64(now()));
-            res.insert("pool_info_extent".into(), Value::U8(0));
             return Ok(res);
         }
     }
@@ -208,7 +258,7 @@ fn get_blocks(db: &LmdbDb, request: &Section) -> BinaryResult {
     let mut tx_budget = MAX_TX_COUNT;
 
     for h in from..height {
-        if blocks.len() >= MAX_BLOCK_COUNT {
+        if blocks.len() >= max_blocks {
             break;
         }
         let blob = db.get_block_blob(h).map_err(db_error)?;
@@ -222,9 +272,25 @@ fn get_blocks(db: &LmdbDb, request: &Section) -> BinaryResult {
         }
         tx_budget = tx_budget.saturating_sub(block.tx_hashes.len());
 
+        // With `prune`, each transaction is its **base** serialization — the
+        // prefix and the unprunable half of the RingCT data — which is all a
+        // wallet scans, and it travels as a `tx_blob_entry` rather than a bare
+        // string. The reference puts the null hash in `prunable_hash` there
+        // rather than the real one, so this does too. The block blob itself is
+        // never pruned: a header and a list of hashes has no prunable half.
         let mut tx_blobs = Vec::with_capacity(block.tx_hashes.len());
         for txid in &block.tx_hashes {
-            tx_blobs.push(Value::String(db.get_tx_blob(txid).map_err(db_error)?));
+            if prune {
+                let mut entry = Section::new();
+                entry.insert(
+                    "blob".into(),
+                    Value::String(db.get_pruned_tx_blob(txid).map_err(db_error)?),
+                );
+                entry.insert("prunable_hash".into(), Value::String(vec![0u8; 32]));
+                tx_blobs.push(Value::Object(entry));
+            } else {
+                tx_blobs.push(Value::String(db.get_tx_blob(txid).map_err(db_error)?));
+            }
         }
 
         // Global output indices, coinbase first then `tx_hashes` order
@@ -236,11 +302,15 @@ fn get_blocks(db: &LmdbDb, request: &Section) -> BinaryResult {
         entry.insert(
             "txs".into(),
             Value::Array(Array {
-                elem_type: epee::ty::STRING,
+                elem_type: if prune {
+                    epee::ty::OBJECT
+                } else {
+                    epee::ty::STRING
+                },
                 items: tx_blobs,
             }),
         );
-        entry.insert("pruned".into(), Value::Bool(false));
+        entry.insert("pruned".into(), Value::Bool(prune));
         entry.insert(
             "block_weight".into(),
             Value::U64(db.get_block_weight(h).unwrap_or(0)),
@@ -249,7 +319,6 @@ fn get_blocks(db: &LmdbDb, request: &Section) -> BinaryResult {
         output_indices.push(per_tx);
     }
 
-    let mut res = base_response();
     res.insert(
         "blocks".into(),
         Value::Array(Array {
@@ -266,9 +335,106 @@ fn get_blocks(db: &LmdbDb, request: &Section) -> BinaryResult {
     );
     res.insert("start_height".into(), Value::U64(from));
     res.insert("current_height".into(), Value::U64(height));
-    res.insert("daemon_time".into(), Value::U64(now()));
-    res.insert("pool_info_extent".into(), Value::U8(0));
+    // `daemon_time` and `pool_info_extent` were set before the pool was read,
+    // and setting them again here would undo it.
     Ok(res)
+}
+
+/// `pool_info_extent` (`COMMAND_RPC_GET_BLOCKS_FAST::POOL_INFO_EXTENT`).
+const POOL_INFO_NONE: u8 = 0;
+/// Sent when the answer names only what changed since `pool_info_since`.
+#[allow(dead_code, reason = "the C++ value; this node always answers FULL")]
+const POOL_INFO_INCREMENTAL: u8 = 1;
+/// Sent when the answer is the whole pool.
+const POOL_INFO_FULL: u8 = 2;
+
+/// The pool half of `/getblocks.bin`, which spares a wallet the separate
+/// `/get_transaction_pool_hashes.bin` round trip.
+///
+/// Always **FULL**, never INCREMENTAL. An incremental answer has to name the
+/// transactions that have *left* the pool since a given time, and this pool
+/// keeps no record of removals -- so it cannot tell a wallet what to forget.
+/// A wallet told FULL replaces its idea of the pool with what it is given
+/// (`update_pool_state_from_pool_data`), which is right whatever it held
+/// before; an incremental answer that quietly failed to mention a removal
+/// would leave it holding a transaction that no longer exists.
+///
+/// `pool_info_since` is therefore read and ignored, which is allowed: the
+/// reference decides between the two extents itself and the wallet follows
+/// what it is told.
+fn add_pool_info(server: &Server, res: &mut Section, restricted: bool, prune: bool) {
+    let pool = server.pool();
+    // A restricted listener sends at most `RESTRICTED_TRANSACTIONS_COUNT`
+    // transactions whole and names the rest, which the wallet then asks for
+    // through `/get_transactions` at its own pace. Without the cap, a public
+    // node's whole pool would go out with every wallet's first refresh.
+    let max_whole = if restricted {
+        RESTRICTED_TRANSACTIONS_COUNT
+    } else {
+        usize::MAX
+    };
+
+    let mut added = Vec::new();
+    let mut remaining = Vec::new();
+    for (id, e) in pool.entries() {
+        // A stem transaction is nobody else's to see, as everywhere else.
+        if restricted && !e.is_public() {
+            continue;
+        }
+        if added.len() >= max_whole {
+            remaining.extend_from_slice(id);
+            continue;
+        }
+        let blob = if prune {
+            pruned_blob(&e.blob)
+        } else {
+            e.blob.clone()
+        };
+        let mut info = Section::new();
+        info.insert("tx_hash".into(), Value::String(id.to_vec()));
+        info.insert("tx_blob".into(), Value::String(blob));
+        info.insert("double_spend_seen".into(), Value::Bool(e.double_spend_seen));
+        added.push(Value::Object(info));
+    }
+
+    // Empty containers are left out, as epee leaves them out: an answer with
+    // no `added_pool_txs` and extent FULL says the pool is empty.
+    if !added.is_empty() {
+        res.insert(
+            "added_pool_txs".into(),
+            Value::Array(Array {
+                elem_type: epee::ty::OBJECT,
+                items: added,
+            }),
+        );
+    }
+    if !remaining.is_empty() {
+        // `CONTAINER_POD_AS_BLOB`: packed 32-byte hashes.
+        res.insert(
+            "remaining_added_pool_txids".into(),
+            Value::String(remaining),
+        );
+    }
+    // `removed_pool_txids` is not sent at all: the reference serialises it only
+    // for an INCREMENTAL answer, and this one is always FULL.
+    res.insert("pool_info_extent".into(), Value::U8(POOL_INFO_FULL));
+}
+
+/// A transaction's base serialization: the prefix and the unprunable half of
+/// its RingCT data, which is `serialize_base` and what `prune` asks for.
+///
+/// `unprunable_size` is recorded while the blob is parsed, so this is a slice
+/// of the original rather than a re-serialization. A blob that will not parse
+/// goes out whole: a wallet reads the base of it either way
+/// (`parse_and_validate_tx_base_from_blob` stops at the end of the base and
+/// ignores what follows), so the cost of the fallback is bytes, not meaning.
+fn pruned_blob(blob: &[u8]) -> Vec<u8> {
+    match wow_types::tx::Transaction::from_blob(blob) {
+        Ok(tx) if tx.unprunable_size > 0 && tx.unprunable_size <= blob.len() => {
+            blob[..tx.unprunable_size].to_vec()
+        }
+        _ => blob.to_vec(),
+    }
 }
 
 /// `block_output_indices` for one block: a section holding an array of
@@ -437,6 +603,98 @@ fn get_outs(db: &LmdbDb, request: &Section) -> BinaryResult {
     Ok(res)
 }
 
+/// One amount's output distribution, as `RpcHandler::get_output_distribution`
+/// leaves it.
+pub(crate) struct Distribution {
+    /// The first height the counts are for.
+    pub start_height: u64,
+    /// How many outputs there were below `start_height`.
+    pub base: u64,
+    /// One count per height, running totals only when `cumulative` asked for
+    /// them.
+    pub data: Vec<u64>,
+}
+
+/// The counts behind both forms of `get_output_distribution` — this file's
+/// epee endpoint and [`super::methods::output_distribution_json`] — so the two
+/// cannot drift apart. Only the packing differs between them.
+pub(crate) fn distribution_for(
+    db: &LmdbDb,
+    network: wow_types::Network,
+    amount: u64,
+    from: u64,
+    to: u64,
+    cumulative: bool,
+) -> Result<Distribution, RpcError> {
+    let failed = || RpcError::new(error::INTERNAL_ERROR, "Failed to get output distribution");
+    let height = db.height();
+
+    // "rct outputs don't exist before v4": the height
+    // `get_earliest_ideal_height_for_version` gives, walking the fork table
+    // down from the top while each fork is at least that version. Height 1 on
+    // mainnet, where every fork is.
+    let earliest = if amount == 0 && network != wow_types::Network::Fakechain {
+        let mut earliest = u64::MAX;
+        for fork in wow_consensus::hardfork::HardFork::new(network)
+            .forks()
+            .iter()
+            .rev()
+        {
+            if fork.version < wow_consensus::hardfork::gates::HF_VERSION_DYNAMIC_FEE {
+                break;
+            }
+            earliest = fork.height;
+        }
+        earliest
+    } else {
+        0
+    };
+    if to > 0 && to < from {
+        return Err(failed());
+    }
+    let start = earliest.max(from);
+    // Only amount 0 is kept as a running total, and no wallet asks for the
+    // others.
+    if height == 0 || start >= height || to >= height || amount != 0 {
+        return Err(failed());
+    }
+    // One block below the start as well, which becomes `base`.
+    let heights: Vec<u64> = (start.saturating_sub(1)..=to).collect();
+    let mut d = db
+        .get_block_cumulative_rct_outputs(&heights)
+        .map_err(db_error)?;
+    let base = if start > 0 {
+        if d.is_empty() {
+            return Err(failed());
+        }
+        d.remove(0)
+    } else {
+        0
+    };
+
+    // `RpcHandler::get_output_distribution` trims to the range asked for,
+    // which matters to its cache and is a no-op here.
+    if to >= from {
+        let offset = from.max(start);
+        if offset <= to && ((to - offset + 1) as usize) < d.len() {
+            d.truncate((to - offset + 1) as usize);
+        }
+    }
+    // `process_distribution`.
+    if !cumulative && !d.is_empty() {
+        for n in (1..d.len()).rev() {
+            d[n] = d[n].wrapping_sub(d[n - 1]);
+        }
+        d[0] = d[0].wrapping_sub(base);
+    }
+
+    Ok(Distribution {
+        start_height: start,
+        base,
+        data: d,
+    })
+}
+
 /// `/get_output_distribution.bin` — what decoy selection is built on
 /// (`specs/12` §4.3): `core_rpc_server::on_get_output_distribution_bin`, with
 /// `Blockchain::get_output_distribution` and `RpcHandler`'s
@@ -494,88 +752,29 @@ fn get_output_distribution(
         0 => height.saturating_sub(1),
         t => t,
     };
-    let failed = || RpcError::new(error::INTERNAL_ERROR, "Failed to get output distribution");
-
     let mut entries = Vec::with_capacity(amounts.len());
     for amount in amounts {
-        // "rct outputs don't exist before v4": the height
-        // `get_earliest_ideal_height_for_version` gives, walking the fork
-        // table down from the top while each fork is at least that version.
-        // Height 1 on mainnet, where every fork is.
-        let earliest = if amount == 0 && network != wow_types::Network::Fakechain {
-            let mut earliest = u64::MAX;
-            for fork in wow_consensus::hardfork::HardFork::new(network)
-                .forks()
-                .iter()
-                .rev()
-            {
-                if fork.version < wow_consensus::hardfork::gates::HF_VERSION_DYNAMIC_FEE {
-                    break;
-                }
-                earliest = fork.height;
-            }
-            earliest
-        } else {
-            0
-        };
-        if to > 0 && to < from {
-            return Err(failed());
-        }
-        let start = earliest.max(from);
-        // Only amount 0 is kept as a running total, and no wallet asks for the
-        // others.
-        if height == 0 || start >= height || to >= height || amount != 0 {
-            return Err(failed());
-        }
-        // One block below the start as well, which becomes `base`.
-        let heights: Vec<u64> = (start.saturating_sub(1)..=to).collect();
-        let mut d = db
-            .get_block_cumulative_rct_outputs(&heights)
-            .map_err(db_error)?;
-        let base = if start > 0 {
-            if d.is_empty() {
-                return Err(failed());
-            }
-            d.remove(0)
-        } else {
-            0
-        };
-
-        // `RpcHandler::get_output_distribution` trims to the range asked for,
-        // which matters to its cache and is a no-op here.
-        if to >= from {
-            let offset = from.max(start);
-            if offset <= to && ((to - offset + 1) as usize) < d.len() {
-                d.truncate((to - offset + 1) as usize);
-            }
-        }
-        // `process_distribution`.
-        if !cumulative && !d.is_empty() {
-            for n in (1..d.len()).rev() {
-                d[n] = d[n].wrapping_sub(d[n - 1]);
-            }
-            d[0] = d[0].wrapping_sub(base);
-        }
+        let d = distribution_for(db, network, amount, from, to, cumulative)?;
 
         let mut s = Section::new();
         s.insert("amount".into(), Value::U64(amount));
-        s.insert("start_height".into(), Value::U64(start));
+        s.insert("start_height".into(), Value::U64(d.start_height));
         s.insert("binary".into(), Value::Bool(true));
         s.insert("compress".into(), Value::Bool(compress));
         if compress {
             // `compress_integer_array`: base-128 varints back to back.
-            let mut packed = Vec::with_capacity(d.len());
-            for v in &d {
+            let mut packed = Vec::with_capacity(d.data.len());
+            for v in &d.data {
                 wow_serialize::varint::write_varint(&mut packed, *v);
             }
             s.insert("compressed_data".into(), Value::String(packed));
-        } else if !d.is_empty() {
+        } else if !d.data.is_empty() {
             // `KV_SERIALIZE_CONTAINER_POD_AS_BLOB_N(data.distribution, ...)`,
             // left out when empty as epee leaves out an empty container.
-            let packed: Vec<u8> = d.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let packed: Vec<u8> = d.data.iter().flat_map(|v| v.to_le_bytes()).collect();
             s.insert("distribution".into(), Value::String(packed));
         }
-        s.insert("base".into(), Value::U64(base));
+        s.insert("base".into(), Value::U64(d.base));
         entries.push(Value::Object(s));
     }
 
@@ -592,10 +791,15 @@ fn get_output_distribution(
     Ok(res)
 }
 
-/// `/get_transaction_pool_hashes.bin`: on a restricted listener, the public
-/// transactions only. A wallet polls this; listing a stem transaction to
-/// whoever asks is the one thing a stem must not do.
-fn get_pool_hashes(server: &Server, restricted: bool) -> BinaryResult {
+/// `/get_transaction_pool_hashes.bin` in epee, for a caller that asked in
+/// epee.
+///
+/// The reference serves this path as JSON and nothing else
+/// ([`super::admin::pool_hashes_as_json`]); this is here only so that a node
+/// upgraded ahead of the wallets pointed at it still answers the ones that
+/// read the `.bin` suffix at face value. The router picks between the two by
+/// what the request was written in.
+pub(crate) fn pool_hashes_epee(server: &Server, restricted: bool) -> Section {
     // `CONTAINER_POD_AS_BLOB`: one string of packed 32-byte hashes, not an
     // array (`specs/04` §2).
     let mut packed = Vec::new();
@@ -605,6 +809,68 @@ fn get_pool_hashes(server: &Server, restricted: bool) -> BinaryResult {
 
     let mut res = base_response();
     res.insert("tx_hashes".into(), Value::String(packed));
+    res
+}
+
+/// `/getblocks_by_height.bin` — whole blocks at the heights asked for.
+///
+/// `heights` is a plain `KV_SERIALIZE` array of `uint64`, not the packed blob
+/// that `block_ids` is: two neighbouring fields in the same file, written with
+/// different macros. The blocks are never pruned -- `on_get_blocks_by_height`
+/// has no `prune` flag and always sends whole transactions.
+fn get_blocks_by_height(db: &LmdbDb, request: &Section, restricted: bool) -> BinaryResult {
+    let heights: Vec<u64> = request
+        .get("heights")
+        .and_then(Value::as_array)
+        .map(|a| a.items.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+
+    if restricted && heights.len() > RESTRICTED_BLOCK_COUNT {
+        return Err(RpcError::new(
+            error::WRONG_PARAM,
+            "Too many blocks requested in restricted mode",
+        ));
+    }
+
+    let mut blocks = Vec::with_capacity(heights.len());
+    for h in heights {
+        let blob = db.get_block_blob(h).map_err(|_| {
+            RpcError::new(
+                error::INTERNAL_ERROR,
+                format!("Error retrieving block at height {h}"),
+            )
+        })?;
+        let block = wow_types::block::Block::from_blob(&blob).map_err(db_error)?;
+        let mut txs = Vec::with_capacity(block.tx_hashes.len());
+        for txid in &block.tx_hashes {
+            txs.push(Value::String(db.get_tx_blob(txid).map_err(db_error)?));
+        }
+
+        let mut entry = Section::new();
+        entry.insert("block".into(), Value::String(blob));
+        entry.insert(
+            "txs".into(),
+            Value::Array(Array {
+                elem_type: epee::ty::STRING,
+                items: txs,
+            }),
+        );
+        entry.insert("pruned".into(), Value::Bool(false));
+        entry.insert(
+            "block_weight".into(),
+            Value::U64(db.get_block_weight(h).unwrap_or(0)),
+        );
+        blocks.push(Value::Object(entry));
+    }
+
+    let mut res = base_response();
+    res.insert(
+        "blocks".into(),
+        Value::Array(Array {
+            elem_type: epee::ty::OBJECT,
+            items: blocks,
+        }),
+    );
     Ok(res)
 }
 

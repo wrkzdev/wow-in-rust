@@ -4,7 +4,7 @@
 //! write to it: a transaction built by `wow-wallet` goes to
 //! `/send_raw_transaction`, through the pool's admission checks — including
 //! full ring-signature and range-proof verification — and comes back out of
-//! `/get_transaction_pool_hashes.bin`.
+//! `/get_transaction_pool_hashes`.
 //!
 //! # What the fixture can and cannot do
 //!
