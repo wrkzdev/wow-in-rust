@@ -340,7 +340,10 @@ fn percent_decode(s: &str) -> Result<String, String> {
         out.push(byte);
         i += 3;
     }
-    String::from_utf8(out).map_err(|_| "the user or password is not UTF-8".to_string())
+    let Ok(text) = String::from_utf8(out) else {
+        return Err("the user or password is not UTF-8".into());
+    };
+    Ok(text)
 }
 
 #[cfg(test)]
