@@ -1391,9 +1391,16 @@ mod tests {
     }
 
     /// A sweep that fits takes everything and leaves nothing to report.
+    ///
+    /// The outputs have to be worth more than the fee the sweep costs: two
+    /// inputs and a ring of 22 weigh a couple of thousand bytes, so at one
+    /// piconero a byte the fee alone is of that order. Amounts of a few
+    /// thousand made a transaction that could not pay for itself, which is
+    /// `sweeping_an_output_that_cannot_pay_its_own_fee_is_refused` above, not
+    /// this.
     #[test]
     fn a_sweep_that_fits_leaves_nothing_behind() {
-        let transfers = vec![transfer(5_000, 1, 1), transfer(3_000, 1, 2)];
+        let transfers = vec![transfer(5_000_000, 1, 1), transfer(3_000_000, 1, 2)];
         let p = plan_sweep(&transfers, &options(3), &mut seq()).expect("a sweep");
         assert_eq!(p.inputs.len(), 2);
         assert_eq!(p.left_behind, 0);
