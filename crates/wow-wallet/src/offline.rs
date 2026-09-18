@@ -173,7 +173,11 @@ pub struct UnsignedTransfer {
 }
 
 /// A signed transfer set, and what the wallet that signed it kept.
-#[derive(Debug)]
+///
+/// `Debug` is written by hand rather than derived: `tx_keys` holds real
+/// transaction secret keys, and a `{:?}` of this on the cold machine — into a
+/// log, a panic message or a crash report — would put them where the whole
+/// arrangement exists to keep them out of.
 pub struct SignedTransfer {
     pub set: SignedTxSet,
     /// The file to hand back to the watch-only half.
@@ -188,6 +192,18 @@ pub struct SignedTransfer {
     pub tx_keys: Vec<Vec<SecretKey>>,
     /// How many outputs the set carried and this wallet took in.
     pub imported_outputs: usize,
+}
+
+impl std::fmt::Debug for SignedTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignedTransfer")
+            .field("txids", &self.txids)
+            .field("transactions", &self.set.ptx.len())
+            .field("key_images", &self.set.key_images.len())
+            .field("imported_outputs", &self.imported_outputs)
+            .field("tx_keys", &format_args!("<{} kept>", self.tx_keys.len()))
+            .finish_non_exhaustive()
+    }
 }
 
 /// What `submit_transfer` did.
