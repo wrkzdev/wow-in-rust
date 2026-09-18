@@ -125,6 +125,10 @@ pub struct Config {
     pub pad_transactions: bool,
     /// `--proxy [socks5://[user:pass@]]ip:port`: dial every peer through it.
     pub proxy: Option<wow_p2p::socks::Proxy>,
+    /// `--tx-proxy`: one anonymity network each. Their peer lists are filled
+    /// in when the node starts, from the hidden addresses the peer options
+    /// name.
+    pub tx_proxies: Vec<wow_p2p::zone::ZoneConfig>,
     /// `--proxy-allow-dns-leaks`: with `--proxy`, allow a peer option to name
     /// a host this node then resolves itself.
     pub proxy_allow_dns_leaks: bool,
@@ -251,6 +255,7 @@ impl Default for Config {
             pad_transactions: false,
             proxy: None,
             proxy_allow_dns_leaks: false,
+            tx_proxies: Vec::new(),
             log_level: None,
             log_file: None,
             max_log_file_size: 104_850_000,
@@ -428,6 +433,16 @@ PEER-TO-PEER (specs/08)
                               host this node resolves itself. Without it they
                               must be addresses, so no resolver is told whom
                               this node is about to talk to
+    --tx-proxy <net>,<ip:port>[,max_connections][,disable_noise]
+                              reach tor or i2p peers through this SOCKS5
+                              proxy (once per network). With any of these,
+                              transactions this node originates go only over
+                              them and never to a clearnet peer. Name the
+                              peers with --add-peer <address>.onion or
+                              --add-exclusive-node: Wownero has no hidden
+                              seed nodes. disable_noise gives up the covert
+                              channels and fluffs to the zone's outgoing
+                              peers instead
 
 LOGGING (specs/09 §8)
     --log-level <0-4 | category:LEVEL,...>                      (default: 0)
@@ -505,8 +520,9 @@ RPC METHODS SERVED   (R: not routed with --restricted-rpc)
                 json-minimal-txpool_add
 
 NOT YET IMPLEMENTED
-    i2p/Tor, rate limits, pruning, bootstrap daemons, background mining
-    and extra messages in mined blocks are not built.
+    Inbound i2p/Tor connections (--anonymous-inbound), rate limits,
+    pruning, bootstrap daemons, background mining and extra messages in
+    mined blocks are not built.
 
     Proof of work is checked for RandomWOW (major version 13 and up) and
     CryptoNight variant 1 (versions 7-8). Variants 2 and 4, which cover
@@ -527,10 +543,6 @@ NOT YET IMPLEMENTED
 /// Refused explicitly: accepting and ignoring them would make a node look
 /// configured when it is not.
 const NOT_IMPLEMENTED: &[(&str, &str)] = &[
-    (
-        "--tx-proxy",
-        "the i2p/Tor transaction proxy is not implemented",
-    ),
     (
         "--anonymous-inbound",
         "i2p/Tor inbound connections are not implemented",
@@ -679,6 +691,47 @@ fn zmq_endpoint(v: &str, flag: &str) -> Result<std::net::SocketAddr, String> {
         host.parse().map_err(|_| shape())?
     };
     Ok(std::net::SocketAddr::new(ip, port))
+}
+
+/// `--tx-proxy <net>,<ip:port>[,max_connections][,disable_noise]`, read as
+/// `get_proxies` reads it (`net_node.cpp`).
+///
+/// The fields after the proxy may come in either order, at most two of them,
+/// and an empty one means the default. A count of zero is an error, as it is
+/// there: a zone that may make no connection could send nothing.
+fn tx_proxy(v: &str) -> Result<wow_p2p::zone::ZoneConfig, String> {
+    use wow_p2p::zone::{Zone, ZoneConfig};
+
+    let mut fields = v.split(',');
+    let network = fields.next().unwrap_or_default();
+    let zone = match Zone::parse(network) {
+        Some(Zone::Tor) => Zone::Tor,
+        Some(Zone::I2p) => Zone::I2p,
+        _ => return Err(format!("--tx-proxy: `{network}` is not tor or i2p")),
+    };
+    let Some(addr) = fields.next().filter(|s| !s.is_empty()) else {
+        return Err(format!("--tx-proxy: no ip:port in `{v}`"));
+    };
+    let proxy = wow_p2p::socks::Proxy::parse(addr).map_err(|e| format!("--tx-proxy: {e}"))?;
+
+    let mut cfg = ZoneConfig::new(zone, proxy);
+    for (n, field) in fields.enumerate() {
+        if n >= 2 {
+            return Err(format!("--tx-proxy: too many `,` in `{v}`"));
+        }
+        if field == "disable_noise" {
+            cfg.noise = false;
+        } else if !field.is_empty() {
+            let count: u32 = field
+                .parse()
+                .map_err(|_| format!("--tx-proxy: `{field}` is not a connection count"))?;
+            if count == 0 {
+                return Err("--tx-proxy: a connection count of 0".into());
+            }
+            cfg.max_out = count as usize;
+        }
+    }
+    Ok(cfg)
 }
 
 /// A connection count, where `-1` means the default, as the C++ takes it.
@@ -998,6 +1051,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 cfg.proxy = Some(take!(parsed.map_err(|e| format!("{arg}: {e}"))));
             }
             "--proxy-allow-dns-leaks" => cfg.proxy_allow_dns_leaks = true,
+            "--tx-proxy" => {
+                let what = "<net>,<ip:port>[,max_connections][,disable_noise]";
+                let v = take!(value(&mut it, &arg, what));
+                let zone = take!(tx_proxy(&v));
+                if cfg.tx_proxies.iter().any(|z| z.zone == zone.zone) {
+                    let twice = format!("--tx-proxy given twice for {}", zone.zone);
+                    return ParseOutcome::Error(twice);
+                }
+                cfg.tx_proxies.push(zone);
+            }
 
             "--log-level" => {
                 cfg.log_level = Some(take!(value(&mut it, &arg, "0-4 or category:LEVEL,...")));
@@ -1441,7 +1504,7 @@ mod tests {
             assert!(e.len() > opt.len() + 2, "{opt}: no reason given");
             assert!(e.contains(": "), "{opt}: {e}");
         }
-        assert!(err(&["--tx-proxy"]).contains("i2p/Tor"));
+        assert!(err(&["--anonymous-inbound"]).contains("i2p/Tor"));
         assert!(err(&["--bg-mining-enable"]).contains("background mining"));
 
         // The RPC options are real now, so they must *not* be refused.
@@ -1856,6 +1919,50 @@ mod tests {
         assert!(err(&["--proxy", "socks4a://127.0.0.1:9050"]).contains("SOCKS5"));
         let e = err(&["--proxy", "tor.example:9050"]);
         assert!(e.starts_with("--proxy: "), "{e}");
+    }
+
+    /// `--tx-proxy`, field by field, as `get_proxies` reads it.
+    #[test]
+    fn the_tx_proxy_option_parses() {
+        use wow_p2p::zone::{Zone, DEFAULT_MAX_OUT};
+
+        assert!(run(&[]).tx_proxies.is_empty());
+
+        let c = run(&[
+            "--tx-proxy",
+            "tor,127.0.0.1:9050,10",
+            "--tx-proxy",
+            "i2p,socks5://127.0.0.1:4447,,disable_noise",
+        ]);
+        assert_eq!(c.tx_proxies.len(), 2);
+        let tor = &c.tx_proxies[0];
+        assert_eq!(tor.zone, Zone::Tor);
+        assert_eq!(tor.max_out, 10);
+        assert!(tor.noise, "noise unless disable_noise says otherwise");
+        assert_eq!(
+            tor.proxy.as_ref().map(|p| p.address),
+            Some("127.0.0.1:9050".parse().unwrap())
+        );
+        let i2p = &c.tx_proxies[1];
+        assert_eq!(i2p.zone, Zone::I2p);
+        assert!(!i2p.noise);
+        assert_eq!(i2p.max_out, DEFAULT_MAX_OUT, "an empty field is default");
+
+        // The order of the last two fields does not matter.
+        let c = run(&["--tx-proxy", "tor,127.0.0.1:9050,disable_noise,4"]);
+        assert!(!c.tx_proxies[0].noise);
+        assert_eq!(c.tx_proxies[0].max_out, 4);
+
+        assert!(err(&["--tx-proxy"]).contains("needs"));
+        assert!(err(&["--tx-proxy", "public,127.0.0.1:9050"]).contains("tor or i2p"));
+        assert!(err(&["--tx-proxy", "tor"]).contains("no ip:port"));
+        assert!(err(&["--tx-proxy", "tor,127.0.0.1:9050,0"]).contains("count of 0"));
+        assert!(err(&["--tx-proxy", "tor,127.0.0.1:9050,x"]).contains("count"));
+        assert!(err(&["--tx-proxy", "tor,127.0.0.1:9050,1,2,3"]).contains("too many"));
+        assert!(err(&["--tx-proxy", "tor,example.com:9050"]).contains("--tx-proxy"));
+
+        let twice = ["--tx-proxy", "tor,127.0.0.1:9050", "--tx-proxy", "tor,[::1]:1"];
+        assert!(err(&twice).contains("twice for tor"));
     }
 
     /// The TLS options, with autodetect as the default and the key and

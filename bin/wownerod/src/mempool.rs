@@ -536,8 +536,12 @@ impl TxPool {
         verify(db, &tx, fee_context.version, db.height(), now)?;
 
         // What came from a peer has, as far as the pool's statistics go, been
-        // relayed (`handle_incoming_tx(..., relayed = true)`).
-        let relayed = matches!(method, RelayMethod::Stem | RelayMethod::Fluff);
+        // relayed (`handle_incoming_tx(..., relayed = true)`), a forward from
+        // an anonymity network included.
+        let relayed = matches!(
+            method,
+            RelayMethod::Stem | RelayMethod::Fluff | RelayMethod::Forward
+        );
         let mut method = method;
         match self.by_id.get_mut(&id) {
             Some(entry) => {
@@ -729,7 +733,13 @@ impl TxPool {
                     return false;
                 }
                 match self.relayed_at.get(*id) {
-                    None => !matches!(e.relay, RelayMethod::Stem | RelayMethod::Forward),
+                    // A forward is offered at once and the peer-to-peer layer
+                    // holds it for its delay, which is where that delay
+                    // lives; the C++ keeps it in `last_relayed_time` instead.
+                    // A stem is the other way about: its embargo is that
+                    // layer's too, and offering it here would fluff it the
+                    // moment it arrived.
+                    None => e.relay != RelayMethod::Stem,
                     Some(&last) => now.saturating_sub(last) > relay_delay(last, e.receive_time),
                 }
             })
@@ -1163,6 +1173,16 @@ mod tests {
         let due = pool.due_for_relay(0);
         assert_eq!(due.len(), 1);
         assert_eq!((due[0].0, due[0].2), (id(1), RelayMethod::Local));
+
+        // A forward is offered at once, as what it is: the wait before it is
+        // stemmed on the public network is the peer-to-peer layer's, which
+        // holds it there rather than asking the pool again.
+        put(&mut pool, 3, RelayMethod::Forward, 12);
+        let due = pool.due_for_relay(0);
+        assert_eq!(due.len(), 2);
+        assert!(due
+            .iter()
+            .any(|(i, _, how)| *i == id(3) && *how == RelayMethod::Forward));
 
         // Once stemmed, it comes back after the delay -- to be fluffed.
         pool.set_relayed(&[id(2)], RelayMethod::Stem, 0);
