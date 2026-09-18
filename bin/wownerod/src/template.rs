@@ -35,7 +35,7 @@ use wow_types::rct::RctSignatures;
 use wow_types::tx::{Transaction, TransactionPrefix, TxIn, TxOut, TxOutTarget};
 use wow_types::Network;
 
-use crate::mempool::TxPool;
+use crate::mempool::{PoolEntry, RelayMethod, TxPool};
 
 /// `TX_EXTRA_NONCE_MAX_COUNT`: the most extra-nonce bytes a template carries.
 pub const MAX_RESERVE_SIZE: usize = 255;
@@ -117,6 +117,27 @@ impl std::error::Error for TemplateError {}
 
 fn chain(e: impl std::fmt::Display) -> TemplateError {
     TemplateError::Chain(e.to_string())
+}
+
+/// Whether a pooled transaction may go into a template (`fill_block_template`).
+///
+/// Public ones only. A block is as public as it gets, and mining a transaction
+/// still in its stem, or submitted here and not out yet, would announce it
+/// from this node -- the very link Dandelion++ is there to break. The C++ also
+/// mines ones kept from relay; they stay out here, as they always have.
+///
+/// A fake chain is a test network, where the C++ mines stem transactions too
+/// (`m_mine_stem_txes`). It mines a lone node's own as well, in effect: with
+/// no peer to stem to, `dandelionpp_notify` fluffs it and so makes it public.
+/// Here a transaction sent to nobody stays unrelayed, to go out once a peer
+/// can take it, so on a fake chain one submitted here is minable as it stands
+/// -- or a single regtest node would never confirm a payment made to it.
+fn minable(entry: &PoolEntry, network: Network) -> bool {
+    match entry.relay {
+        RelayMethod::Fluff | RelayMethod::Block => true,
+        RelayMethod::Stem | RelayMethod::Local => network == Network::Fakechain,
+        RelayMethod::None | RelayMethod::Forward => false,
+    }
 }
 
 /// `add_tx_pub_key_to_extra`, then `add_extra_nonce_to_tx_extra` when there
@@ -202,9 +223,7 @@ pub fn build(
     let mut spent: HashSet<KeyImage> = HashSet::new();
     let (mut txs_weight, mut fees) = (0u64, 0u64);
     for (id, entry) in pool.by_fee() {
-        // A transaction kept back from relay is not announced by a block
-        // either.
-        if entry.do_not_relay || txs_weight + entry.weight > max_weight {
+        if !minable(entry, network) || txs_weight + entry.weight > max_weight {
             continue;
         }
         let Some(reward) = reward_at(txs_weight + entry.weight) else {
@@ -386,6 +405,33 @@ mod tests {
         // 200 would take two bytes as a varint; the reference writes one.
         let long = coinbase_extra(&key, &[0u8; 200]);
         assert_eq!((long[34], long.len()), (200, 35 + 200));
+    }
+
+    /// Only what the network already has goes into a block; a stem
+    /// transaction, or this node's own, only on a fake chain; and one kept
+    /// from relay never.
+    #[test]
+    fn a_template_takes_public_transactions_only() {
+        let entry = |relay| PoolEntry {
+            blob: Vec::new(),
+            weight: 1,
+            fee: 1,
+            receive_time: 0,
+            relay,
+            relayed: false,
+            double_spend_seen: false,
+        };
+        for (relay, mainnet, fake) in [
+            (RelayMethod::None, false, false),
+            (RelayMethod::Local, false, true),
+            (RelayMethod::Stem, false, true),
+            (RelayMethod::Fluff, true, true),
+            (RelayMethod::Block, true, true),
+        ] {
+            let e = entry(relay);
+            assert_eq!(minable(&e, Network::Mainnet), mainnet, "{relay:?}");
+            assert_eq!(minable(&e, Network::Fakechain), fake, "{relay:?}");
+        }
     }
 
     #[test]

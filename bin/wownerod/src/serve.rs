@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use wow_p2p::addressbook::{parse_ban_list, STATE_FILENAME};
 use wow_p2p::node::{Core, Node, SyncStatus};
+use wow_p2p::zone::{HiddenAddr, ZoneConfig};
 use wow_storage::db::BlockchainDb;
 use wow_storage::lmdb::LmdbDb;
 
@@ -375,6 +376,71 @@ fn resolve_all(list: &[String], default_port: u16) -> Result<Vec<SocketAddr>, St
     Ok(out)
 }
 
+/// Whether `s` names an address rather than a host: `1.2.3.4`, `1.2.3.4:1`,
+/// `::1` or `[::1]:1`.
+fn is_address_literal(s: &str) -> bool {
+    s.parse::<SocketAddr>().is_ok() || s.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Split the hidden-service addresses out of a peer list.
+///
+/// They belong to their anonymity zone's peer list, not to the public one,
+/// and there is nothing for a resolver to do with them -- the C++ files each
+/// `--add-peer` entry under `p.adr.get_zone()` for the same reason.
+fn split_hidden(
+    list: &[String],
+    flag: &str,
+    default_port: u16,
+) -> Result<(Vec<String>, Vec<HiddenAddr>), String> {
+    let mut clear = Vec::new();
+    let mut hidden = Vec::new();
+    for entry in list {
+        if HiddenAddr::is_hidden(entry) {
+            let bad = |e| format!("{flag}: {e}");
+            hidden.push(HiddenAddr::parse(entry, default_port).map_err(bad)?);
+        } else {
+            clear.push(entry.clone());
+        }
+    }
+    Ok((clear, hidden))
+}
+
+/// Refuse a peer option that would be resolved on this machine while
+/// `--proxy` is in force.
+///
+/// [`resolve_all`] asks this host's resolver, which would tell it whom the
+/// node is about to talk to -- the one thing the proxy is there to hide. The
+/// C++ guards the lookups it has the same way (`m_enable_dns_seed_nodes &=
+/// proxy_dns_leaks_allowed`); Wownero has no DNS seed nodes, so the lookups
+/// left to guard are the operator's own lists.
+fn check_no_dns_leaks(cfg: &Config) -> Result<(), String> {
+    if cfg.proxy.is_none() || cfg.proxy_allow_dns_leaks {
+        return Ok(());
+    }
+    let lists = [
+        ("--add-peer", &cfg.add_peers),
+        ("--add-priority-node", &cfg.priority_nodes),
+        ("--add-exclusive-node", &cfg.exclusive_nodes),
+        ("--seed-node", &cfg.seed_nodes),
+    ];
+    for (flag, list) in lists {
+        for entry in list {
+            // A hidden service is never looked up here: it goes to its
+            // zone's proxy by name.
+            if HiddenAddr::is_hidden(entry) {
+                continue;
+            }
+            if !is_address_literal(entry) {
+                return Err(format!(
+                    "{flag} {entry}: with --proxy, give an address rather than a name, \
+                     or pass --proxy-allow-dns-leaks to have this node resolve it here"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn start_p2p(cfg: &Config, core: Arc<NodeCore>) -> Result<Node, String> {
     let default_port = wow_p2p::messages::default_port(cfg.network);
     let mut p = wow_p2p::node::Config::new(cfg.network);
@@ -400,19 +466,67 @@ fn start_p2p(cfg: &Config, core: Arc<NodeCore>) -> Result<Node, String> {
         p.listen_v6 = Some(SocketAddr::new(ip6.into(), cfg.p2p_bind_port_ipv6));
     }
     p.require_ipv4 = !cfg.p2p_ignore_ipv4;
+    p.proxy = cfg.proxy.clone();
+    check_no_dns_leaks(cfg)?;
     p.external_port = cfg.p2p_external_port;
     p.hide_my_port = cfg.hide_my_port;
     p.out_peers = cfg.out_peers;
     p.in_peers = cfg.in_peers;
     p.max_connections_per_ip = cfg.max_connections_per_ip;
+    // The peer options may name hidden services, which belong to their zone.
+    let mut hidden: Vec<HiddenAddr> = Vec::new();
+    let mut public_only = |list: &[String], flag: &str| -> Result<Vec<String>, String> {
+        let (clear, mine) = split_hidden(list, flag, default_port)?;
+        hidden.extend(mine);
+        Ok(clear)
+    };
+    let seeds = public_only(&cfg.seed_nodes, "--seed-node")?;
+    let added = public_only(&cfg.add_peers, "--add-peer")?;
+    let priority = public_only(&cfg.priority_nodes, "--add-priority-node")?;
+    let exclusive = public_only(&cfg.exclusive_nodes, "--add-exclusive-node")?;
+
     if !cfg.seed_nodes.is_empty() {
-        p.seed_nodes = resolve_all(&cfg.seed_nodes, default_port)?;
+        p.seed_nodes = resolve_all(&seeds, default_port)?;
     }
-    p.add_peers = resolve_all(&cfg.add_peers, default_port)?;
-    p.priority_nodes = resolve_all(&cfg.priority_nodes, default_port)?;
-    p.exclusive_nodes = resolve_all(&cfg.exclusive_nodes, default_port)?;
+    p.add_peers = resolve_all(&added, default_port)?;
+    p.priority_nodes = resolve_all(&priority, default_port)?;
+    p.exclusive_nodes = resolve_all(&exclusive, default_port)?;
+
+    // Each hidden peer goes to its zone, and a zone it has no `--tx-proxy`
+    // for is an error: "Set outgoing peer for <zone> but did not set
+    // --tx-proxy. The latter is necessary for sending local txes over
+    // anonymity networks".
+    p.tx_proxies = cfg.tx_proxies.clone();
+    for addr in hidden {
+        match p.tx_proxies.iter_mut().find(|z| z.zone == addr.zone) {
+            Some(zone) => zone.peers.push(addr),
+            None => {
+                return Err(format!(
+                    "the peer {addr} needs --tx-proxy {},<ip:port> to be reached",
+                    addr.zone
+                ))
+            }
+        }
+    }
+
+    // `--anonymous-inbound` joins its zone, or makes one that only listens:
+    // the C++ calls `add_zone` for it and leaves `m_connect` null, so such a
+    // zone takes connections and dials nothing.
+    for inbound in &cfg.anonymous_inbound {
+        let zone = inbound.our_address.zone;
+        if p.tx_proxies.iter().all(|z| z.zone != zone) {
+            p.tx_proxies.push(ZoneConfig::inbound_only(zone));
+        }
+        let Some(existing) = p.tx_proxies.iter_mut().find(|z| z.zone == zone) else {
+            continue;
+        };
+        existing.our_address = Some(inbound.our_address.clone());
+        existing.bind = Some(inbound.bind);
+        existing.max_in = inbound.max_in;
+    }
     p.allow_local_ip = cfg.allow_local_ip;
     p.no_sync = cfg.no_sync;
+    p.pad_transactions = cfg.pad_transactions;
     // `--public-node` advertises the RPC peers may use: the restricted one.
     p.rpc_port = if cfg.public_node {
         cfg.rpc_restricted_bind_port.unwrap_or(cfg.rpc_bind_port)
@@ -542,5 +656,41 @@ mod tests {
             vec!["[::1]:28080".parse().unwrap()]
         );
         assert!(resolve("not a host name!", 1).is_err());
+    }
+
+    /// Behind a proxy, a peer option naming a host is refused: resolving it
+    /// here would leak whom the node is about to reach. `--proxy-allow-dns-
+    /// leaks` says to do it anyway.
+    #[test]
+    fn a_proxied_node_refuses_to_resolve_a_peer_name() {
+        for literal in ["1.2.3.4", "1.2.3.4:34567", "::1", "[::1]:28080"] {
+            assert!(is_address_literal(literal), "{literal}");
+        }
+        for name in ["node.example", "node.example:34567", "x.onion:34567"] {
+            assert!(!is_address_literal(name), "{name}");
+        }
+
+        let mut cfg = Config {
+            add_peers: vec!["node.example".into()],
+            ..Config::default()
+        };
+        assert!(check_no_dns_leaks(&cfg).is_ok(), "no proxy, no rule");
+
+        cfg.proxy = Some(wow_p2p::socks::Proxy {
+            address: "127.0.0.1:9050".parse().unwrap(),
+            user: String::new(),
+            pass: String::new(),
+        });
+        let e = check_no_dns_leaks(&cfg).expect_err("a name behind a proxy");
+        assert!(e.starts_with("--add-peer node.example: "), "{e}");
+        assert!(e.contains("--proxy-allow-dns-leaks"), "{e}");
+
+        cfg.proxy_allow_dns_leaks = true;
+        assert!(check_no_dns_leaks(&cfg).is_ok(), "asked for anyway");
+
+        cfg.proxy_allow_dns_leaks = false;
+        cfg.add_peers = vec!["1.2.3.4:34567".into()];
+        cfg.seed_nodes = vec!["5.6.7.8".into()];
+        assert!(check_no_dns_leaks(&cfg).is_ok(), "addresses need no lookup");
     }
 }

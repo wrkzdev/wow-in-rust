@@ -190,7 +190,8 @@ impl Host for WebHost {
         });
     }
 
-    fn fetch_nodes(&mut self, url: &str) {
+    /// A page cannot reach a proxy, so there is never one to use.
+    fn fetch_nodes(&mut self, url: &str, _proxy: Option<&str>) {
         let promise = page_fetch_text(url);
         let inbox = self.inbox.clone();
         wasm_bindgen_futures::spawn_local(async move {

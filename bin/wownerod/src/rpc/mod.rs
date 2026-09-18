@@ -202,8 +202,10 @@ impl Server {
         self.pool.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn pool_size(&self) -> usize {
-        self.pool().len()
+    /// The pool's size as a caller may see it: every transaction with
+    /// `include_sensitive`, the public ones otherwise.
+    pub fn pool_size(&self, include_sensitive: bool) -> usize {
+        self.pool().count(include_sensitive)
     }
 
     pub fn core(&self) -> Option<&NodeCore> {
@@ -293,6 +295,7 @@ impl Server {
 /// until the server's stop flag is set.
 pub fn start(server: Arc<Server>) -> Result<Vec<JoinHandle<()>>, String> {
     let cfg = &server.cfg;
+    check_external_bind(cfg)?;
     let mut threads = listen(
         &server,
         &cfg.rpc_bind_ip,
@@ -302,13 +305,9 @@ pub fn start(server: Arc<Server>) -> Result<Vec<JoinHandle<()>>, String> {
         cfg.restricted_rpc,
     )?;
     if let Some(port) = cfg.rpc_restricted_bind_port {
-        let ip = cfg
-            .rpc_restricted_bind_ip
-            .clone()
-            .unwrap_or_else(|| cfg.rpc_bind_ip.clone());
         threads.extend(listen(
             &server,
-            &ip,
+            &cfg.rpc_restricted_bind_ip,
             cfg.rpc_use_ipv6
                 .then_some(cfg.rpc_restricted_bind_ipv6_address.as_str()),
             port,
@@ -316,6 +315,35 @@ pub fn start(server: Arc<Server>) -> Result<Vec<JoinHandle<()>>, String> {
         )?);
     }
     Ok(threads)
+}
+
+/// `rpc_args::process` (`specs/11` §1.2): a non-loopback `--rpc-bind-ip` or
+/// `--rpc-bind-ipv6-address` needs `--confirm-external-bind`, whatever else
+/// is given.
+///
+/// `--restricted-rpc` and `--rpc-login` used to waive it here, and the C++
+/// waives it for neither: a restricted RPC or a password is still an RPC in
+/// the clear to whoever can reach the address, and the consent is to that.
+/// The IPv6 address is checked even without `--rpc-use-ipv6`, as the C++
+/// checks it. The restricted listener's own addresses need no consent -- a
+/// public restricted port is what `--rpc-restricted-bind-port` is for -- and
+/// default to loopback like the others.
+fn check_external_bind(cfg: &Config) -> Result<(), String> {
+    if cfg.confirm_external_bind {
+        return Ok(());
+    }
+    for (flag, addr) in [
+        ("--rpc-bind-ip", &cfg.rpc_bind_ip),
+        ("--rpc-bind-ipv6-address", &cfg.rpc_bind_ipv6_address),
+    ] {
+        if !is_loopback(addr) {
+            return Err(format!(
+                "{flag} permits inbound unencrypted external connections. Consider SSH \
+                 tunnel or SSL proxy instead. Override with --confirm-external-bind"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One RPC server's listeners: IPv4, and IPv6 on the same port with
@@ -327,27 +355,6 @@ fn listen(
     port: u16,
     restricted: bool,
 ) -> Result<Vec<JoinHandle<()>>, String> {
-    // `specs/11` §1.2: exposing the full RPC in the clear needs explicit
-    // consent. As in the C++, a restricted listener -- what a public node
-    // offers -- and one behind `--rpc-login` do not.
-    for addr in std::iter::once(ip).chain(ipv6) {
-        if !is_loopback(addr)
-            && !restricted
-            && server.login.is_none()
-            && !server.cfg.confirm_external_bind
-        {
-            return Err(format!(
-                "refusing to bind {}: a non-loopback address exposes the \
-                 unrestricted RPC to the network, in the clear to any client \
-                 that does not use TLS.\n\
-                 Pass --confirm-external-bind if that is what you want; use \
-                 --restricted-rpc, --rpc-restricted-bind-port or --rpc-login; or put \
-                 a reverse proxy in front of 127.0.0.1.",
-                bind_address(addr, port)
-            ));
-        }
-    }
-
     let resolve = |a: &str| -> Result<SocketAddr, String> {
         let text = bind_address(a, port);
         text.to_socket_addrs()
@@ -558,7 +565,7 @@ fn respond(server: &Server, stream: &mut tls::Stream, restricted: bool, ip: IpAd
     // The binary endpoints answer in epee, not JSON, so they branch before the
     // JSON writer (`specs/11` §5).
     if path.ends_with(".bin") {
-        let body = match binary::dispatch(server, path, &req.body) {
+        let body = match binary::dispatch(server, path, &req.body, restricted) {
             Ok(section) => wow_serialize::epee::to_bytes(&section).unwrap_or_else(|e| {
                 binary::error_response(&RpcError::new(
                     methods::error::INTERNAL_ERROR,
@@ -601,7 +608,7 @@ fn json_rpc(server: &Server, body: &[u8], restricted: bool) -> String {
         return error_envelope(&id, &RpcError::unsupported(method));
     }
 
-    match dispatch(server, method, &params) {
+    match dispatch(server, method, &params, restricted) {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
         Err(e) => error_envelope(&id, &e),
     }
@@ -616,12 +623,18 @@ fn error_envelope(id: &Value, e: &RpcError) -> String {
     .to_string()
 }
 
-fn dispatch(server: &Server, method: &str, params: &Value) -> RpcResult {
+/// A JSON-RPC method, for a caller on a listener that is `restricted` or not.
+///
+/// What is marked **R** never gets here on a restricted listener. The rest
+/// is still asked whether it is: the C++ answers several of them with less
+/// on a restricted listener -- no private pool transactions, no node
+/// counters -- and so does this node.
+fn dispatch(server: &Server, method: &str, params: &Value, restricted: bool) -> RpcResult {
     let db = server.db();
     let cfg = server.config();
     match method {
         // `specs/11` §4, with the C++'s aliases.
-        "get_info" => methods::get_info(server),
+        "get_info" => methods::get_info(server, restricted),
         "get_version" => methods::get_version(server),
         "hard_fork_info" => methods::hard_fork_info(db, cfg, params),
         "get_fee_estimate" => methods::get_fee_estimate(server, params),
@@ -676,16 +689,20 @@ fn direct(server: &Server, path: &str, body: &[u8], restricted: bool) -> String 
     } else {
         match path {
             "/get_height" | "/getheight" => methods::get_height(db),
-            "/get_info" | "/getinfo" => methods::get_info(server),
+            "/get_info" | "/getinfo" => methods::get_info(server, restricted),
             "/get_checkpoints" => methods::get_checkpoints(db, cfg),
             "/send_raw_transaction" | "/sendrawtransaction" => {
                 return methods::send_raw_transaction(server, body);
             }
-            "/get_transactions" | "/gettransactions" => methods::get_transactions(server, body),
-            "/is_key_image_spent" => admin::is_key_image_spent(server, body),
-            "/get_transaction_pool" => admin::get_transaction_pool(server),
-            "/get_transaction_pool_hashes" => admin::get_transaction_pool_hashes(server),
-            "/get_transaction_pool_stats" => admin::get_transaction_pool_stats(server),
+            "/get_transactions" | "/gettransactions" => {
+                methods::get_transactions(server, body, restricted)
+            }
+            "/is_key_image_spent" => admin::is_key_image_spent(server, body, restricted),
+            "/get_transaction_pool" => admin::get_transaction_pool(server, restricted),
+            "/get_transaction_pool_hashes" => {
+                admin::get_transaction_pool_hashes(server, restricted)
+            }
+            "/get_transaction_pool_stats" => admin::get_transaction_pool_stats(server, restricted),
             "/get_peer_list" => admin::get_peer_list(server),
             "/get_public_nodes" => admin::get_public_nodes(server, body),
             "/in_peers" => admin::in_peers(server, body),
@@ -746,6 +763,48 @@ mod tests {
             .is_ok());
         // A name goes through as given, to be resolved by the bind.
         assert_eq!(bind_address("localhost", 1), "localhost:1");
+    }
+
+    /// A non-loopback main RPC address needs `--confirm-external-bind`, and
+    /// neither a restricted RPC nor a login stands in for it; the restricted
+    /// listener's address needs nothing, and is loopback unless given.
+    #[test]
+    fn an_external_bind_needs_confirming_whatever_else_is_given() {
+        let defaults = Config::default();
+        assert!(check_external_bind(&defaults).is_ok());
+        assert_eq!(defaults.rpc_restricted_bind_ip, "127.0.0.1");
+
+        let exposed = Config {
+            rpc_bind_ip: "0.0.0.0".into(),
+            restricted_rpc: true,
+            rpc_login: Some(("alice".into(), Some("pw".into()))),
+            ..Config::default()
+        };
+        let e = check_external_bind(&exposed).unwrap_err();
+        assert!(
+            e.starts_with("--rpc-bind-ip permits inbound unencrypted external connections"),
+            "{e}"
+        );
+        let confirmed = Config {
+            confirm_external_bind: true,
+            ..exposed
+        };
+        assert!(check_external_bind(&confirmed).is_ok());
+
+        // IPv6 is checked whether or not it is in use, as the C++ checks it.
+        let v6 = Config {
+            rpc_bind_ipv6_address: "::".into(),
+            ..Config::default()
+        };
+        let e = check_external_bind(&v6).unwrap_err();
+        assert!(e.starts_with("--rpc-bind-ipv6-address"), "{e}");
+
+        let public_restricted = Config {
+            rpc_restricted_bind_ip: "0.0.0.0".into(),
+            rpc_restricted_bind_port: Some(34_570),
+            ..Config::default()
+        };
+        assert!(check_external_bind(&public_restricted).is_ok());
     }
 
     /// The connection caps are `specs/11` §1.2's numbers.

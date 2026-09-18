@@ -10,8 +10,11 @@
 //! | [`subaddress`] | the spend-key → `(major, minor)` table |
 //! | [`scan`] | deciding whether a transaction paid this wallet |
 //! | [`history`] | what this wallet sent, and its transfer history |
+//! | [`rings`] | the rings this wallet has spent with, to spend with again |
 //! | [`store`] | where an open wallet's files live: on disk, or in memory a program keeps |
 //! | [`send`] | a destination to a relayed transaction, prepared and then committed |
+//! | [`cold`] | the files a watch-only wallet and an offline wallet exchange |
+//! | [`offline`] | what the two halves of a cold-signing pair do with them |
 //!
 //! # What is here and what is not
 //!
@@ -23,22 +26,30 @@
 //! building and signing ([`transfer`]), and the path from a destination to a
 //! relayed transaction that every wallet front end shares ([`send`]).
 //!
+//! And cold signing: the four files a watch-only half and an offline half
+//! exchange ([`cold`]), and what each half does with them ([`offline`]).
+//!
 //! The cache file (`specs/12` §2.2) is deliberately **not** the C++ format —
 //! that is a Boost portable binary archive, and §2.2 says so and says to detect
 //! one and rescan from the chain instead. The keys file is the one that must be
-//! shared, and it is.
+//! shared, and it is. So are the cold-signing files: those stopped being Boost
+//! archives in Monero 0.18 / Wownero 0.11 and are `binary_archive` now, which
+//! is reproducible — see [`cold`].
 
 pub mod account;
 pub mod chacha;
 pub mod clock;
+pub mod cold;
 pub mod decoys;
 pub mod entropy;
 pub mod files;
 pub mod history;
 pub mod keys_file;
 pub mod lock;
+pub mod offline;
 pub mod priority;
 pub mod refresh;
+pub mod rings;
 pub mod scan;
 pub mod send;
 pub mod spend;

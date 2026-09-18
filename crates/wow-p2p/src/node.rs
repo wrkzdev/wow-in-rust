@@ -5,12 +5,12 @@
 //!
 //! Each connection is two threads. The **reader** owns the socket's read side
 //! and runs the protocol: it answers requests, follows the sync, and wakes
-//! once a second to send timed syncs and notice a peer that has stopped
-//! answering. The **writer** drains a bounded outbox, so anything -- another
-//! connection relaying a transaction, the RPC server announcing a block -- can
-//! send to a peer without waiting on its socket. A peer too slow to keep its
-//! outbox from filling is disconnected rather than allowed to hold up the
-//! senders.
+//! once a second to notice a peer that has stopped answering. The **writer**
+//! drains a bounded outbox, so anything -- another connection relaying a
+//! transaction, the RPC server announcing a block, the maintenance thread's
+//! timed syncs -- can send to a peer without waiting on its socket. A peer too
+//! slow to keep its outbox from filling is disconnected rather than allowed to
+//! hold up the senders.
 //!
 //! At the connection counts a node runs with (a dozen outgoing, some tens
 //! incoming) that is well within what threads do comfortably, and it keeps
@@ -44,6 +44,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use wow_crypto::keccak::HASH_STATE_BYTES;
 use wow_crypto::random::Rng;
 use wow_crypto::types::Hash256;
 use wow_types::Network;
@@ -54,10 +55,13 @@ use crate::levin::{self, command, Header, Kind};
 use crate::messages::{
     self, BasicNodeData, BlockEntry, ChainEntry, ChainRequest, CoreSyncData, FluffyMissingTxs,
     HandshakeRequest, HandshakeResponse, NewBlock, NewTransactions, ObjectsRequest,
-    ObjectsResponse, PingResponse, TimedSync, TxpoolComplement, SUPPORT_FLAG_FLUFFY_BLOCKS,
+    ObjectsResponse, PeerlistEntry, PingResponse, TimedSync, TxpoolComplement,
+    SUPPORT_FLAG_FLUFFY_BLOCKS,
 };
 use crate::queue::{self, BlockQueue, SpanInfo};
+use crate::socks::{self, Proxy};
 use crate::sync::BatchSize;
+use crate::zone::{AnonZone, ZoneConfig};
 
 const LOG: &str = "net.p2p";
 
@@ -87,6 +91,12 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 const MAX_DIALING: usize = 8;
 /// How often the peer lists are written out while running.
 const SAVE_EVERY: Duration = Duration::from_secs(30 * 60);
+/// `P2P_DEFAULT_WHITELIST_CONNECTIONS_PERCENT`: the share of outgoing
+/// connections dialled from the white list before the gray list comes first.
+const WHITELIST_CONNECTIONS_PERCENT: usize = 70;
+/// How often one gray-list address is checked
+/// (`m_gray_peerlist_housekeeping_interval`).
+const GRAY_HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60);
 /// How long the applier first waits before retrying blocks that failed through
 /// no fault of their sender. The wait doubles each time the failure recurs.
 const STALL_RETRY: Duration = Duration::from_secs(1);
@@ -108,6 +118,20 @@ const DANDELION_EPOCH_RANGE_SECS: u64 = 30;
 const DANDELION_EMBARGO_AVERAGE: Duration = Duration::from_secs(39);
 /// `CRYPTONOTE_DANDELIONPP_FLUSH_AVERAGE`.
 const DANDELION_FLUSH_AVERAGE: Duration = Duration::from_secs(5);
+/// `CRYPTONOTE_FORWARD_DELAY_AVERAGE`: the mean wait before a transaction
+/// that arrived over an anonymity network is stemmed on the public one.
+///
+/// The C++ derives it from the noise timers --
+/// `(NOISE_MIN_DELAY + NOISE_DELAY_RANGE) * 3 / 2`, so 22 s -- the point
+/// being that in that time two or more incoming hidden connections could
+/// have been the one that sent it.
+const FORWARD_DELAY_AVERAGE_SECS: u64 = 22;
+/// The flush average for an incoming connection in the quarter seconds the
+/// C++ draws it in (`fluff_average_in`): 20.
+const FLUSH_QUARTERS_IN: u64 = DANDELION_FLUSH_AVERAGE.as_secs() * 4;
+/// Half that for an outgoing connection (`fluff_average_out`), as Bitcoin
+/// Core halves it: the operator chose those peers.
+const FLUSH_QUARTERS_OUT: u64 = FLUSH_QUARTERS_IN / 2;
 
 /// The hard-coded mainnet seed nodes (`specs/01` §12.2). Wownero has no DNS
 /// seeds, and testnet and stagenet have no seeds of their own.
@@ -153,12 +177,31 @@ pub enum BlockVerdict {
     },
 }
 
+/// How a transaction goes on through the network: the part of the C++'s
+/// `relay_method` this layer acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxRelay {
+    /// Submitted to this node. Always through a stem, whatever the epoch --
+    /// or, when an anonymity network is configured, only over that.
+    Local,
+    /// Received through a stem: on through one, unless this epoch fluffs.
+    Stem,
+    /// To every peer.
+    Fluff,
+    /// Received over an anonymity network. Held for a delay averaging
+    /// `CRYPTONOTE_FORWARD_DELAY_AVERAGE`, then stemmed on the public
+    /// network, so that two or more incoming hidden connections could have
+    /// been the one that sent it.
+    Forward,
+}
+
 /// What happened to a transaction a peer sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TxVerdict {
-    /// New to the pool. `relay` is false for one that must not be passed on.
-    Accepted { id: Hash256, relay: bool },
-    /// Already in the pool or the chain.
+    /// Taken by the pool: new to it, or held privately until now and moved
+    /// on by this copy. `how` it goes on, `None` for not at all.
+    Accepted { id: Hash256, how: Option<TxRelay> },
+    /// Already held publicly, or on the chain.
     Known { id: Hash256 },
     /// Refused. `ban` only for a transaction that could not be honest;
     /// relay-policy refusals never ban (`specs/08` §8.2).
@@ -201,19 +244,39 @@ pub trait Core: Send + Sync {
     /// A block on the main chain with only the transactions at `indices`, for
     /// a peer reconstructing a fluffy block.
     fn block_with_txs(&self, id: &Hash256, indices: &[u64]) -> Option<BlockEntry>;
-    /// Transactions a peer sent, one verdict each.
-    fn incoming_txs(&self, txs: &[Vec<u8>]) -> Vec<TxVerdict>;
-    /// Relayable pool transactions whose hashes are not in `known`.
+    /// Transactions a peer sent, one verdict each. `fluff` is the message's
+    /// `dandelionpp_fluff`: false for a stem.
+    fn incoming_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict>;
+    /// The same, for a peer on an anonymity network
+    /// (`handle_notify_new_transactions` with a non-public zone).
+    ///
+    /// The relay method there is `forward`, not `stem`: the pool holds the
+    /// transaction privately and this node passes it on over the public
+    /// network after a delay. A `fluff` flag still means fluff -- a hidden
+    /// service with noise disabled sets it, and says by it that the receiver
+    /// should not wait.
+    ///
+    /// The default treats it as any other peer's, which is what a core
+    /// without a private pool state can do; a core that keeps relay methods
+    /// overrides this.
+    fn incoming_txs_anonymous(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
+        self.incoming_txs(txs, fluff)
+    }
+    /// Public pool transactions -- fluffed or mined -- whose hashes are not in
+    /// `known` (`get_complement`). Never one still private: a peer asking is
+    /// not a peer the stem chose.
     fn pool_txs_except(&self, known: &HashSet<Hash256>) -> Vec<Vec<u8>>;
-    /// The hashes of relayable pool transactions.
+    /// The hashes of the public pool transactions, for this node's own
+    /// complement request.
     fn pool_hashes(&self) -> Vec<Hash256>;
-    /// These transactions have gone out to at least one peer.
-    fn tx_relayed(&self, ids: &[Hash256]);
-    /// Pool transactions due to go out again: never sent, or sent long enough
-    /// ago (`tx_memory_pool::get_relayable_transactions`). Asked on every
-    /// maintenance tick, so an implementation keeps its own pace; the default
-    /// is a core with nothing to send again.
-    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>)> {
+    /// These transactions have gone out to at least one peer: `Stem` when
+    /// through a stem, `Fluff` otherwise (`on_transactions_relayed`).
+    fn tx_relayed(&self, ids: &[Hash256], how: TxRelay);
+    /// Pool transactions due to go out again, and how: never sent, or sent
+    /// long enough ago (`tx_memory_pool::get_relayable_transactions`). Asked
+    /// on every maintenance tick, so an implementation keeps its own pace; the
+    /// default is a core with nothing to send again.
+    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>, TxRelay)> {
         Vec::new()
     }
 }
@@ -264,6 +327,22 @@ pub struct Config {
     pub ban_list: Vec<BanTarget>,
     /// The RPC port to advertise; zero unless the operator opted in.
     pub rpc_port: u16,
+    /// `--pad-transactions`: relay transactions in messages padded to a
+    /// multiple of a kilobyte, against traffic volume analysis.
+    pub pad_transactions: bool,
+    /// `--proxy`: dial every outgoing connection through this SOCKS5 proxy.
+    ///
+    /// The listener is unaffected -- a node behind a proxy can still be
+    /// reached at a port it forwards -- but nothing it says advertises an
+    /// address any more, and it stops pinging back incoming peers, because
+    /// the address they see is the proxy's (`m_can_pingback`).
+    pub proxy: Option<Proxy>,
+    /// `--tx-proxy`: one anonymity network each, i2p before Tor.
+    ///
+    /// With any of these, a transaction this node originates goes **only**
+    /// over them and never to a clearnet peer, which is how `send_txs` routes
+    /// one whose origin is not a peer.
+    pub tx_proxies: Vec<ZoneConfig>,
 }
 
 impl Config {
@@ -292,6 +371,9 @@ impl Config {
             state_file: None,
             ban_list: Vec::new(),
             rpc_port: 0,
+            pad_transactions: false,
+            proxy: None,
+            tx_proxies: Vec::new(),
         }
     }
 }
@@ -370,6 +452,8 @@ struct Conn {
     recv_bytes: AtomicU64,
     sent_bytes: Arc<AtomicU64>,
     last_recv: Mutex<Instant>,
+    /// When the timed sync still unanswered went out (`m_in_timedsync`).
+    timed_sync_sent: Mutex<Option<Instant>>,
 }
 
 impl Conn {
@@ -481,13 +565,14 @@ struct Proto {
     batch: BatchSize,
     /// When a peer whose chain entry offered nothing new may be asked again.
     chain_again_at: Instant,
-    last_timed_sync: Instant,
     next_housekeeping: Instant,
-    asked_complement: bool,
+    /// The addresses this peer has been given in a peer list
+    /// (`sent_addresses` in the C++'s connection context).
+    sent_addresses: HashSet<SocketAddr>,
 }
 
 impl Proto {
-    fn new() -> Proto {
+    fn new(sent_addresses: HashSet<SocketAddr>) -> Proto {
         let now = Instant::now();
         Proto {
             pending: None,
@@ -496,9 +581,8 @@ impl Proto {
             generation: 0,
             batch: BatchSize::default(),
             chain_again_at: now,
-            last_timed_sync: now,
             next_housekeeping: now,
-            asked_complement: false,
+            sent_addresses,
         }
     }
 }
@@ -507,17 +591,221 @@ impl Proto {
 // relay state
 // ---------------------------------------------------------------------------
 
-/// Transactions with their ids, waiting to go to one peer.
-type TxBatch = Vec<(Hash256, Vec<u8>)>;
+/// Transactions with their ids, going to a peer together.
+pub type TxBatch = Vec<(Hash256, Vec<u8>)>;
 
 struct Relay {
     epoch_ends: Instant,
-    /// This epoch's stem peers: outgoing connection ids.
-    stems: Vec<u64>,
+    /// Whether this epoch fluffs what arrives through a stem, rather than
+    /// passing it on through one (`zone::fluffing`). Drawn once an epoch, as
+    /// the C++ draws it: a per-transaction draw fluffed a fifth of every
+    /// stem, where Dandelion++ has a fifth of the nodes fluff everything for
+    /// ten minutes.
+    fluffing: bool,
+    /// This epoch's stems, and which one each source is sent to.
+    stems: StemMap,
     /// Stem transactions waiting to be seen fluffed, with their deadline.
     embargo: HashMap<Hash256, (Instant, Vec<u8>)>,
     /// Fluff transactions waiting for each connection's next flush.
     queued: HashMap<u64, (Instant, TxBatch)>,
+    /// Transactions that arrived over an anonymity network, with the time
+    /// each may go out on the public one.
+    forward: HashMap<Hash256, (Instant, Vec<u8>)>,
+}
+
+/// `net::dandelionpp::connection_map`: this epoch's stem connections, and the
+/// stem each source's transactions go to.
+///
+/// The mapping is sticky. Every transaction from one peer -- and every one
+/// this node originates, whose source is `None` -- takes the same stem for
+/// the whole epoch, and a new source takes the least used, so the stems
+/// split the sources between them. A transaction's path therefore says
+/// nothing about it that its source does not, where choosing afresh for each
+/// one let a stem peer that saw several correlate them. A stem that goes away
+/// leaves its slot empty; [`StemMap::update`] refills that slot alone, and a
+/// source mapped to it is moved on the next time it sends.
+#[derive(Debug, Default)]
+pub(crate) struct StemMap {
+    /// `out_mapping_`: the connection in each stem slot, `None` where one
+    /// went away.
+    out: Vec<Option<u64>>,
+    /// `in_mapping_`: the slot each source is sent to.
+    sources: HashMap<Option<u64>, usize>,
+    /// `usage_count_`: how many sources each slot has, one entry a stem.
+    usage: Vec<usize>,
+}
+
+impl StemMap {
+    /// `connection_map(out_connections, stems)`: `stems` of `connections`,
+    /// chosen at random.
+    pub(crate) fn new(
+        mut connections: Vec<u64>,
+        stems: usize,
+        rand: &mut impl FnMut(usize) -> usize,
+    ) -> StemMap {
+        if stems < connections.len() {
+            for i in 0..stems {
+                let j = i + rand(connections.len() - i);
+                connections.swap(i, j);
+            }
+            connections.truncate(stems);
+        } else {
+            for i in (1..connections.len()).rev() {
+                let j = rand(i + 1);
+                connections.swap(i, j);
+            }
+        }
+        StemMap {
+            out: connections.into_iter().map(Some).collect(),
+            sources: HashMap::new(),
+            usage: vec![0; stems],
+        }
+    }
+
+    /// `connection_map::update`: merge in the connections a stem may use
+    /// now. A slot whose connection is not among them is emptied, and empty
+    /// slots -- or ones never filled, for a map made with fewer connections
+    /// than stems -- take a connection not already a stem. Returns whether
+    /// anything changed.
+    pub(crate) fn update(
+        &mut self,
+        mut current: Vec<u64>,
+        rand: &mut impl FnMut(usize) -> usize,
+    ) -> bool {
+        current.sort_unstable();
+        let mut replace = false;
+        for slot in &mut self.out {
+            match slot.map(|id| current.binary_search(&id)) {
+                // Already a stem, so not a candidate for another slot.
+                Some(Ok(at)) => {
+                    current.remove(at);
+                }
+                _ => {
+                    *slot = None;
+                    replace = true;
+                }
+            }
+        }
+        if !replace && self.out.len() == self.usage.len() {
+            return false;
+        }
+        let existing = self.out.len();
+        for i in 0..self.usage.len() {
+            if current.is_empty() {
+                break;
+            }
+            let grow = self.out.len() <= i;
+            if grow || self.out[i].is_none() {
+                let last = current.len() - 1;
+                let pick = rand(current.len());
+                current.swap(last, pick);
+                let id = current.pop();
+                if grow {
+                    self.out.push(id);
+                } else {
+                    self.out[i] = id;
+                }
+            }
+        }
+        replace || existing < self.out.len()
+    }
+
+    /// The connection in slot `i`, for a noise channel: the channels take one
+    /// slot each (`update_channels::post`).
+    pub(crate) fn slot(&self, i: usize) -> Option<u64> {
+        self.out.get(i).copied().flatten()
+    }
+
+    /// `connection_map::get_stem`: the stem for transactions from `source`,
+    /// or `None` when no stem is left.
+    fn get_stem(
+        &mut self,
+        source: Option<u64>,
+        rand: &mut impl FnMut(usize) -> usize,
+    ) -> Option<u64> {
+        let slot = match self.sources.get(&source).copied() {
+            Some(slot) if self.out[slot].is_some() => slot,
+            mapped => {
+                // Never mapped, or mapped to a stem that has gone.
+                if let Some(old) = mapped {
+                    self.usage[old] = self.usage[old].saturating_sub(1);
+                }
+                let Some(slot) = self.least_used(rand) else {
+                    self.sources.remove(&source);
+                    return None;
+                };
+                self.sources.insert(source, slot);
+                self.usage[slot] += 1;
+                slot
+            }
+        };
+        self.out[slot]
+    }
+
+    /// `select_stem`: a live slot with the fewest sources, at random among
+    /// equals.
+    fn least_used(&self, rand: &mut impl FnMut(usize) -> usize) -> Option<usize> {
+        let mut lowest = usize::MAX;
+        let mut choices = Vec::new();
+        for (i, slot) in self.out.iter().enumerate() {
+            if slot.is_none() {
+                continue;
+            }
+            match self.usage[i].cmp(&lowest) {
+                std::cmp::Ordering::Less => {
+                    lowest = self.usage[i];
+                    choices.clear();
+                    choices.push(i);
+                }
+                std::cmp::Ordering::Equal => choices.push(i),
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        match choices.len() {
+            0 => None,
+            1 => Some(choices[0]),
+            n => Some(choices[rand(n)]),
+        }
+    }
+}
+
+/// A Poisson-distributed count with the given mean, from uniform draws in
+/// (0, 1]: Knuth's method, multiplying draws until the product falls to
+/// e^-mean.
+///
+/// The C++'s Dandelion++ timers are `std::poisson_distribution` in whole units
+/// (`crypto::random_poisson_duration`): seconds for an embargo, quarter
+/// seconds for a flush. An exponential delay with the same mean, which this
+/// used, spreads far wider -- a fifth of the embargoes under 9 s where the
+/// C++'s almost never go under 27 -- and the spread is what an observer
+/// times. At the means used here it takes as many draws as the mean.
+fn poisson(mean: u64, mut uniform: impl FnMut() -> f64) -> u64 {
+    let floor = (-(mean as f64)).exp();
+    let mut product = uniform();
+    let mut k = 0;
+    while product > floor {
+        k += 1;
+        product *= uniform();
+    }
+    k
+}
+
+/// A [`poisson`] count drawn from `rng`, as `crypto::random_poisson_duration`
+/// draws from `crypto::random_device`.
+pub(crate) fn poisson_from(rng: &mut Rng, mean: u64) -> u64 {
+    poisson(mean, || {
+        let mut b = [0u8; 8];
+        rng.fill(&mut b);
+        // 53 random bits, shifted off zero: a draw in (0, 1].
+        ((u64::from_le_bytes(b) >> 11) + 1) as f64 / (1u64 << 53) as f64
+    })
+}
+
+/// Sorted by blob, each once: the order a peer is sent transactions in must
+/// not be the order this node received them (`fluff_flush`).
+pub(crate) fn flush_order(txs: &mut TxBatch) {
+    txs.sort_by(|(_, a), (_, b)| a.cmp(b));
+    txs.dedup_by(|(_, a), (_, b)| a == b);
 }
 
 // ---------------------------------------------------------------------------
@@ -540,9 +828,16 @@ struct Shared {
     /// Set, with a notification, when a span arrives for the applier.
     apply_wake: (Mutex<bool>, Condvar),
     ever_synced: AtomicBool,
+    /// Whether the next connection to settle once the node is synchronised
+    /// asks its peer for the pool's complement (`m_ask_for_txpool_complement`):
+    /// set at start, and again when the last connection goes.
+    ask_complement: AtomicBool,
     stopping: AtomicBool,
     rng: Mutex<Rng>,
     relay: Mutex<Relay>,
+    /// The anonymity networks (`--tx-proxy`), i2p before Tor. Empty for a
+    /// node with only the public zone.
+    zones: Vec<Arc<AnonZone>>,
     out_peers: AtomicUsize,
     in_peers: AtomicUsize,
     dialing: Mutex<HashSet<SocketAddr>>,
@@ -581,6 +876,9 @@ impl Node {
             (false, None, None) => 0,
         };
 
+        let mut id = [0u8; 8];
+        rng.fill(&mut id);
+
         let mut book = match &cfg.state_file {
             Some(p) => AddressBook::load(p, cfg.allow_local_ip).unwrap_or_else(|e| {
                 wow_log::warn!(LOG, "starting with empty peer lists: {e}");
@@ -589,20 +887,41 @@ impl Node {
             None => AddressBook::new(cfg.allow_local_ip),
         };
         for addr in &cfg.add_peers {
-            book.add_white(PeerRecord {
-                addr: *addr,
-                id: 0,
-                last_seen: 0,
-                pruning_seed: 0,
-                rpc_port: 0,
-            });
+            // A random id, as the C++ gives each `--add-peer` entry
+            // (`crypto::rand<uint64_t>()`). The id goes out in peer lists,
+            // and zero is an id no node has.
+            let mut peer_id = [0u8; 8];
+            rng.fill(&mut peer_id);
+            book.add_white(
+                PeerRecord {
+                    addr: *addr,
+                    id: u64::from_le_bytes(peer_id),
+                    last_seen: 0,
+                    pruning_seed: 0,
+                    rpc_port: 0,
+                },
+                false,
+            );
         }
         for target in &cfg.ban_list {
             book.ban(*target, u64::MAX, 0);
         }
 
-        let mut id = [0u8; 8];
-        rng.fill(&mut id);
+        // The anonymity networks, in the C++'s order, each with a generator
+        // of its own seeded from this one: a zone's noise timers should not
+        // be predictable from the node's, nor the node's from a zone's.
+        let mut zone_cfgs = cfg.tx_proxies.clone();
+        zone_cfgs.sort_by_key(|z| z.zone);
+        let mut zones: Vec<Arc<AnonZone>> = Vec::new();
+        for mut zone_cfg in zone_cfgs {
+            zone_cfg.pad_transactions = cfg.pad_transactions;
+            let mut seed = [0u8; HASH_STATE_BYTES];
+            rng.fill(&mut seed);
+            let zone_rng = Rng::from_state(seed);
+            let zone = zone_cfg.zone;
+            zones.push(AnonZone::start(zone_cfg, cfg.network, core.clone(), zone_rng)?);
+            wow_log::info!(LOG, "sending this node's own transactions over {zone}");
+        }
 
         let shared = Arc::new(Shared {
             out_peers: AtomicUsize::new(cfg.out_peers),
@@ -618,19 +937,26 @@ impl Node {
             generation: AtomicU64::new(0),
             apply_wake: (Mutex::new(false), Condvar::new()),
             ever_synced: AtomicBool::new(false),
+            ask_complement: AtomicBool::new(true),
             stopping: AtomicBool::new(false),
             rng: Mutex::new(rng),
             relay: Mutex::new(Relay {
                 epoch_ends: Instant::now(),
-                stems: Vec::new(),
+                fluffing: false,
+                stems: StemMap::default(),
                 embargo: HashMap::new(),
                 queued: HashMap::new(),
+                forward: HashMap::new(),
             }),
+            zones,
             dialing: Mutex::new(HashSet::new()),
             tried: Mutex::new(HashMap::new()),
         });
 
         let mut threads = Vec::new();
+        if let Some(proxy) = &shared.cfg.proxy {
+            wow_log::info!(LOG, "dialling peers through the proxy at {proxy}");
+        }
         for listener in [listener, listener_v6].into_iter().flatten() {
             if let Ok(a) = listener.local_addr() {
                 wow_log::info!(LOG, "listening for peers on {a}");
@@ -702,6 +1028,9 @@ impl Node {
         }
         for c in &conns {
             c.close();
+        }
+        for zone in &self.shared.zones {
+            zone.stop();
         }
         for t in lock(&self.threads).drain(..) {
             let _ = t.join();
@@ -784,7 +1113,14 @@ impl Node {
     /// Send a transaction this node originated. It starts in the Dandelion++
     /// stem phase (`specs/08` §7.2).
     pub fn relay_transaction(&self, id: Hash256, blob: Vec<u8>) {
-        self.shared.relay_tx(None, id, blob, true);
+        self.shared.relay_txs(None, vec![(id, blob)], TxRelay::Local);
+    }
+
+    /// Send a transaction the network already has to every peer, as the
+    /// `relay_tx` RPC does for a public one: stemming it again would only
+    /// look like a loop to the stem.
+    pub fn fluff_transaction(&self, id: Hash256, blob: Vec<u8>) {
+        self.shared.relay_txs(None, vec![(id, blob)], TxRelay::Fluff);
     }
 
     /// Announce a block this node added itself, such as one submitted over
@@ -845,19 +1181,47 @@ impl Shared {
         }
     }
 
-    /// An exponentially distributed delay with the given mean -- the Poisson
-    /// timers of `specs/08` §7.2.
-    fn exp_delay(&self, mean: Duration) -> Duration {
-        let u = (self.rand_u64() >> 11) as f64 / (1u64 << 53) as f64;
-        Duration::from_secs_f64(-mean.as_secs_f64() * (1.0 - u).ln())
+    /// A [`poisson`] count with the given mean, drawn from the node's CSPRNG
+    /// as `crypto::random_poisson_duration` draws from `crypto::random_device`.
+    fn poisson_draw(&self, mean: u64) -> u64 {
+        poisson_from(&mut lock(&self.rng), mean)
+    }
+
+    /// An embargo (`tx_pool.cpp`'s `embargo_duration`): whole seconds, Poisson
+    /// about `CRYPTONOTE_DANDELIONPP_EMBARGO_AVERAGE`.
+    fn embargo(&self) -> Duration {
+        Duration::from_secs(self.poisson_draw(DANDELION_EMBARGO_AVERAGE.as_secs()))
+    }
+
+    /// The wait before a connection's first queued fluff goes (`fluff_notify`):
+    /// quarter seconds, Poisson about 5 s for an incoming connection and 2.5 s
+    /// for an outgoing one.
+    fn flush_delay(&self, incoming: bool) -> Duration {
+        let mean = if incoming {
+            FLUSH_QUARTERS_IN
+        } else {
+            FLUSH_QUARTERS_OUT
+        };
+        Duration::from_millis(250 * self.poisson_draw(mean))
+    }
+
+    /// `network_zone::m_can_pingback`: whether a peer could reach this node
+    /// at the address the connection came from.
+    ///
+    /// False behind `--proxy`, where the address a peer sees is the proxy's.
+    /// A node that cannot be pinged back advertises no port and no RPC port,
+    /// and does not ping back the peers that reach it.
+    fn can_pingback(&self) -> bool {
+        self.cfg.proxy.is_none()
     }
 
     fn node_data(&self) -> BasicNodeData {
+        let pingback = self.can_pingback();
         BasicNodeData {
             network_id: messages::network_id(self.cfg.network),
             peer_id: self.peer_id,
-            my_port: self.my_port,
-            rpc_port: self.cfg.rpc_port,
+            my_port: if pingback { self.my_port } else { 0 },
+            rpc_port: if pingback { self.cfg.rpc_port } else { 0 },
             rpc_credits_per_hash: 0,
             support_flags: SUPPORT_FLAG_FLUFFY_BLOCKS,
         }
@@ -877,6 +1241,26 @@ impl Shared {
         let conns = lock(&self.conns);
         let incoming = conns.values().filter(|c| c.incoming).count();
         (conns.len() - incoming, incoming)
+    }
+
+    /// `needs_new_sync_connections`: not known to be caught up, and short of
+    /// outgoing connections.
+    ///
+    /// The C++ compares its height with the target height peers have given it
+    /// over time. This node goes by the heights its connected peers report,
+    /// and with no peer to report one it is not known to be caught up.
+    fn needs_new_sync_connections(&self) -> bool {
+        let conns = self.snapshot();
+        let target = conns
+            .iter()
+            .map(|c| c.peer_sync().current_height)
+            .max()
+            .unwrap_or(0);
+        if target != 0 && target <= self.core.sync_data().current_height {
+            return false;
+        }
+        let outgoing = conns.iter().filter(|c| !c.incoming).count();
+        outgoing < self.out_peers.load(Ordering::Relaxed)
     }
 
     fn save_state(&self) {
@@ -956,125 +1340,295 @@ impl Shared {
 
     // ---------------------------------------------------------------- relay
 
-    /// Pass a transaction on (`specs/08` §7).
+    /// Pass transactions on (`specs/08` §7; `levin_notify.cpp`'s `send_txs`).
     ///
-    /// One this node originated, or a stem transaction that loses the 20%
-    /// draw, goes to a single stem peer and waits under an embargo; if it has
-    /// not been seen fluffed when the embargo ends, this node fluffs it. A
-    /// fluff transaction is queued to every other peer and flushed on each
+    /// What this node originated always goes through a stem; what arrived
+    /// through one goes on through one in a stem epoch, and is fluffed in a
+    /// fluff epoch. A stem send is one message to the stem the epoch maps
+    /// the sender to, after which each transaction waits under an embargo --
+    /// if it has not been seen fluffed when the embargo ends, this node
+    /// fluffs it. A fluff is queued to every other peer and flushed on each
     /// one's Poisson timer.
-    fn relay_tx(&self, from: Option<u64>, id: Hash256, blob: Vec<u8>, stem: bool) {
-        let fluff_now = if from.is_none() {
-            false
-        } else if stem {
-            self.rand_below(100) < DANDELION_FLUFF_PERCENT
+    fn relay_txs(&self, from: Option<u64>, txs: TxBatch, how: TxRelay) {
+        if how == TxRelay::Forward {
+            self.hold_forwarded(txs);
+            return;
+        }
+        let own = how == TxRelay::Local;
+        // This node's own transaction already under an embargo has just gone
+        // through a stem, sent by another thread that read the pool a moment
+        // before this one: the RPC and the pool's re-relay both reach here.
+        // Sending it again would show the stem peer what looks like a loop,
+        // and a loop is fluffed.
+        let txs: TxBatch = if own {
+            let relay = lock(&self.relay);
+            txs.into_iter()
+                .filter(|(id, _)| !relay.embargo.contains_key(id))
+                .collect()
         } else {
-            true
+            txs
         };
-
-        if !fluff_now {
-            if let Some(target) = self.stem_peer(from) {
-                let body = NewTransactions {
-                    txs: vec![blob.clone()],
-                    dandelionpp_fluff: false,
+        if txs.is_empty() {
+            return;
+        }
+        // `send_txs`: a transaction that did not come from a peer goes to an
+        // anonymity network when one is configured, and to no clearnet peer
+        // at all. One that cannot be sent is left unmarked, so the pool
+        // offers it again when a hidden connection turns up
+        // (`docs/ANONYMITY_NETWORKS.md`: "the transaction is kept for future
+        // broadcasting over an anonymity network").
+        if own && !self.zones.is_empty() {
+            match self.pick_zone() {
+                Some(zone) => {
+                    zone.send_txs(&txs);
                 }
-                .to_bytes();
-                if target.notify(command::NEW_TRANSACTIONS, &body) {
-                    let deadline = Instant::now() + self.exp_delay(DANDELION_EMBARGO_AVERAGE);
-                    lock(&self.relay).embargo.insert(id, (deadline, blob));
-                    self.core.tx_relayed(&[id]);
+                None => wow_log::warn!(
+                    LOG,
+                    "cannot send {} transaction(s): the anonymity networks had no \
+                     outgoing connections",
+                    txs.len()
+                ),
+            }
+            return;
+        }
+        let stem = match how {
+            TxRelay::Local => true,
+            TxRelay::Stem => !lock(&self.relay).fluffing,
+            TxRelay::Fluff => false,
+            // Held above.
+            TxRelay::Forward => return,
+        };
+        if stem {
+            // As `dandelionpp_notify` tries it: the stem, and when that finds
+            // no connection, the map mended from the connections there are now
+            // and the stem again -- twice, before giving up and fluffing. With
+            // the stems mended only on the next tick, a transaction submitted
+            // just after a stem went, or just after the first peer arrived,
+            // was fluffed straight from this node.
+            for _ in 0..2 {
+                if self.stem(from, &txs, own) {
                     return;
                 }
+                let candidates = self.stem_candidates();
+                let mut rand = |n: usize| self.rand_below(n);
+                lock(&self.relay).stems.update(candidates, &mut rand);
             }
+            wow_log::debug!(
+                LOG,
+                "no Dandelion++ stem for {} transaction(s); fluffing",
+                txs.len()
+            );
         }
-        self.fluff(from, id, blob);
+        self.fluff(from, txs);
     }
 
-    fn fluff(&self, except: Option<u64>, id: Hash256, blob: Vec<u8>) {
-        let targets: Vec<u64> = self
+    /// Hold transactions that arrived over an anonymity network until their
+    /// forward delay is up (`tx_pool.cpp`: `last_relayed_time = now +
+    /// random_poisson_seconds{forward_delay_average}()`).
+    ///
+    /// One already waiting keeps the deadline it has, so a pool that offers
+    /// it again does not push it further out.
+    fn hold_forwarded(&self, txs: TxBatch) {
+        if txs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut relay = lock(&self.relay);
+        for (id, blob) in txs {
+            if relay.forward.contains_key(&id) {
+                continue;
+            }
+            let wait = Duration::from_secs(self.poisson_draw(FORWARD_DELAY_AVERAGE_SECS));
+            relay.forward.insert(id, (now + wait, blob));
+        }
+    }
+
+    /// `send_txs`'s choice of anonymity network.
+    ///
+    /// With one zone, that one, whatever it can do right now -- the C++ sends
+    /// to `*m_network_zones.rbegin()` without looking. With more, i2p first,
+    /// preferring a zone whose noise channels are all connected, then one
+    /// with an outgoing connection at all.
+    fn pick_zone(&self) -> Option<&Arc<AnonZone>> {
+        if self.zones.len() <= 1 {
+            return self.zones.first();
+        }
+        self.zones
+            .iter()
+            .find(|z| {
+                let s = z.status();
+                s.has_noise && s.connections_filled
+            })
+            .or_else(|| self.zones.iter().find(|z| z.status().has_outgoing))
+    }
+
+    /// Send `txs` through the stem the epoch's map gives `from`, together,
+    /// and put them under an embargo. Returns whether they went -- or, when
+    /// they are this node's `own`, whether each is under an embargo now.
+    ///
+    /// The relay lock is held from choosing the stem to recording the
+    /// embargo, so two threads relaying the same transaction of this node's
+    /// cannot both send it.
+    fn stem(&self, from: Option<u64>, txs: &TxBatch, own: bool) -> bool {
+        let mut relay = lock(&self.relay);
+        let fresh: TxBatch = txs
+            .iter()
+            .filter(|(id, _)| !own || !relay.embargo.contains_key(id))
+            .cloned()
+            .collect();
+        if fresh.is_empty() {
+            return true;
+        }
+        let mut rand = |n: usize| self.rand_below(n);
+        let conn = relay
+            .stems
+            .get_stem(from, &mut rand)
+            .and_then(|id| lock(&self.conns).get(&id).cloned())
+            .filter(|c| c.state() == STATE_NORMAL);
+        let Some(conn) = conn else {
+            return false;
+        };
+        let blobs = fresh.iter().map(|(_, blob)| blob.clone()).collect();
+        let body = self.tx_message(blobs, false);
+        if !conn.notify(command::NEW_TRANSACTIONS, &body) {
+            return false;
+        }
+        let now = Instant::now();
+        for (id, blob) in &fresh {
+            let deadline = now + self.embargo();
+            relay.embargo.insert(*id, (deadline, blob.clone()));
+        }
+        drop(relay);
+        let ids: Vec<Hash256> = fresh.iter().map(|(id, _)| *id).collect();
+        self.core.tx_relayed(&ids, TxRelay::Stem);
+        true
+    }
+
+    /// Queue `txs` to every synchronised peer but `except` (`fluff_notify`).
+    fn fluff(&self, except: Option<u64>, txs: TxBatch) {
+        let targets: Vec<(u64, bool)> = self
             .snapshot()
             .iter()
             .filter(|c| Some(c.id) != except && c.state() == STATE_NORMAL)
-            .map(|c| c.id)
+            .map(|c| (c.id, c.incoming))
             .collect();
+        let ids: Vec<Hash256> = txs.iter().map(|(id, _)| *id).collect();
         let mut relay = lock(&self.relay);
-        relay.embargo.remove(&id);
+        for id in &ids {
+            relay.embargo.remove(id);
+        }
         if targets.is_empty() {
-            // Sent to nobody, so not marked relayed: the pool offers it again
-            // ([`Core::due_for_relay`]) until a synchronised peer can take it.
-            // Marking it here left it in the pool for good.
+            // Sent to nobody, so not marked relayed: the pool offers them
+            // again ([`Core::due_for_relay`]) until a synchronised peer can
+            // take them. Marking them here left them in the pool for good.
             wow_log::debug!(
                 LOG,
-                "no synchronised peer to send transaction {} to; it waits in the pool",
-                wow_crypto::hex::encode(&id)
+                "no synchronised peer to send {} transaction(s) to; they wait in the pool",
+                ids.len()
             );
             return;
         }
-        for t in targets {
-            let flush_at = Instant::now() + self.exp_delay(DANDELION_FLUSH_AVERAGE);
-            let entry = relay.queued.entry(t).or_insert((flush_at, Vec::new()));
-            if !entry.1.iter().any(|(i, _)| *i == id) {
-                entry.1.push((id, blob.clone()));
-            }
+        let now = Instant::now();
+        for (t, incoming) in targets {
+            // The timer starts with the first transaction a connection's
+            // queue takes, and the rest wait for it.
+            let queue = relay
+                .queued
+                .entry(t)
+                .or_insert_with(|| (now + self.flush_delay(incoming), Vec::new()));
+            queue.1.extend(txs.iter().cloned());
         }
         drop(relay);
-        self.core.tx_relayed(&[id]);
+        self.core.tx_relayed(&ids, TxRelay::Fluff);
     }
 
-    /// The stem peer for a transaction: for one received from `from`, the
-    /// epoch's mapping of that connection; for a local one, either stem.
-    fn stem_peer(&self, from: Option<u64>) -> Option<Arc<Conn>> {
-        let stems = lock(&self.relay).stems.clone();
-        let conns = lock(&self.conns);
-        let live: Vec<&Arc<Conn>> = stems
-            .iter()
-            .filter_map(|id| conns.get(id))
-            .filter(|c| Some(c.id) != from && c.state() == STATE_NORMAL)
-            .collect();
-        if live.is_empty() {
-            return None;
-        }
-        let i = match from {
-            Some(f) => (f as usize) % live.len(),
-            None => self.rand_below(live.len()),
+    /// A `NOTIFY_NEW_TRANSACTIONS` body for a relay, padded with
+    /// `--pad-transactions` as `make_tx_message` pads it. Only relays are: an
+    /// answer to a complement request goes out as it is, as the C++ sends it.
+    fn tx_message(&self, txs: Vec<Vec<u8>>, fluff: bool) -> Vec<u8> {
+        let message = NewTransactions {
+            txs,
+            dandelionpp_fluff: fluff,
         };
-        Some(live[i].clone())
+        if self.cfg.pad_transactions {
+            message.to_padded_bytes()
+        } else {
+            message.to_bytes()
+        }
+    }
+
+    /// The outgoing connections a stem may use (`get_out_connections`):
+    /// synchronised ones.
+    fn stem_candidates(&self) -> Vec<u64> {
+        self.snapshot()
+            .iter()
+            .filter(|c| !c.incoming && c.state() == STATE_NORMAL)
+            .map(|c| c.id)
+            .collect()
     }
 
     fn relay_tick(&self) {
         let now = Instant::now();
 
-        // A new epoch picks new stem peers from the outgoing connections -- as
-        // does losing one, or having none: an epoch that began before any
-        // connection was up would otherwise run ten minutes with no stems.
-        let rotate = {
-            let relay = lock(&self.relay);
-            let conns = lock(&self.conns);
-            now >= relay.epoch_ends
-                || relay.stems.is_empty()
-                || relay.stems.iter().any(|id| !conns.contains_key(id))
-        };
-        if rotate {
-            let mut outgoing: Vec<u64> = self
-                .snapshot()
-                .iter()
-                .filter(|c| !c.incoming && c.state() == STATE_NORMAL)
-                .map(|c| c.id)
-                .collect();
-            let mut stems = Vec::new();
-            while stems.len() < DANDELION_STEMS && !outgoing.is_empty() {
-                let i = self.rand_below(outgoing.len());
-                stems.push(outgoing.swap_remove(i));
-            }
+        // A new epoch (`start_epoch`): new stems from the outgoing
+        // connections, and a new draw of whether it fluffs. Between epochs a
+        // stem that went away is replaced when a send finds it gone, and only
+        // it ([`Shared::relay_txs`]); replacing both and starting the epoch
+        // over whenever one stem dropped reshuffled every source's path.
+        if now >= lock(&self.relay).epoch_ends {
+            let candidates = self.stem_candidates();
+            let mut rand = |n: usize| self.rand_below(n);
+            let fluffing = rand(100) < DANDELION_FLUFF_PERCENT;
+            let stems = StemMap::new(candidates, DANDELION_STEMS, &mut rand);
             let epoch = DANDELION_MIN_EPOCH
                 + Duration::from_secs(self.rand_u64() % DANDELION_EPOCH_RANGE_SECS);
             let mut relay = lock(&self.relay);
+            relay.fluffing = fluffing;
             relay.stems = stems;
             relay.epoch_ends = now + epoch;
+            wow_log::debug!(
+                LOG,
+                "a new Dandelion++ epoch: {}",
+                if fluffing { "fluff" } else { "stem" }
+            );
         }
 
+        // What arrived over an anonymity network since the last tick. A
+        // forward waits; one whose sender set the fluff flag does not, and is
+        // fluffed on the public network as
+        // `handle_notify_new_transactions` fluffs it.
+        let mut arrived = TxBatch::new();
+        let mut fluffed = TxBatch::new();
+        for zone in &self.zones {
+            for (id, blob, how) in zone.take_arrived() {
+                match how {
+                    TxRelay::Fluff => fluffed.push((id, blob)),
+                    _ => arrived.push((id, blob)),
+                }
+            }
+        }
+        self.hold_forwarded(arrived);
+        self.relay_txs(None, fluffed, TxRelay::Fluff);
+
+        // Forwards whose delay is up: on through a public stem, as
+        // `relay_txpool_transactions` sends them
+        // (`relay_transactions(stem_req, source, zone::public_, stem)`).
+        let ready: TxBatch = {
+            let mut relay = lock(&self.relay);
+            let ids: Vec<Hash256> = relay
+                .forward
+                .iter()
+                .filter(|(_, (at, _))| *at <= now)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| relay.forward.remove(&id).map(|(_, blob)| (id, blob)))
+                .collect()
+        };
+        self.relay_txs(None, ready, TxRelay::Stem);
+
         // Embargoes that ran out without the transaction coming back fluffed.
-        let expired: Vec<(Hash256, Vec<u8>)> = {
+        let expired: TxBatch = {
             let mut relay = lock(&self.relay);
             let ids: Vec<Hash256> = relay
                 .embargo
@@ -1086,9 +1640,7 @@ impl Shared {
                 .filter_map(|id| relay.embargo.remove(&id).map(|(_, blob)| (id, blob)))
                 .collect()
         };
-        for (id, blob) in expired {
-            self.fluff(None, id, blob);
-        }
+        self.relay_txs(None, expired, TxRelay::Fluff);
 
         // Flushes that are due.
         let due: Vec<(u64, TxBatch)> = {
@@ -1105,14 +1657,11 @@ impl Shared {
         };
         if !due.is_empty() {
             let conns = lock(&self.conns);
-            for (id, txs) in due {
+            for (id, mut txs) in due {
                 if let Some(c) = conns.get(&id) {
-                    let body = NewTransactions {
-                        txs: txs.into_iter().map(|(_, b)| b).collect(),
-                        dandelionpp_fluff: true,
-                    }
-                    .to_bytes();
-                    c.notify(command::NEW_TRANSACTIONS, &body);
+                    flush_order(&mut txs);
+                    let blobs = txs.into_iter().map(|(_, b)| b).collect();
+                    c.notify(command::NEW_TRANSACTIONS, &self.tx_message(blobs, true));
                 }
             }
         }
@@ -1120,10 +1669,23 @@ impl Shared {
         // A transaction sent once can still have reached no one: a peer that
         // dropped it, a connection that closed before its flush. The pool says
         // what is due to go again, as `relay_txpool_transactions` asks it in
-        // the C++, and it goes as fluff.
-        for (id, blob) in self.core.due_for_relay() {
-            self.fluff(None, id, blob);
+        // the C++, and they go together: those submitted here and never
+        // stemmed through the stem, the rest as fluff.
+        let mut local = TxBatch::new();
+        let mut public = TxBatch::new();
+        let mut waiting = TxBatch::new();
+        for (id, blob, how) in self.core.due_for_relay() {
+            match how {
+                TxRelay::Local => local.push((id, blob)),
+                TxRelay::Stem | TxRelay::Fluff => public.push((id, blob)),
+                // A forward the pool still holds: this process was restarted
+                // before its delay was up, so it starts a new one.
+                TxRelay::Forward => waiting.push((id, blob)),
+            }
         }
+        self.relay_txs(None, local, TxRelay::Local);
+        self.relay_txs(None, public, TxRelay::Fluff);
+        self.hold_forwarded(waiting);
     }
 
     /// Announce a block to every synchronised peer but `except`: fluffy, with
@@ -1162,7 +1724,7 @@ impl Shared {
 // threads
 // ---------------------------------------------------------------------------
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panic elsewhere while holding a lock poisons it; the data is still
     // usable, and a node that stopped serving every peer over one panic would
     // be worse off.
@@ -1239,10 +1801,12 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
         return;
     }
     if !addr.ip().is_loopback() {
+        // Incoming connections only, as `has_too_many_connections` counts:
+        // this node dialling a host does not stop that host dialling back.
         let from_here = shared
             .snapshot()
             .iter()
-            .filter(|c| c.addr.ip() == addr.ip())
+            .filter(|c| c.incoming && c.addr.ip() == addr.ip())
             .count();
         if from_here >= shared.cfg.max_connections_per_ip {
             return;
@@ -1289,10 +1853,11 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
                 return;
             }
 
+            let peers = shared.handshake_peers();
             let resp = messages::handshake_response(
                 &shared.node_data(),
                 &shared.core.sync_data(),
-                &shared.handshake_peers(),
+                &peers,
             );
             if write_frame(
                 &mut stream,
@@ -1304,7 +1869,12 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
                 return;
             }
 
-            if req.node_data.my_port != 0 && req.node_data.my_port <= u32::from(u16::MAX) {
+            // `if(arg.node_data.my_port && zone.m_can_pingback)`: a node that
+            // dials out through a proxy does not ping anyone back.
+            let ping_back_it = req.node_data.my_port != 0
+                && req.node_data.my_port <= u32::from(u16::MAX)
+                && shared.can_pingback();
+            if ping_back_it {
                 let s = shared.clone();
                 let node = req.node_data.clone();
                 let seed = req.payload_data.pruning_seed;
@@ -1314,6 +1884,11 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
             }
 
             reader.set_limit(levin::DEFAULT_MAX_PACKET_SIZE);
+            // What the handshake handed over, no timed sync hands over again.
+            let sent_addresses = peers
+                .iter()
+                .filter_map(|e| e.address.socket_addr())
+                .collect();
             run_connection(
                 shared,
                 stream,
@@ -1322,6 +1897,7 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
                 req.node_data,
                 req.payload_data,
                 reader,
+                sent_addresses,
             );
         }
         _ => {}
@@ -1356,24 +1932,40 @@ fn ping_back(shared: Arc<Shared>, ip: IpAddr, node: BasicNodeData, pruning_seed:
     })();
 
     if let Ok(true) = confirmed {
-        lock(&shared.book).add_white(PeerRecord {
-            addr: target,
-            id: node.peer_id,
-            last_seen: unix_now() as i64,
-            pruning_seed,
-            rpc_port: node.rpc_port,
-        });
+        // Not `set_peer_just_seen`: an address already white keeps its
+        // `last_seen`, as `append_with_peer_white` leaves it after a ping.
+        lock(&shared.book).add_white(
+            PeerRecord {
+                addr: target,
+                id: node.peer_id,
+                last_seen: unix_now() as i64,
+                pruning_seed,
+                rpc_port: node.rpc_port,
+            },
+            false,
+        );
         wow_log::debug!(LOG, "{target} answered a ping-back; white-listed");
     }
 }
 
 /// Dial and handshake, returning the connection ready to run.
+///
+/// With `--proxy`, the socket comes from the proxy instead. The target is
+/// given to it as an address rather than a name: everything dialled here came
+/// from a peer list or from an option this node resolved at start, so there is
+/// nothing left to look up.
 fn dial(
     shared: &Shared,
     addr: SocketAddr,
 ) -> Result<(TcpStream, FrameReader, HandshakeResponse), String> {
-    let mut stream =
-        TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
+    let mut stream = match &shared.cfg.proxy {
+        Some(proxy) => {
+            let target = socks::Target::Ip(addr);
+            socks::connect(proxy, target, socks::CONNECT_TIMEOUT)
+                .map_err(|e| format!("through the proxy at {proxy}: {e}"))?
+        }
+        None => TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?,
+    };
     let _ = stream.set_nodelay(true);
     let body = messages::handshake_request(&shared.node_data(), &shared.core.sync_data());
     write_frame(
@@ -1584,8 +2176,19 @@ fn drain_queue(shared: &Shared, stall: &mut Stall) {
 
 fn maintenance(shared: Arc<Shared>) {
     let mut last_save = Instant::now();
+    // Both due at once, as `once_a_time_seconds` is on its first call.
+    let mut last_timed_sync: Option<Instant> = None;
+    let mut last_gray_check: Option<Instant> = None;
     while !shared.stopping() {
+        if last_timed_sync.is_none_or(|t| t.elapsed() >= TIMED_SYNC_INTERVAL) {
+            last_timed_sync = Some(Instant::now());
+            timed_sync_all(&shared);
+        }
         make_connections(&shared);
+        if last_gray_check.is_none_or(|t| t.elapsed() >= GRAY_HOUSEKEEPING_INTERVAL) {
+            last_gray_check = Some(Instant::now());
+            gray_housekeeping(&shared);
+        }
         shared.relay_tick();
         if last_save.elapsed() >= SAVE_EVERY {
             shared.save_state();
@@ -1636,7 +2239,7 @@ fn make_connections(shared: &Arc<Shared>) {
                 .filter(|a| !taken.contains(a) && fresh(a)),
         );
         if outgoing + dialing + wanted.len() < target {
-            if let Some(a) = pick_candidate(shared, &taken, outgoing) {
+            if let Some(a) = pick_candidate(shared, &taken, outgoing, target) {
                 wanted.push(a);
             }
         }
@@ -1660,19 +2263,19 @@ fn make_connections(shared: &Arc<Shared>) {
                 match result {
                     Ok((stream, reader, hs)) => {
                         {
+                            let now = unix_now();
                             let mut book = lock(&s.book);
-                            book.add_white(PeerRecord {
-                                addr,
-                                id: hs.node_data.peer_id,
-                                last_seen: unix_now() as i64,
-                                pruning_seed: hs.payload_data.pruning_seed,
-                                rpc_port: hs.node_data.rpc_port,
-                            });
-                            for p in &hs.peers {
-                                if let Some(r) = PeerRecord::from_entry(p) {
-                                    book.add_gray(r);
-                                }
-                            }
+                            book.merge_peerlist(&hs.peers, now);
+                            book.add_white(
+                                PeerRecord {
+                                    addr,
+                                    id: hs.node_data.peer_id,
+                                    last_seen: now as i64,
+                                    pruning_seed: hs.payload_data.pruning_seed,
+                                    rpc_port: hs.node_data.rpc_port,
+                                },
+                                true,
+                            );
                         }
                         run_connection(
                             s,
@@ -1682,11 +2285,15 @@ fn make_connections(shared: &Arc<Shared>) {
                             hs.node_data,
                             hs.payload_data,
                             reader,
+                            HashSet::new(),
                         );
                     }
                     Err(e) => {
+                        // Not dropped from the lists: the C++ leaves a peer
+                        // it could not reach where it was, and does not try
+                        // the host from them again for an hour.
                         wow_log::debug!(LOG, "{addr}: {e}");
-                        lock(&s.book).failed_to_reach(&addr);
+                        lock(&s.book).record_addr_failed(addr.ip(), unix_now());
                     }
                 }
             });
@@ -1696,13 +2303,16 @@ fn make_connections(shared: &Arc<Shared>) {
     }
 }
 
-/// The next address to dial: an anchor while there are few connections, then
-/// the white list 70% of the time and the gray list otherwise, then the
-/// operator's `--add-peer` addresses, then the seed nodes.
+/// The next address to dial (`connections_maker`): an anchor while there are
+/// few connections; then the white list until 70% of the outgoing target is
+/// connected and the gray list first after that, choosing as
+/// [`AddressBook::pick`] does; then the operator's `--add-peer` addresses,
+/// then the seed nodes.
 fn pick_candidate(
     shared: &Arc<Shared>,
     taken: &HashSet<SocketAddr>,
     outgoing: usize,
+    target: usize,
 ) -> Option<SocketAddr> {
     let now = Instant::now();
     let unix = unix_now();
@@ -1713,34 +2323,35 @@ fn pick_candidate(
                 .get(a)
                 .is_none_or(|t| now.duration_since(*t) >= RETRY_AFTER)
     };
+    // `is_peer_used` also knows a node by its id on the same host, whatever
+    // the port.
+    let peers: HashSet<(IpAddr, u64)> = shared
+        .snapshot()
+        .iter()
+        .map(|c| (c.addr.ip(), c.peer_id))
+        .collect();
 
     let mut book = lock(&shared.book);
-    let ok = |a: &SocketAddr, book: &mut AddressBook| usable(a) && !book.is_banned(a.ip(), unix);
+    let bans = book.bans(unix);
+    let unusable = |r: &PeerRecord| {
+        !usable(&r.addr)
+            || r.id == shared.peer_id
+            || peers.contains(&(r.addr.ip(), r.id))
+            || bans.iter().any(|(t, _)| t.covers(r.addr.ip()))
+            || book.is_addr_recently_failed(r.addr.ip(), unix)
+    };
 
     if outgoing < ANCHOR_CONNECTIONS {
-        if let Some(a) = book
-            .anchors()
-            .into_iter()
-            .map(|r| r.addr)
-            .find(|a| ok(a, &mut book))
-        {
-            return Some(a);
+        if let Some(r) = book.anchors().into_iter().find(|r| !unusable(r)) {
+            return Some(r.addr);
         }
     }
 
-    let white_first = shared.rand_below(100) < 70;
-    let banned: HashSet<IpAddr> = book
-        .bans(unix)
-        .into_iter()
-        .filter_map(|(t, _)| match t {
-            BanTarget::Host(ip) => Some(ip),
-            BanTarget::Subnet(_) => None,
-        })
-        .collect();
-    let skip = |a: &SocketAddr| !usable(a) || banned.contains(&a.ip());
+    let white_first = outgoing < target * WHITELIST_CONNECTIONS_PERCENT / 100;
+    let connected: Vec<SocketAddr> = taken.iter().copied().collect();
     for from_white in [white_first, !white_first] {
         let mut rand = |n: usize| shared.rand_below(n);
-        if let Some(r) = book.pick(from_white, &mut rand, &skip) {
+        if let Some(r) = book.pick(from_white, &connected, &mut rand, &unusable) {
             return Some(r.addr);
         }
     }
@@ -1755,7 +2366,77 @@ fn pick_candidate(
         .find(|a| usable(a))
 }
 
+/// Check one gray-list address, and promote or forget it
+/// (`gray_peerlist_housekeeping`).
+///
+/// A handshake, and a disconnect straight after. An address that answers is
+/// white-listed, with what the gray list knew of it, and its peer list is
+/// taken as any handshake's is; one that does not is dropped from the gray
+/// list. Without this the gray list only grows staler, and every outgoing
+/// connection dialled from it is a guess.
+///
+/// Not with exclusive nodes, and not while this node is still short of
+/// connections to sync from (`needs_new_sync_connections`): those dials go to
+/// connections it keeps.
+fn gray_housekeeping(shared: &Arc<Shared>) {
+    if !shared.cfg.exclusive_nodes.is_empty() || shared.needs_new_sync_connections() {
+        return;
+    }
+    let candidate = {
+        let book = lock(&shared.book);
+        let mut rand = |n: usize| shared.rand_below(n);
+        book.random_gray(&mut rand)
+    };
+    let Some(rec) = candidate else {
+        return;
+    };
+    let addr = rec.addr;
+    if !lock(&shared.dialing).insert(addr) {
+        return;
+    }
+    let s = shared.clone();
+    let spawned = std::thread::Builder::new()
+        .name("p2p-gray".into())
+        .spawn(move || {
+            let result = dial(&s, addr);
+            lock(&s.dialing).remove(&addr);
+            let now = unix_now();
+            let mut book = lock(&s.book);
+            match result {
+                Ok((stream, _, hs)) => {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    book.merge_peerlist(&hs.peers, now);
+                    // `set_peer_just_seen`, with the gray entry's id, pruning
+                    // seed and RPC port.
+                    book.add_white(
+                        PeerRecord {
+                            last_seen: now as i64,
+                            ..rec
+                        },
+                        true,
+                    );
+                    wow_log::debug!(LOG, "{addr}: answered; white-listed");
+                }
+                Err(e) => {
+                    book.record_addr_failed(addr.ip(), now);
+                    book.remove_gray(&addr);
+                    wow_log::debug!(LOG, "{addr}: {e}; dropped from the gray list");
+                }
+            }
+        });
+    if spawned.is_err() {
+        lock(&shared.dialing).remove(&addr);
+    }
+}
+
 /// Run a handshaken connection on the current thread until it ends.
+///
+/// `sent_addresses` is what the handshake gave the peer: nothing for an
+/// outgoing connection, whose handshake request carries no peer list.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "what the handshake settled, which each side gathers differently"
+)]
 fn run_connection(
     shared: Arc<Shared>,
     mut stream: TcpStream,
@@ -1764,6 +2445,7 @@ fn run_connection(
     node: BasicNodeData,
     sync: CoreSyncData,
     mut reader: FrameReader,
+    sent_addresses: HashSet<SocketAddr>,
 ) {
     let (Ok(writer), Ok(socket)) = (stream.try_clone(), stream.try_clone()) else {
         return;
@@ -1787,6 +2469,7 @@ fn run_connection(
         recv_bytes: AtomicU64::new(0),
         sent_bytes: sent.clone(),
         last_recv: Mutex::new(Instant::now()),
+        timed_sync_sent: Mutex::new(None),
     });
 
     {
@@ -1810,7 +2493,7 @@ fn run_connection(
         .name("p2p-write".into())
         .spawn(move || write_loop(writer, rx, closed, sent));
 
-    let mut proto = Proto::new();
+    let mut proto = Proto::new(sent_addresses);
     let _ = stream.set_read_timeout(Some(TICK));
     advance(&shared, &conn, &mut proto);
 
@@ -1835,7 +2518,15 @@ fn run_connection(
         }
     };
 
-    lock(&shared.conns).remove(&conn.id);
+    {
+        let mut conns = lock(&shared.conns);
+        conns.remove(&conn.id);
+        // Cut off from the network: whatever the pool missed meanwhile is
+        // asked for again once back.
+        if conns.is_empty() {
+            shared.ask_complement.store(true, Ordering::Relaxed);
+        }
+    }
     lock(&shared.queue).flush(conn.id, false);
     conn.close();
     match fault {
@@ -1896,21 +2587,32 @@ fn handle_message(
         (Kind::Request, command::TIMED_SYNC) => {
             let t = TimedSync::parse(body).map_err(|e| malformed("timed sync", e))?;
             *lock(&conn.sync) = t.payload_data;
-            let reply = messages::timed_sync_response_with_peers(
-                &core.sync_data(),
-                &shared.handshake_peers(),
-            );
+            let peers = unsent(shared.handshake_peers(), &mut proto.sent_addresses);
+            let reply = messages::timed_sync_response_with_peers(&core.sync_data(), &peers);
             conn.respond(command::TIMED_SYNC, 1, &reply);
         }
         (Kind::Response, command::TIMED_SYNC) => {
+            *lock(&conn.timed_sync_sent) = None;
             if header.return_code >= 0 {
                 let t = TimedSync::parse(body).map_err(|e| malformed("timed sync", e))?;
+                let pruning_seed = t.payload_data.pruning_seed;
                 *lock(&conn.sync) = t.payload_data;
+                let now = unix_now();
                 let mut book = lock(&shared.book);
-                for p in &t.peers {
-                    if let Some(r) = PeerRecord::from_entry(p) {
-                        book.add_gray(r);
-                    }
+                book.merge_peerlist(&t.peers, now);
+                // An outgoing peer that answers is seen just now
+                // (`set_peer_just_seen` in `do_peer_timed_sync`).
+                if !conn.incoming {
+                    book.add_white(
+                        PeerRecord {
+                            addr: conn.addr,
+                            id: conn.peer_id,
+                            last_seen: now as i64,
+                            pruning_seed,
+                            rpc_port: conn.rpc_port,
+                        },
+                        true,
+                    );
                 }
             }
         }
@@ -1993,7 +2695,8 @@ fn handle_message(
         (Kind::Notification, command::NEW_TRANSACTIONS) => {
             on_new_transactions(shared, conn, body)?;
         }
-        (Kind::Notification, command::GET_TXPOOL_COMPLEMENT) => {
+        // Only from a peer in the normal state, as the C++ answers.
+        (Kind::Notification, command::GET_TXPOOL_COMPLEMENT) if conn.state() == STATE_NORMAL => {
             let c = TxpoolComplement::parse(body).map_err(|e| malformed("pool complement", e))?;
             let known: HashSet<Hash256> = c.hashes.into_iter().collect();
             let txs = core.pool_txs_except(&known);
@@ -2011,6 +2714,19 @@ fn handle_message(
     Ok(())
 }
 
+/// The peers of `peers` this connection has not been given yet, now marked
+/// given (`handle_timed_sync`).
+///
+/// A peer asks for a timed sync every minute. Handing it a fresh random
+/// selection each time would give it the whole white list within the hour,
+/// and show it, entry by entry, what joined the list and when.
+fn unsent(peers: Vec<PeerlistEntry>, sent: &mut HashSet<SocketAddr>) -> Vec<PeerlistEntry> {
+    peers
+        .into_iter()
+        .filter(|e| e.address.socket_addr().is_none_or(|a| sent.insert(a)))
+        .collect()
+}
+
 fn housekeeping(shared: &Shared, conn: &Conn, proto: &mut Proto) -> Result<(), Fault> {
     let now = Instant::now();
     if now < proto.next_housekeeping {
@@ -2026,15 +2742,29 @@ fn housekeeping(shared: &Shared, conn: &Conn, proto: &mut Proto) -> Result<(), F
     if now.duration_since(*lock(&conn.last_recv)) > IDLE_TIMEOUT {
         return Err(Fault::drop("idle"));
     }
-    if now.duration_since(proto.last_timed_sync) >= TIMED_SYNC_INTERVAL {
-        proto.last_timed_sync = now;
-        conn.request(
-            command::TIMED_SYNC,
-            &messages::timed_sync_request(&shared.core.sync_data()),
-        );
-    }
     advance(shared, conn, proto);
     Ok(())
+}
+
+/// A timed sync to every connection not still waiting on its last one
+/// (`peer_sync_idle_maker`).
+///
+/// One clock for all of them, as the C++ runs it from its idle loop, so a
+/// peer's first comes anywhere up to a minute after its handshake. On each
+/// connection's own clock, a timed sync came exactly a minute after every
+/// handshake, which only this node did.
+fn timed_sync_all(shared: &Shared) {
+    let body = messages::timed_sync_request(&shared.core.sync_data());
+    for c in shared.snapshot() {
+        let mut sent = lock(&c.timed_sync_sent);
+        // One the peer never answered stops holding the next back after
+        // `P2P_DEFAULT_INVOKE_TIMEOUT`, when the C++'s invoke would time out.
+        if sent.is_some_and(|t| t.elapsed() < INVOKE_TIMEOUT) {
+            continue;
+        }
+        *sent = Some(Instant::now());
+        c.request(command::TIMED_SYNC, &body);
+    }
 }
 
 /// Move this connection's part of the sync along (`request_missing_objects`).
@@ -2056,7 +2786,7 @@ fn advance(shared: &Shared, conn: &Conn, proto: &mut Proto) {
         proto.chain.clear();
     }
     if shared.cfg.no_sync {
-        settle(shared, conn, proto);
+        settle(shared, conn);
         return;
     }
 
@@ -2081,7 +2811,7 @@ fn advance(shared: &Shared, conn: &Conn, proto: &mut Proto) {
         if peer.cumulative_difficulty <= ours.cumulative_difficulty
             || shared.core.have_block(&peer.top_id)
         {
-            settle(shared, conn, proto);
+            settle(shared, conn);
         } else if Instant::now() >= proto.chain_again_at {
             request_chain(shared, conn, proto);
         } else {
@@ -2122,6 +2852,19 @@ fn advance(shared: &Shared, conn: &Conn, proto: &mut Proto) {
 
     match reserved {
         Some((start, ids)) => {
+            // One request in flight per connection, which is what `pending`
+            // being a single slot means and what the reference does.
+            //
+            // A second in flight would hide the round trip, and it is worth
+            // knowing why that is not done here. Parallelism across *peers* is
+            // the reference's answer and this node's: a dozen connections each
+            // filling a span is already a dozen requests in the air, and the
+            // applier is the thing they queue behind. A second request per
+            // connection would also mean matching an answer to the request it
+            // belongs to -- `RESPONSE_GET_OBJECTS` does not name one -- and
+            // deciding what a span whose partner failed should do. That is a
+            // protocol change, on the path that has to agree with C++ peers,
+            // for a saving the peer count already buys.
             conn.notify(
                 command::REQUEST_GET_OBJECTS,
                 &messages::request_objects(&ids, false),
@@ -2153,12 +2896,28 @@ fn offers(proto: &Proto, start: u64, ids: &[Hash256]) -> bool {
 
 /// The peer is not ahead: the connection is in the normal state, and a sync
 /// it took part in has ended.
-fn settle(shared: &Shared, conn: &Conn, proto: &mut Proto) {
+fn settle(shared: &Shared, conn: &Conn) {
     // A handshaken peer that is not ahead means this node is caught up with at
     // least one of the network's views.
     shared.ever_synced.store(true, Ordering::Relaxed);
     let was_syncing = matches!(conn.state(), STATE_SYNCHRONIZING | STATE_STANDBY);
     conn.set_state(STATE_NORMAL);
+    // Catch the pool up with the network's (`specs/08` §6.3), once, from the
+    // first connection to settle after the node is synchronised
+    // (`on_connection_synchronized`). Asking every connection that finished a
+    // sync fetched the same pool a dozen times over, and it offered the
+    // peers this node's private transactions' hashes too: only public ones
+    // are listed, since a hash is all it takes to tell a stem holds one.
+    if shared.ask_complement.load(Ordering::Relaxed)
+        && shared.sync_status().synchronized
+        && shared.ask_complement.swap(false, Ordering::SeqCst)
+    {
+        let body = TxpoolComplement {
+            hashes: shared.core.pool_hashes(),
+        }
+        .to_bytes();
+        conn.notify(command::GET_TXPOOL_COMPLEMENT, &body);
+    }
     if !was_syncing {
         return;
     }
@@ -2168,15 +2927,6 @@ fn settle(shared: &Shared, conn: &Conn, proto: &mut Proto) {
         conn.addr,
         shared.core.sync_data().current_height
     );
-    // Catch the pool up with what the peer holds (`specs/08` §6.3).
-    if !proto.asked_complement {
-        proto.asked_complement = true;
-        let body = TxpoolComplement {
-            hashes: shared.core.pool_hashes(),
-        }
-        .to_bytes();
-        conn.notify(command::GET_TXPOOL_COMPLEMENT, &body);
-    }
 }
 
 fn request_chain(shared: &Shared, conn: &Conn, proto: &mut Proto) {
@@ -2350,12 +3100,26 @@ fn on_new_transactions(shared: &Shared, conn: &Conn, body: &[u8]) -> Result<(), 
         return Ok(());
     }
     let m = NewTransactions::parse(body).map_err(|e| malformed("transactions", e))?;
-    let verdicts = shared.core.incoming_txs(&m.txs);
-    for (blob, verdict) in m.txs.iter().zip(verdicts) {
+    let verdicts = shared.core.incoming_txs(&m.txs, m.dandelionpp_fluff);
+    // Passed on as two batches, the stem and the fluff, as the C++ relays
+    // them (`handle_notify_new_transactions`); one message per transaction
+    // told a stem peer how many there had been, and in what order.
+    let mut stem = TxBatch::new();
+    let mut fluff = TxBatch::new();
+    for (blob, verdict) in m.txs.into_iter().zip(verdicts) {
         match verdict {
-            TxVerdict::Accepted { id, relay: true } => {
-                shared.relay_tx(Some(conn.id), id, blob.clone(), !m.dandelionpp_fluff);
-            }
+            // As the pool says, not as the message says: a stem copy of a
+            // transaction this node already holds in its stem is a loop, and
+            // is fluffed -- where answering "known" left it to sit out the
+            // embargo while the stem went quiet.
+            TxVerdict::Accepted {
+                id,
+                how: Some(TxRelay::Local | TxRelay::Stem),
+            } => stem.push((id, blob)),
+            TxVerdict::Accepted {
+                id,
+                how: Some(TxRelay::Fluff),
+            } => fluff.push((id, blob)),
             TxVerdict::Accepted { .. } => {}
             TxVerdict::Known { id } => {
                 // Seen fluffed: any embargo on it has served its purpose.
@@ -2367,6 +3131,8 @@ fn on_new_transactions(shared: &Shared, conn: &Conn, body: &[u8]) -> Result<(), 
             TxVerdict::Rejected { .. } => {}
         }
     }
+    shared.relay_txs(Some(conn.id), stem, TxRelay::Stem);
+    shared.relay_txs(Some(conn.id), fluff, TxRelay::Fluff);
     Ok(())
 }
 
@@ -2391,6 +3157,107 @@ mod tests {
         assert_eq!(DANDELION_MIN_EPOCH, Duration::from_secs(600));
         assert_eq!(DANDELION_EMBARGO_AVERAGE, Duration::from_secs(39));
         assert_eq!(DANDELION_FLUSH_AVERAGE, Duration::from_secs(5));
+        assert_eq!((FLUSH_QUARTERS_IN, FLUSH_QUARTERS_OUT), (20, 10));
+    }
+
+    /// splitmix64, as uniform draws in (0, 1]: a fixed sequence, so the
+    /// statistics below are the same on every run.
+    fn uniforms(mut state: u64) -> impl FnMut() -> f64 {
+        move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            ((z >> 11) + 1) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// The timers are Poisson counts, as `std::poisson_distribution` gives
+    /// them: the mean asked for, and a variance equal to it. An exponential
+    /// delay, which this used, has the mean but a variance of its square --
+    /// 1,521 s² for the embargo rather than 39.
+    #[test]
+    fn the_dandelion_timers_are_poisson() {
+        for mean in [10u64, 20, 39] {
+            let mut next = uniforms(mean);
+            let n = 20_000;
+            let draws: Vec<f64> = (0..n).map(|_| poisson(mean, &mut next) as f64).collect();
+            let avg = draws.iter().sum::<f64>() / n as f64;
+            let var = draws.iter().map(|d| (d - avg).powi(2)).sum::<f64>() / n as f64;
+            let expected = mean as f64;
+            assert!((avg - expected).abs() < 0.3, "mean {mean}: {avg}");
+            assert!((var / expected - 1.0).abs() < 0.1, "mean {mean}: {var}");
+        }
+        assert_eq!(poisson(0, uniforms(1)), 0);
+    }
+
+    /// A batch goes out sorted and without repeats, whatever order it was
+    /// queued in.
+    #[test]
+    fn a_flush_does_not_keep_the_arrival_order() {
+        let mut txs: TxBatch = vec![
+            ([3; 32], vec![3, 3]),
+            ([1; 32], vec![1]),
+            ([3; 32], vec![3, 3]),
+            ([2; 32], vec![2]),
+        ];
+        flush_order(&mut txs);
+        let blobs: Vec<Vec<u8>> = txs.into_iter().map(|(_, b)| b).collect();
+        assert_eq!(blobs, vec![vec![1], vec![2], vec![3, 3]]);
+    }
+
+    /// Each source keeps its stem for the epoch; a new source takes the least
+    /// used; a stem that goes away is replaced alone, and a source mapped to it
+    /// moves on.
+    #[test]
+    fn the_stem_map_is_sticky_and_mends_only_what_broke() {
+        let mut first = |_: usize| 0;
+        let mut map = StemMap::new(vec![10, 11, 12, 13], DANDELION_STEMS, &mut first);
+        let stems: Vec<Option<u64>> = map.out.clone();
+        assert_eq!(stems.len(), 2);
+        assert!(stems.iter().all(|s| s.is_some()));
+
+        let local = map.get_stem(None, &mut first).unwrap();
+        let peer = map.get_stem(Some(7), &mut first).unwrap();
+        assert_ne!(local, peer, "the second source takes the other stem");
+        for _ in 0..5 {
+            assert_eq!(map.get_stem(None, &mut first), Some(local));
+            assert_eq!(map.get_stem(Some(7), &mut first), Some(peer));
+        }
+        assert_eq!(map.usage, vec![1, 1]);
+
+        // Nothing changed: nothing to do.
+        assert!(!map.update((10..14).collect(), &mut first));
+
+        // The local stem goes away. Its slot takes another connection, the
+        // other slot keeps its own, and the local source moves.
+        let live: Vec<u64> = (10..14).filter(|c| *c != local).collect();
+        assert!(map.update(live, &mut first));
+        assert!(map.out.contains(&Some(peer)));
+        assert!(!map.out.contains(&Some(local)));
+        assert_eq!(map.get_stem(Some(7), &mut first), Some(peer));
+        let moved = map.get_stem(None, &mut first).unwrap();
+        assert_ne!(moved, local);
+        assert_eq!(map.usage.iter().sum::<usize>(), 2);
+
+        // With no connections left, there is no stem, and no mapping kept.
+        assert!(map.update(Vec::new(), &mut first));
+        assert_eq!(map.get_stem(None, &mut first), None);
+        assert!(!map.sources.contains_key(&None));
+    }
+
+    /// An epoch that starts with no connections fills its stems as they come.
+    #[test]
+    fn an_empty_stem_map_fills_up() {
+        let mut first = |_: usize| 0;
+        let mut map = StemMap::new(Vec::new(), DANDELION_STEMS, &mut first);
+        assert_eq!(map.get_stem(None, &mut first), None);
+        assert!(map.update(vec![5], &mut first));
+        assert_eq!(map.get_stem(None, &mut first), Some(5));
+        assert!(map.update(vec![5, 6, 7], &mut first));
+        assert_eq!(map.out.len(), DANDELION_STEMS);
+        assert_eq!(map.get_stem(Some(1), &mut first), map.out[1]);
     }
 
     /// Mainnet has its six hard-coded seeds; the test networks have none of
@@ -2444,6 +3311,37 @@ mod tests {
         assert!(!stall.waiting(later));
         assert!(!stall.cleared(), "only once");
         assert_eq!(stall.failed("clock", later).0, Duration::from_secs(1));
+    }
+
+    /// A peer is given each address once per connection: what the handshake
+    /// gave, and what an earlier timed sync gave, the next timed sync leaves
+    /// out.
+    #[test]
+    fn a_timed_sync_gives_only_peers_not_given_before() {
+        let entry = |host: &str| PeerlistEntry {
+            address: messages::NetworkAddress::from_socket_addr(host.parse().unwrap()),
+            id: 1,
+            last_seen: 0,
+            pruning_seed: 0,
+            rpc_port: 0,
+        };
+        let a = entry("8.8.8.8:34567");
+        let b = entry("9.9.9.9:34567");
+        let c = entry("1.1.1.1:34567");
+
+        // The handshake gave `a`.
+        let mut sent = HashSet::new();
+        sent.insert("8.8.8.8:34567".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            unsent(vec![a.clone(), b.clone()], &mut sent),
+            vec![b.clone()]
+        );
+        assert_eq!(
+            unsent(vec![b.clone(), c.clone(), a.clone()], &mut sent),
+            vec![c]
+        );
+        assert!(unsent(vec![a, b], &mut sent).is_empty());
+        assert_eq!(sent.len(), 3);
     }
 
     #[test]

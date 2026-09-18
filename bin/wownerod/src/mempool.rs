@@ -26,12 +26,25 @@
 //! The last check is not policy. `check_tx_inputs` verifies every ring
 //! signature and the range proof, and a node that skipped it would relay
 //! forgeries.
+//!
+//! # What the pool keeps to itself
+//!
+//! Every entry carries the C++'s `relay_method`: how the transaction arrived
+//! and how far it has gone since, which only ever moves up -- kept from relay,
+//! submitted here, in a Dandelion++ stem, fluffed, mined. Only the last two are
+//! the network's already (`relay_category::broadcasted`). A transaction still
+//! in its stem, or submitted here and not yet out, is exactly what Dandelion++
+//! exists to hide, so everything an outsider can ask about the pool -- the
+//! restricted RPC, the ZMQ RPC, a peer's complement request, a block template
+//! -- sees only [`PoolEntry::is_public`] ones.
 
 use std::collections::HashMap;
 
 use wow_crypto::types::{Hash256, KeyImage};
 use wow_storage::db::{BlockchainDb, OutputData};
 use wow_storage::lmdb::LmdbDb;
+pub use wow_storage::records::RelayMethod;
+use wow_storage::records::TxPoolMeta;
 use wow_types::tx::{Transaction, TxIn};
 
 /// `CRYPTONOTE_MAX_TX_SIZE`.
@@ -45,10 +58,6 @@ const TX_LIVETIME: u64 = 3 * 86_400;
 /// `CRYPTONOTE_MEMPOOL_TX_FROM_ALT_BLOCK_LIVETIME`, a week: a transaction that
 /// came back out of a replaced block gets longer to be mined again.
 const TX_FROM_ALT_BLOCK_LIVETIME: u64 = 7 * 86_400;
-/// How long a transaction stays out of `NOTIFY_GET_TXPOOL_COMPLEMENT` answers,
-/// so one still in its Dandelion++ stem phase (embargo mean 39 s) is not
-/// handed to a peer that did not get it through the stem.
-const COMPLEMENT_QUIET_SECS: u64 = 120;
 /// `MIN_RELAY_TIME`: a transaction sent to peers is not sent again sooner.
 pub const MIN_RELAY_SECS: u64 = 5 * 60;
 /// `MAX_RELAY_TIME`: nor later than this after the last time.
@@ -76,12 +85,17 @@ pub enum Rejection {
     NonZeroUnlockTime {
         unlock_time: u64,
     },
-    /// `in_pool` is the pooled transaction spending it; `None` means a block
-    /// did.
-    DoubleSpend {
-        key_image: KeyImage,
-        in_pool: Option<Hash256>,
-    },
+    /// A key image a block or another pooled transaction has spent.
+    ///
+    /// Which one is deliberately not said. Naming the pooled transaction told
+    /// anyone with a key image to try which transaction this node held for it
+    /// -- including one still in its Dandelion++ stem, which is the one thing
+    /// the stem is there to keep quiet. The C++'s reason is "double spend" and
+    /// nothing more.
+    DoubleSpend,
+    /// Already held publicly or kept from relay, or already on the chain
+    /// (`core::add_new_tx`'s early return). Not a failure to the C++: it
+    /// answers OK, and relays nothing.
     AlreadyInPool,
     InvalidInput(String),
     InvalidOutput(String),
@@ -90,6 +104,18 @@ pub enum Rejection {
         count: usize,
     },
     NotParseable(String),
+    /// A RingCT shape this node has no verifier for.
+    ///
+    /// Its own variant, not an [`Rejection::InvalidInput`], because the two
+    /// mean opposite things about whoever sent it: an invalid input is the
+    /// sender's fault, and this is **ours**. A block carrying one is refused
+    /// either way, but the peer that sent it is not banned for this node's
+    /// gap -- the same distinction `PowError::CryptoNightNotImplemented`
+    /// makes for proofs of work, and the one that stops a missing rule
+    /// costing this node every peer it has.
+    UnsupportedRctType {
+        ty: wow_types::rct::RctType,
+    },
 }
 
 impl Rejection {
@@ -109,21 +135,7 @@ impl Rejection {
                 "the unlock time is {unlock_time}; Wownero does not relay a transaction with a \
                  non-zero unlock time, though one is valid inside a block"
             ),
-            Rejection::DoubleSpend {
-                key_image,
-                in_pool: None,
-            } => format!(
-                "the output with key image {} has already been spent in a block",
-                wow_crypto::hex::encode(&key_image.0)
-            ),
-            Rejection::DoubleSpend {
-                key_image,
-                in_pool: Some(tx),
-            } => format!(
-                "the output with key image {} is already being spent by transaction {} in the pool",
-                wow_crypto::hex::encode(&key_image.0),
-                wow_crypto::hex::encode(tx)
-            ),
+            Rejection::DoubleSpend => "double spend".into(),
             Rejection::AlreadyInPool => "the transaction is already in the pool".into(),
             Rejection::InvalidInput(w) => format!("an input is not valid: {w}"),
             Rejection::InvalidOutput(w) => format!("an output is not valid: {w}"),
@@ -132,6 +144,10 @@ impl Rejection {
                 format!("{count} output(s); at least two are required")
             }
             Rejection::NotParseable(w) => format!("the transaction does not parse: {w}"),
+            Rejection::UnsupportedRctType { ty } => format!(
+                "RCT type {ty:?} is not one this node can verify yet, so the \
+                 transaction is refused rather than taken on trust"
+            ),
         }
     }
 
@@ -143,10 +159,7 @@ impl Rejection {
     pub fn flags(&self) -> [(&'static str, bool); 9] {
         [
             ("low_mixin", false),
-            (
-                "double_spend",
-                matches!(self, Rejection::DoubleSpend { .. }),
-            ),
+            ("double_spend", matches!(self, Rejection::DoubleSpend)),
             ("invalid_input", matches!(self, Rejection::InvalidInput(_))),
             (
                 "invalid_output",
@@ -171,6 +184,23 @@ impl Rejection {
     }
 }
 
+/// Where a relay method stands in `relay_method`'s order, which a transaction
+/// only ever moves up: kept from relay, submitted here, forwarded, stem,
+/// fluff, mined (`txpool_tx_meta_t::upgrade_relay_method`).
+///
+/// Spelled out rather than read off the enum, whose declaration order is the
+/// storage record's and puts `Block` before `Fluff`.
+fn rank(method: RelayMethod) -> u8 {
+    match method {
+        RelayMethod::None => 0,
+        RelayMethod::Local => 1,
+        RelayMethod::Forward => 2,
+        RelayMethod::Stem => 3,
+        RelayMethod::Fluff => 4,
+        RelayMethod::Block => 5,
+    }
+}
+
 /// One transaction in the pool.
 #[derive(Clone, Debug)]
 pub struct PoolEntry {
@@ -178,15 +208,62 @@ pub struct PoolEntry {
     pub weight: u64,
     pub fee: u64,
     pub receive_time: u64,
-    /// Set when the submitter asked for the transaction not to be broadcast.
-    pub do_not_relay: bool,
-    /// Whether it has actually been sent to a peer. Separate from
-    /// `do_not_relay`: a transaction nobody forbade relaying has still not
-    /// been relayed until something sends it.
+    /// How it reached the pool and how far it has gone since. `None` is
+    /// `do_not_relay`, and `Block` is `kept_by_block`: in the C++ those two
+    /// flags are this, stored.
+    pub relay: RelayMethod,
+    /// Whether it has been sent to a peer, or came from one. Separate from the
+    /// relay method: a transaction nobody forbade relaying has still not been
+    /// relayed until something sends it.
     pub relayed: bool,
     pub double_spend_seen: bool,
+}
+
+impl PoolEntry {
+    /// `relay_category::broadcasted`: fluffed or mined, and so already the
+    /// network's to see. The only transactions anyone outside this node is
+    /// told about.
+    pub fn is_public(&self) -> bool {
+        matches!(self.relay, RelayMethod::Fluff | RelayMethod::Block)
+    }
+
+    /// `relay_category::legacy`: public, or kept from relay by whoever
+    /// submitted it -- the transactions the pool simply holds, as opposed to
+    /// ones still on their private way out.
+    pub fn is_legacy(&self) -> bool {
+        self.is_public() || self.relay == RelayMethod::None
+    }
+
+    /// Submitted with `do_not_relay`.
+    pub fn do_not_relay(&self) -> bool {
+        self.relay == RelayMethod::None
+    }
+
     /// It came back out of a block a reorganisation replaced.
-    pub kept_by_block: bool,
+    pub fn kept_by_block(&self) -> bool {
+        self.relay == RelayMethod::Block
+    }
+
+    /// `upgrade_relay_method`: move on to `method` if that is further along.
+    /// Returns whether it moved.
+    fn upgrade(&mut self, method: RelayMethod) -> bool {
+        if rank(self.relay) < rank(method) {
+            self.relay = method;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A transaction the pool took (`tx_verification_context`, the part a caller
+/// acts on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admitted {
+    pub id: Hash256,
+    /// `m_relay`: how it goes on from here. `RelayMethod::None` for not at
+    /// all -- asked not to be, or paying no fee.
+    pub relay: RelayMethod,
 }
 
 /// The pool.
@@ -248,9 +325,24 @@ impl TxPool {
         self.by_id.get(id)
     }
 
-    /// Every transaction id in the pool.
-    pub fn ids(&self) -> Vec<Hash256> {
-        self.by_id.keys().copied().collect()
+    /// The transaction ids a caller may see: every one with
+    /// `include_sensitive`, the public ones otherwise
+    /// (`get_transaction_hashes`).
+    pub fn ids(&self, include_sensitive: bool) -> Vec<Hash256> {
+        self.by_id
+            .iter()
+            .filter(|(_, e)| include_sensitive || e.is_public())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// How many transactions [`TxPool::ids`] would list
+    /// (`get_transactions_count`).
+    pub fn count(&self, include_sensitive: bool) -> usize {
+        self.by_id
+            .values()
+            .filter(|e| include_sensitive || e.is_public())
+            .count()
     }
 
     /// In the order a block template wants them: descending fee per weight,
@@ -282,7 +374,7 @@ impl TxPool {
             .by_id
             .iter()
             .filter(|(_, e)| {
-                let life = if e.kept_by_block {
+                let life = if e.kept_by_block() {
                     TX_FROM_ALT_BLOCK_LIVETIME
                 } else {
                     TX_LIVETIME
@@ -323,21 +415,32 @@ impl TxPool {
         dropped
     }
 
-    /// Refuse a key image a block or a pooled transaction has spent, saying
-    /// which.
-    fn check_unspent(&self, db: &LmdbDb, k_image: &KeyImage) -> Result<(), Rejection> {
-        if db.has_key_image(k_image).unwrap_or(false) {
-            return Err(Rejection::DoubleSpend {
-                key_image: *k_image,
-                in_pool: None,
-            });
+    /// Refuse a key image a block or a pooled transaction has spent.
+    fn check_unspent(
+        &self,
+        db: &LmdbDb,
+        k_image: &KeyImage,
+        id: &Hash256,
+    ) -> Result<(), Rejection> {
+        if db.has_key_image(k_image).unwrap_or(false) || self.spent_in_pool(k_image, id) {
+            return Err(Rejection::DoubleSpend);
         }
+        Ok(())
+    }
+
+    /// `have_tx_keyimg_as_spent`: whether a pooled transaction spends this key
+    /// image, when the transaction asking is `id`.
+    ///
+    /// `id`'s own spend counts only when the pool holds `id` as
+    /// `relay_category::legacy`. One held privately -- submitted here, or in
+    /// its stem -- is being seen again, not spent twice, and refusing it as a
+    /// double spend both stalled its relay and told whoever sent it that this
+    /// node had it.
+    fn spent_in_pool(&self, k_image: &KeyImage, id: &Hash256) -> bool {
         match self.spent.get(k_image) {
-            Some(owner) => Err(Rejection::DoubleSpend {
-                key_image: *k_image,
-                in_pool: Some(*owner),
-            }),
-            None => Ok(()),
+            None => false,
+            Some(owner) if owner != id => true,
+            Some(owner) => self.by_id.get(owner).is_some_and(PoolEntry::is_legacy),
         }
     }
 
@@ -352,23 +455,43 @@ impl TxPool {
         self.by_id.insert(id, entry);
     }
 
-    /// `add_tx` for a transaction arriving from a wallet or a peer.
+    /// `add_new_tx` and `add_tx` for a transaction arriving from a wallet or a
+    /// peer, as `method`: `None` for `do_not_relay`, `Local` from this node's
+    /// RPC, `Stem` or `Fluff` from a peer.
     ///
-    /// The checks are `specs/09` §2.2's, in its order. `kept_by_block` is not a
-    /// parameter because this path never has it: a transaction inside a block
-    /// goes through consensus validation in `wow-core`, not through here.
+    /// First, as `add_new_tx` asks: one the pool holds as
+    /// `relay_category::legacy`, or the chain holds, is already known. Then
+    /// the checks are `specs/09` §2.2's, in its order. `kept_by_block` is not
+    /// a method this path takes: a transaction inside a block goes through
+    /// consensus validation in `wow-core`, not through here.
+    ///
+    /// One held privately -- submitted here, or in its stem -- is not known in
+    /// that sense, since it is not to anyone asking. It is checked again and
+    /// moves on as far as the new copy takes it: a fluffed copy of a stem
+    /// transaction fluffs it, and a stem copy of one already held as stem is a
+    /// Dandelion++ loop and fluffs it too. Once it moves, its receive time is
+    /// the time it went public, not the time it arrived privately.
     pub fn add(
         &mut self,
         db: &LmdbDb,
         blob: &[u8],
         fee_context: &wow_consensus::fee::FeeContext,
         now: u64,
-        do_not_relay: bool,
-    ) -> Result<Hash256, Rejection> {
+        method: RelayMethod,
+    ) -> Result<Admitted, Rejection> {
         let tx =
             Transaction::from_blob(blob).map_err(|e| Rejection::NotParseable(e.to_string()))?;
         let id = wow_types::hashes::transaction_hash_from_blob(&tx, blob)
             .ok_or_else(|| Rejection::NotParseable("no transaction hash".into()))?;
+
+        // Already known. Before the key images, which a transaction the pool
+        // holds spends itself: checked the other way round, sending a pooled
+        // transaction again was answered as a double spend of its own inputs.
+        if self.by_id.get(&id).is_some_and(PoolEntry::is_legacy)
+            || db.tx_exists(&id).unwrap_or(false)
+        {
+            return Err(Rejection::AlreadyInPool);
+        }
 
         let weight = wow_types::weight::get_transaction_weight(&tx, blob.len());
 
@@ -405,39 +528,58 @@ impl TxPool {
         // 5. Key images unspent, on chain and in the pool.
         for input in &tx.prefix.vin {
             if let TxIn::ToKey { k_image, .. } = input {
-                self.check_unspent(db, k_image)?;
+                self.check_unspent(db, k_image, &id)?;
             }
         }
 
-        // 6. Not already here.
-        if self.contains(&id) {
-            return Err(Rejection::AlreadyInPool);
-        }
+        // 6. Full verification. Not policy: skipping it relays forgeries.
+        verify(db, &tx, fee_context.version, db.height(), now)?;
 
-        // 7. Full verification. Not policy: skipping it relays forgeries.
-        verify(db, &tx, fee_context.version, now)?;
-
-        // The pool has no clock of its own, so a stale entry goes when something
-        // else arrives. That is enough: a pool nobody is adding to is a pool
-        // nobody is reading either.
-        self.expire(now);
-
-        self.insert(
-            id,
-            &tx,
-            PoolEntry {
-                blob: blob.to_vec(),
-                weight,
-                fee,
-                receive_time: now,
-                do_not_relay,
-                relayed: false,
-                double_spend_seen: false,
-                kept_by_block: false,
-            },
+        // What came from a peer has, as far as the pool's statistics go, been
+        // relayed (`handle_incoming_tx(..., relayed = true)`), a forward from
+        // an anonymity network included.
+        let relayed = matches!(
+            method,
+            RelayMethod::Stem | RelayMethod::Fluff | RelayMethod::Forward
         );
-        self.evict_to_fit();
-        Ok(id)
+        let mut method = method;
+        match self.by_id.get_mut(&id) {
+            Some(entry) => {
+                // A Dandelion++ loop: this node's own stem came back to it.
+                if method == RelayMethod::Stem && entry.relay == RelayMethod::Stem {
+                    method = RelayMethod::Fluff;
+                }
+                if entry.upgrade(method) {
+                    entry.receive_time = now;
+                    entry.relayed = relayed;
+                    entry.double_spend_seen = false;
+                }
+            }
+            None => {
+                // The pool has no clock of its own, so a stale entry goes when
+                // something else arrives. That is enough: a pool nobody is
+                // adding to is a pool nobody is reading either.
+                self.expire(now);
+
+                self.insert(
+                    id,
+                    &tx,
+                    PoolEntry {
+                        blob: blob.to_vec(),
+                        weight,
+                        fee,
+                        receive_time: now,
+                        relay: method,
+                        relayed,
+                        double_spend_seen: false,
+                    },
+                );
+                self.evict_to_fit();
+            }
+        }
+        // A transaction paying nothing is never relayed.
+        let relay = if fee > 0 { method } else { RelayMethod::None };
+        Ok(Admitted { id, relay })
     }
 
     /// `add_tx` with `kept_by_block`: a transaction coming back out of a block
@@ -461,10 +603,10 @@ impl TxPool {
         }
         for input in &tx.prefix.vin {
             if let TxIn::ToKey { k_image, .. } = input {
-                self.check_unspent(db, k_image)?;
+                self.check_unspent(db, k_image, &id)?;
             }
         }
-        verify(db, tx, hf_version, now)?;
+        verify(db, tx, hf_version, db.height(), now)?;
         self.insert(
             id,
             tx,
@@ -473,10 +615,11 @@ impl TxPool {
                 weight: wow_types::weight::get_transaction_weight(tx, blob.len()),
                 fee: tx.rct_signatures.txn_fee,
                 receive_time: now,
-                do_not_relay: false,
-                relayed: false,
+                // Mined once already, so public, and relayed as the C++ counts
+                // it.
+                relay: RelayMethod::Block,
+                relayed: true,
                 double_spend_seen: false,
-                kept_by_block: true,
             },
         );
         Ok(id)
@@ -520,64 +663,68 @@ impl TxPool {
         stale.iter().filter(|id| self.remove(id).is_some()).count()
     }
 
-    /// Transactions that may be relayed.
-    pub fn relayable_ids(&self) -> Vec<Hash256> {
-        self.by_id
-            .iter()
-            .filter(|(_, e)| !e.do_not_relay)
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// Relayed transactions whose hashes are not in `known`, for a peer's
-    /// `NOTIFY_GET_TXPOOL_COMPLEMENT`.
+    /// `get_complement`: the public transactions whose hashes are not in
+    /// `known`, for a peer's `NOTIFY_GET_TXPOOL_COMPLEMENT`.
     ///
-    /// A transaction received in the last [`COMPLEMENT_QUIET_SECS`] is held
-    /// back: it may still be in its Dandelion++ stem, and answering with it
-    /// would publish what the stem is there to hide.
-    pub fn public_txs_except(
-        &self,
-        known: &std::collections::HashSet<Hash256>,
-        now: u64,
-    ) -> Vec<Vec<u8>> {
+    /// Fluffed or mined ones only, as the C++ serves. One still in its
+    /// Dandelion++ stem, or submitted here and not out yet, is not this node's
+    /// to hand to a peer that did not get it through the stem; this used to be
+    /// guessed from the receive time, which a stem outlasts often enough.
+    pub fn public_txs_except(&self, known: &std::collections::HashSet<Hash256>) -> Vec<Vec<u8>> {
         self.by_id
             .iter()
-            .filter(|(id, e)| {
-                e.relayed
-                    && !e.do_not_relay
-                    && now.saturating_sub(e.receive_time) >= COMPLEMENT_QUIET_SECS
-                    && !known.contains(*id)
-            })
+            .filter(|(id, e)| e.is_public() && !known.contains(*id))
             .map(|(_, e)| e.blob.clone())
             .collect()
     }
 
-    /// These went out to peers at `now`.
-    pub fn mark_relayed(&mut self, ids: &[Hash256], now: u64) {
+    /// `set_relayed`: these went out to peers at `now`, as `method` -- `Stem`
+    /// or `Fluff`.
+    ///
+    /// Returns the ones that became public by it. That is when a listener
+    /// hears of a transaction that arrived privately, and not before
+    /// (`core::on_transactions_relayed`).
+    pub fn set_relayed(&mut self, ids: &[Hash256], method: RelayMethod, now: u64) -> Vec<Hash256> {
+        let mut public = Vec::new();
         for id in ids {
             if let Some(e) = self.by_id.get_mut(id) {
+                // Stem and fluff copies can arrive in either order.
+                let was_public = e.is_public();
+                e.upgrade(method);
                 e.relayed = true;
                 self.relayed_at.insert(*id, now);
+                if !was_public && e.is_public() {
+                    public.push(*id);
+                }
             }
         }
+        public
     }
 
-    /// `get_relayable_transactions`: what is due to go out to peers again.
+    /// `get_relayable_transactions`: what is due to go out to peers again, and
+    /// as what.
     ///
-    /// One never sent from this process goes at once. One sent goes again
-    /// after [`relay_delay`], since a single send can reach no one: a peer
-    /// that drops it, a connection that closes, no peer synchronised at the
-    /// time. One older than half its lifetime is left to expire rather than
-    /// spread again, where a node about to drop it would take it back.
-    pub fn due_for_relay(&self, now: u64) -> Vec<(Hash256, Vec<u8>)> {
+    /// One never sent from this process goes at once -- except one in its
+    /// stem, whose embargo is the peer-to-peer layer's to run and which
+    /// nothing has sent yet: offering it here fluffed stem transactions the
+    /// moment they arrived, whenever this walk landed between a peer's message
+    /// and its relay. One sent goes again after [`relay_delay`], since a
+    /// single send can reach no one: a peer that drops it, a connection that
+    /// closes, no peer synchronised at the time. One older than half its
+    /// lifetime is left to expire rather than spread again, where a node about
+    /// to drop it would take it back.
+    ///
+    /// The method says how it goes: one submitted here and still `Local`
+    /// through the stem, anything else as fluff.
+    pub fn due_for_relay(&self, now: u64) -> Vec<(Hash256, Vec<u8>, RelayMethod)> {
         self.by_id
             .iter()
             .filter(|(id, e)| {
                 // A transaction paying no fee is never relayed.
-                if e.do_not_relay || e.fee == 0 {
+                if e.do_not_relay() || e.fee == 0 {
                     return false;
                 }
-                let life = if e.kept_by_block {
+                let life = if e.kept_by_block() {
                     TX_FROM_ALT_BLOCK_LIVETIME
                 } else {
                     TX_LIVETIME
@@ -586,11 +733,17 @@ impl TxPool {
                     return false;
                 }
                 match self.relayed_at.get(*id) {
-                    None => true,
+                    // A forward is offered at once and the peer-to-peer layer
+                    // holds it for its delay, which is where that delay
+                    // lives; the C++ keeps it in `last_relayed_time` instead.
+                    // A stem is the other way about: its embargo is that
+                    // layer's too, and offering it here would fluff it the
+                    // moment it arrived.
+                    None => e.relay != RelayMethod::Stem,
                     Some(&last) => now.saturating_sub(last) > relay_delay(last, e.receive_time),
                 }
             })
-            .map(|(id, e)| (*id, e.blob.clone()))
+            .map(|(id, e)| (*id, e.blob.clone(), e.relay))
             .collect()
     }
 
@@ -613,15 +766,28 @@ impl TxPool {
         self.by_id.iter()
     }
 
-    /// Whether a pooled transaction spends this key image.
-    pub fn spends(&self, ki: &KeyImage) -> bool {
-        self.spent.contains_key(ki)
+    /// Whether a pooled transaction a caller may see spends this key image:
+    /// any with `include_sensitive`, a public one otherwise
+    /// (`check_for_key_images`).
+    pub fn spends(&self, ki: &KeyImage, include_sensitive: bool) -> bool {
+        self.spent
+            .get(ki)
+            .and_then(|owner| self.by_id.get(owner))
+            .is_some_and(|e| include_sensitive || e.is_public())
     }
 
-    /// Key images spent by pooled transactions, with the transaction spending
-    /// each.
-    pub fn spent_key_images(&self) -> Vec<(KeyImage, Hash256)> {
-        self.spent.iter().map(|(k, v)| (*k, *v)).collect()
+    /// Key images spent by pooled transactions a caller may see, with the
+    /// transaction spending each.
+    pub fn spent_key_images(&self, include_sensitive: bool) -> Vec<(KeyImage, Hash256)> {
+        self.spent
+            .iter()
+            .filter(|(_, owner)| {
+                self.by_id
+                    .get(*owner)
+                    .is_some_and(|e| include_sensitive || e.is_public())
+            })
+            .map(|(k, v)| (*k, *v))
+            .collect()
     }
 
     /// Write the pool to `txpool_meta` / `txpool_blob`, replacing what they
@@ -638,17 +804,7 @@ impl TxPool {
                 .map_err(|e| format!("cannot clear the stored pool: {e}"))?;
         }
         for (id, e) in &self.by_id {
-            let meta = wow_storage::records::TxPoolMeta {
-                weight: e.weight,
-                fee: e.fee,
-                receive_time: e.receive_time,
-                kept_by_block: e.kept_by_block,
-                relayed: e.relayed,
-                do_not_relay: e.do_not_relay,
-                double_spend_seen: e.double_spend_seen,
-                ..Default::default()
-            };
-            db.add_txpool_tx(id, &e.blob, &meta)
+            db.add_txpool_tx(id, &e.blob, &meta_of(e))
                 .map_err(|e| format!("cannot store the pool: {e}"))?;
         }
         Ok(self.by_id.len())
@@ -658,7 +814,7 @@ impl TxPool {
     /// that does not parse, is already in the chain, spends a key image the
     /// chain has spent, or has outlived its welcome.
     pub fn load(db: &LmdbDb, now: u64) -> TxPool {
-        let mut stored: Vec<(Hash256, wow_storage::records::TxPoolMeta, Vec<u8>)> = Vec::new();
+        let mut stored: Vec<(Hash256, TxPoolMeta, Vec<u8>)> = Vec::new();
         let _ = db.for_all_txpool_txes(&mut |h, meta, blob| {
             if let Some(b) = blob {
                 stored.push((*h, *meta, b.to_vec()));
@@ -693,16 +849,34 @@ impl TxPool {
                     weight: meta.weight,
                     fee: meta.fee,
                     receive_time: meta.receive_time,
-                    do_not_relay: meta.do_not_relay,
+                    relay: meta.relay_method(),
                     relayed: meta.relayed,
                     double_spend_seen: meta.double_spend_seen,
-                    kept_by_block: meta.kept_by_block,
                 },
             );
         }
         pool.expire(now);
         pool
     }
+}
+
+/// The `txpool_meta` record for an entry.
+///
+/// The relay method is not a field of its own in the record but five flags
+/// across bytes 112, 114 and 115, laid out as the C++ lays them out, so a pool
+/// saved here and read by a C++ node -- or the other way round -- keeps a stem
+/// transaction private.
+fn meta_of(e: &PoolEntry) -> TxPoolMeta {
+    let mut meta = TxPoolMeta {
+        weight: e.weight,
+        fee: e.fee,
+        receive_time: e.receive_time,
+        relayed: e.relayed,
+        double_spend_seen: e.double_spend_seen,
+        ..Default::default()
+    };
+    meta.set_relay_method(e.relay);
+    meta
 }
 
 /// `get_relay_delay`: the wait before sending a transaction again, five minutes
@@ -726,7 +900,24 @@ fn fee_rate(e: &PoolEntry) -> f64 {
 /// This is what makes a pool worth having. A node that admits without verifying
 /// is a node that relays forgeries, and the wallet on the other end cannot tell
 /// the difference until the transaction fails to confirm.
-fn verify(db: &LmdbDb, tx: &Transaction, hf_version: u8, now: u64) -> Result<(), Rejection> {
+///
+/// It is also what a *block's* transactions are checked with
+/// (`netsync::ChainTxs`), and deliberately the same function: a transaction in
+/// a block and the same transaction in the pool have to be judged identically,
+/// or this node disagrees with itself about the same bytes.
+///
+/// `chain_height` is the height the checks are made at -- `db.height()` for
+/// the pool, and for a block the height the chain stands at before it is
+/// added, which is what the C++ `check_tx_inputs` sees. It is a parameter
+/// rather than a call to `db.height()` because the block path verifies a whole
+/// batch ahead of applying it, at a height below the one each block lands at.
+pub(crate) fn verify(
+    db: &LmdbDb,
+    tx: &Transaction,
+    hf_version: u8,
+    chain_height: u64,
+    now: u64,
+) -> Result<(), Rejection> {
     use wow_crypto::bulletproofs_plus as bpp;
     use wow_crypto::clsag;
 
@@ -735,10 +926,7 @@ fn verify(db: &LmdbDb, tx: &Transaction, hf_version: u8, now: u64) -> Result<(),
     // Only the shapes this chain currently produces are verified here. A type
     // this node cannot check is refused rather than waved through.
     if !rct.ty.is_bulletproof_plus() {
-        return Err(Rejection::InvalidInput(format!(
-            "RCT type {:?} is not one this node verifies yet",
-            rct.ty
-        )));
+        return Err(Rejection::UnsupportedRctType { ty: rct.ty });
     }
     if tx.prefix.vout.len() < 2 {
         return Err(Rejection::TooFewOutputs {
@@ -813,7 +1001,7 @@ fn verify(db: &LmdbDb, tx: &Transaction, hf_version: u8, now: u64) -> Result<(),
                 "a ring member is unknown to this node".into(),
             ));
         }
-        check_ring_members(&keys, slot, db.height(), hf_version, now)?;
+        check_ring_members(&keys, slot, chain_height, hf_version, now)?;
 
         let ring: Vec<clsag::RingMember> = keys
             .iter()
@@ -910,17 +1098,28 @@ fn to_absolute(relative: &[u64]) -> Option<Vec<u64>> {
 mod tests {
     use super::*;
 
+    /// A fluffed transaction: the public kind, as most of a pool is.
     fn entry(fee: u64, weight: u64, receive_time: u64) -> PoolEntry {
         PoolEntry {
             blob: vec![0u8; weight as usize],
             weight,
             fee,
             receive_time,
-            do_not_relay: false,
+            relay: RelayMethod::Fluff,
             relayed: false,
             double_spend_seen: false,
-            kept_by_block: false,
         }
+    }
+
+    fn with_relay(relay: RelayMethod, weight: u64) -> PoolEntry {
+        PoolEntry {
+            relay,
+            ..entry(100, weight, 0)
+        }
+    }
+
+    fn put(pool: &mut TxPool, n: u8, relay: RelayMethod, weight: u64) {
+        pool.by_id.insert(id(n), with_relay(relay, weight));
     }
 
     /// Never sent goes now; sent goes again on a delay that grows with its
@@ -931,7 +1130,7 @@ mod tests {
         let mut pool = TxPool::new();
         pool.by_id.insert(id(1), entry(100, 10, t0));
         let mut private = entry(100, 10, t0);
-        private.do_not_relay = true;
+        private.relay = RelayMethod::None;
         pool.by_id.insert(id(2), private);
         pool.by_id
             .insert(id(3), entry(100, 10, t0 - TX_LIVETIME / 2 - 1));
@@ -940,26 +1139,188 @@ mod tests {
             let mut ids: Vec<u8> = pool
                 .due_for_relay(now)
                 .iter()
-                .map(|(id, _)| id[0])
+                .map(|(id, _, _)| id[0])
                 .collect();
             ids.sort_unstable();
             ids
         };
         assert_eq!(due(&pool, t0), vec![1], "never sent: at once");
 
-        pool.mark_relayed(&[id(1)], t0);
+        pool.set_relayed(&[id(1)], RelayMethod::Fluff, t0);
         assert!(due(&pool, t0 + MIN_RELAY_SECS).is_empty(), "just sent");
         assert_eq!(due(&pool, t0 + MIN_RELAY_SECS + 1), vec![1]);
 
         // Sent again an hour after it arrived: it waits an hour and five
         // minutes before the next time.
-        pool.mark_relayed(&[id(1)], t0 + 3_600);
+        pool.set_relayed(&[id(1)], RelayMethod::Fluff, t0 + 3_600);
         assert!(due(&pool, t0 + 7_200).is_empty());
         assert_eq!(relay_delay(t0 + 3_600, t0), 3_600 + MIN_RELAY_SECS);
         assert_eq!(relay_delay(t0 + 86_400, t0), MAX_RELAY_SECS, "capped");
 
         pool.remove(&id(1));
         assert!(pool.relayed_at.is_empty(), "forgotten with the transaction");
+    }
+
+    /// One submitted here goes out again through the stem; one in its stem
+    /// that nothing has sent yet is not offered at all, since its embargo is
+    /// the peer-to-peer layer's and offering it fluffed it on arrival.
+    #[test]
+    fn a_stem_transaction_is_not_offered_before_it_is_sent() {
+        let mut pool = TxPool::new();
+        put(&mut pool, 1, RelayMethod::Local, 10);
+        put(&mut pool, 2, RelayMethod::Stem, 11);
+
+        let due = pool.due_for_relay(0);
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].0, due[0].2), (id(1), RelayMethod::Local));
+
+        // A forward is offered at once, as what it is: the wait before it is
+        // stemmed on the public network is the peer-to-peer layer's, which
+        // holds it there rather than asking the pool again.
+        put(&mut pool, 3, RelayMethod::Forward, 12);
+        let due = pool.due_for_relay(0);
+        assert_eq!(due.len(), 2);
+        assert!(due
+            .iter()
+            .any(|(i, _, how)| *i == id(3) && *how == RelayMethod::Forward));
+
+        // Once stemmed, it comes back after the delay -- to be fluffed.
+        pool.set_relayed(&[id(2)], RelayMethod::Stem, 0);
+        let due = pool.due_for_relay(MIN_RELAY_SECS + 1);
+        assert!(due
+            .iter()
+            .any(|(i, _, how)| *i == id(2) && *how == RelayMethod::Stem));
+    }
+
+    /// A relay method moves up and never down: a stem copy after a fluffed one
+    /// does not make it private again, and a mined one stays mined.
+    #[test]
+    fn a_relay_method_only_moves_up() {
+        let mut e = with_relay(RelayMethod::None, 10);
+        assert!(e.upgrade(RelayMethod::Local));
+        assert!(!e.upgrade(RelayMethod::Local), "no move to where it is");
+        assert!(e.upgrade(RelayMethod::Stem));
+        assert!(e.upgrade(RelayMethod::Fluff));
+        assert!(!e.upgrade(RelayMethod::Stem));
+        assert_eq!(e.relay, RelayMethod::Fluff);
+        assert!(e.upgrade(RelayMethod::Block));
+        assert!(!e.upgrade(RelayMethod::Fluff));
+        assert!(e.kept_by_block() && e.is_public());
+
+        // `relay_category`: public is fluff and block; legacy adds none.
+        for (method, public, legacy) in [
+            (RelayMethod::None, false, true),
+            (RelayMethod::Local, false, false),
+            (RelayMethod::Forward, false, false),
+            (RelayMethod::Stem, false, false),
+            (RelayMethod::Fluff, true, true),
+            (RelayMethod::Block, true, true),
+        ] {
+            let e = with_relay(method, 10);
+            assert_eq!(e.is_public(), public, "{method:?}");
+            assert_eq!(e.is_legacy(), legacy, "{method:?}");
+        }
+    }
+
+    /// Relaying reports what went public by it, once.
+    #[test]
+    fn relaying_says_what_became_public() {
+        let mut pool = TxPool::new();
+        put(&mut pool, 1, RelayMethod::Local, 10);
+        put(&mut pool, 2, RelayMethod::Fluff, 11);
+
+        let stemmed = pool.set_relayed(&[id(1), id(2)], RelayMethod::Stem, 5);
+        assert!(stemmed.is_empty());
+        assert_eq!(pool.get(&id(1)).unwrap().relay, RelayMethod::Stem);
+        assert!(pool.get(&id(1)).unwrap().relayed);
+        assert_eq!(
+            pool.set_relayed(&[id(1), id(2)], RelayMethod::Fluff, 6),
+            vec![id(1)],
+            "the one that was private"
+        );
+        let again = pool.set_relayed(&[id(1)], RelayMethod::Fluff, 7);
+        assert!(again.is_empty());
+    }
+
+    /// What is private stays out of every view an outsider has: the hashes,
+    /// the count, the key images, the complement.
+    #[test]
+    fn private_transactions_stay_out_of_sight() {
+        let mut pool = TxPool::new();
+        for (n, method) in [
+            (1, RelayMethod::None),
+            (2, RelayMethod::Local),
+            (3, RelayMethod::Stem),
+            (4, RelayMethod::Fluff),
+            (5, RelayMethod::Block),
+        ] {
+            put(&mut pool, n, method, 10 + u64::from(n));
+            pool.spent.insert(KeyImage([n; 32]), id(n));
+        }
+
+        let mut public = pool.ids(false);
+        public.sort_unstable();
+        assert_eq!(public, vec![id(4), id(5)]);
+        assert_eq!(pool.ids(true).len(), 5);
+        assert_eq!((pool.count(false), pool.count(true)), (2, 5));
+
+        assert!(!pool.spends(&KeyImage([3; 32]), false), "a stem spend");
+        assert!(pool.spends(&KeyImage([3; 32]), true));
+        assert!(pool.spends(&KeyImage([4; 32]), false));
+        assert_eq!(pool.spent_key_images(false).len(), 2);
+        assert_eq!(pool.spent_key_images(true).len(), 5);
+
+        let mut sizes: Vec<usize> = pool
+            .public_txs_except(&Default::default())
+            .iter()
+            .map(Vec::len)
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![14, 15], "fluffed and mined only");
+    }
+
+    /// A transaction's own key images are not a double spend of it while the
+    /// pool holds it privately, and are once it holds it publicly. Another
+    /// transaction's always are.
+    #[test]
+    fn a_private_transaction_seen_again_is_not_its_own_double_spend() {
+        let mut pool = TxPool::new();
+        put(&mut pool, 1, RelayMethod::Stem, 10);
+        pool.spent.insert(KeyImage([1; 32]), id(1));
+
+        assert!(!pool.spent_in_pool(&KeyImage([1; 32]), &id(1)));
+        assert!(pool.spent_in_pool(&KeyImage([1; 32]), &id(2)));
+        assert!(!pool.spent_in_pool(&KeyImage([9; 32]), &id(2)));
+
+        pool.by_id.get_mut(&id(1)).unwrap().relay = RelayMethod::Fluff;
+        assert!(pool.spent_in_pool(&KeyImage([1; 32]), &id(1)));
+    }
+
+    /// The saved record carries the relay method in the C++'s flags, so a stem
+    /// transaction is still one after a restart -- here or in a C++ node.
+    #[test]
+    fn the_relay_method_is_saved_in_the_cpp_layout() {
+        let mut stem = with_relay(RelayMethod::Stem, 10);
+        stem.relayed = true;
+        let raw = meta_of(&stem).encode();
+        assert_eq!(raw[115], 0b0000_1000, "dandelionpp_stem, bit 3");
+        assert_eq!((raw[112], raw[113], raw[114]), (0, 1, 0));
+
+        let raw = meta_of(&with_relay(RelayMethod::None, 10)).encode();
+        assert_eq!(raw[114], 1, "do_not_relay");
+        let raw = meta_of(&with_relay(RelayMethod::Block, 10)).encode();
+        assert_eq!(raw[112], 1, "kept_by_block");
+
+        for method in [
+            RelayMethod::None,
+            RelayMethod::Local,
+            RelayMethod::Stem,
+            RelayMethod::Fluff,
+            RelayMethod::Block,
+        ] {
+            let back = TxPoolMeta::decode(&meta_of(&with_relay(method, 10)).encode()).unwrap();
+            assert_eq!(back.relay_method(), method);
+        }
     }
 
     /// A transaction mined in a block leaves the pool, and so does one that
@@ -985,7 +1346,7 @@ mod tests {
     fn a_transaction_from_a_replaced_block_lives_longer() {
         let mut pool = TxPool::new();
         let mut kept = entry(100, 10, 0);
-        kept.kept_by_block = true;
+        kept.relay = RelayMethod::Block;
         pool.by_id.insert(id(1), kept);
         pool.by_id.insert(id(2), entry(100, 10, 0));
         pool.weight = 20;
@@ -995,31 +1356,24 @@ mod tests {
         assert_eq!(pool.expire(TX_FROM_ALT_BLOCK_LIVETIME + 1), 1);
     }
 
-    /// The complement a peer asks for holds relayed transactions only, and
-    /// none still young enough to be in a Dandelion++ stem.
+    /// The complement a peer asks for holds public transactions only, however
+    /// long a private one has been in the pool, and none the peer has.
     #[test]
     fn the_complement_leaves_out_what_is_not_public() {
         let mut pool = TxPool::new();
-        let mut relayed_old = entry(100, 10, 0);
-        relayed_old.relayed = true;
-        let mut relayed_new = entry(100, 11, 1_000);
-        relayed_new.relayed = true;
-        let mut private = entry(100, 12, 0);
-        private.relayed = true;
-        private.do_not_relay = true;
-        pool.by_id.insert(id(1), relayed_old);
-        pool.by_id.insert(id(2), relayed_new);
-        pool.by_id.insert(id(3), private);
-        pool.by_id.insert(id(4), entry(100, 13, 0));
+        let mut stem_old = with_relay(RelayMethod::Stem, 11);
+        stem_old.relayed = true;
+        pool.by_id.insert(id(1), entry(100, 10, 1_000));
+        pool.by_id.insert(id(2), stem_old);
+        put(&mut pool, 3, RelayMethod::None, 12);
+        put(&mut pool, 4, RelayMethod::Local, 13);
 
-        let out = pool.public_txs_except(&Default::default(), 1_000 + COMPLEMENT_QUIET_SECS - 1);
+        let out = pool.public_txs_except(&Default::default());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), 10);
 
         let known = [id(1)].into_iter().collect();
-        assert!(pool
-            .public_txs_except(&known, 1_000 + COMPLEMENT_QUIET_SECS - 1)
-            .is_empty());
+        assert!(pool.public_txs_except(&known).is_empty());
     }
 
     #[test]
@@ -1034,7 +1388,7 @@ mod tests {
         assert_eq!(pool.flush(&[]), 1);
         assert_eq!(pool.len(), 0);
         assert_eq!(pool.weight(), 0);
-        assert!(pool.spent_key_images().is_empty());
+        assert!(pool.spent_key_images(true).is_empty());
     }
 
     fn id(n: u8) -> Hash256 {
@@ -1152,10 +1506,7 @@ mod tests {
             },
             Rejection::TxExtraTooBig { len: 2_000 },
             Rejection::NonZeroUnlockTime { unlock_time: 5 },
-            Rejection::DoubleSpend {
-                key_image: KeyImage([1u8; 32]),
-                in_pool: None,
-            },
+            Rejection::DoubleSpend,
             Rejection::AlreadyInPool,
             Rejection::Overspend,
             Rejection::TooFewOutputs { count: 1 },
@@ -1166,10 +1517,7 @@ mod tests {
         }
 
         // Each one sets its own flag and no other.
-        let d = Rejection::DoubleSpend {
-            key_image: KeyImage([1u8; 32]),
-            in_pool: None,
-        };
+        let d = Rejection::DoubleSpend;
         let set: Vec<&str> = d
             .flags()
             .iter()
@@ -1178,20 +1526,10 @@ mod tests {
             .collect();
         assert_eq!(set, vec!["double_spend"]);
 
-        // A double spend says where the first spend is, so a wallet that did
-        // not send it can be told which transaction to look for.
-        assert!(d.reason().contains("in a block"), "{}", d.reason());
-        let pooled = Rejection::DoubleSpend {
-            key_image: KeyImage([1u8; 32]),
-            in_pool: Some([0x3a; 32]),
-        };
-        assert!(
-            pooled
-                .reason()
-                .contains(&format!("by transaction {} in the pool", "3a".repeat(32))),
-            "{}",
-            pooled.reason()
-        );
+        // A double spend says no more than that, as the C++ says it: naming
+        // the pooled transaction that spends the key image, or even that one
+        // does, tells whoever asks what this node holds in its stem.
+        assert_eq!(d.reason(), "double spend");
 
         // `tx_extra_too_big` is separate because it is not in the flag array.
         assert!(Rejection::TxExtraTooBig { len: 2_000 }.tx_extra_too_big());

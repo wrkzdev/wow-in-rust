@@ -19,8 +19,17 @@
 //! does not reuse `p2pstate.bin`, which a C++ node sharing the data directory
 //! would try to read. This one is epee portable storage in
 //! [`STATE_FILENAME`].
+//!
+//! # A stranger's `last_seen` decides nothing
+//!
+//! Each list is ordered as the C++ orders its `multi_index_container`: by
+//! `last_seen`, and among equal ones by arrival. That order decides what is
+//! trimmed and what is dialled first, so only this node's own clock sets
+//! `last_seen`. A peer list's timestamps are zeroed on the way in
+//! (`sanitize_peerlist`), and an address already listed keeps the one it had
+//! (`append_with_peer_gray`: "incoming peer list are untrusted").
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 
@@ -40,6 +49,15 @@ pub const FAILS_BEFORE_BLOCK: u32 = 10;
 pub const FAILED_ADDR_FORGET_SECONDS: u64 = 3_600;
 /// `P2P_IP_BLOCKTIME`.
 pub const IP_BLOCKTIME: u64 = 86_400;
+/// How many of the most recently seen white peers an outgoing connection is
+/// chosen among: the `limit` in `make_new_connection_from_peerlist`. The
+/// gray list has none.
+pub const WHITE_CANDIDATES: usize = 20;
+
+/// `CRYPTONOTE_PRUNING_LOG_STRIPES`.
+const PRUNING_LOG_STRIPES: u32 = 3;
+/// `PRUNING_SEED_LOG_STRIPES_SHIFT`.
+const PRUNING_SEED_LOG_STRIPES_SHIFT: u32 = 7;
 
 /// The peer-state file, beside the database directory. Deliberately not
 /// `p2pstate.bin`.
@@ -79,6 +97,88 @@ impl PeerRecord {
             pruning_seed: self.pruning_seed,
             rpc_port: self.rpc_port,
         }
+    }
+
+    /// `self` in place of `old`, as the C++ updates an entry already listed:
+    /// a pruning seed or RPC port `self` lacks is kept from `old` ("guard
+    /// against older nodes not passing pruning info around"), and so is
+    /// `last_seen`, unless this node has just seen the peer itself.
+    fn replacing(self, old: &PeerRecord, trust_last_seen: bool) -> PeerRecord {
+        let mut new = self;
+        if new.pruning_seed == 0 {
+            new.pruning_seed = old.pruning_seed;
+        }
+        if new.rpc_port == 0 {
+            new.rpc_port = old.rpc_port;
+        }
+        if !trust_last_seen {
+            new.last_seen = old.last_seen;
+        }
+        new
+    }
+}
+
+/// A list entry, and when it arrived.
+#[derive(Clone, Debug)]
+struct Listed {
+    rec: PeerRecord,
+    /// Arrival order. Entries with equal `last_seen` keep it in the C++'s
+    /// time index, and every address a peer mentions has a `last_seen` of
+    /// zero, so this is what trims the oldest of them first rather than,
+    /// say, the one whose address sorts lowest -- which a peer could choose.
+    seq: u64,
+}
+
+/// Whether two addresses are one host (`is_same_host`).
+///
+/// Never for loopback. The C++ lists no loopback address at all; this node
+/// does only under `--allow-local-ip`, which is for several nodes on one
+/// machine, and treating them as one host would leave room for one of them.
+fn same_host(a: &SocketAddr, b: &SocketAddr) -> bool {
+    a.ip() == b.ip() && !a.ip().is_loopback()
+}
+
+/// The host an address counts as when choosing whom to dial: an IPv4-mapped
+/// IPv6 address is its IPv4 host, as `get_host_string` has it.
+fn host_of(ip: IpAddr) -> IpAddr {
+    ip.to_canonical()
+}
+
+/// The IPv4 /24 an address is in, for the one-peer-per-subnet rule. `None`
+/// for IPv6, which the rule does not cover, and for loopback, for the reason
+/// [`same_host`] gives.
+fn subnet_of(ip: IpAddr) -> Option<u32> {
+    match ip.to_canonical() {
+        IpAddr::V4(a) if !a.is_loopback() => Some(u32::from(a) & 0xffff_ff00),
+        _ => None,
+    }
+}
+
+/// Whether a pruning seed is one a node could send: none, or
+/// `make_pruning_seed(stripe, CRYPTONOTE_PRUNING_LOG_STRIPES)` for a stripe
+/// from 1 to 8 (`sanitize_peerlist`).
+fn is_valid_pruning_seed(seed: u32) -> bool {
+    let first = PRUNING_LOG_STRIPES << PRUNING_SEED_LOG_STRIPES_SHIFT;
+    let last = first | ((1 << PRUNING_LOG_STRIPES) - 1);
+    seed == 0 || (first..=last).contains(&seed)
+}
+
+/// `get_random_index_with_fixed_probability`: an index from `0` to
+/// `max_index`, `x³ / (16³ · max_index²)` for a uniform `x` up to
+/// `16 · max_index`. The front is heavily favoured: with twenty candidates
+/// the first is picked more than a third of the time.
+fn weighted_index(max_index: usize, rand_below: &mut dyn FnMut(usize) -> usize) -> usize {
+    if max_index == 0 {
+        return 0;
+    }
+    let x = rand_below(16 * max_index + 1);
+    x * x * x / (max_index * max_index * 16 * 16 * 16)
+}
+
+/// A Fisher-Yates shuffle.
+fn shuffle<T>(items: &mut [T], rand_below: &mut dyn FnMut(usize) -> usize) {
+    for i in (1..items.len()).rev() {
+        items.swap(i, rand_below(i + 1));
     }
 }
 
@@ -213,13 +313,18 @@ pub fn is_public(ip: IpAddr) -> bool {
 /// The peer lists and the ban table.
 #[derive(Debug, Default)]
 pub struct AddressBook {
-    white: HashMap<SocketAddr, PeerRecord>,
-    gray: HashMap<SocketAddr, PeerRecord>,
+    white: HashMap<SocketAddr, Listed>,
+    gray: HashMap<SocketAddr, Listed>,
     anchors: HashMap<SocketAddr, PeerRecord>,
     /// Target and the unix second the ban ends; `u64::MAX` is indefinite.
     bans: HashMap<BanTarget, u64>,
     /// Failures per address: how many, and when the first of them was.
     fails: HashMap<IpAddr, (u32, u64)>,
+    /// Hosts a connection to failed, and when the last one did
+    /// (`m_conn_fails_cache`).
+    failed_hosts: HashMap<IpAddr, u64>,
+    /// The next [`Listed::seq`].
+    next_seq: u64,
     allow_local: bool,
 }
 
@@ -242,31 +347,54 @@ impl AddressBook {
         addr.port() != 0 && (self.allow_local || is_public(addr.ip()))
     }
 
-    /// An address a peer mentioned. Ignored if it is already white.
+    fn listed(&mut self, rec: PeerRecord) -> Listed {
+        self.next_seq += 1;
+        Listed {
+            rec,
+            seq: self.next_seq,
+        }
+    }
+
+    /// An address a peer mentioned (`append_with_peer_gray`). Ignored if it
+    /// is already white.
+    ///
+    /// Already gray, it is updated but keeps its `last_seen`. A peer that
+    /// could raise that could keep its own entries away from the trimming,
+    /// which starts with the least recently seen.
     pub fn add_gray(&mut self, rec: PeerRecord) {
         if !self.is_listable(&rec.addr) || self.white.contains_key(&rec.addr) {
             return;
         }
-        match self.gray.get_mut(&rec.addr) {
-            Some(existing) => {
-                if rec.last_seen > existing.last_seen {
-                    *existing = rec;
-                }
-            }
-            None => {
-                self.gray.insert(rec.addr, rec);
-            }
+        if let Some(existing) = self.gray.get_mut(&rec.addr) {
+            existing.rec = rec.replacing(&existing.rec, false);
+            return;
         }
+        let listed = self.listed(rec);
+        self.gray.insert(listed.rec.addr, listed);
         trim(&mut self.gray, GRAY_LIMIT, |_| {});
     }
 
-    /// An address this node verified itself.
-    pub fn add_white(&mut self, rec: PeerRecord) {
+    /// An address this node verified itself (`append_with_peer_white`).
+    ///
+    /// New to the white list, it replaces any entry for another port of the
+    /// same host (`evict_host_from_peerlist`): one host is one peer, however
+    /// many ports it answers on. Already there, it is updated, and takes
+    /// `rec`'s `last_seen` only with `trust_last_seen` -- when this node has
+    /// just handshaken with or heard from the peer (`set_peer_just_seen`).
+    /// A ping-back or an `--add-peer` entry leaves it as it was.
+    pub fn add_white(&mut self, rec: PeerRecord, trust_last_seen: bool) {
         if !self.is_listable(&rec.addr) {
             return;
         }
         self.gray.remove(&rec.addr);
-        self.white.insert(rec.addr, rec);
+        if let Some(existing) = self.white.get_mut(&rec.addr) {
+            existing.rec = rec.replacing(&existing.rec, trust_last_seen);
+            return;
+        }
+        let addr = rec.addr;
+        self.white.retain(|a, _| !same_host(a, &addr));
+        let listed = self.listed(rec);
+        self.white.insert(addr, listed);
         let mut evicted = Vec::new();
         trim(&mut self.white, WHITE_LIMIT, |r| evicted.push(r));
         // A peer pushed out of the white list is still a peer; it goes back
@@ -276,16 +404,53 @@ impl AddressBook {
         }
     }
 
-    /// Forget an address that could not be reached.
+    /// A peer list another node sent (`handle_remote_peerlist`).
     ///
-    /// A white one is demoted to gray rather than dropped -- it answered once,
-    /// and a node that is down for an hour should not vanish from every list
-    /// it was on.
-    pub fn failed_to_reach(&mut self, addr: &SocketAddr) {
-        self.gray.remove(addr);
-        if let Some(r) = self.white.remove(addr) {
-            self.gray.insert(r.addr, r);
+    /// Sanitised first, as `sanitize_peerlist` does: an entry that is not a
+    /// public address, whose port is its own RPC port, or whose pruning seed
+    /// no node could have is dropped, and every `last_seen` is zeroed. Then
+    /// merged into the gray list, less hosts this node failed to reach within
+    /// the hour or has banned.
+    pub fn merge_peerlist(&mut self, peers: &[PeerlistEntry], now: u64) {
+        for e in peers {
+            let Some(mut rec) = PeerRecord::from_entry(e) else {
+                continue;
+            };
+            let ip = rec.addr.ip();
+            if !is_public(ip)
+                || (ip.is_ipv4() && rec.addr.port() == rec.rpc_port)
+                || !is_valid_pruning_seed(rec.pruning_seed)
+                || self.is_addr_recently_failed(ip, now)
+                || self.is_banned(ip, now)
+            {
+                continue;
+            }
+            rec.last_seen = 0;
+            self.add_gray(rec);
         }
+    }
+
+    /// Forget a gray address that did not answer the housekeeping check
+    /// (`remove_from_peer_gray`).
+    pub fn remove_gray(&mut self, addr: &SocketAddr) {
+        self.gray.remove(addr);
+    }
+
+    /// Note that a connection to `ip` failed (`record_addr_failed`).
+    pub fn record_addr_failed(&mut self, ip: IpAddr, now: u64) {
+        // What has been forgotten goes, so the table holds an hour at most.
+        self.failed_hosts
+            .retain(|_, at| now.saturating_sub(*at) <= FAILED_ADDR_FORGET_SECONDS);
+        self.failed_hosts.insert(ip, now);
+    }
+
+    /// Whether a connection to `ip` failed within the last
+    /// [`FAILED_ADDR_FORGET_SECONDS`] (`is_addr_recently_failed`). Such a host
+    /// is not dialled from the lists, nor taken from a peer list, until then.
+    pub fn is_addr_recently_failed(&self, ip: IpAddr, now: u64) -> bool {
+        self.failed_hosts
+            .get(&ip)
+            .is_some_and(|at| now.saturating_sub(*at) <= FAILED_ADDR_FORGET_SECONDS)
     }
 
     pub fn add_anchor(&mut self, rec: PeerRecord) {
@@ -303,17 +468,17 @@ impl AddressBook {
     }
 
     pub fn anchors(&self) -> Vec<PeerRecord> {
-        sorted(&self.anchors)
+        sorted(self.anchors.values().cloned().collect())
     }
 
     /// The white list, most recently seen first.
     pub fn white(&self) -> Vec<PeerRecord> {
-        sorted(&self.white)
+        sorted(self.white.values().map(|l| l.rec.clone()).collect())
     }
 
     /// The gray list, most recently seen first.
     pub fn gray(&self) -> Vec<PeerRecord> {
-        sorted(&self.gray)
+        sorted(self.gray.values().map(|l| l.rec.clone()).collect())
     }
 
     pub fn is_white(&self, addr: &SocketAddr) -> bool {
@@ -325,32 +490,114 @@ impl AddressBook {
         (self.white.len(), self.gray.len())
     }
 
-    /// A random address from one list, skipping those `skip` rejects.
+    /// The next address to dial from one list, chosen as
+    /// `make_new_connection_from_peerlist` chooses it (`p2p/net_node.inl`).
+    ///
+    /// * One port per host: of a host's entries only the most recently seen
+    ///   is a candidate, so a host cannot weigh the choice by advertising many
+    ///   ports.
+    /// * One peer per /24: the candidates are gone through in random order,
+    ///   taking one from each IPv4 /24 that none of `connected` is in, and put
+    ///   back in `last_seen` order. Only when that leaves none that can be
+    ///   used is the rule dropped.
+    /// * From the white list, one of the [`WHITE_CANDIDATES`] most recently
+    ///   seen, weighted heavily towards the most recent; from the gray list,
+    ///   any, uniformly.
+    ///
+    /// `unusable` rejects a candidate that is connected, banned or failed
+    /// recently. The C++ rejects those after picking, and picks again, three
+    /// times at most; leaving them out before the pick makes the same choice
+    /// without the limit.
     ///
     /// `rand_below(n)` returns a uniformly random value in `0..n`.
     pub fn pick(
         &self,
         from_white: bool,
+        connected: &[SocketAddr],
         rand_below: &mut dyn FnMut(usize) -> usize,
-        skip: &dyn Fn(&SocketAddr) -> bool,
+        unusable: &dyn Fn(&PeerRecord) -> bool,
     ) -> Option<PeerRecord> {
         let list = if from_white { &self.white } else { &self.gray };
-        let candidates: Vec<&PeerRecord> = list.values().filter(|r| !skip(&r.addr)).collect();
-        if candidates.is_empty() {
+        // Most recently seen first and, of equal `last_seen`, the latest to
+        // arrive, as the C++ walks its time index from the end.
+        let mut by_time: Vec<&Listed> = list.values().collect();
+        by_time.sort_by(|a, b| (b.rec.last_seen, b.seq).cmp(&(a.rec.last_seen, a.seq)));
+
+        let mut hosts = HashSet::new();
+        let peers: Vec<&PeerRecord> = by_time
+            .into_iter()
+            .map(|l| &l.rec)
+            .filter(|r| r.addr.ip().is_loopback() || hosts.insert(host_of(r.addr.ip())))
+            .collect();
+
+        let mut subnets: HashSet<u32> = connected
+            .iter()
+            .filter_map(|a| subnet_of(a.ip()))
+            .collect();
+        let mut shuffled = peers.clone();
+        shuffle(&mut shuffled, rand_below);
+        let mut one_per_subnet: Vec<&PeerRecord> = shuffled
+            .into_iter()
+            .filter(|r| subnet_of(r.addr.ip()).is_none_or(|s| subnets.insert(s)))
+            .collect();
+        one_per_subnet.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+
+        let limit = if from_white {
+            WHITE_CANDIDATES
+        } else {
+            usize::MAX
+        };
+        let mut filtered: Vec<&PeerRecord> = Vec::new();
+        for candidates in [one_per_subnet, peers] {
+            filtered = candidates
+                .into_iter()
+                .filter(|r| !unusable(r))
+                .take(limit)
+                .collect();
+            if !filtered.is_empty() {
+                break;
+            }
+        }
+        if filtered.is_empty() {
             return None;
         }
-        Some(candidates[rand_below(candidates.len())].clone())
+        let i = if from_white {
+            weighted_index(filtered.len() - 1, rand_below)
+        } else {
+            rand_below(filtered.len())
+        };
+        filtered.get(i).copied().cloned()
     }
 
-    /// Up to `n` white peers, chosen at random, for a handshake or timed-sync
-    /// response.
+    /// A gray address chosen uniformly, for the housekeeping that checks one
+    /// a minute (`get_random_gray_peer`).
+    pub fn random_gray(&self, rand_below: &mut dyn FnMut(usize) -> usize) -> Option<PeerRecord> {
+        if self.gray.is_empty() {
+            return None;
+        }
+        let i = rand_below(self.gray.len());
+        self.gray.values().nth(i).map(|l| l.rec.clone())
+    }
+
+    /// Up to `n` white peers for a handshake or timed-sync response, picked
+    /// as `get_peerlist_head(..., anonymize = true, depth = n)` picks them
+    /// (`p2p/net_peerlist.h`).
+    ///
+    /// At random from the whole white list, and with `last_seen` zeroed.
+    /// This node sets a peer's `last_seen` when it connects to it or the peer
+    /// answers a ping-back, so the real timestamps -- or a list that took the
+    /// `n` most recently seen -- would tell anyone who asks which peers this
+    /// node is connected to right now, its Dandelion++ stems among them. The
+    /// C++ comment cites Cao et al., "Exploring the Monero Peer-to-Peer
+    /// Network", for the attack.
     pub fn handshake_peers(
         &self,
         n: usize,
         rand_below: &mut dyn FnMut(usize) -> usize,
     ) -> Vec<PeerlistEntry> {
-        let mut all: Vec<&PeerRecord> = self.white.values().collect();
-        // A partial Fisher-Yates: only the first `n` places need shuffling.
+        let mut all: Vec<&PeerRecord> = self.white.values().map(|l| &l.rec).collect();
+        // A partial Fisher-Yates: only the first `n` places need shuffling,
+        // which picks the same way as the C++'s whole shuffle and truncate.
         let take = n.min(all.len());
         for i in 0..take {
             let j = i + rand_below(all.len() - i);
@@ -358,7 +605,10 @@ impl AddressBook {
         }
         all.into_iter()
             .take(take)
-            .map(PeerRecord::to_entry)
+            .map(|r| PeerlistEntry {
+                last_seen: 0,
+                ..r.to_entry()
+            })
             .collect()
     }
 
@@ -415,9 +665,9 @@ impl AddressBook {
     // --------------------------------------------------------- persistence
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let entries = |m: &HashMap<SocketAddr, PeerRecord>| {
+        let entries = |records: Vec<PeerRecord>| {
             peer_list_value(
-                &sorted(m)
+                &records
                     .iter()
                     .map(PeerRecord::to_entry)
                     .collect::<Vec<_>>(),
@@ -425,9 +675,9 @@ impl AddressBook {
         };
         let mut s = Section::new();
         s.insert("version".into(), Value::U64(STATE_VERSION));
-        s.insert("white".into(), entries(&self.white));
-        s.insert("gray".into(), entries(&self.gray));
-        s.insert("anchor".into(), entries(&self.anchors));
+        s.insert("white".into(), entries(self.white()));
+        s.insert("gray".into(), entries(self.gray()));
+        s.insert("anchor".into(), entries(self.anchors()));
         let bans = self
             .bans
             .iter()
@@ -467,11 +717,14 @@ impl AddressBook {
                 .unwrap_or_default()
         };
 
+        // The lists are saved most recently seen first. Read back oldest
+        // first, so they arrive in the order they are kept in, and of two
+        // entries for one host the white list keeps the more recent.
         let mut book = AddressBook::new(allow_local);
-        for r in records("white") {
-            book.add_white(r);
+        for r in records("white").into_iter().rev() {
+            book.add_white(r, true);
         }
-        for r in records("gray") {
+        for r in records("gray").into_iter().rev() {
             book.add_gray(r);
         }
         for r in records("anchor") {
@@ -511,27 +764,30 @@ impl AddressBook {
     }
 }
 
-fn sorted(m: &HashMap<SocketAddr, PeerRecord>) -> Vec<PeerRecord> {
-    let mut v: Vec<PeerRecord> = m.values().cloned().collect();
+fn sorted(mut v: Vec<PeerRecord>) -> Vec<PeerRecord> {
     v.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(a.addr.cmp(&b.addr)));
     v
 }
 
-/// Drop the least recently seen entries until `m` fits, handing each to
-/// `evicted`.
+/// Drop entries from the front of the C++'s time order -- least recently
+/// seen, and of those the first to arrive -- until `m` fits, handing each to
+/// `evicted` (`trim_gray_peerlist`, `trim_white_peerlist`).
 fn trim(
-    m: &mut HashMap<SocketAddr, PeerRecord>,
+    m: &mut HashMap<SocketAddr, Listed>,
     limit: usize,
     mut evicted: impl FnMut(PeerRecord),
 ) {
     if m.len() <= limit {
         return;
     }
-    let mut by_age: Vec<(i64, SocketAddr)> = m.values().map(|r| (r.last_seen, r.addr)).collect();
+    let mut by_age: Vec<(i64, u64, SocketAddr)> = m
+        .values()
+        .map(|l| (l.rec.last_seen, l.seq, l.rec.addr))
+        .collect();
     by_age.sort();
-    for (_, addr) in by_age.into_iter().take(m.len() - limit) {
-        if let Some(r) = m.remove(&addr) {
-            evicted(r);
+    for (_, _, addr) in by_age.into_iter().take(m.len() - limit) {
+        if let Some(l) = m.remove(&addr) {
+            evicted(l.rec);
         }
     }
 }
@@ -554,13 +810,27 @@ mod tests {
         0
     }
 
+    fn entry(addr: &str, last_seen: i64, pruning_seed: u32, rpc_port: u16) -> PeerlistEntry {
+        PeerlistEntry {
+            address: NetworkAddress::from_socket_addr(addr.parse().unwrap()),
+            id: 1,
+            last_seen,
+            pruning_seed,
+            rpc_port,
+        }
+    }
+
+    fn never(_: &PeerRecord) -> bool {
+        false
+    }
+
     #[test]
     fn a_verified_peer_moves_from_gray_to_white() {
         let mut b = AddressBook::new(false);
         b.add_gray(rec("8.8.8.8:34567", 1));
         assert_eq!(b.counts(), (0, 1));
 
-        b.add_white(rec("8.8.8.8:34567", 2));
+        b.add_white(rec("8.8.8.8:34567", 2), true);
         assert_eq!(b.counts(), (1, 0), "promotion removes it from gray");
 
         // Mentioned again by a peer, it stays white.
@@ -581,12 +851,12 @@ mod tests {
             "8.8.8.8:0",
         ] {
             b.add_gray(rec(a, 1));
-            b.add_white(rec(a, 1));
+            b.add_white(rec(a, 1), true);
         }
         assert_eq!(b.counts(), (0, 0));
 
         let mut b = AddressBook::new(true);
-        b.add_white(rec("127.0.0.1:34567", 1));
+        b.add_white(rec("127.0.0.1:34567", 1), true);
         assert_eq!(b.counts(), (1, 0));
     }
 
@@ -596,20 +866,196 @@ mod tests {
     fn the_white_list_is_capped_by_age() {
         let mut b = AddressBook::new(true);
         for i in 0..WHITE_LIMIT as i64 + 1 {
-            b.add_white(rec(&format!("10.1.{}.{}:1", i / 256, i % 256), i + 1));
+            let addr = format!("10.1.{}.{}:1", i / 256, i % 256);
+            b.add_white(rec(&addr, i + 1), true);
         }
         assert_eq!(b.counts(), (WHITE_LIMIT, 1));
         assert_eq!(b.gray()[0].last_seen, 1, "the oldest was evicted");
     }
 
+    /// Only this node's own clock moves `last_seen`. A peer mentioning an
+    /// address again cannot, nor can a ping-back; a handshake can. What an
+    /// update leaves out -- a pruning seed, an RPC port -- is kept.
     #[test]
-    fn failing_to_reach_a_white_peer_demotes_it() {
+    fn only_this_node_moves_last_seen() {
         let mut b = AddressBook::new(false);
-        b.add_white(rec("8.8.8.8:1", 1));
-        b.failed_to_reach(&"8.8.8.8:1".parse().unwrap());
-        assert_eq!(b.counts(), (0, 1));
-        b.failed_to_reach(&"8.8.8.8:1".parse().unwrap());
-        assert_eq!(b.counts(), (0, 0), "a gray one is forgotten");
+        let mut first_mention = rec("8.8.8.8:34567", 0);
+        first_mention.pruning_seed = 385;
+        b.add_gray(first_mention);
+        let mut again = rec("8.8.8.8:34567", i64::MAX);
+        again.rpc_port = 34_568;
+        b.add_gray(again);
+        let gray = b.gray();
+        assert_eq!(gray[0].last_seen, 0);
+        assert_eq!((gray[0].pruning_seed, gray[0].rpc_port), (385, 34_568));
+
+        b.add_white(rec("9.9.9.9:34567", 100), true);
+        b.add_white(rec("9.9.9.9:34567", 200), false);
+        assert_eq!(b.white()[0].last_seen, 100, "a ping-back leaves it");
+        b.add_white(rec("9.9.9.9:34567", 300), true);
+        assert_eq!(b.white()[0].last_seen, 300, "a handshake moves it");
+    }
+
+    /// The gray list is trimmed first come, first gone. Everything a peer
+    /// mentions has a `last_seen` of zero, so an address that happens to sort
+    /// high must not be what keeps an entry in.
+    #[test]
+    fn the_gray_list_trims_the_first_to_arrive() {
+        let mut b = AddressBook::new(false);
+        let high: SocketAddr = "223.255.255.1:34567".parse().unwrap();
+        b.add_gray(rec(&high.to_string(), 0));
+        for i in 0..GRAY_LIMIT - 1 {
+            b.add_gray(rec(&format!("8.{}.{}.1:34567", i / 256, i % 256), 0));
+        }
+        assert_eq!(b.counts(), (0, GRAY_LIMIT));
+
+        b.add_gray(rec("9.0.0.1:34567", 0));
+        assert_eq!(b.counts(), (0, GRAY_LIMIT));
+        let gray = b.gray();
+        assert!(
+            !gray.iter().any(|r| r.addr == high),
+            "the first to arrive went"
+        );
+        assert!(gray.iter().any(|r| r.addr.to_string() == "8.0.0.1:34567"));
+    }
+
+    /// A peer list is sanitised as the C++ sanitises one: public addresses
+    /// only, whatever `--allow-local-ip` says; not a port that is the entry's
+    /// own RPC port, nor a pruning seed no node could have; `last_seen`
+    /// zeroed; and nothing from a host that failed within the hour or is
+    /// banned.
+    #[test]
+    fn a_peer_list_is_sanitised_on_the_way_in() {
+        let mut b = AddressBook::new(true);
+        let now = 10_000;
+        b.record_addr_failed("7.7.7.7".parse().unwrap(), now - 60);
+        b.ban(BanTarget::parse("6.6.6.0/24").unwrap(), 3_600, now);
+        b.merge_peerlist(
+            &[
+                entry("8.8.8.8:34567", 1_700_000_000, 0, 34_568),
+                entry("9.9.9.9:34567", 0, 385, 0),
+                entry("192.168.1.5:34567", 0, 0, 0),
+                entry("127.0.0.1:34567", 0, 0, 0),
+                entry("1.1.1.1:34568", 0, 0, 34_568),
+                entry("2.2.2.2:34567", 0, 7, 0),
+                entry("7.7.7.7:34567", 0, 0, 0),
+                entry("6.6.6.6:34567", 0, 0, 0),
+            ],
+            now,
+        );
+        let gray = b.gray();
+        assert_eq!(
+            gray.iter().map(|r| r.addr.to_string()).collect::<Vec<_>>(),
+            ["8.8.8.8:34567", "9.9.9.9:34567"]
+        );
+        assert!(
+            gray.iter().all(|r| r.last_seen == 0),
+            "a stranger's timestamps are not kept"
+        );
+
+        // An hour on, the host that failed is taken again.
+        b.merge_peerlist(
+            &[entry("7.7.7.7:34567", 0, 0, 0)],
+            now + FAILED_ADDR_FORGET_SECONDS,
+        );
+        assert_eq!(b.counts(), (0, 3));
+    }
+
+    /// One host is one white peer: a new port replaces the old. Loopback is
+    /// the exception, for several nodes on one machine.
+    #[test]
+    fn a_host_has_one_white_entry() {
+        let mut b = AddressBook::new(true);
+        b.add_white(rec("8.8.8.8:34567", 1), true);
+        b.add_white(rec("8.8.8.8:28080", 2), true);
+        assert_eq!(b.white().len(), 1);
+        assert_eq!(b.white()[0].addr.port(), 28_080);
+
+        b.add_white(rec("127.0.0.1:34567", 3), true);
+        b.add_white(rec("127.0.0.1:34568", 4), true);
+        assert_eq!(b.counts(), (3, 0));
+    }
+
+    /// A host that could not be reached is left alone for an hour.
+    #[test]
+    fn a_failed_host_is_skipped_for_an_hour() {
+        let mut b = AddressBook::new(false);
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!b.is_addr_recently_failed(ip, 100));
+        b.record_addr_failed(ip, 100);
+        let an_hour_on = 100 + FAILED_ADDR_FORGET_SECONDS;
+        assert!(b.is_addr_recently_failed(ip, an_hour_on));
+        assert!(!b.is_addr_recently_failed(ip, an_hour_on + 1));
+        assert!(!b.is_addr_recently_failed("8.8.4.4".parse().unwrap(), 100));
+    }
+
+    /// A host on several ports is one candidate, the port most recently seen.
+    /// If that one cannot be used, the host is not dialled on another.
+    #[test]
+    fn a_host_is_one_candidate_however_many_ports() {
+        let mut b = AddressBook::new(false);
+        b.add_gray(rec("8.8.8.8:34567", 0));
+        b.add_gray(rec("8.8.8.8:28080", 0));
+        let picked = b.pick(false, &[], &mut first, &never).unwrap();
+        assert_eq!(
+            picked.addr.port(),
+            28_080,
+            "of equal last_seen, the later arrival"
+        );
+        let not_that = |r: &PeerRecord| r.addr.port() == 28_080;
+        assert_eq!(b.pick(false, &[], &mut first, &not_that), None);
+        assert!(AddressBook::new(false).random_gray(&mut first).is_none());
+    }
+
+    /// Not a second peer in a /24 this node is connected to while another
+    /// subnet offers one, however much more recently seen. With nothing
+    /// usable elsewhere, the rule gives way.
+    #[test]
+    fn a_connected_subnet_is_passed_over() {
+        let mut b = AddressBook::new(false);
+        b.add_white(rec("1.2.3.4:34567", 100), true);
+        b.add_white(rec("5.6.7.8:34567", 1), true);
+        let connected: [SocketAddr; 1] = ["1.2.3.200:34567".parse().unwrap()];
+
+        let picked = b.pick(true, &connected, &mut first, &never).unwrap();
+        assert_eq!(picked.addr.to_string(), "5.6.7.8:34567");
+
+        let failed = |r: &PeerRecord| r.last_seen == 1;
+        let picked = b.pick(true, &connected, &mut first, &failed).unwrap();
+        assert_eq!(picked.addr.to_string(), "1.2.3.4:34567");
+    }
+
+    /// From the white list, one of the twenty most recently seen, the most
+    /// recent favoured; from the gray list, any of them.
+    #[test]
+    fn white_candidates_are_the_most_recently_seen() {
+        let mut b = AddressBook::new(false);
+        for i in 1..=30 {
+            b.add_white(rec(&format!("8.8.{i}.1:34567"), i), true);
+            b.add_gray(rec(&format!("9.9.{i}.1:34567"), i));
+        }
+        let mut last = |n: usize| n - 1;
+        let white = b.pick(true, &[], &mut last, &never).unwrap();
+        assert_eq!(white.last_seen, 11, "the twentieth most recent at most");
+        let gray = b.pick(false, &[], &mut last, &never).unwrap();
+        assert_eq!(gray.last_seen, 1, "the least recent of all thirty");
+        let white = b.pick(true, &[], &mut first, &never).unwrap();
+        assert_eq!(white.last_seen, 30);
+    }
+
+    /// `get_random_index_with_fixed_probability`, at its ends and between.
+    #[test]
+    fn the_weighted_index_favours_the_front() {
+        assert_eq!(weighted_index(0, &mut first), 0);
+        assert_eq!(weighted_index(19, &mut first), 0);
+        assert_eq!(weighted_index(19, &mut |n: usize| n - 1), 19);
+        // 160³ / (16³ · 19²) = 4 096 000 / 1 478 656.
+        assert_eq!(weighted_index(19, &mut |_: usize| 160), 2);
+        // Of the 305 values x takes, 0 to 113 give the first candidate.
+        let front = (0..305)
+            .filter(|&x| weighted_index(19, &mut |_: usize| x) == 0)
+            .count();
+        assert_eq!(front, 114);
     }
 
     /// A handshake offers white peers only, at most the number asked for.
@@ -617,7 +1063,7 @@ mod tests {
     fn handshake_peers_come_from_the_white_list() {
         let mut b = AddressBook::new(false);
         for i in 0..10 {
-            b.add_white(rec(&format!("8.8.8.{i}:34567"), i));
+            b.add_white(rec(&format!("8.8.8.{i}:34567"), i), true);
         }
         b.add_gray(rec("9.9.9.9:34567", 100));
 
@@ -627,6 +1073,27 @@ mod tests {
             .iter()
             .all(|e| e.address.socket_addr().unwrap().ip().to_string() != "9.9.9.9"));
         assert_eq!(b.handshake_peers(250, &mut first).len(), 10);
+    }
+
+    /// A shared peer carries no `last_seen`: the real one says when this node
+    /// last connected to that peer, which is who it is connected to now.
+    #[test]
+    fn shared_peers_do_not_say_when_they_were_seen() {
+        let mut b = AddressBook::new(false);
+        for i in 1..=5 {
+            let seen = 1_700_000_000 + i;
+            b.add_white(rec(&format!("8.8.8.{i}:34567"), seen), true);
+        }
+        let offered = b.handshake_peers(250, &mut first);
+        assert_eq!(offered.len(), 5);
+        assert!(offered.iter().all(|e| e.last_seen == 0));
+        assert!(
+            offered.iter().all(|e| e.id != 0),
+            "only the timestamp is hidden"
+        );
+
+        // The book itself keeps them, for its own choices and the state file.
+        assert!(b.white().iter().all(|r| r.last_seen >= 1_700_000_001));
     }
 
     #[test]
@@ -684,8 +1151,11 @@ mod tests {
     #[test]
     fn the_book_survives_a_restart() {
         let mut b = AddressBook::new(false);
-        b.add_white(rec("8.8.8.8:34567", 10));
+        b.add_white(rec("8.8.8.8:34567", 10), true);
+        b.add_white(rec("8.8.4.4:34567", 12), true);
         b.add_gray(rec("9.9.9.9:34567", 5));
+        b.add_gray(rec("9.9.9.10:34567", 0));
+        b.add_gray(rec("9.9.9.11:34567", 0));
         b.add_anchor(rec("1.1.1.1:34567", 7));
         b.ban(BanTarget::parse("4.4.4.4").unwrap(), u64::MAX, 0);
 

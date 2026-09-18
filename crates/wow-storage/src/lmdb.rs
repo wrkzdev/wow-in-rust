@@ -605,6 +605,48 @@ impl BlockchainDb for LmdbDb {
         Ok(self.block_info_in(&rtxn, height)?.hash)
     }
 
+    /// One read transaction and one cursor walk, rather than a transaction
+    /// and a lookup per height.
+    ///
+    /// `get_block_hash` opens a read transaction of its own, so reading every
+    /// hash from genesis one at a time is a million `mdb_txn_begin` and
+    /// `mdb_txn_abort` pairs, and the environment's gate taken and released a
+    /// million times. That is the cost, not the lookups. `block_info` is
+    /// DUPSORT under a single zero key with the height inside the value, so
+    /// the whole range is one positioned cursor and `next_dup` from there.
+    fn block_hashes(&self, from: u64, to: u64) -> Result<Vec<Hash256>> {
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        let rtxn = self.read_txn()?;
+        let mut cursor = rtxn.cursor(self.dbs.block_info)?;
+        let mut out = Vec::with_capacity((to - from) as usize);
+
+        // Positioned at the first record at or after `from`. The comparator
+        // orders duplicates by the height they start with, so "at or after"
+        // is what `get_both_range` means here.
+        let Some(raw) = cursor.get_both_range(&ZEROKEY, &from.to_ne_bytes())? else {
+            return Err(DbError::NotFound);
+        };
+        let mut info = BlockInfo::decode(raw)?;
+        loop {
+            if info.height != from + out.len() as u64 {
+                // A gap, or the walk overshot. Neither should happen on a
+                // chain this node wrote, and carrying on would silently
+                // return hashes for the wrong heights.
+                return Err(DbError::NotFound);
+            }
+            out.push(info.hash);
+            if out.len() as u64 == to - from {
+                return Ok(out);
+            }
+            let Some((_, raw)) = cursor.next_dup()? else {
+                return Err(DbError::NotFound);
+            };
+            info = BlockInfo::decode(raw)?;
+        }
+    }
+
     fn get_block_height(&self, h: &Hash256) -> Result<u64> {
         let rtxn = self.read_txn()?;
         self.block_height_in(&rtxn, h)
@@ -1017,11 +1059,6 @@ impl BlockchainDb for LmdbDb {
     // ------------------------------------------------------------- lifecycle
 
     fn batch_start(&self, _n_blocks: u64, _bytes: u64) -> Result<()> {
-        // `specs/10` §6.2 puts the write transaction in the writer task rather
-        // than in the database object, and `RwTxn` borrows the environment, so
-        // a batch cannot be stashed in `&self`. Use `LmdbDb::writer` and hold
-        // the `Writer` across the batch instead — same transaction, same
-        // atomicity, with the lifetime checked.
         Err(DbError::Backend(Box::new(BatchShape)))
     }
 
@@ -1045,7 +1082,47 @@ impl BlockchainDb for LmdbDb {
     }
 }
 
-/// Explains why `batch_start`/`batch_stop` are not the shape to use.
+/// Why a batch cannot be started yet, and what it would take.
+///
+/// **A known gap, not a design.** Every block is its own write transaction:
+/// [`BlockchainDb::add_block`] goes through [`LmdbDb::write`], which opens a
+/// transaction, writes one block and commits it. The C++ node wraps
+/// `blocks_per_sync` blocks in one transaction during a bulk sync, and
+/// `specs/10` §6.2 describes exactly that — "one `RwTxn` per block (or per
+/// batch during bulk sync)". Committing per block is the largest avoidable
+/// cost in applying a sync batch.
+///
+/// The obstacle is a lifetime. [`Writer`] holds an `RwTxn<'e>` borrowing the
+/// `Env`, and `LmdbDb` owns that `Env`, so a transaction cannot be stashed in
+/// `&self` without making the struct self-referential. Holding a `Writer`
+/// across the batch at the call site does not work either, because
+/// `wow_core`'s `Blockchain` reads from the same database between blocks.
+///
+/// # What would fix it
+///
+/// Give the transactions an owned handle rather than a borrow:
+/// `Env::write_txn(self: &Arc<Self>) -> RwTxn` with `RwTxn { env: Arc<Env> }`
+/// and no lifetime parameter. [`Writer`] becomes `'static`, `LmdbDb` can hold
+/// a `Mutex<Option<Writer>>`, and `batch_start`/`batch_stop` work as
+/// [`BlockchainDb`] already declares them. That is roughly 26 signatures
+/// across this file and `raw.rs`, and **nothing in `wow_core` changes**:
+/// `add_block` keeps calling `db.add_block`, [`LmdbDb::write`] routes into the
+/// open batch when there is one, and `NodeCore::apply_blocks` brackets the
+/// span.
+///
+/// Two things have to be right, and they are why this is not a change to make
+/// without running it against a real chain:
+///
+/// * **The map cannot grow while a transaction is open** — `grow_map` returns
+///   [`DbError::ResizeWhileOpen`]. `batch_start` has to grow it first, for the
+///   whole batch, which is what the C++ `batch_start` does with its `bytes`
+///   argument.
+/// * **An aborted batch rolls the database back and the chain's cached state
+///   does not roll back with it.** `Blockchain` keeps the weight window, the
+///   difficulty window and the generated coins in memory. Anything that
+///   abandons a batch has to call `Blockchain::reload_state` before the chain
+///   is used again, or the node carries on from a state the database does not
+///   have.
 #[derive(Debug)]
 struct BatchShape;
 
@@ -1053,8 +1130,9 @@ impl std::fmt::Display for BatchShape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "use LmdbDb::writer() and hold the Writer across the batch; a write \
-             transaction borrows the environment and cannot live in &self"
+            "batching several blocks into one write transaction is not built yet: a \
+             write transaction borrows the environment and cannot live in &self. See \
+             the BatchShape documentation for what it would take"
         )
     }
 }

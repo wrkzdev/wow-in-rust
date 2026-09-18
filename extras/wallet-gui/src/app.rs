@@ -12,12 +12,13 @@ use egui::{
 };
 use serde::{Deserialize, Serialize};
 use wow_crypto::mnemonic::{self, Language, WordList};
+use wow_crypto::{Zeroize, Zeroizing};
 
 use crate::format;
 use crate::nodes::{self, Node, NodeAddress};
 use crate::protocol::{
-    Bytes, Command, Event, Net, NewWallet, NodeReport, OpenWallet, Pick, Preview, Restore, Row,
-    SendForm, Status, Summary,
+    Bytes, Command, Event, Link, Net, NewWallet, NodeReport, OpenWallet, Pick, Preview, Restore,
+    Row, SendForm, Status, Summary,
 };
 
 /// Where the settings are kept between runs.
@@ -85,8 +86,9 @@ pub trait Host {
     fn download(&mut self, name: &str, bytes: &[u8]);
     /// Ask for a file, which arrives as [`Event::Picked`]. The browser only.
     fn pick_file(&mut self, purpose: Pick);
-    /// Fetch the public node list, which arrives as [`Event::NodeList`].
-    fn fetch_nodes(&mut self, url: &str);
+    /// Fetch the public node list, which arrives as [`Event::NodeList`]:
+    /// through `proxy`, where the host can use one.
+    fn fetch_nodes(&mut self, url: &str, proxy: Option<&str>);
     /// Seconds east of UTC where the wallet runs, at `timestamp`: for times
     /// as the local clock reads them.
     fn utc_offset(&self, timestamp: u64) -> i64;
@@ -135,9 +137,14 @@ pub struct Settings {
     pub folder: String,
     pub accepted_risk: bool,
     pub last_wallet: String,
-    /// Accept an https node's certificate whoever signed it. The desktop
-    /// only.
-    pub any_certificate: bool,
+    /// The nodes, as `host:port`, whose TLS certificate is accepted whoever
+    /// signed it. The desktop only. A setting of all nodes at once, as this
+    /// was, is not read back: trusting one's own node's certificate should not
+    /// stop every other node's being checked.
+    pub any_certificate_nodes: Vec<String>,
+    /// The SOCKS5 proxy nodes and the public node list are reached through,
+    /// as `--proxy` takes one; empty for none. The desktop only.
+    pub proxy: String,
     pub theme: Theme,
     /// The whole interface's zoom, 1 being this wallet's own text sizes.
     pub text_scale: f32,
@@ -171,7 +178,8 @@ impl Default for Settings {
             folder: String::new(),
             accepted_risk: false,
             last_wallet: String::new(),
-            any_certificate: false,
+            any_certificate_nodes: Vec::new(),
+            proxy: String::new(),
             theme: Theme::System,
             text_scale: 1.0,
             hide_notice: false,
@@ -216,7 +224,8 @@ pub struct WalletApp {
     start: StartForm,
     wallet: Option<WalletView>,
     nodes: NodePicker,
-    new_seed: Option<String>,
+    /// A new wallet's seed phrase, shown once. Wiped when it is hidden.
+    new_seed: Option<Zeroizing<String>>,
     seed_written: bool,
     risk_understood: bool,
     /// A wallet waiting for a yes before it is deleted.
@@ -277,14 +286,16 @@ enum StartTab {
 struct StartForm {
     tab: StartTab,
     selected: String,
-    password: String,
+    /// What is typed into a password or seed field. Overwritten as soon as it
+    /// has been handed over, and again when the form is dropped.
+    password: Zeroizing<String>,
     folder: String,
     name: String,
-    new_password: String,
-    confirm: String,
+    new_password: Zeroizing<String>,
+    confirm: Zeroizing<String>,
     language: String,
-    seed: String,
-    passphrase: String,
+    seed: Zeroizing<String>,
+    passphrase: Zeroizing<String>,
     height: String,
     /// The date the restore height is to be found for, as typed.
     date: String,
@@ -342,8 +353,10 @@ struct WalletView {
     preview: Option<Preview>,
     sent: Option<String>,
     rejected: Option<Vec<String>>,
-    seed: Option<String>,
-    seed_password: String,
+    /// The seed phrase while it is on screen, and the password asked for
+    /// before it is shown. Both wiped when they go.
+    seed: Option<Zeroizing<String>>,
+    seed_password: Zeroizing<String>,
     subaddress_index: u32,
     subaddress: Option<(u32, String)>,
     /// Why the last send could not be prepared, shown beside the form.
@@ -362,15 +375,23 @@ struct WalletView {
     history_filter: HistoryFilter,
     /// The transfer whose details are open, by transaction ID.
     selected_tx: Option<String>,
-    view_key: Option<String>,
-    view_key_password: String,
-    old_password: String,
-    new_password: String,
-    new_password_again: String,
+    view_key: Option<Zeroizing<String>>,
+    view_key_password: Zeroizing<String>,
+    old_password: Zeroizing<String>,
+    new_password: Zeroizing<String>,
+    new_password_again: Zeroizing<String>,
     /// A view-only copy: this wallet's password, and the copy's.
-    copy_wallet_password: String,
-    copy_password: String,
-    copy_password_again: String,
+    copy_wallet_password: Zeroizing<String>,
+    copy_password: Zeroizing<String>,
+    copy_password_again: Zeroizing<String>,
+    /// Recent `(seconds since the frame clock started, height scanned)`, for
+    /// the speed and the time left beside the progress bar.
+    ///
+    /// A window rather than an average since the start: blocks near the tip
+    /// carry far more transactions than the early chain, so an average over
+    /// the whole scan promises a finish the rest of it does not keep. The
+    /// command-line wallet measures the same way, over the same 30 seconds.
+    sync_samples: std::collections::VecDeque<(f64, u64)>,
 }
 
 impl WalletView {
@@ -389,7 +410,7 @@ impl WalletView {
             sent: None,
             rejected: None,
             seed: None,
-            seed_password: String::new(),
+            seed_password: Zeroizing::default(),
             subaddress_index: 1,
             subaddress: None,
             send_error: None,
@@ -402,13 +423,14 @@ impl WalletView {
             history_filter: HistoryFilter::All,
             selected_tx: None,
             view_key: None,
-            view_key_password: String::new(),
-            old_password: String::new(),
-            new_password: String::new(),
-            new_password_again: String::new(),
-            copy_wallet_password: String::new(),
-            copy_password: String::new(),
-            copy_password_again: String::new(),
+            view_key_password: Zeroizing::default(),
+            old_password: Zeroizing::default(),
+            new_password: Zeroizing::default(),
+            new_password_again: Zeroizing::default(),
+            copy_wallet_password: Zeroizing::default(),
+            copy_password: Zeroizing::default(),
+            copy_password_again: Zeroizing::default(),
+            sync_samples: std::collections::VecDeque::new(),
         }
     }
 }
@@ -433,6 +455,15 @@ struct NodePicker {
     fetched: Option<Net>,
     /// By the address as it was sent to be tested.
     tests: HashMap<String, Test>,
+    /// A login for a node started with `--rpc-login`.
+    ///
+    /// Here rather than in [`Settings`] on purpose: settings are written to
+    /// disk, and a node's password is not this wallet's to keep. It lasts as
+    /// long as the window does.
+    login_user: String,
+    login_pass: String,
+    /// The proxy as typed, before it is used; `None` until first shown.
+    proxy_input: Option<String>,
 }
 
 enum Test {
@@ -551,7 +582,12 @@ fn log_level_label(level: Option<u8>) -> &'static str {
 
 impl WalletApp {
     pub fn new(settings: Settings, mut host: Box<dyn Host>) -> WalletApp {
-        host.send(Command::AcceptAnyCertificate(settings.any_certificate));
+        host.send(Command::AcceptAnyCertificate(
+            settings.any_certificate_nodes.clone(),
+        ));
+        if !host.in_browser() && !settings.proxy.trim().is_empty() {
+            host.send(Command::SetProxy(Some(settings.proxy.clone())));
+        }
         host.send(Command::SetLog {
             level: settings.log_level,
             to_file: settings.log_to_file,
@@ -701,16 +737,19 @@ impl WalletApp {
             Event::Opened(summary) => {
                 self.settings.last_wallet = summary.name.clone();
                 let form = &mut self.start;
+                // Overwritten rather than cleared: `String::clear` only sets
+                // the length to zero and leaves the bytes in the allocation,
+                // where a seed phrase would sit for the rest of the run.
                 for field in [
                     &mut form.password,
                     &mut form.new_password,
                     &mut form.confirm,
                     &mut form.seed,
                     &mut form.passphrase,
-                    &mut form.name,
-                    &mut form.height,
-                    &mut form.date,
                 ] {
+                    field.zeroize();
+                }
+                for field in [&mut form.name, &mut form.height, &mut form.date] {
                     field.clear();
                 }
                 self.awaiting = None;
@@ -723,7 +762,7 @@ impl WalletApp {
                 self.wallet = Some(WalletView::new(summary));
             }
             Event::NewSeed(seed) => {
-                self.new_seed = Some(seed);
+                self.new_seed = Some(Zeroizing::new(seed));
                 self.seed_written = false;
             }
             Event::Closed => {
@@ -732,7 +771,27 @@ impl WalletApp {
                 self.awaiting = None;
             }
             Event::Status(status) => {
+                // The frame clock, set at the top of `update`. Read before the
+                // wallet is borrowed.
+                let now = self.now;
                 if let Some(w) = &mut self.wallet {
+                    // Only when it has moved: a status that repeats the same
+                    // height says nothing about the speed, and a run of them
+                    // would drag the estimate down towards zero.
+                    if w.status.scanned != status.scanned || w.sync_samples.is_empty() {
+                        w.sync_samples.push_back((now, status.scanned));
+                    }
+                    while w.sync_samples.len() > 2
+                        && now - w.sync_samples[0].0 > SYNC_RATE_WINDOW_SECS
+                    {
+                        w.sync_samples.pop_front();
+                    }
+                    if status.scanned < w.status.scanned {
+                        // A reorganisation, or a scan started again: the
+                        // samples describe a scan that is no longer happening.
+                        w.sync_samples.clear();
+                        w.sync_samples.push_back((now, status.scanned));
+                    }
                     w.status = status;
                 }
             }
@@ -799,20 +858,20 @@ impl WalletApp {
             Event::Seed(seed) => {
                 self.awaiting = None;
                 if let Some(w) = &mut self.wallet {
-                    w.seed = Some(seed);
+                    w.seed = Some(Zeroizing::new(seed));
                 }
             }
             Event::ViewKey(key) => {
                 self.awaiting = None;
                 if let Some(w) = &mut self.wallet {
-                    w.view_key = Some(key);
+                    w.view_key = Some(Zeroizing::new(key));
                 }
             }
             Event::PasswordChanged => {
                 self.awaiting = None;
                 if let Some(w) = &mut self.wallet {
-                    w.new_password.clear();
-                    w.new_password_again.clear();
+                    w.new_password.zeroize();
+                    w.new_password_again.zeroize();
                 }
                 self.notice("The password is changed: the wallet's files are under the new one.");
             }
@@ -1078,6 +1137,7 @@ impl WalletApp {
                             Some(n) => ui.label(format!("In use: {n}")),
                             None => ui.label("No node in use."),
                         };
+                        link_line(ui, w.status.link);
                         if let Some(e) = &w.status.node_error {
                             ui.colored_label(t.bad, e.as_str());
                         }
@@ -1094,6 +1154,7 @@ impl WalletApp {
                     wallet_open: open,
                     in_browser,
                     secure,
+                    proxy: !in_browser && !self.settings.proxy.trim().is_empty(),
                 };
                 node_picker(ui, &mut self.nodes, &mut self.settings, &mut *self.host, cx);
             }
@@ -1216,7 +1277,7 @@ impl WalletApp {
         let mut open = false;
         ui.horizontal(|ui| {
             let field = ui.add(
-                TextEdit::singleline(&mut self.start.password)
+                TextEdit::singleline(&mut *self.start.password)
                     .password(true)
                     .hint_text("Password")
                     .desired_width(240.0),
@@ -1237,7 +1298,7 @@ impl WalletApp {
         if open {
             let command = Command::Open(OpenWallet {
                 name: self.start.selected.clone(),
-                password: std::mem::take(&mut self.start.password),
+                password: take_secret(&mut self.start.password),
                 node: self.settings.node.clone(),
             });
             self.send_from(Place::Start, command);
@@ -1261,14 +1322,14 @@ impl WalletApp {
                 ui.end_row();
                 ui.label("Password");
                 ui.add(
-                    TextEdit::singleline(&mut f.new_password)
+                    TextEdit::singleline(&mut *f.new_password)
                         .password(true)
                         .desired_width(260.0),
                 );
                 ui.end_row();
                 ui.label("Again");
                 ui.add(
-                    TextEdit::singleline(&mut f.confirm)
+                    TextEdit::singleline(&mut *f.confirm)
                         .password(true)
                         .desired_width(260.0),
                 );
@@ -1303,7 +1364,7 @@ impl WalletApp {
         {
             let command = Command::Create(NewWallet {
                 name: f.name.clone(),
-                password: f.new_password.clone(),
+                password: f.new_password.as_str().to_owned(),
                 network: self.settings.network,
                 language: f.language.clone(),
                 node: self.settings.node.clone(),
@@ -1322,7 +1383,7 @@ impl WalletApp {
             .show(ui, |ui| {
                 ui.label("Seed phrase");
                 ui.add(
-                    TextEdit::multiline(&mut f.seed)
+                    TextEdit::multiline(&mut *f.seed)
                         .hint_text("25 words")
                         .desired_rows(3)
                         .desired_width(420.0),
@@ -1330,7 +1391,7 @@ impl WalletApp {
                 ui.end_row();
                 ui.label("Seed passphrase");
                 ui.add(
-                    TextEdit::singleline(&mut f.passphrase)
+                    TextEdit::singleline(&mut *f.passphrase)
                         .password(true)
                         .hint_text("only if the seed was written with one")
                         .desired_width(260.0),
@@ -1364,14 +1425,14 @@ impl WalletApp {
                 ui.end_row();
                 ui.label("Password");
                 ui.add(
-                    TextEdit::singleline(&mut f.new_password)
+                    TextEdit::singleline(&mut *f.new_password)
                         .password(true)
                         .desired_width(260.0),
                 );
                 ui.end_row();
                 ui.label("Again");
                 ui.add(
-                    TextEdit::singleline(&mut f.confirm)
+                    TextEdit::singleline(&mut *f.confirm)
                         .password(true)
                         .desired_width(260.0),
                 );
@@ -1423,10 +1484,10 @@ impl WalletApp {
             if let Ok(restore_height) = height {
                 let command = Command::Restore(Restore {
                     name: f.name.clone(),
-                    password: f.new_password.clone(),
+                    password: f.new_password.as_str().to_owned(),
                     network: self.settings.network,
-                    seed: f.seed.clone(),
-                    passphrase: f.passphrase.clone(),
+                    seed: f.seed.as_str().to_owned(),
+                    passphrase: f.passphrase.as_str().to_owned(),
                     restore_height,
                     node: self.settings.node.clone(),
                 });
@@ -1625,6 +1686,22 @@ impl WalletApp {
                             ui.end_row();
                         }
                     });
+                if p.left_behind > 0 {
+                    // Before the button, not after the send: someone who asked
+                    // to empty a wallet and was told nothing would reasonably
+                    // believe it is now empty.
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "This does not sweep everything. {} more output(s) would \
+                             make the transaction too heavy for a node to relay, so the \
+                             largest {} are being swept. Sweep again afterwards to take \
+                             the rest.",
+                            p.left_behind, p.inputs
+                        ))
+                        .color(tones(ui).warn),
+                    );
+                }
                 ui.add_space(8.0);
                 ui.label("Check the address. A sent transaction cannot be taken back.");
                 ui.horizontal(|ui| {
@@ -1785,9 +1862,17 @@ fn overview(
         if let Some(note) = unlock_note(&w.status) {
             ui.label(RichText::new(note).color(weak));
         }
+        if let Some(note) = frozen_note(&w.status) {
+            ui.label(RichText::new(note).color(weak));
+        }
     }
     ui.add_space(12.0);
-    sync_bar(ui, &w.status);
+    sync_bar(
+        ui,
+        &w.status,
+        w.summary.restore_height,
+        sync_rate(&w.sync_samples),
+    );
     if let Some(e) = &w.status.node_error {
         ui.colored_label(t.bad, e.as_str());
     }
@@ -1828,6 +1913,27 @@ fn overview(
             w.page = Page::History;
         }
     }
+}
+
+/// What `freeze` has set aside, which is in none of the balances.
+///
+/// The command-line wallet's `frozen` lists these; this build's interface has
+/// no per-output page to list them on, so it says how much and how many, so
+/// that money missing from the balance is money accounted for.
+fn frozen_note(status: &Status) -> Option<String> {
+    if status.frozen_outputs == 0 {
+        return None;
+    }
+    let outputs = if status.frozen_outputs == 1 {
+        "1 output is".to_string()
+    } else {
+        format!("{} outputs are", status.frozen_outputs)
+    };
+    Some(format!(
+        "{outputs} frozen, holding {} WOW. Frozen outputs are in no balance above and nothing \
+         spends them. wallet-cli's `thaw` gives one back.",
+        format::amount_short(status.frozen)
+    ))
 }
 
 /// Why money cannot be spent yet, and when the first of it can.
@@ -1978,6 +2084,9 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
         };
         ui.colored_label(t.warn, why);
         if let Some(note) = unlock_note(&w.status) {
+            ui.label(note);
+        }
+        if let Some(note) = frozen_note(&w.status) {
             ui.label(note);
         }
     }
@@ -2479,7 +2588,7 @@ fn wallet_settings(
     } else {
         ui.horizontal(|ui| {
             ui.add(
-                TextEdit::singleline(&mut w.seed_password)
+                TextEdit::singleline(&mut *w.seed_password)
                     .password(true)
                     .hint_text("wallet password")
                     .desired_width(200.0),
@@ -2488,7 +2597,7 @@ fn wallet_settings(
                 *error = None;
                 *awaiting = Some(Place::Wallet);
                 host.send(Command::ShowSeed {
-                    password: std::mem::take(&mut w.seed_password),
+                    password: take_secret(&mut w.seed_password),
                 });
             }
         });
@@ -2516,7 +2625,7 @@ fn wallet_settings(
     } else {
         ui.horizontal(|ui| {
             ui.add(
-                TextEdit::singleline(&mut w.view_key_password)
+                TextEdit::singleline(&mut *w.view_key_password)
                     .password(true)
                     .hint_text("wallet password")
                     .desired_width(200.0),
@@ -2525,7 +2634,7 @@ fn wallet_settings(
                 *error = None;
                 *awaiting = Some(Place::Wallet);
                 host.send(Command::ShowViewKey {
-                    password: std::mem::take(&mut w.view_key_password),
+                    password: take_secret(&mut w.view_key_password),
                 });
             }
         });
@@ -2542,27 +2651,27 @@ fn wallet_settings(
         .show(ui, |ui| {
             ui.label("Now");
             ui.add(
-                TextEdit::singleline(&mut w.old_password)
+                TextEdit::singleline(&mut *w.old_password)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
             ui.label("New");
             ui.add(
-                TextEdit::singleline(&mut w.new_password)
+                TextEdit::singleline(&mut *w.new_password)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
             ui.label("Again");
             ui.add(
-                TextEdit::singleline(&mut w.new_password_again)
+                TextEdit::singleline(&mut *w.new_password_again)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
         });
-    let mismatch = w.new_password != w.new_password_again;
+    let mismatch = *w.new_password != *w.new_password_again;
     if mismatch && !w.new_password_again.is_empty() {
         ui.colored_label(t.bad, "The new passwords do not match.");
     }
@@ -2580,8 +2689,8 @@ fn wallet_settings(
         *error = None;
         *awaiting = Some(Place::Wallet);
         host.send(Command::ChangePassword {
-            old: std::mem::take(&mut w.old_password),
-            new: w.new_password.clone(),
+            old: take_secret(&mut w.old_password),
+            new: w.new_password.as_str().to_owned(),
         });
     }
 
@@ -2600,27 +2709,27 @@ fn wallet_settings(
         .show(ui, |ui| {
             ui.label("This wallet's password");
             ui.add(
-                TextEdit::singleline(&mut w.copy_wallet_password)
+                TextEdit::singleline(&mut *w.copy_wallet_password)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
             ui.label("The copy's password");
             ui.add(
-                TextEdit::singleline(&mut w.copy_password)
+                TextEdit::singleline(&mut *w.copy_password)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
             ui.label("Again");
             ui.add(
-                TextEdit::singleline(&mut w.copy_password_again)
+                TextEdit::singleline(&mut *w.copy_password_again)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
         });
-    let copy_mismatch = w.copy_password != w.copy_password_again;
+    let copy_mismatch = *w.copy_password != *w.copy_password_again;
     if copy_mismatch && !w.copy_password_again.is_empty() {
         ui.colored_label(t.bad, "The copy's passwords do not match.");
     }
@@ -2631,10 +2740,10 @@ fn wallet_settings(
         *error = None;
         *awaiting = Some(Place::Wallet);
         host.send(Command::ExportViewOnly {
-            password: std::mem::take(&mut w.copy_wallet_password),
-            copy_password: std::mem::take(&mut w.copy_password),
+            password: take_secret(&mut w.copy_wallet_password),
+            copy_password: take_secret(&mut w.copy_password),
         });
-        w.copy_password_again.clear();
+        w.copy_password_again.zeroize();
     }
 
     // Reading the chain again, from a height or from the height on a date.
@@ -2854,6 +2963,8 @@ struct NodeContext {
     wallet_open: bool,
     in_browser: bool,
     secure: bool,
+    /// Nodes are reached through a proxy.
+    proxy: bool,
 }
 
 /// A node typed in or picked from the list, each with a Test button.
@@ -2871,7 +2982,11 @@ fn node_picker(
         picker.fetched = Some(cx.network);
         picker.fetching = true;
         picker.list = nodes::own_nodes(cx.network);
-        host.fetch_nodes(&nodes::list_url(cx.network));
+        let proxy = settings.proxy.trim();
+        host.fetch_nodes(
+            &nodes::list_url(cx.network),
+            (cx.proxy && !proxy.is_empty()).then_some(proxy),
+        );
     }
     let use_label = if cx.wallet_open { "Use" } else { "Choose" };
     let weak = ui.visuals().weak_text_color();
@@ -2904,7 +3019,7 @@ fn node_picker(
     let input = picker.input.trim().to_string();
     match NodeAddress::parse(&input) {
         Ok(node) => {
-            if let Some(why) = node.unreachable_reason(cx.in_browser, cx.secure) {
+            if let Some(why) = node.unreachable_reason(cx.in_browser, cx.secure, cx.proxy) {
                 ui.colored_label(t.warn, why);
             }
         }
@@ -2922,24 +3037,121 @@ fn node_picker(
     }
     // A browser decides about certificates itself.
     if !cx.in_browser {
-        let mut any = settings.any_certificate;
-        let changed = ui
-            .checkbox(&mut any, "Accept an https node's certificate whoever signed it")
-            .on_hover_text(
-                "For a node you run yourself, with a self-signed certificate. The connection is \
-                 still encrypted, but nothing checks who is at the other end of it.",
-            )
-            .changed();
-        if changed {
-            settings.any_certificate = any;
-            host.send(Command::AcceptAnyCertificate(any));
+        // For the node in the address box, and for no other.
+        if let Ok(node) = NodeAddress::parse(&input) {
+            let key = node.host_port();
+            let mut any = settings.any_certificate_nodes.contains(&key);
+            let changed = ui
+                .checkbox(
+                    &mut any,
+                    format!("Accept {key}'s certificate whoever signed it"),
+                )
+                .on_hover_text(
+                    "For a node you run yourself, with a self-signed certificate. The connection \
+                     is still encrypted, but nothing checks who is at the other end of it. \
+                     Other nodes' certificates are still checked.",
+                )
+                .changed();
+            if changed {
+                settings.any_certificate_nodes.retain(|n| *n != key);
+                if any {
+                    settings.any_certificate_nodes.push(key);
+                }
+                host.send(Command::AcceptAnyCertificate(
+                    settings.any_certificate_nodes.clone(),
+                ));
+            }
+            if any {
+                ui.colored_label(
+                    t.warn,
+                    "This node's certificate is not checked, so someone between this computer \
+                     and the node could pose as it.",
+                );
+            }
         }
-        if any {
-            ui.colored_label(
-                t.warn,
-                "Certificates are not checked, so someone between this computer and the node \
-                 could pose as it.",
+
+        // A node started with --rpc-login refuses everything, including the
+        // height check the Test button makes, until a request carries a
+        // login. Without this a wallet simply cannot use one.
+        ui.add_space(8.0);
+        ui.label(RichText::new("Login").strong());
+        ui.label("Only for a node started with --rpc-login. Most public nodes need none.");
+        let mut login_changed = false;
+        egui::Grid::new("node-login")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("User");
+                login_changed |= ui
+                    .add(
+                        TextEdit::singleline(&mut picker.login_user)
+                            .desired_width(200.0)
+                            .hint_text("empty for no login"),
+                    )
+                    .changed();
+                ui.end_row();
+                ui.label("Password");
+                login_changed |= ui
+                    .add(
+                        TextEdit::singleline(&mut picker.login_pass)
+                            .password(true)
+                            .desired_width(200.0),
+                    )
+                    .changed();
+                ui.end_row();
+            });
+        if login_changed {
+            let login = (!picker.login_user.is_empty())
+                .then(|| (picker.login_user.clone(), picker.login_pass.clone()));
+            host.send(Command::SetNodeLogin(login));
+        }
+        if !picker.login_user.is_empty() {
+            ui.label("Kept until this window closes; it is not saved with the settings.");
+        }
+
+        // A page cannot open a socket to a proxy, so this is the desktop's.
+        ui.add_space(8.0);
+        ui.label(RichText::new("Proxy").strong());
+        ui.label(
+            "A SOCKS5 proxy to reach nodes and the node list through: Tor's is 127.0.0.1:9050. A \
+             node's name then goes to the proxy, and .onion and .i2p nodes can be used. Other \
+             nodes are reached only over TLS through it, so whoever runs its exit can neither \
+             read what this wallet asks nor pose as the node.",
+        );
+        let proxy_input = picker
+            .proxy_input
+            .get_or_insert_with(|| settings.proxy.clone());
+        let mut apply = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                TextEdit::singleline(proxy_input)
+                    .hint_text("127.0.0.1:9050")
+                    .desired_width(200.0),
             );
+            let typed = proxy_input.trim().to_string();
+            let valid = typed.is_empty() || wow_daemon_client::Proxy::parse(&typed).is_ok();
+            let changed = typed != settings.proxy;
+            if ui.add_enabled(valid && changed, Button::new("Use")).clicked() {
+                apply = Some(typed.clone());
+            }
+            if !settings.proxy.is_empty() && ui.button("None").clicked() {
+                apply = Some(String::new());
+            }
+            if !valid {
+                if let Err(e) = wow_daemon_client::Proxy::parse(&typed) {
+                    ui.colored_label(t.bad, e);
+                }
+            }
+        });
+        if let Some(proxy) = apply {
+            *proxy_input = proxy.clone();
+            settings.proxy = proxy.clone();
+            host.send(Command::SetProxy((!proxy.is_empty()).then_some(proxy)));
+            // The list comes again, through the proxy or not.
+            picker.fetched = None;
+        }
+        if !settings.proxy.is_empty() {
+            ui.label(format!("Nodes are reached through {}.", settings.proxy));
         }
     }
 
@@ -2982,7 +3194,7 @@ fn node_picker(
                 for node in &picker.list {
                     let unusable = NodeAddress::parse(&node.url)
                         .ok()
-                        .and_then(|a| a.unreachable_reason(cx.in_browser, cx.secure));
+                        .and_then(|a| a.unreachable_reason(cx.in_browser, cx.secure, cx.proxy));
                     ui.label(RichText::new(node.url.as_str()).monospace())
                         .on_hover_text(node.country_name.as_deref().unwrap_or("location unknown"));
                     ui.label(node.note.as_deref().unwrap_or(""));
@@ -3082,6 +3294,24 @@ fn test_line(ui: &mut Ui, test: Option<&Test>, full: bool) {
     }
 }
 
+/// How the node in use is reached, coloured by what that exposes.
+fn link_line(ui: &mut Ui, link: Link) {
+    let t = tones(ui);
+    let color = match link {
+        Link::Unknown => return,
+        Link::Tls => t.good,
+        Link::TlsUnchecked | Link::Plain => t.warn,
+        Link::PlainFallback => t.bad,
+    };
+    ui.colored_label(color, format!("Reached {}.", link.describe()));
+    if link.is_plain() {
+        ui.label(
+            "What this wallet asks the node, and every answer, can be read and changed on the \
+             way. An https:// node, or one that answers TLS, keeps that between the two.",
+        );
+    }
+}
+
 /// The node's state in a word or two, which opens the node settings when
 /// clicked.
 fn node_chip(ui: &mut Ui, status: &Status) -> egui::Response {
@@ -3105,7 +3335,7 @@ fn node_chip(ui: &mut Ui, status: &Status) -> egui::Response {
     };
     let hover = match (&status.node_error, &status.node) {
         (Some(e), _) => e.clone(),
-        (None, Some(node)) => node.clone(),
+        (None, Some(node)) => format!("{node} {}", status.link.describe()),
         (None, None) => "No node in use.".to_string(),
     };
     ui.add(
@@ -3115,20 +3345,59 @@ fn node_chip(ui: &mut Ui, status: &Status) -> egui::Response {
     .on_hover_text(format!("{hover}\nClick for the node settings."))
 }
 
-fn sync_bar(ui: &mut Ui, s: &Status) {
+/// How far back the sync speed is measured, in seconds. As
+/// `wownero-wallet-cli`'s `RATE_WINDOW`.
+const SYNC_RATE_WINDOW_SECS: f64 = 30.0;
+
+/// Blocks per second over the samples held, once there is a second of them to
+/// measure.
+fn sync_rate(samples: &std::collections::VecDeque<(f64, u64)>) -> Option<f64> {
+    let (t0, h0) = *samples.front()?;
+    let (t1, h1) = *samples.back()?;
+    let secs = t1 - t0;
+    (secs >= 1.0 && h1 > h0).then(|| (h1 - h0) as f64 / secs)
+}
+
+/// The progress bar, measured over the blocks this wallet actually has to
+/// scan.
+///
+/// `from` is the height the wallet starts at. Measuring from genesis instead
+/// would open a wallet restored at 800,000 on an 874,000 chain at "91%" and
+/// leave it creeping there for an hour, which is a bar that lies twice: about
+/// how much is done and about how much is left.
+fn sync_bar(ui: &mut Ui, s: &Status, from: u64, rate: Option<f64>) {
     if s.chain == 0 {
         ui.label("Not synced with any node yet.");
         return;
     }
-    let fraction = (s.scanned as f64 / s.chain as f64).clamp(0.0, 1.0) as f32;
+    let from = from.min(s.scanned);
+    let span = s.chain.saturating_sub(from);
+    let done = s.scanned.saturating_sub(from);
+    let fraction = if span == 0 {
+        1.0
+    } else {
+        (done as f64 / span as f64).clamp(0.0, 1.0) as f32
+    };
     let text = if s.scanned >= s.chain {
         format!("Synced at height {}", format::grouped(s.scanned))
     } else {
-        format!(
+        let mut text = format!(
             "Height {} of {}",
             format::grouped(s.scanned),
             format::grouped(s.chain)
-        )
+        );
+        // The speed and what is left of the wait. On a first scan this is the
+        // difference between a bar that creeps and a bar that says how long to
+        // go and make a cup of tea.
+        if let Some(rate) = rate {
+            let left = ((s.chain - s.scanned) as f64 / rate).round() as u64;
+            text.push_str(&format!(
+                " — {}, {} left",
+                format::rate(rate),
+                format::duration(left)
+            ));
+        }
+        text
     };
     ui.add(egui::ProgressBar::new(fraction).text(text));
 }
@@ -3239,6 +3508,20 @@ fn network_combo(ui: &mut Ui, network: &mut Net) {
                 ui.selectable_value(network, n, n.name());
             }
         });
+}
+
+/// Take what was typed into a field, leaving it empty and overwritten.
+///
+/// `std::mem::take` alone would move the bytes out and leave the field's
+/// allocation behind untouched. What comes back is a plain `String`, because
+/// a [`Command`] crosses `postMessage` as JSON in a browser and cannot be
+/// wiped on the way; this at least does not leave a second copy in the form.
+fn take_secret(field: &mut Zeroizing<String>) -> String {
+    let taken = field.as_str().to_owned();
+    // `Zeroize for String` overwrites the whole allocation and then empties
+    // it, which is both halves of what is wanted here.
+    field.zeroize();
+    taken
 }
 
 /// Shows what is wrong with a new wallet's name and password, and says

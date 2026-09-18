@@ -262,6 +262,91 @@ fn the_restricted_port_leaves_out_what_is_restricted() {
     let rpc = r#"{"jsonrpc":"2.0","id":"0","method":"get_bans","params":{}}"#;
     let (_, _, body) = exchange(restricted, "POST", "/json_rpc", &[], rpc);
     assert!(body.contains("-11"), "{body}");
+
+    // `get_info` says what the C++'s restricted listener says: it is
+    // restricted, whatever `--restricted-rpc` says, and it keeps the node's
+    // counters and exact disk use to itself.
+    let (_, _, body) = exchange(restricted, "POST", "/get_info", &[], "{}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(info["restricted"], true, "{info}");
+    assert_eq!(info["start_time"], 0);
+    assert_eq!(info["rpc_connections_count"], 0);
+    assert_eq!(info["height_without_bootstrap"], 0);
+    assert_eq!(info["free_space"], u64::MAX);
+    assert_eq!(
+        info["database_size"].as_u64().unwrap() % (5 << 30),
+        0,
+        "rounded to 5 GiB: {info}"
+    );
+    let (_, _, body) = exchange(main, "POST", "/get_info", &[], "{}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(info["restricted"], false, "{info}");
+    assert_ne!(info["start_time"], 0);
+
+    // And it caps what one call may ask, in `status` as the C++ answers.
+    let hashes = vec![format!("\"{}\"", "00".repeat(32)); 101].join(",");
+    let request = format!("{{\"txs_hashes\":[{hashes}]}}");
+    let (_, _, body) = exchange(restricted, "POST", "/get_transactions", &[], &request);
+    assert!(
+        body.contains("Too many transactions requested in restricted mode"),
+        "{body}"
+    );
+    let (_, _, body) = exchange(main, "POST", "/get_transactions", &[], &request);
+    assert!(body.contains("\"missed_tx\""), "unrestricted: {body}");
+
+    let images = vec![format!("\"{}\"", "00".repeat(32)); 5_001].join(",");
+    let request = format!("{{\"key_images\":[{images}]}}");
+    let (_, _, body) = exchange(restricted, "POST", "/is_key_image_spent", &[], &request);
+    assert!(
+        body.contains("Too many key images queried in restricted mode"),
+        "{body}"
+    );
+}
+
+/// **`--confirm-external-bind`.** A main RPC on a non-loopback address is
+/// refused without it, as the C++ refuses it -- even restricted, even behind
+/// a login -- and started with it.
+#[test]
+fn an_external_rpc_bind_needs_confirming() {
+    let s = Scratch::new("external");
+    let port = free_port();
+    let out = Command::new(env!("CARGO_BIN_EXE_wownerod"))
+        .args([
+            "--data-dir",
+            s.0.to_str().unwrap(),
+            "--serve",
+            "--no-zmq",
+            "--db-readonly",
+            "--non-interactive",
+            "--rpc-bind-port",
+            &port.to_string(),
+            "--rpc-bind-ip",
+            "0.0.0.0",
+            "--restricted-rpc",
+            "--rpc-login",
+            "alice:hunter2",
+        ])
+        .output()
+        .expect("run wownerod");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("--confirm-external-bind"), "{stderr}");
+
+    let _d = start(
+        &s.0,
+        &[
+            "--db-readonly",
+            "--rpc-bind-port",
+            &port.to_string(),
+            "--rpc-bind-ip",
+            "0.0.0.0",
+            "--restricted-rpc",
+            "--confirm-external-bind",
+        ],
+        &[port],
+    );
+    let (code, _, _) = exchange(port, "POST", "/get_height", &[], "{}");
+    assert_eq!(code, 200);
 }
 
 /// **`--rpc-access-control-origins`.** A listed origin gets its preflight

@@ -164,6 +164,8 @@ pub enum LevinError {
     FragmentWithoutBegin,
     /// Reassembled fragments did not contain a complete nested header.
     FragmentTooShort { found: usize },
+    /// Fewer bytes arrived than the nested header declares.
+    FragmentShortBody { found: u64, declared: u64 },
     /// The reassembly buffer would exceed the limit.
     FragmentTooLarge { length: usize, limit: u64 },
 }
@@ -191,6 +193,9 @@ impl fmt::Display for LevinError {
             }
             LevinError::FragmentTooShort { found } => {
                 write!(f, "reassembled {found} bytes, too few for a nested header")
+            }
+            LevinError::FragmentShortBody { found, declared } => {
+                write!(f, "reassembled body of {found} bytes, {declared} declared")
             }
             LevinError::FragmentTooLarge { length, limit } => {
                 write!(
@@ -412,9 +417,21 @@ impl Reassembler {
                     LevinError::ShortHeader { found } => LevinError::FragmentTooShort { found },
                     other => other,
                 })?;
+                // The nested length is what the message is; anything after it
+                // is padding, which is how a sender keeps every fragment the
+                // same size. `levin_protocol_handler_async.h` cuts the buffer
+                // to `inner_size` the same way, and errors when it is short.
+                let found = (whole.len() - HEADER_LEN) as u64;
+                if found < nested.length {
+                    return Err(LevinError::FragmentShortBody {
+                        found,
+                        declared: nested.length,
+                    });
+                }
+                let end = HEADER_LEN + nested.length as usize;
                 Ok(Reassembly::Complete {
                     header: nested,
-                    body: whole[HEADER_LEN..].to_vec(),
+                    body: whole[HEADER_LEN..end].to_vec(),
                 })
             }
             _ => Ok(Reassembly::NotAFragment),
@@ -433,6 +450,101 @@ impl Reassembler {
         self.buf.extend_from_slice(body);
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// the sending half: noise, and messages hidden inside it
+// ---------------------------------------------------------------------------
+
+/// `make_noise_notify`: a frame of exactly `bytes` bytes that says nothing.
+///
+/// Command zero, a `BEGIN | END` dummy, and zeroes for a body. A peer accepts
+/// and discards it ([`Reassembly::Discarded`]), so a link can carry a steady
+/// stream of these and a real message, sent as [`fragmented_notify`] pieces of
+/// the same size, looks no different to anyone watching the bytes go by.
+///
+/// `None` when `bytes` cannot hold a header.
+pub fn noise_notify(bytes: usize) -> Option<Vec<u8>> {
+    if bytes < HEADER_LEN {
+        return None;
+    }
+    let header = Header {
+        length: (bytes - HEADER_LEN) as u64,
+        expect_response: false,
+        command: 0,
+        return_code: 0,
+        flags: flags::BEGIN | flags::END,
+        version: PROTOCOL_VERSION,
+    };
+    let mut out = vec![0u8; bytes];
+    out[..HEADER_LEN].copy_from_slice(&header.write());
+    Some(out)
+}
+
+/// `make_fragmented_notify`: a notification of `command` with `body`, laid out
+/// as frames of exactly `frame` bytes each.
+///
+/// The message that comes back out is the real one, nested header and all, so
+/// the output starts with a `BEGIN` frame whose body **is** that header and
+/// ends with an `END` frame padded with zeroes -- every frame the same size as
+/// a [`noise_notify`] of the same `frame`, which is the point.
+///
+/// A message that fits one frame is sent as a plain notification padded to
+/// `frame`, not as a one-fragment stream: `BEGIN | END` together would be read
+/// as a dummy and thrown away. The declared length then covers the padding,
+/// which an epee parser ignores because it stops at the end of the value it
+/// read.
+///
+/// `None` when a frame cannot hold two headers, the case the C++ refuses.
+pub fn fragmented_notify(frame: usize, command: u32, body: &[u8]) -> Option<Vec<u8>> {
+    if frame < HEADER_LEN * 2 {
+        return None;
+    }
+    let total = HEADER_LEN.checked_add(body.len())?;
+    if total <= frame {
+        let header = Header::notification(command, (frame - HEADER_LEN) as u64);
+        let mut out = vec![0u8; frame];
+        out[..HEADER_LEN].copy_from_slice(&header.write());
+        out[HEADER_LEN..total].copy_from_slice(body);
+        return Some(out);
+    }
+
+    let mut message = Vec::with_capacity(total);
+    message.extend_from_slice(&Header::notification(command, body.len() as u64).write());
+    message.extend_from_slice(body);
+
+    // Each frame's header declares a full `space` bytes, so the short last
+    // one is padded out to it.
+    let space = frame - HEADER_LEN;
+    let mut out = Vec::with_capacity((message.len() / space + 1) * frame);
+    let mut rest = &message[..];
+    let mut first = true;
+    while !rest.is_empty() {
+        let (piece, tail) = rest.split_at(space.min(rest.len()));
+        rest = tail;
+        // The first frame is `BEGIN` and never also `END`: this path is only
+        // taken when the message needs more than one frame.
+        let flags = if first {
+            flags::BEGIN
+        } else if rest.is_empty() {
+            flags::END
+        } else {
+            0
+        };
+        first = false;
+        let header = Header {
+            length: space as u64,
+            expect_response: false,
+            command: 0,
+            return_code: 0,
+            flags,
+            version: PROTOCOL_VERSION,
+        };
+        out.extend_from_slice(&header.write());
+        out.extend_from_slice(piece);
+        out.resize(out.len() + (space - piece.len()), 0);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -927,6 +1039,109 @@ mod tests {
             ),
             Ok(Reassembly::NotAFragment)
         );
+    }
+
+    /// A stream whose nested header declares more than arrived is rejected,
+    /// as `levin_protocol_handler_async.h` rejects it.
+    #[test]
+    fn a_reassembly_shorter_than_its_header_says_is_rejected() {
+        let inner = Header::notification(command::NEW_BLOCK, 5);
+        let mut whole = inner.write().to_vec();
+        whole.extend_from_slice(b"hi");
+
+        let mut r = Reassembler::new();
+        r.push(&frag(flags::BEGIN), &whole, DEFAULT_MAX_PACKET_SIZE)
+            .unwrap();
+        assert_eq!(
+            r.push(&frag(flags::END), b"", DEFAULT_MAX_PACKET_SIZE),
+            Err(LevinError::FragmentShortBody {
+                found: 2,
+                declared: 5
+            })
+        );
+    }
+
+    // ---- noise and fragments, the sending half ----
+
+    #[test]
+    fn a_noise_frame_is_a_dummy_of_the_size_asked_for() {
+        let noise = noise_notify(3 * 1024).expect("a frame");
+        assert_eq!(noise.len(), 3 * 1024);
+        let header = Header::read(&noise[..HEADER_LEN], DEFAULT_MAX_PACKET_SIZE).unwrap();
+        assert_eq!(header.kind(), Kind::Dummy);
+        assert_eq!(header.command, 0);
+        assert_eq!(header.length as usize, 3 * 1024 - HEADER_LEN);
+        assert!(noise[HEADER_LEN..].iter().all(|b| *b == 0));
+
+        // The receiving half takes it and throws it away.
+        let mut r = Reassembler::new();
+        let body = &noise[HEADER_LEN..];
+        assert_eq!(
+            r.push(&header, body, DEFAULT_MAX_PACKET_SIZE),
+            Ok(Reassembly::Discarded)
+        );
+
+        assert_eq!(noise_notify(HEADER_LEN - 1), None);
+        assert_eq!(noise_notify(HEADER_LEN).map(|n| n.len()), Some(HEADER_LEN));
+    }
+
+    /// A message small enough goes as one padded notification, **not** as a
+    /// one-fragment stream: `BEGIN | END` is a dummy and would be dropped.
+    #[test]
+    fn a_short_message_goes_as_one_padded_notification() {
+        let frame = 200;
+        let out = fragmented_notify(frame, command::NEW_TRANSACTIONS, b"tx").expect("a frame");
+        assert_eq!(out.len(), frame);
+
+        let header = Header::read(&out[..HEADER_LEN], DEFAULT_MAX_PACKET_SIZE).unwrap();
+        assert_eq!(header.kind(), Kind::Notification);
+        assert_eq!(header.command, command::NEW_TRANSACTIONS);
+        assert_eq!(header.length as usize, frame - HEADER_LEN);
+        assert_eq!(&out[HEADER_LEN..HEADER_LEN + 2], b"tx");
+        assert!(out[HEADER_LEN + 2..].iter().all(|b| *b == 0));
+
+        // The largest body that still fits one frame, and the first that
+        // does not.
+        let body = vec![7u8; frame - HEADER_LEN];
+        let one = fragmented_notify(frame, 1, &body).expect("one frame");
+        assert_eq!(one.len(), frame);
+        let body = vec![7u8; frame - HEADER_LEN + 1];
+        let two = fragmented_notify(frame, 1, &body).expect("two frames");
+        assert_eq!(two.len(), 2 * frame);
+
+        assert_eq!(fragmented_notify(HEADER_LEN * 2 - 1, 1, b""), None);
+    }
+
+    /// **The point of fragmenting.** Every frame is the size of a noise frame
+    /// and carries no command, and the message comes back out of the
+    /// reassembler whole, with the padding gone.
+    #[test]
+    fn a_fragmented_message_comes_back_whole() {
+        let frame = 3 * 1024;
+        let body: Vec<u8> = (0..5_000u32).map(|i| i as u8).collect();
+        let out = fragmented_notify(frame, command::NEW_TRANSACTIONS, &body).expect("frames");
+        assert_eq!(out.len(), 2 * frame, "33 + 5000 bytes over 3039 of space");
+
+        let mut r = Reassembler::new();
+        let mut done = None;
+        for piece in out.chunks(frame) {
+            let header = Header::read(&piece[..HEADER_LEN], DEFAULT_MAX_PACKET_SIZE).unwrap();
+            assert_eq!(header.command, 0, "a fragment carries no command");
+            assert_eq!(header.length as usize, frame - HEADER_LEN);
+            let pushed = r
+                .push(&header, &piece[HEADER_LEN..], DEFAULT_MAX_PACKET_SIZE)
+                .unwrap();
+            match pushed {
+                Reassembly::Buffered => {}
+                Reassembly::Complete { header, body } => done = Some((header, body)),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        let (header, whole) = done.expect("the message came back");
+        assert_eq!(header.command, command::NEW_TRANSACTIONS);
+        assert_eq!(header.kind(), Kind::Notification);
+        assert_eq!(whole, body, "the padding was trimmed");
     }
 
     /// The advertised `network_config` maximum is a different number from

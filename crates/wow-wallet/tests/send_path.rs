@@ -56,6 +56,8 @@ impl Lcg {
     }
 }
 
+/// So the same source can choose the inputs and the ring members, as a wallet's
+/// does.
 impl RandomSource for Lcg {
     fn next_u64(&mut self) -> u64 {
         self.next()
@@ -136,6 +138,10 @@ fn owned(chain: &mut Chain, amount: u64, index: u64, rng: &mut Lcg) -> (Transfer
             is_coinbase: false,
             timestamp: 0,
             payment_id: None,
+            frozen: false,
+            tx_public_key: PublicKey::ZERO,
+            additional_tx_keys: Vec::new(),
+            key_image_request: false,
         },
         x,
         mask,
@@ -205,7 +211,7 @@ fn the_whole_send_path() {
         now: 1_700_000_000,
         ..Default::default()
     };
-    let plan = spend::plan(&transfers, &[4_000_000_000], &options).expect("a plan");
+    let plan = spend::plan(&transfers, &[4_000_000_000], &options, &mut Lcg(7)).expect("a plan");
     assert_eq!(plan.inputs, vec![0]);
     assert!(plan.fee > 0);
 
@@ -338,7 +344,7 @@ fn a_sweep_goes_through_the_same_path() {
         now: 1_700_000_000,
         ..Default::default()
     };
-    let plan = spend::plan_sweep(&transfers, &options).expect("a sweep");
+    let plan = spend::plan_sweep(&transfers, &options, &mut Lcg(9)).expect("a sweep");
     assert_eq!(plan.change, 0);
     assert_eq!(plan.amounts[0] + plan.fee, 7_000_000_000);
 

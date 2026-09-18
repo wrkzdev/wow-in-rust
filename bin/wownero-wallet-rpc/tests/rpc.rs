@@ -570,9 +570,12 @@ fn disabled_methods_say_so() {
     let s = start("disabled", false);
     create_wallet(&s, "w");
 
+    // `export_key_images` used to be here; it is a live method now, so the
+    // stand-in for "import and export" is gone and these three are what is
+    // left of the kinds of refusal.
     for (method, fragment) in [
         ("get_tx_proof", "proofs"),
-        ("export_key_images", "import/export"),
+        ("get_reserve_proof", "reserve proofs"),
         ("start_mining", "miner"),
     ] {
         let v = call(&s, method, json!({}));
@@ -622,6 +625,40 @@ fn a_wrong_password_is_refused() {
         json!({ "filename": "w", "password": "pw" }),
     );
     assert!(v.get("error").is_none(), "{v}");
+}
+
+/// `freeze`, `thaw` and `frozen` take a `key_image` and answer with the
+/// C++'s codes: `-1` when none was given, `-10` when it does not decode, and
+/// `-1` with `wallet2`'s message for one this wallet does not hold.
+///
+/// A wallet with no outputs is enough to check the surface, which is what a
+/// client branches on.
+#[test]
+fn freezing_needs_a_key_image_this_wallet_holds() {
+    let s = start("freeze", false);
+    create_wallet(&s, "w");
+
+    for method in ["freeze", "thaw", "frozen"] {
+        let v = call(&s, method, json!({}));
+        assert_eq!(v["error"]["code"], -1, "{method}: {v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Must specify key image"),
+            "{method}: {v}"
+        );
+
+        let v = call(&s, method, json!({ "key_image": "not hex" }));
+        assert_eq!(v["error"]["code"], -10, "{method}: {v}");
+
+        let v = call(&s, method, json!({ "key_image": "ab".repeat(32) }));
+        assert_eq!(v["error"]["code"], -1, "{method}: {v}");
+        assert_eq!(
+            v["error"]["message"], "Key image not found",
+            "{method}: {v}"
+        );
+    }
 }
 
 /// Creating over an existing wallet is refused rather than overwriting.

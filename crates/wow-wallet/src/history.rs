@@ -601,6 +601,10 @@ mod tests {
             is_coinbase: false,
             timestamp: 1_600_000_000,
             payment_id: None,
+            frozen: false,
+            tx_public_key: PublicKey::ZERO,
+            additional_tx_keys: Vec::new(),
+            key_image_request: false,
         });
         w.by_key_image.insert(KeyImage([9u8; 32]), 0);
         w
@@ -615,6 +619,7 @@ mod tests {
             fee: 500,
             estimated_weight: 0,
             sweep: false,
+            left_behind: 0,
         };
         let txid = [2u8; 32];
         w.record_sent(txid, &plan, &["Wo1payee"], Some([3u8; 8]), SENT);

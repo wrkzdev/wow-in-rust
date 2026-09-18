@@ -4,7 +4,7 @@ The review of `wownerod` started when `--serve` would not start on an empty
 data directory. This file tracks what became of each item it raised, in the
 review's own order.
 
-Last updated 2026-09-13.
+Last updated 2026-09-16.
 
 Statuses:
 
@@ -15,10 +15,16 @@ Statuses:
   and ignored.
 
 > [!NOTE]
-> Everything marked Done has been exercised between local daemons (mostly on
-> regtest), not by running for a long time against live C++ peers. The one
-> path verified against mainnet before this review, `--sync-from`, is
-> unchanged.
+> **Done means built and covered by tests, not proven on mainnet.** Since this
+> note was first written the node has run against live C++ peers and held the
+> network's tip for over a day with twelve outgoing connections, so the
+> outbound half — syncing from several peers, fluffy blocks, the peer store,
+> alternative blocks — has now been exercised for real. The rest has not:
+> inbound peers, IPv6, Dandelion++ relay, a real reorg, the admin and mining
+> RPC, HTTP Digest login, RPC over TLS, the ZMQ RPC and publisher, and the
+> miner have all only run between local daemons, mostly on regtest. The README's
+> Status table says the same thing and is the one to trust if these two ever
+> drift again.
 
 ## The failure that started it
 
@@ -46,12 +52,13 @@ Statuses:
 | Sync inside `--serve`, with one writer | Done | The chain sits behind a single lock in `NodeCore`, and locks are always taken chain first, then pool ([`node.rs`](../bin/wownerod/src/node.rs)) |
 | Bootstrap from seeds; `--add-peer`, `--seed-node`, `--add-priority-node`, `--add-exclusive-node` | Done | Six mainnet seeds. Testnet and stagenet have none, so they need `--add-peer` |
 | Move to another peer on disconnect | Done | |
-| Stay connected: timed sync every 60 s, `NEW_BLOCK` and `NEW_FLUFFY_BLOCK` | Done | |
+| Stay connected: timed sync every 60 s, `NEW_BLOCK` and `NEW_FLUFFY_BLOCK` | Done | Timed syncs go out on one clock for all connections, as the C++ sends them from its idle loop |
 | Alternative blocks and reorgs | Done | See bug 6 |
 | Keep the pool in step with the chain | Done | Mined transactions leave the pool. After a reorg or `pop_blocks`, transactions from the replaced blocks go back in |
 | Real `synchronized`, `target_height` and connection counts in `get_info`; `sync_info` | Done | `untrusted` also follows the sync state |
 | `--no-sync`, `--offline`, clean Ctrl-C/SIGTERM | Done | Shutdown order: miner, peers, pool saved, database synced last |
 | *(found along the way)* proof of work for a sync batch on every core | Done | Before taking the chain lock, `apply_blocks` computes the RandomWOW hash of each block in the batch in parallel; the chain then takes each hash instead of computing it. A hash depends only on its seed and hashing blob, so a stored one is exactly what the chain would compute, and unused ones are dropped after the batch (`ChainPow::prehash` in [`netsync.rs`](../bin/wownerod/src/netsync.rs)) |
+| *(found along the way)* a block's transactions verified, not trusted | Done | `check_tx_inputs`' cryptographic half (`specs/06` §5.11, §5.4) ran only for the pool; the block path checked shapes and double spends and took the ring signatures, the range proof and the commitment sum on the sending peer's word. `wow_core::txcheck::TxVerifier` is the seam, `netsync::ChainTxs` the implementation, and the work is the same `mempool::verify` — a transaction in a block and the same transaction in the pool are now judged by one function. A batch is verified on every core before the chain lock is taken, as its proofs of work already were. A shape this node cannot verify is refused **and does not ban the peer**, the distinction `PowError::CryptoNightNotImplemented` already made |
 | *(found along the way)* syncing from several peers at once | Done | Spans of block ids are reserved per connection and filled by different peers, as in the C++ `block_queue` ([`queue.rs`](../crates/wow-p2p/src/queue.rs), [`node.rs`](../crates/wow-p2p/src/node.rs)). One `p2p-apply` thread applies filled spans in height order. The C++ thresholds hold: at most 10 filled spans and 100 MB queued, with download forced within 1000 blocks of the tip. A stale next span is re-requested from another peer after 30 s (5 s in standby). A peer that disconnects has its unfilled spans flushed; a peer whose blocks are rejected loses its spans and is banned, or has its connection closed when the rejection does not warrant a ban. `sync_info` now reports `spans` and `overview` ([`tests/node.rs`](../crates/wow-p2p/tests/node.rs)) |
 
 ## B. P2P listener
@@ -59,20 +66,23 @@ Statuses:
 | Item | Status | Notes |
 |---|---|---|
 | `--p2p-bind-ip`, `--p2p-bind-port`, `--p2p-external-port`, `--hide-my-port`, `--no-igd` | Done | `--igd disabled` is accepted too; any other `--igd` value is refused |
-| Answer incoming handshakes with the peer list, real port and support flags | Done | |
+| Answer incoming handshakes with the peer list, real port and support flags | Done | The list is a random pick of the white list with `last_seen` zeroed, and a timed sync gives a peer only addresses it has not had yet, as `get_peerlist_head` and `sent_addresses` do in the C++ |
 | Serve `REQUEST_CHAIN` and `REQUEST_GET_OBJECTS` | Done | At most 100 objects per request ([spec-deltas §22](spec-deltas.md)) |
-| White, gray and anchor lists; ping back before white-listing; state file | Done | Saved to `p2pstate-rs.bin`, so a C++ node's `p2pstate.bin` is left alone |
+| White, gray and anchor lists; ping back before white-listing; state file | Done | Saved to `p2pstate-rs.bin`, so a C++ node's `p2pstate.bin` is left alone. Outgoing peers are chosen as the C++ chooses them: one port per host, one peer per /24, the white list favouring its most recently seen, and a host that failed skipped for an hour. A peer list's `last_seen` values are zeroed on arrival, and one gray address a minute is handshaken and promoted or dropped |
 | `--out-peers`, `--in-peers`, `--max-connections-per-ip`; drop idle connections after 300 s | Done | |
 | Bans for bad proof of work and protocol violations; `--ban-list`; `get_bans`, `set_bans` | Done | `banned` added too. Only a failed verification bans a peer; this node's own gaps (such as an unimplemented CryptoNight variant) do not |
 | IPv6: `--p2p-use-ipv6`, `--p2p-bind-ipv6-address`, `--p2p-bind-port-ipv6`, `--p2p-ignore-ipv4` | Done | The IPv6 listener sets `IPV6_V6ONLY`, so it and the IPv4 listener can share a port ([`net.rs`](../crates/wow-p2p/src/net.rs)). `--p2p-bind-ipv6-address` defaults to `::`. IPv6 peers are dialled whether or not `--p2p-use-ipv6` is given, as in the C++ ([`tests/ipv6.rs`](../bin/wownerod/tests/ipv6.rs), [`tests/node.rs`](../crates/wow-p2p/tests/node.rs)) |
-| `--limit-rate-*`, `--proxy` | Open | Refused |
+| `--proxy` | Built, not yet run against a live proxy | Every outgoing connection is dialled through a SOCKS5 proxy written by hand ([`socks.rs`](../crates/wow-p2p/src/socks.rs), RFC 1928 with RFC 1929 for the password). The listener is untouched, but the node advertises `my_port` and `rpc_port` as 0 and pings nobody back, as `m_can_pingback = false` makes the C++ do. Two departures: only SOCKS5 is spoken, where the C++ also takes SOCKS 4 and 4a and reads a bare `ip:port` as 4a; and with `--proxy`, `--add-peer` and its companions must name an address rather than a host unless `--proxy-allow-dns-leaks` is given, since resolving one here would leak what the proxy hides |
+| `--tx-proxy` (i2p/Tor zones) | Built, not yet run against a live proxy or a real hidden service | A zone per anonymity network with its own peer list, connections, noise channels and relay state, as the C++'s `network_zone` ([`zone.rs`](../crates/wow-p2p/src/zone.rs)). Peers are dialled through the zone's SOCKS5 proxy **by name**, so nothing resolves a `.onion`; the handshake uses peer id 1 with `my_port` and `rpc_port` 0, skips the self-connection check and pings nobody back; only the handshake, the timed sync and `NOTIFY_NEW_TRANSACTIONS` are spoken, and anything else is answered with `LEVIN_ERROR_CONNECTION_HANDLER_NOT_DEFINED` as `is_filtered_command` makes the C++ do. With any zone, a transaction this node originates goes only over it and never to a clearnet peer, and stays `Local` in the pool rather than being marked public. Noise: two channels, each holding one outgoing connection and sending a 3 KiB frame every 10-15 s, with a real message fragmented into frames of the same size; `disable_noise` fluffs to the zone's outgoing peers on Poisson timers instead. A transaction arriving from a zone becomes `Forward`, waits the C++'s ~22 s and is then stemmed on the public network |
+| `--anonymous-inbound` | Built, not yet run against a live hidden service | The zone listens where the hidden service forwards, answers a handshake as that zone (peer 1, no ports, no support flags) and takes transactions over it. A peer this node dialled on the same network is told the address to answer at, inserted at a random place in a timed sync's peer list with the list one shorter to make room, exactly as `handle_timed_sync` does -- a peer reached through a proxy cannot see the address it is talking to. Requires a `--tx-proxy`, as the C++ requires one |
+| `--limit-rate-*` | Open | Refused |
 | Blocking threads rather than an async runtime | Done as suggested | A reader and a writer thread per connection, with a bounded outbox |
 
 ## C. Relay and propagation
 
 | Item | Status | Notes |
 |---|---|---|
-| Relay transactions from `send_raw_transaction` and from peers | Done | Dandelion++ from the start rather than broadcast-first: 2 stems, 20% fluff, 39 s embargo, 10-minute epochs |
+| Relay transactions from `send_raw_transaction` and from peers | Done | Dandelion++ from the start rather than broadcast-first: 2 stems, 10-minute epochs of which 20% fluff, stems kept per source for the epoch as the C++'s `connection_map` keeps them and mended when a send finds one gone (tried twice before fluffing), and Poisson timers in the C++'s units (a 39 s embargo; a 5 s flush for incoming peers, 2.5 s for outgoing), with batches sent sorted rather than in arrival order; `--pad-transactions` pads them to a kilobyte boundary as the C++ does. The pool keeps each transaction's relay method as the C++ does (saved in its `txpool_meta` flags), and only fluffed or mined ones reach the restricted RPC, the ZMQ RPC, a peer's complement request, block templates, miner data and ZMQ `txpool_add` |
 | Fluffy block announcements; requests for missing transactions | Done | |
 | Keep the pool across restarts | Done | Saved on shutdown and by `save_bc`, loaded at start |
 
@@ -82,7 +92,7 @@ Statuses:
 |---|---|---|
 | `--config-file` and `<data dir>/wownero.conf` | Done | The command line wins, lists included |
 | `--log-level` and `--log-file` using `tracing` | Different | Uses a small [`wow-log`](../crates/wow-log) crate instead, with the C++'s `0`–`4` and `category:LEVEL` syntax plus file rotation (`--max-log-file-size`, `--max-log-files`). **Open:** `WOW_P2P_TRACE` remains in the single-peer `--sync-from` code ([`peer.rs`](../crates/wow-p2p/src/peer.rs)) |
-| `--rpc-restricted-bind-port`, a second restricted listener | Done | `--rpc-restricted-bind-ip` too |
+| `--rpc-restricted-bind-port`, a second restricted listener | Done | `--rpc-restricted-bind-ip` too, 127.0.0.1 unless given. As in the C++, a restricted listener's `get_info` zeroes the node's own counters and rounds the database size up to 5 GiB, `get_transactions` takes at most 100 hashes, `is_key_image_spent` 5,000 key images, and `get_output_distribution.bin` amount 0 only. A non-loopback `--rpc-bind-ip` or `--rpc-bind-ipv6-address` needs `--confirm-external-bind` even with `--restricted-rpc` or `--rpc-login` |
 | IPv6 on the RPC port: `--rpc-use-ipv6`, `--rpc-bind-ipv6-address`, `--rpc-restricted-bind-ipv6-address`, `--rpc-ignore-ipv4` | Done | Both bind addresses default to `::1` ([`tests/ipv6.rs`](../bin/wownerod/tests/ipv6.rs)) |
 | TLS on the RPC port | Done | rustls, on a provider of pure-Rust RustCrypto crates ([`tls.rs`](../bin/wownerod/src/rpc/tls.rs), [`provider.rs`](../crates/wow-tls/src/provider.rs)) that replaced ring. It negotiates what the C++ does: TLS 1.3, and TLS 1.2 with ECDHE, ECDSA or RSA certificates, AES-GCM or ChaCha20-Poly1305, and X25519, P-256 or P-384. `--rpc-ssl enabled\|disabled\|autodetect`; the default, autodetect, takes plain and TLS connections on the same port. A self-signed ECDSA P-256 certificate is generated once and kept as `rpc_ssl.crt` and `rpc_ssl.key` in the data directory, unless `--rpc-ssl-certificate` and `--rpc-ssl-private-key` supply one. RSA pairs, which the C++ generates (RSA-4096) and `wownero-gen-ssl-cert` makes, are served as they are, with the same fingerprint. They are signed with `rsa` 0.9, blinded but not constant-time (RUSTSEC-2023-0071), and the node warns at startup when it serves one. Client certificates are checked against `--rpc-ssl-allowed-fingerprints` (SHA-256) or `--rpc-ssl-ca-certificates`, with `--rpc-ssl-allow-chained`; `--rpc-ssl-allow-any-cert` turns the check off ([`tests/tls.rs`](../bin/wownerod/tests/tls.rs)) |
 | `--rpc-login` (HTTP Digest) and `--rpc-access-control-origins` | Done | RFC 2617, MD5, `qop=auth`. A password left out is generated and printed. An address is blocked for 24 h after 3 failed logins unless `--disable-rpc-ban`; loopback is exempt |
@@ -120,14 +130,20 @@ Statuses:
 | Item | Status | Notes |
 |---|---|---|
 | RandomWOW, from the pinned C++ library | Done | Rewritten in Rust ([`wow-randomwow`](../crates/wow-randomwow)). The submodule, `build.rs`, and CMake, Ninja and the C++ runtime are gone from the builds, CI and Docker images. The fork changes `AesGenerator4R`'s keys as well as `configuration.h` ([spec-deltas §25](spec-deltas.md)). Checked against upstream RandomX's published hashes, hashes from the C++ library, and 26 mainnet blocks. SuperscalarHash is compiled to machine code on x86-64; the VM is interpreted. A light-mode hash takes about 75 ms on a 16-thread desktop; the C++ took 19 ms with its JIT and 389 ms without |
-| ring, under the RPC TLS | Done | Replaced by the RustCrypto provider (see D). Tested with every suite, group and key type, with record vectors computed by OpenSSL, and against OpenSSL's `s_client` with an RSA-4096 pair laid out as the C++ leaves it. `cargo tree` finds no ring, aws-lc-rs or OpenSSL |
-| LMDB | Kept | The one C dependency, by design: `data.mdb` must stay byte-compatible with the C++ node |
+| ring, under the RPC TLS | Done | Replaced by the RustCrypto provider (see D). Tested with every suite, group and key type, with record vectors computed by OpenSSL, and against OpenSSL's `s_client` with an RSA-4096 pair laid out as the C++ leaves it. No ring, aws-lc-rs or OpenSSL is in either workspace's dependency graph |
+| LMDB | Kept | The one C dependency of the node and the command-line wallets, by design: `data.mdb` must stay byte-compatible with the C++ node |
+| Wayland, under the desktop GUI | Kept | Found by [`scripts/check-no-c.sh`](../scripts/check-no-c.sh), which was written to pin the two rows above and immediately turned up a third. `wayland-backend` compiles a small C shim on Linux, reached from eframe's default features through winit and smithay-client-toolkit. Distinct from *linking* libwayland, which still happens at run time through `wayland-sys`, so a Linux build needs no system development packages — but it is C, and "LMDB is the only C" was wrong without this asterisk. Dropping it would mean dropping Wayland support |
+| Anything else | Checked | [`scripts/check-no-c.sh`](../scripts/check-no-c.sh) resolves both workspaces for every target that is actually shipped — Linux, Windows, macOS, Android, wasm — and fails on any crate that compiles C and is not on its list. A CI job runs it. Per target rather than `--target all`, which drags in Haiku and Android dependencies for platforms nothing here ships |
 
 ## Still open, in one place
 
 **Daemon**
 
-* `--proxy`, `--tx-proxy` and `--anonymous-inbound` (i2p/Tor).
+* `--proxy`, `--tx-proxy` and `--anonymous-inbound` are built (see B), but
+  none of them has been run against a live proxy, hidden service or C++ peer.
+  The forward delay a transaction from an anonymity network waits is kept in
+  this process rather than in the pool, so a restart starts it again where the
+  C++ would remember it.
 * Rate limits (`--limit-rate*`).
 * Pruning, bootstrap daemons, RPC payments.
 * Background mining and extra messages in mined blocks.
@@ -144,13 +160,22 @@ Statuses:
 * The hard-coded 1000-batch cap and `WOW_P2P_TRACE` in `--sync-from`.
 * The RPC does not check the `Host` header.
 * The writer lock cannot detect a C++ node using the same data directory.
+* A RingCT shape with no verifier here — anything but Bulletproofs+ — is
+  refused rather than waved through, so a chain replayed from genesis stops at
+  the first pre-HF-18 transaction, as it already does at the first CryptoNight
+  v2 block. Mainnet above the last checkpoint is all Bulletproofs+.
 * CryptoNight variants 2 and 4 (versions 9–12). A mainnet sync does not need
   them, because checkpoints cover those heights. A chain replayed without
   checkpoints still stops at the version 9 fork, and the miner cannot mine
   those versions.
 * RandomWOW's VM is interpreted, and SuperscalarHash is compiled only on
   x86-64. A JIT for the VM, and for aarch64, would bring verification and
-  mining closer to the C++ speed.
+  mining closer to the C++ speed. This is the only lever that helps
+  verification: the 2 GiB dataset, which is the other way to make a hash
+  faster, has to be rebuilt every 2,048 blocks when the seed changes, and at
+  one hash per block that costs three to twelve times what light mode does
+  — the arithmetic is written out at `ChainPow::pow_hash`. `monerod`
+  reaches the same conclusion and builds a dataset only for mining.
 * The Docker release builds have not been run since the C++ toolchain was
   removed from their images.
 * An RSA key on the RPC TLS port is signed by `rsa` 0.9, which is not
@@ -159,8 +184,12 @@ Statuses:
 
 **Wallets**
 
-* Neither wallet can send daemon login credentials, so they cannot use a
-  daemon started with `--rpc-login`.
+* The web wallet cannot send daemon login credentials. Requests go through
+  the browser's `fetch`, which does not do HTTP Digest, so a node started
+  with `--rpc-login` is out of reach from a browser. `wownero-wallet-cli`,
+  `wownero-wallet-rpc` and the desktop GUI all can — `--daemon-login
+  <user>:<password>`, `set_daemon <address> <user>:<password>`, or Settings,
+  Node in the GUI.
 
 **Verification**
 

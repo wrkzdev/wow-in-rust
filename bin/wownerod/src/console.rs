@@ -47,6 +47,12 @@ pub enum Cmd {
     StartMining { address: String, threads: usize },
     StopMining,
     MiningStatus,
+    /// A height, or a block id as hex.
+    PrintBlock(String),
+    PrintTx(String),
+    AltChainInfo,
+    PrintNetStats,
+    Version,
     Exit,
 }
 
@@ -72,6 +78,11 @@ Commands (a subset of the C++ daemon's; see specs/09 §4):
   start_mining <address> [threads]
   stop_mining
   mining_status           whether mining, and how fast
+  print_block <height|id> one block's header
+  print_tx <txid>         where a transaction is, and how big
+  alt_chain_info          blocks held off the main chain
+  print_net_stats         bytes in and out, and for how long
+  version                 this build, and the C++ release it targets
   exit                    stop the node";
 
 /// Parse a line. `Ok(None)` for a blank one.
@@ -133,6 +144,19 @@ pub fn parse(line: &str) -> Result<Option<Cmd>, String> {
         },
         "stop_mining" => Cmd::StopMining,
         "mining_status" => Cmd::MiningStatus,
+        "print_block" => Cmd::PrintBlock(
+            args.first()
+                .ok_or("print_block needs a height or a block id")?
+                .to_string(),
+        ),
+        "print_tx" => Cmd::PrintTx(
+            args.first()
+                .ok_or("print_tx needs a transaction id")?
+                .to_string(),
+        ),
+        "alt_chain_info" => Cmd::AltChainInfo,
+        "print_net_stats" => Cmd::PrintNetStats,
+        "version" => Cmd::Version,
         "exit" | "stop_daemon" => Cmd::Exit,
         other => return Err(format!("unknown command `{other}`; try `help`")),
     };
@@ -209,6 +233,27 @@ pub fn run(server: &Server, cmd: Cmd) -> Result<String, String> {
     Ok(match cmd {
         Cmd::Help => HELP.to_string(),
         Cmd::Status => status(server)?,
+        Cmd::Version => format!(
+            "wownero-rs {} — a Rust reimplementation, compatible with the C++ tree at {}",
+            env!("CARGO_PKG_VERSION"),
+            CPP_VERSION
+        ),
+        Cmd::PrintBlock(what) => print_block(server, &what)?,
+        Cmd::PrintTx(txid) => print_tx(server, &txid)?,
+        Cmd::AltChainInfo => alt_chain_info(server)?,
+        Cmd::PrintNetStats => {
+            let v = admin::get_net_stats(server).map_err(err)?;
+            let uptime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .saturating_sub(server.start_time());
+            table(&[
+                ("In", bytes(v["total_bytes_in"].as_u64().unwrap_or(0))),
+                ("Out", bytes(v["total_bytes_out"].as_u64().unwrap_or(0))),
+                ("Over", uptime_text(uptime)),
+            ])
+        }
         Cmd::PrintHeight => server.db().height().to_string(),
         Cmd::SyncInfo => {
             let v = admin::sync_info(server).map_err(err)?;
@@ -273,7 +318,7 @@ pub fn run(server: &Server, cmd: Cmd) -> Result<String, String> {
                 .join("\n")
         }
         Cmd::Diff => {
-            let i = methods::get_info(server).map_err(err)?;
+            let i = methods::get_info(server, false).map_err(err)?;
             let d = i["difficulty"].as_u64().unwrap_or(0);
             format!(
                 "BH: {}, TH: {}, DIFF: {}, CUM_DIFF: {}, HR: {:.2} H/s",
@@ -299,7 +344,7 @@ pub fn run(server: &Server, cmd: Cmd) -> Result<String, String> {
             )
         }
         Cmd::PrintPool => {
-            let v = admin::get_transaction_pool(server).map_err(err)?;
+            let v = admin::get_transaction_pool(server, false).map_err(err)?;
             let txs = v["transactions"].as_array().cloned().unwrap_or_default();
             if txs.is_empty() {
                 return Ok("the pool is empty".into());
@@ -411,7 +456,7 @@ pub fn run(server: &Server, cmd: Cmd) -> Result<String, String> {
 /// `status`: what `get_info` says, and what the node knows beside it, as a
 /// table.
 fn status(server: &Server) -> Result<String, String> {
-    let i = methods::get_info(server).map_err(err)?;
+    let i = methods::get_info(server, false).map_err(err)?;
     let height = i["height"].as_u64().unwrap_or(0);
     let target = i["target_height"].as_u64().unwrap_or(0).max(height);
     let difficulty = i["difficulty"].as_u64().unwrap_or(0);
@@ -430,10 +475,23 @@ fn status(server: &Server) -> Result<String, String> {
         _ => "No".into(),
     };
 
-    Ok(table(&[
+    // The speed and what is left of the wait, while there is a wait. An
+    // operator watching a sync wants to know whether to come back in ten
+    // minutes or tomorrow, and the height alone does not say.
+    let rate = (height < target)
+        .then(|| server.core().and_then(crate::node::NodeCore::blocks_per_second))
+        .flatten();
+    let mut rows: Vec<(&str, String)> = vec![
         ("Local Height", height.to_string()),
         ("Network Height", target.to_string()),
         ("Percentage Synced", percent_synced(height, target)),
+    ];
+    if let Some(rate) = rate {
+        rows.push(("Sync Speed", format!("{rate:.1} blocks/s")));
+        let left = ((target - height) as f64 / rate).round() as u64;
+        rows.push(("Time Left", uptime_text(left)));
+    }
+    rows.extend([
         (
             "Sync Status",
             if i["offline"] == true {
@@ -481,6 +539,112 @@ fn status(server: &Server) -> Result<String, String> {
         ("Pruned Node", "No".into()),
         ("Mining", mining),
         ("wownero-rs Version", env!("CARGO_PKG_VERSION").into()),
+    ]);
+    Ok(table(&rows))
+}
+
+/// The C++ release this build aims to be compatible with. `specs/00` §1.
+const CPP_VERSION: &str = "0.11.4.0 \"Kunty Karen\"";
+
+/// `print_block <height|id>` — one block's header.
+///
+/// Takes either, because an operator chasing a problem has whichever one the
+/// log gave them. A bare number is a height; anything else is tried as an id.
+fn print_block(server: &Server, what: &str) -> Result<String, String> {
+    let db = server.db();
+    let height = match what.parse::<u64>() {
+        Ok(h) => h,
+        Err(_) => {
+            let id: [u8; 32] = wow_crypto::hex::decode(what)
+                .and_then(|v| v.try_into().ok())
+                .ok_or("print_block takes a height or a 64-character block id")?;
+            db.get_block_height(&id)
+                .map_err(|_| format!("no block with id {what}"))?
+        }
+    };
+    let v = crate::rpc::methods::get_block_header_by_height(
+        db,
+        server.config(),
+        &serde_json::json!({ "height": height }),
+    )
+    .map_err(err)?;
+    let h = &v["block_header"];
+    Ok(table(&[
+        ("Height", s(h, "height")),
+        ("Hash", s(h, "hash")),
+        ("Previous", s(h, "prev_hash")),
+        ("Timestamp", s(h, "timestamp")),
+        ("Version", format!("v{}", s(h, "major_version"))),
+        ("Difficulty", s(h, "difficulty")),
+        ("Nonce", s(h, "nonce")),
+        ("Reward", s(h, "reward")),
+        ("Transactions", s(h, "num_txes")),
+        ("Block Size", s(h, "block_size")),
+        ("Coinbase Tx", s(h, "miner_tx_hash")),
+        ("Orphan", s(h, "orphan_status")),
+    ]))
+}
+
+/// `print_tx <txid>` — where a transaction is, and how big.
+///
+/// Not the whole transaction: a decoded RingCT transaction is thousands of
+/// lines and nobody reads it at a console. What an operator is after is
+/// whether the node has it, whether it is confirmed, and at what height.
+fn print_tx(server: &Server, txid: &str) -> Result<String, String> {
+    let id: [u8; 32] = wow_crypto::hex::decode(txid)
+        .and_then(|v| v.try_into().ok())
+        .ok_or("print_tx takes a 64-character transaction id")?;
+    let db = server.db();
+
+    if let Ok(blob) = db.get_tx_blob(&id) {
+        let height = db
+            .get_tx_block_height(&id)
+            .map(|h| h.to_string())
+            .unwrap_or_else(|_| "unknown".into());
+        let confirmations = db
+            .get_tx_block_height(&id)
+            .map(|h| db.height().saturating_sub(h).to_string())
+            .unwrap_or_else(|_| "unknown".into());
+        return Ok(table(&[
+            ("State", "in the chain".into()),
+            ("Height", height),
+            ("Confirmations", confirmations),
+            ("Size", bytes(blob.len() as u64)),
+        ]));
+    }
+
+    let pooled = server.pool().get(&id).map(|e| (e.blob.len(), e.weight, e.fee));
+    match pooled {
+        Some((size, weight, fee)) => Ok(table(&[
+            ("State", "in the pool".into()),
+            ("Size", bytes(size as u64)),
+            ("Weight", weight.to_string()),
+            ("Fee", fee.to_string()),
+        ])),
+        None => Err(format!("this node has no transaction {txid}")),
+    }
+}
+
+/// `alt_chain_info` — what is being held off the main chain.
+///
+/// Worth having now that reorganisations are handled: when a node is behind or
+/// disagreeing with its peers, whether it is holding an alternative chain, and
+/// how much work is on it, is the first thing to look at.
+fn alt_chain_info(server: &Server) -> Result<String, String> {
+    let db = server.db();
+    let count = db.get_alt_block_count().unwrap_or(0);
+    if count == 0 {
+        return Ok("No alternative blocks are being held.".into());
+    }
+    Ok(table(&[
+        ("Alternative Blocks", count.to_string()),
+        ("Main Chain Height", db.height().to_string()),
+        (
+            "Main Chain Difficulty",
+            db.get_block_cumulative_difficulty(db.height().saturating_sub(1))
+                .unwrap_or(0)
+                .to_string(),
+        ),
     ]))
 }
 
@@ -539,6 +703,7 @@ fn bytes(n: u64) -> String {
     }
 }
 
+/// `1d 4h 12m 30s`. Used for the uptime and for how much of a sync is left.
 fn uptime_text(secs: u64) -> String {
     format!(
         "{}d {}h {}m {}s",
@@ -679,6 +844,8 @@ mod tests {
                 "pop_blocks" | "out_peers" | "in_peers" => format!("{name} 1"),
                 "set_log" => format!("{name} 0"),
                 "start_mining" => format!("{name} WWabc"),
+                "print_block" => format!("{name} 100"),
+                "print_tx" => format!("{name} {}", "ab".repeat(32)),
                 _ => name.to_string(),
             };
             assert!(parse(&sample).is_ok(), "help names `{name}`");

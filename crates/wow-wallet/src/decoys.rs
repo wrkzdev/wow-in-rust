@@ -12,9 +12,17 @@
 //! everyone who happens to be in a ring with them.
 //!
 //! The one rule is the lock, and the picker cannot see it: a lock belongs to
-//! the output, not to where it sits in the distribution.
-//! [`select_unlocked_ring`] asks a daemon about each member and replaces the
-//! locked ones.
+//! the output, not to where it sits in the distribution. [`get_outs`] asks a
+//! daemon about far more candidates than a ring needs and keeps the unlocked
+//! ones, as `wallet2::get_outs` does.
+//!
+//! # What the daemon sees
+//!
+//! Every input's candidates go to the node in one request, the same number
+//! for every input, each input's share sorted. A wallet that asked again for
+//! a few more whenever some came back locked would tell the node that what it
+//! asked for later was a decoy, since the real output is always in the first
+//! request. So the shape of the request is `wallet2`'s, number for number.
 //!
 //! # The constants are not Monero's
 //!
@@ -38,7 +46,10 @@
 //! predictable here does not produce an invalid transaction — it produces a
 //! valid one whose real spend can be picked out.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
+
+/// `wallet2`'s log category, so one `--log-level` means the same to both.
+const LOG: &str = "wallet.wallet2";
 
 /// `GAMMA_SHAPE`.
 pub const GAMMA_SHAPE: f64 = 19.28;
@@ -166,10 +177,24 @@ pub enum DecoyError {
     RealOutputNotFound(u64),
     #[error("the daemon could not say what the ring members are: {0}")]
     Fetch(String),
-    #[error("the output being spent, at index {0}, is still locked")]
-    RealOutputLocked(u64),
-    #[error("found only {found} unlocked decoys of the {wanted} a ring needs")]
+    #[error(
+        "the daemon's answer did not include the output being spent, at index {0}, unlocked and \
+         with its own key and commitment"
+    )]
+    RealOutputNotReturned(u64),
+    #[error("found only {found} usable ring members of the {wanted} a ring needs")]
     TooFewUnlocked { wanted: usize, found: usize },
+    #[error(
+        "an output in this transaction was previously spent on another chain with ring size \
+         {size}; it cannot be spent now with ring size {ring_size}, which is smaller"
+    )]
+    KnownRingTooLarge { size: usize, ring_size: usize },
+    #[error("the known ring member at index {0} is not in the daemon's answer")]
+    KnownRingMemberMissing(u64),
+    #[error("the rings failed the transaction sanity check {0} times")]
+    SanityCheckFailed(usize),
+    #[error("the output distribution cannot be used: {0}")]
+    Distribution(String),
 }
 
 impl<'a> GammaPicker<'a> {
@@ -405,6 +430,43 @@ pub fn assemble_ring(
     })
 }
 
+/// `CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW_V2`: how long a coinbase output stays
+/// locked.
+pub const MINED_MONEY_UNLOCK_WINDOW: u64 = 288;
+
+/// How many ring members one `/get_outs.bin` call asks about: the chunk size
+/// `wallet2::get_outs` splits a large request into, so the answer stays under
+/// a node's anti-DoS limits.
+pub const GET_OUTS_CHUNK: usize = 1_000;
+
+/// How many times rings are picked before a transaction that keeps failing
+/// [`tx_sanity_check`] is given up on: `wallet2::get_outs`'s `attempts`.
+pub const SANITY_CHECK_ATTEMPTS: usize = 3;
+
+/// How many candidates `wallet2::get_outs` asks the daemon about for each
+/// input: `(ring_size * 1.5) + 1`, "to have spares if some outputs are still
+/// locked", and for a RingCT output as many again as a coinbase stays locked
+/// past the spendable age, "since they're locked for longer".
+///
+/// At ring size 22 that is 34 + 284 = 318, the same for every input, whether
+/// or not any of them turn out to be locked.
+pub fn requested_outputs_count(ring_size: usize) -> usize {
+    let base = (ring_size as f64 * 1.5 + 1.0) as usize;
+    base + (MINED_MONEY_UNLOCK_WINDOW - SPENDABLE_AGE) as usize
+}
+
+/// An output being spent, as [`get_outs`] needs to know it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RealOutput {
+    pub global_index: u64,
+    /// Its one-time public key.
+    pub public_key: [u8; 32],
+    /// Its commitment, `rct::commit(amount, mask)`.
+    pub commitment: [u8; 32],
+    /// Its key image, which its ring is kept under ([`crate::rings`]).
+    pub key_image: wow_crypto::types::KeyImage,
+}
+
 /// A ring member as a daemon describes it in `get_outs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Member {
@@ -418,133 +480,410 @@ pub struct Member {
 /// takes.
 pub type MemberKeys = Vec<([u8; 32], [u8; 32])>;
 
-/// How many times a daemon is asked before a ring is given up on.
-const MAX_FETCH_ROUNDS: usize = 10;
+/// `rct::isInMainSubgroup`: the bytes decode as a point, and that point times
+/// the group order is the identity.
+pub fn in_main_subgroup(bytes: &[u8; 32]) -> bool {
+    wow_crypto::ops::decode_point(bytes).is_some_and(|p| p.is_torsion_free())
+}
 
-/// [`select_ring`] with every member one the chain has unlocked, and the
-/// members' `(key, mask)` in ring order, ready for [`assemble_ring`].
+/// `wallet2::get_outs`, for RingCT inputs: a ring for each of `reals`, every
+/// member one the daemon says is unlocked, with each member's `(key, mask)`
+/// in ring order.
 ///
-/// A ring member still locked makes the whole transaction invalid:
-/// `outputs_visitor::handle_output` refuses it with "One of outputs for one of
-/// inputs has wrong tx.unlock_time". So `wallet2::get_outs` reads `unlocked`
-/// in the daemon's answer and puts another pick in place of each locked one,
-/// and so does this. It matters more here than it looks: most recent Wownero
-/// outputs are coinbase, locked for 288 blocks, and a ring of 22 picked without
-/// asking held several of them every time.
+/// # The request
 ///
-/// `fetch` is given global indices, ascending, and answers one [`Member`] for
-/// each in that order. The real output is asked about in the first round, among
-/// the first candidates, and must be unlocked too.
-pub fn select_unlocked_ring(
+/// For each input, [`requested_outputs_count`] indices: the members of a
+/// `known` ring first, if there is one, then the real output unless that ring
+/// already named something, then gamma picks until there are enough, and each
+/// input's share sorted before it is sent, "to ensure the daemon doesn't know
+/// which output is ours". A chain with too few outputs to pick that many from
+/// is asked about every one of them, the last repeated to make up the number.
+/// All of it goes in [`GET_OUTS_CHUNK`]s, which for fewer than four inputs is
+/// one call. `fetch` is given the indices of one chunk and answers one
+/// [`Member`] for each, in that order.
+///
+/// # The answer
+///
+/// Checked before it is used, as `wallet2` checks it: the real output must be
+/// in it with the key and commitment this wallet holds for it, and unlocked,
+/// or a node could send dummy data for every output and tell the real one
+/// from the difference; every member must be unlocked, not a repeat, and have
+/// a key and a commitment in the prime-order subgroup (`tx_add_fake_output`).
+/// Members are then taken in the order they were picked, not the order they
+/// were sent in, because each later pick from a finite set is a little less
+/// independent than the one before.
+///
+/// `known` gives, per input, a ring this wallet used before for that key
+/// image. Its members are kept, so a key image spent again on another chain
+/// is spent with the same ring rather than one an observer can intersect
+/// with the first.
+pub fn get_outs<F>(
     picker: &GammaPicker<'_>,
     rng: &mut dyn RandomSource,
-    real: u64,
+    reals: &[RealOutput],
     ring_size: usize,
-    mut fetch: impl FnMut(&[u64]) -> Result<Vec<Member>, String>,
-) -> Result<(Ring, MemberKeys), DecoyError> {
-    if real >= picker.num_rct_outputs() {
-        return Err(DecoyError::RealOutputNotFound(real));
+    known: Option<&[Vec<u64>]>,
+    fetch: &mut F,
+) -> Result<Vec<(Ring, MemberKeys)>, DecoyError>
+where
+    F: FnMut(&[u64]) -> Result<Vec<Member>, String>,
+{
+    let requested = requested_outputs_count(ring_size);
+    // "the base offset of the first rct output in the first unlocked block"
+    let num_outs = picker.num_rct_outputs();
+    if num_outs == 0 {
+        return Err(DecoyError::NoOutputs);
     }
-    let wanted = ring_size.saturating_sub(1);
-    let max_tries = ring_size * 200;
-    let mut members: HashMap<u64, Member> = HashMap::new();
-    let mut decoys: Vec<u64> = Vec::with_capacity(wanted);
-    let mut refused: HashSet<u64> = HashSet::new();
 
-    for round in 0..MAX_FETCH_ROUNDS {
-        let missing = wanted - decoys.len();
-        if round > 0 && missing == 0 {
-            break;
-        }
+    // What goes to the node, and the same indices in the order they were
+    // picked. `sections[n]` is where input `n`'s share of both lies.
+    let mut request: Vec<u64> = Vec::with_capacity(reals.len() * requested);
+    let mut picking_order: Vec<u64> = Vec::with_capacity(reals.len() * requested);
+    let mut sections: Vec<(usize, usize)> = Vec::with_capacity(reals.len());
 
-        // Twice what is missing, so a round with a few locked still fills.
-        // Kept in the order picked, so the ones used are the picker's choice
-        // and not the oldest of them.
-        let mut candidates: Vec<u64> = Vec::with_capacity(missing * 2);
-        let mut tries = 0;
-        while candidates.len() < missing * 2 && tries < max_tries {
-            tries += 1;
-            let Some(i) = picker.pick(rng) else {
-                continue;
-            };
-            if i != real
-                && !refused.contains(&i)
-                && !members.contains_key(&i)
-                && !candidates.contains(&i)
-            {
-                candidates.push(i);
+    for (n, real) in reals.iter().enumerate() {
+        let start = request.len();
+        let mut add = |i: u64| {
+            request.push(i);
+            picking_order.push(i);
+        };
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut num_found = 0usize;
+
+        if let Some(ring) = known.and_then(|k| k.get(n)) {
+            if ring.len() > ring_size {
+                return Err(DecoyError::KnownRingTooLarge {
+                    size: ring.len(),
+                    ring_size,
+                });
+            }
+            let mut own_found = false;
+            for &out in ring {
+                // Anything newer than the picker's range is too recent to be
+                // asked about.
+                if out < num_outs {
+                    add(out);
+                    num_found += 1;
+                    seen.insert(out);
+                    own_found |= out == real.global_index;
+                }
+            }
+            if !own_found {
+                wow_log::warn!(
+                    LOG,
+                    "Known ring does not include the spent output: {}, there may have been a \
+                     reorg that moved the spent output's position in the chain",
+                    real.global_index
+                );
             }
         }
-        if candidates.len() < missing {
-            return Err(DecoyError::NotEnoughDecoys {
-                wanted,
-                tries: max_tries,
+
+        if num_outs <= requested as u64 {
+            // Every output there is, and the last one again to make up the
+            // count: the shortfall is caught once the answer says which are
+            // unlocked.
+            for i in 0..num_outs {
+                add(i);
+            }
+            for _ in num_outs..requested as u64 {
+                add(num_outs - 1);
+            }
+        } else {
+            // Start with the real one.
+            if num_found == 0 {
+                num_found = 1;
+                seen.insert(real.global_index);
+                add(real.global_index);
+            }
+            // `wallet2` has two passes here, the first leaving out outputs its
+            // shared database marks as spent. This wallet keeps no such marks,
+            // so both passes see every output, and the second ends the picking
+            // once every one has been seen.
+            let mut allow_blackballed = false;
+            // Not in the reference, which picks until it has enough. A chain
+            // whose old outputs the gamma almost never reaches could keep it
+            // picking for a very long time; this stops, and the rings are
+            // judged on what was found.
+            let mut picks_left = requested.saturating_mul(1_000);
+            while num_found < requested {
+                if seen.len() as u64 == num_outs {
+                    if allow_blackballed {
+                        break;
+                    }
+                    allow_blackballed = true;
+                }
+                // `do i = gamma->pick(); while (i >= num_outs);`, where a pick
+                // off the chain is `None`. A repeat is picked again too.
+                match picker.pick(rng).filter(|i| *i < num_outs) {
+                    Some(i) if seen.insert(i) => {
+                        add(i);
+                        num_found += 1;
+                    }
+                    _ => {
+                        if picks_left == 0 {
+                            break;
+                        }
+                        picks_left -= 1;
+                    }
+                }
+            }
+            // "stuff with one to keep counts good, and we'll error out later"
+            while num_found < requested {
+                add(0);
+                num_found += 1;
+            }
+        }
+
+        // Sorted, so the node cannot tell which is ours from where it sits.
+        request[start..].sort_unstable();
+        sections.push((start, request.len()));
+    }
+
+    let mut answer: Vec<Member> = Vec::with_capacity(request.len());
+    for chunk in request.chunks(GET_OUTS_CHUNK) {
+        let got = fetch(chunk).map_err(DecoyError::Fetch)?;
+        if got.len() != chunk.len() {
+            return Err(DecoyError::Fetch(format!(
+                "daemon returned wrong response for get_outs.bin, wrong amounts count = {}, \
+                 expected {}",
+                got.len(),
+                chunk.len()
+            )));
+        }
+        answer.extend(got);
+    }
+
+    let mut valid_keys: HashSet<[u8; 32]> = HashSet::new();
+    let mut rings = Vec::with_capacity(reals.len());
+    for (n, real) in reals.iter().enumerate() {
+        let (start, end) = sections[n];
+        let asked = &request[start..end];
+        let told = &answer[start..end];
+
+        // "this guards against an active attack where the node sends dummy
+        // data for all outputs, and we then send the real one, which the node
+        // can then tell from the fake outputs"
+        let real_out_found = asked.iter().zip(told).any(|(i, m)| {
+            *i == real.global_index
+                && m.key == real.public_key
+                && m.mask == real.commitment
+                && m.unlocked
+        });
+        if !real_out_found {
+            return Err(DecoyError::RealOutputNotReturned(real.global_index));
+        }
+
+        let mut outs: Vec<(u64, [u8; 32], [u8; 32])> =
+            vec![(real.global_index, real.public_key, real.commitment)];
+
+        if let Some(ring) = known.and_then(|k| k.get(n)) {
+            for &out in ring {
+                if out < num_outs && out != real.global_index {
+                    let at = asked
+                        .iter()
+                        .position(|i| *i == out)
+                        .ok_or(DecoyError::KnownRingMemberMissing(out))?;
+                    add_fake_output(&mut outs, out, &told[at], real, &mut valid_keys);
+                }
+            }
+        }
+
+        // "While we are still lacking outputs in this result ring, in our
+        // secret pick order..."
+        for &picked in &picking_order[start..end] {
+            if outs.len() >= ring_size {
+                break;
+            }
+            let at = asked
+                .iter()
+                .position(|i| *i == picked)
+                .ok_or(DecoyError::RealOutputNotFound(picked))?;
+            add_fake_output(&mut outs, picked, &told[at], real, &mut valid_keys);
+        }
+        if outs.len() < ring_size {
+            return Err(DecoyError::TooFewUnlocked {
+                wanted: ring_size,
+                found: outs.len(),
             });
         }
 
-        // Ascending, so where the real output sits in the request says
-        // nothing about which it is.
-        let mut ask = candidates.clone();
-        if round == 0 {
-            ask.push(real);
-        }
-        ask.sort_unstable();
-        let answer = fetch(&ask).map_err(DecoyError::Fetch)?;
-        if answer.len() != ask.len() {
-            return Err(DecoyError::Fetch(format!(
-                "asked about {} outputs and was told about {}",
-                ask.len(),
-                answer.len()
-            )));
-        }
-        let answer: HashMap<u64, Member> = ask.into_iter().zip(answer).collect();
-
-        if round == 0 {
-            let m = answer[&real];
-            if !m.unlocked {
-                return Err(DecoyError::RealOutputLocked(real));
-            }
-            members.insert(real, m);
-        }
-        for i in candidates {
-            let m = answer[&i];
-            if !m.unlocked {
-                refused.insert(i);
-            } else if decoys.len() < wanted {
-                decoys.push(i);
-                members.insert(i, m);
-            }
-        }
+        outs.sort_by_key(|o| o.0);
+        let indices: Vec<u64> = outs.iter().map(|o| o.0).collect();
+        let real_index = indices
+            .iter()
+            .position(|&i| i == real.global_index)
+            .ok_or(DecoyError::RealOutputNotFound(real.global_index))?;
+        let keys = outs.iter().map(|o| (o.1, o.2)).collect();
+        rings.push((
+            Ring {
+                indices,
+                real_index,
+            },
+            keys,
+        ));
     }
-    if decoys.len() < wanted {
-        return Err(DecoyError::TooFewUnlocked {
-            wanted,
-            found: decoys.len(),
-        });
-    }
-
-    let mut indices = decoys;
-    indices.push(real);
-    indices.sort_unstable();
-    let real_index = indices
-        .iter()
-        .position(|&i| i == real)
-        .ok_or(DecoyError::RealOutputNotFound(real))?;
-    let keys = indices
-        .iter()
-        .map(|i| (members[i].key, members[i].mask))
-        .collect();
-    Ok((
-        Ring {
-            indices,
-            real_index,
-        },
-        keys,
-    ))
+    Ok(rings)
 }
 
-/// [`Member`]s from a daemon's `/get_outs.bin`, for
-/// [`select_unlocked_ring`].
+/// `wallet2::tx_add_fake_output`: take a member the daemon described, if it
+/// can go in a ring.
+///
+/// Not if it is locked, is the real output, or is already in the ring. Nor if
+/// its key or its commitment is outside the prime-order subgroup: a node that
+/// handed out such a point could recognise it in a ring later. `valid` holds
+/// the points already found good, so each is checked once.
+fn add_fake_output(
+    outs: &mut Vec<(u64, [u8; 32], [u8; 32])>,
+    index: u64,
+    member: &Member,
+    real: &RealOutput,
+    valid: &mut HashSet<[u8; 32]>,
+) -> bool {
+    if !member.unlocked || index == real.global_index {
+        return false;
+    }
+    let item = (index, member.key, member.mask);
+    if outs.contains(&item) {
+        return false;
+    }
+    if !valid.contains(&member.key) && !in_main_subgroup(&member.key) {
+        wow_log::warn!(
+            LOG,
+            "Key {} at index {index} is not in the main subgroup",
+            wow_crypto::hex::encode(&member.key)
+        );
+        return false;
+    }
+    valid.insert(member.key);
+    if !valid.contains(&member.mask) && !in_main_subgroup(&member.mask) {
+        wow_log::warn!(
+            LOG,
+            "Commitment {} at index {index} is not in the main subgroup",
+            wow_crypto::hex::encode(&member.mask)
+        );
+        return false;
+    }
+    valid.insert(member.mask);
+    outs.push(item);
+    true
+}
+
+/// `tx_sanity_check` (`cryptonote_core/tx_sanity_check.cpp`), over the set of
+/// every ring member's index, how many members there are in all, and how many
+/// RingCT outputs the chain has.
+///
+/// A transaction whose rings are mostly repeats, or mostly old, looks like
+/// nobody else's, and a node that fed a wallet a skewed distribution would get
+/// exactly that. At least 80% of the members must be distinct, and their
+/// median must be at least 60% of the way up the chain. Too few members, or
+/// too young a chain, to judge by passes.
+pub fn tx_sanity_check(
+    rct_indices: &BTreeSet<u64>,
+    n_indices: usize,
+    rct_outs_available: u64,
+) -> bool {
+    if n_indices <= 10 {
+        return true;
+    }
+    if rct_outs_available < 10_000 {
+        return true;
+    }
+    if rct_indices.len() < n_indices * 8 / 10 {
+        wow_log::error!(
+            "verify",
+            "amount of unique indices is too low (amount of rct indices is {}, out of total {} \
+             indices.",
+            rct_indices.len(),
+            n_indices
+        );
+        return false;
+    }
+    let offsets: Vec<u64> = rct_indices.iter().copied().collect();
+    let median = median(&offsets);
+    if median < rct_outs_available.wrapping_mul(6) / 10 {
+        wow_log::error!(
+            "verify",
+            "median offset index is too low (median is {median} out of total \
+             {rct_outs_available} offsets). Transactions should contain a higher fraction of \
+             recent outputs."
+        );
+        return false;
+    }
+    true
+}
+
+/// `epee::misc_utils::median` of an ascending slice: the middle element, or
+/// the mean of the middle two taken without overflowing (`get_mid`).
+fn median(sorted: &[u64]) -> u64 {
+    match sorted.len() {
+        0 => 0,
+        1 => sorted[0],
+        n if n % 2 == 1 => sorted[n / 2],
+        n => {
+            let (a, b) = (sorted[n / 2 - 1], sorted[n / 2]);
+            a / 2 + b / 2 + (a % 2 + b % 2) / 2
+        }
+    }
+}
+
+/// The outer `wallet2::get_outs`: rings from [`get_outs`], judged by
+/// [`tx_sanity_check`] over every member of every ring, and picked again up to
+/// [`SANITY_CHECK_ATTEMPTS`] times while they fail.
+///
+/// The reference judges the rings, not the built transaction, and so does
+/// this: they are the same indices, and judging them first means a
+/// transaction that would fail is never built and signed.
+///
+/// # The ring database
+///
+/// Each attempt starts from the rings `db` holds for these key images, if it
+/// holds one for every one of them, and keeps the rings it chose in `db`,
+/// "for reuse", before they are judged: a ring is kept from the moment it is
+/// chosen, whether or not the transaction is ever relayed, because a node
+/// may already have seen the request. Rings that fail the check are
+/// forgotten again (`unset_ring`), so the next attempt picks afresh.
+///
+/// `offsets` is the distribution `picker` was built from, whose last entry is
+/// how many RingCT outputs the chain has.
+pub fn select_rings<F>(
+    offsets: &[u64],
+    picker: &GammaPicker<'_>,
+    rng: &mut dyn RandomSource,
+    reals: &[RealOutput],
+    ring_size: usize,
+    db: &mut crate::rings::RingDb,
+    mut fetch: F,
+) -> Result<Vec<(Ring, MemberKeys)>, DecoyError>
+where
+    F: FnMut(&[u64]) -> Result<Vec<Member>, String>,
+{
+    let available = offsets.last().copied().unwrap_or(0);
+    let key_images: Vec<wow_crypto::types::KeyImage> =
+        reals.iter().map(|r| r.key_image).collect();
+    for _ in 0..SANITY_CHECK_ATTEMPTS {
+        let known = db.get_rings(&key_images);
+        let rings = get_outs(picker, rng, reals, ring_size, known.as_deref(), &mut fetch)?;
+        db.set_rings(
+            key_images
+                .iter()
+                .copied()
+                .zip(rings.iter().map(|(r, _)| r.indices.as_slice())),
+        );
+
+        let unique: BTreeSet<u64> = rings
+            .iter()
+            .flat_map(|(r, _)| r.indices.iter().copied())
+            .collect();
+        let total = rings.iter().map(|(r, _)| r.indices.len()).sum();
+        if tx_sanity_check(&unique, total, available) {
+            return Ok(rings);
+        }
+        db.unset(&key_images);
+    }
+    Err(DecoyError::SanityCheckFailed(SANITY_CHECK_ATTEMPTS))
+}
+
+/// [`Member`]s from a daemon's `/get_outs.bin`, for [`get_outs`].
 pub fn fetch_members(
     client: &wow_daemon_client::DaemonClient,
     indices: &[u64],
@@ -559,6 +898,100 @@ pub fn fetch_members(
             unlocked: o.unlocked,
         })
         .collect())
+}
+
+/// The RingCT output distribution a transaction's rings are picked from:
+/// what `wallet2::get_rct_distribution` hands `get_outs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RctDistribution {
+    /// The height `offsets[0]` is for, as the node said.
+    ///
+    /// `wallet2` reads it and uses it for nothing, and neither does this: the
+    /// offsets go to the picker as they are. A C++ node starts them at height
+    /// 1, where RingCT outputs begin on mainnet, so `offsets[i]` is the block
+    /// `i + 1`. That shifts no pick: the picker finds a block by its running
+    /// total and takes the output within it from the totals alone, and the
+    /// only thing a block's position feeds is how many blocks a young chain
+    /// spans, which mainnet is long past. Lining the array up by prepending
+    /// the missing blocks would make this wallet's picker the one that
+    /// differs.
+    pub start_height: u64,
+    /// Running totals of RingCT outputs, one per block from `start_height`.
+    pub offsets: Vec<u64>,
+}
+
+/// `wallet2::get_rct_distribution`: the whole RingCT distribution, asked for
+/// exactly as the reference wallet asks.
+///
+/// Amount 0 only, from height 0, per-block counts rather than running totals,
+/// compressed, and to the node's own tip -- not the height this wallet has
+/// scanned to, which may be behind it. The node sees the same request from
+/// this wallet as from the C++ one, every transaction.
+///
+/// Nothing is kept between sends. A cache that asked only for the blocks since
+/// the last send would be a request no other wallet makes; the one this
+/// replaces also counted every output below the window twice once it had
+/// something to append to.
+pub fn rct_distribution(
+    client: &wow_daemon_client::DaemonClient,
+) -> Result<RctDistribution, DecoyError> {
+    let answer = client
+        .get_output_distribution(&[0], 0, 0, false, true)
+        .map_err(|e| DecoyError::Fetch(e.to_string()))?;
+    rct_distribution_from(answer)
+}
+
+/// The checks and the sum in `wallet2::get_rct_distribution`, on an answer
+/// already fetched.
+///
+/// The answer must be exactly one distribution, for amount 0; anything else
+/// is refused rather than guessed at. The per-block counts are then summed in
+/// place into running totals. `base` is not added: the reference does not add
+/// it, and a node counts no RingCT outputs below where it starts.
+pub fn rct_distribution_from(
+    mut answer: Vec<wow_daemon_client::OutputDistribution>,
+) -> Result<RctDistribution, DecoyError> {
+    if answer.len() != 1 {
+        return Err(DecoyError::Distribution(format!(
+            "not the expected single result, but {}",
+            answer.len()
+        )));
+    }
+    let d = answer.remove(0);
+    if d.amount != 0 {
+        return Err(DecoyError::Distribution(
+            "the result is not for amount 0".into(),
+        ));
+    }
+    let mut offsets = d.distribution;
+    for i in 1..offsets.len() {
+        offsets[i] = offsets[i].wrapping_add(offsets[i - 1]);
+    }
+    Ok(RctDistribution {
+        start_height: d.start_height,
+        offsets,
+    })
+}
+
+/// The checks `wallet2::get_outs` makes of a distribution before picking from
+/// it.
+///
+/// Too few blocks to leave the spendable age out of is "Not enough rct
+/// outputs". And a chain whose last running total does not reach past every
+/// output being spent cannot be the chain those outputs are on: "Daemon
+/// reports suspicious number of rct outputs". A node that answered short would
+/// otherwise have every ring picked from the part of the chain it chose to
+/// show.
+pub fn check_distribution(offsets: &[u64], max_real_index: u64) -> Result<(), DecoyError> {
+    if offsets.len() <= SPENDABLE_AGE as usize {
+        return Err(DecoyError::Distribution("not enough rct outputs".into()));
+    }
+    if offsets.last().is_none_or(|last| *last <= max_real_index) {
+        return Err(DecoyError::Distribution(
+            "the daemon reports a suspicious number of rct outputs".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -857,101 +1290,475 @@ mod tests {
         assert!(assemble_ring(&ring, &keys[..3], &real_key, &real_mask).is_err());
     }
 
+    /// A real point for output `i`, so a member's key passes the subgroup
+    /// check the way a key on chain does.
     fn key_of(i: u64) -> [u8; 32] {
-        let mut k = [0u8; 32];
-        k[..8].copy_from_slice(&i.to_le_bytes());
-        k
+        wow_crypto::ops::encode_point(&wow_crypto::ops::scalarmult_base(
+            &curve25519_dalek::scalar::Scalar::from(i + 1),
+        ))
+    }
+
+    /// The commitment every member of the test daemon's answer has.
+    fn mask() -> [u8; 32] {
+        wow_crypto::ops::encode_point(&curve25519_dalek::constants::ED25519_BASEPOINT_POINT)
+    }
+
+    fn real(i: u64) -> RealOutput {
+        let mut image = [0u8; 32];
+        image[..8].copy_from_slice(&i.to_le_bytes());
+        RealOutput {
+            global_index: i,
+            public_key: key_of(i),
+            commitment: mask(),
+            key_image: wow_crypto::types::KeyImage(image),
+        }
     }
 
     /// A daemon's answer where `locked` says which outputs are still locked.
-    fn daemon(locked: impl Fn(u64) -> bool) -> impl Fn(&[u64]) -> Result<Vec<Member>, String> {
+    fn daemon(
+        locked: impl Fn(u64) -> bool,
+    ) -> impl FnMut(&[u64]) -> Result<Vec<Member>, String> {
         move |indices| {
             Ok(indices
                 .iter()
                 .map(|&i| Member {
                     key: key_of(i),
-                    mask: [1u8; 32],
+                    mask: mask(),
                     unlocked: !locked(i),
                 })
                 .collect())
         }
     }
 
-    /// An output the daemon says is locked is offered by the picker and
-    /// turned down, and the ring is filled with unlocked ones. On mainnet the
-    /// newest outputs are mostly coinbase, locked for 288 blocks, and a ring
-    /// picked without asking held several every time -- which every C++ node
-    /// refuses.
+    /// Ring size 22 asks about 34 candidates, and 284 more for how long a
+    /// coinbase stays locked past the spendable age.
     #[test]
-    fn locked_members_are_replaced() {
+    fn the_request_count_is_wallet2s() {
+        assert_eq!(requested_outputs_count(22), 318);
+        assert_eq!(requested_outputs_count(11), 17 + 284);
+    }
+
+    /// Every input's candidates go in one request, the same number for each,
+    /// each input's share sorted with its real output among them. Nothing is
+    /// asked for afterwards, so nothing the node sees marks a decoy.
+    #[test]
+    fn the_request_has_wallet2s_shape() {
+        let o = offsets(10_000, 4);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let reals = [real(20_000), real(31_337)];
+        let mut calls: Vec<Vec<u64>> = Vec::new();
+        let mut answer = daemon(|_| false);
+
+        let mut fetch = |indices: &[u64]| {
+            calls.push(indices.to_vec());
+            answer(indices)
+        };
+        let rings = get_outs(&p, &mut Lcg(12), &reals, RING_SIZE, None, &mut fetch)
+            .expect("rings");
+
+        assert_eq!(calls.len(), 1, "one call, not one per input or per round");
+        let n = requested_outputs_count(RING_SIZE);
+        assert_eq!(calls[0].len(), 2 * n);
+        for (share, r) in calls[0].chunks(n).zip(&reals) {
+            let mut sorted = share.to_vec();
+            sorted.sort_unstable();
+            assert_eq!(share, sorted.as_slice(), "each input's share is sorted");
+            assert!(share.contains(&r.global_index), "and holds its real output");
+            assert!(share.iter().all(|i| *i < p.num_rct_outputs()));
+        }
+
+        for ((ring, keys), r) in rings.iter().zip(&reals) {
+            assert_eq!(ring.indices.len(), RING_SIZE);
+            assert_eq!(ring.indices[ring.real_index], r.global_index);
+            let mut distinct = ring.indices.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(distinct, ring.indices, "ascending and distinct");
+            for (i, (key, m)) in ring.indices.iter().zip(keys) {
+                assert_eq!((*key, *m), (key_of(*i), mask()), "each key is its index's");
+            }
+        }
+    }
+
+    /// More than a thousand candidates go in chunks of a thousand, as
+    /// `wallet2` splits them.
+    #[test]
+    fn a_large_request_goes_in_chunks_of_a_thousand() {
+        let o = offsets(10_000, 4);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let reals = [real(1_000), real(9_000), real(20_000), real(35_000)];
+        let mut sizes = Vec::new();
+        let mut answer = daemon(|_| false);
+        let mut fetch = |indices: &[u64]| {
+            sizes.push(indices.len());
+            answer(indices)
+        };
+        get_outs(&p, &mut Lcg(5), &reals, RING_SIZE, None, &mut fetch).expect("rings");
+        assert_eq!(sizes, vec![1_000, 4 * 318 - 1_000]);
+    }
+
+    /// An output the daemon says is locked is asked about and left out, and
+    /// the ring is filled with unlocked ones. On mainnet the newest outputs
+    /// are mostly coinbase, locked for 288 blocks, and a ring picked without
+    /// asking held several every time -- which every C++ node refuses.
+    #[test]
+    fn locked_members_are_left_out() {
         let o = offsets(10_000, 4);
         let p = GammaPicker::new(&o).expect("a picker");
         let newest = p.num_rct_outputs() - p.num_rct_outputs() / 50;
         let locked = move |i: u64| i >= newest;
-        let answer = daemon(locked);
+        let mut answer = daemon(locked);
         let mut asked = Vec::new();
-        let real = 20_000;
 
-        let (ring, keys) = select_unlocked_ring(&p, &mut Lcg(77), real, RING_SIZE, |indices| {
+        let mut fetch = |indices: &[u64]| {
             asked.extend_from_slice(indices);
             answer(indices)
-        })
-        .expect("a ring");
+        };
+        let rings = get_outs(&p, &mut Lcg(77), &[real(20_000)], RING_SIZE, None, &mut fetch)
+            .expect("a ring");
 
         assert!(
             asked.iter().any(|&i| locked(i)),
             "the picker offered locked outputs"
         );
         assert!(
-            ring.indices.iter().all(|&i| !locked(i)),
+            rings[0].0.indices.iter().all(|&i| !locked(i)),
             "and none is in the ring: {:?}",
-            ring.indices
+            rings[0].0.indices
         );
-        assert_eq!(ring.indices.len(), RING_SIZE);
-        assert_eq!(ring.indices[ring.real_index], real);
-        let mut sorted = ring.indices.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted, ring.indices, "ascending and distinct");
-        for (i, (key, _)) in ring.indices.iter().zip(&keys) {
-            assert_eq!(*key, key_of(*i), "each key belongs to its index");
-        }
     }
 
-    /// The output being spent must be unlocked too; a ring around a locked one
-    /// is refused rather than built.
+    /// The output being spent must come back unlocked, with the key and the
+    /// commitment this wallet holds for it. A node that answered otherwise
+    /// could tell it from the decoys once it was spent.
     #[test]
-    fn a_locked_real_output_is_refused() {
+    fn the_real_output_must_come_back_as_it_is_held() {
         let o = offsets(10_000, 4);
         let p = GammaPicker::new(&o).expect("a picker");
-        let real = 20_000;
+        let r = real(20_000);
+
+        let mut locked = daemon(|i| i == 20_000);
         assert_eq!(
-            select_unlocked_ring(&p, &mut Lcg(3), real, RING_SIZE, daemon(|i| i == real)),
-            Err(DecoyError::RealOutputLocked(real))
+            get_outs(&p, &mut Lcg(3), &[r], RING_SIZE, None, &mut locked),
+            Err(DecoyError::RealOutputNotReturned(20_000))
+        );
+
+        let mut honest = daemon(|_| false);
+        let mut dummy = |indices: &[u64]| -> Result<Vec<Member>, String> {
+            let mut members = honest(indices)?;
+            for (i, m) in indices.iter().zip(&mut members) {
+                if *i == 20_000 {
+                    m.key = key_of(1);
+                }
+            }
+            Ok(members)
+        };
+        assert_eq!(
+            get_outs(&p, &mut Lcg(3), &[r], RING_SIZE, None, &mut dummy),
+            Err(DecoyError::RealOutputNotReturned(20_000))
         );
     }
 
-    /// With nothing unlocked to pick, it gives up after a bounded number of
-    /// rounds instead of asking the daemon forever.
+    /// A member whose key or commitment is outside the prime-order subgroup
+    /// is never put in a ring.
     #[test]
-    fn a_chain_with_nothing_unlocked_gives_up() {
+    fn members_outside_the_prime_order_subgroup_are_left_out() {
+        // (0, -1): a valid encoding of a point of order two.
+        let mut small_order = [0xffu8; 32];
+        small_order[0] = 0xec;
+        small_order[31] = 0x7f;
+        assert!(wow_crypto::ops::decode_point(&small_order).is_some());
+        assert!(!in_main_subgroup(&small_order));
+        assert!(in_main_subgroup(&key_of(7)));
+
         let o = offsets(10_000, 4);
         let p = GammaPicker::new(&o).expect("a picker");
-        let real = 20_000;
-        let mut rounds = 0;
-        let everything_else = daemon(|i| i != real);
-        let e = select_unlocked_ring(&p, &mut Lcg(4), real, RING_SIZE, |indices| {
-            rounds += 1;
+        let bad = |i: u64| i != 20_000 && i.is_multiple_of(2);
+        let mut honest = daemon(|_| false);
+        let mut torsioned = |indices: &[u64]| -> Result<Vec<Member>, String> {
+            let mut members = honest(indices)?;
+            for (i, m) in indices.iter().zip(&mut members) {
+                if bad(*i) && i.is_multiple_of(4) {
+                    m.key = small_order;
+                } else if bad(*i) {
+                    m.mask = small_order;
+                }
+            }
+            Ok(members)
+        };
+        let rings = get_outs(&p, &mut Lcg(9), &[real(20_000)], RING_SIZE, None, &mut torsioned)
+            .expect("a ring of the others");
+        assert!(
+            rings[0].0.indices.iter().all(|&i| !bad(i)),
+            "{:?}",
+            rings[0].0.indices
+        );
+    }
+
+    /// With nothing but the real output unlocked the ring cannot be filled,
+    /// and it says so after the one request rather than asking again.
+    #[test]
+    fn a_chain_with_nothing_unlocked_is_refused_after_one_request() {
+        let o = offsets(10_000, 4);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let mut calls = 0;
+        let mut everything_else = daemon(|i| i != 20_000);
+        let mut fetch = |indices: &[u64]| {
+            calls += 1;
             everything_else(indices)
-        })
-        .expect_err("nothing to fill it with");
+        };
+        let e = get_outs(&p, &mut Lcg(4), &[real(20_000)], RING_SIZE, None, &mut fetch)
+            .expect_err("nothing to fill it with");
         assert_eq!(
             e,
             DecoyError::TooFewUnlocked {
-                wanted: RING_SIZE - 1,
-                found: 0
+                wanted: RING_SIZE,
+                found: 1
             }
         );
-        assert_eq!(rounds, MAX_FETCH_ROUNDS);
+        assert_eq!(calls, 1);
+    }
+
+    /// A chain with fewer outputs than a request asks about is asked about
+    /// every one of them, the last repeated to make up the count.
+    #[test]
+    fn a_small_chain_is_asked_about_every_output() {
+        let o = offsets(10, 5);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let total = p.num_rct_outputs();
+        let mut asked = Vec::new();
+        let mut answer = daemon(|_| false);
+        let mut fetch = |indices: &[u64]| {
+            asked.extend_from_slice(indices);
+            answer(indices)
+        };
+        let rings =
+            get_outs(&p, &mut Lcg(1), &[real(3)], RING_SIZE, None, &mut fetch).expect("a ring");
+        assert_eq!(asked.len(), requested_outputs_count(RING_SIZE));
+        assert!((0..total).all(|i| asked.contains(&i)));
+        assert!(asked[total as usize..].iter().all(|&i| i == total - 1));
+        assert_eq!(rings[0].0.indices.len(), RING_SIZE);
+    }
+
+    /// A known ring is used again, member for member.
+    #[test]
+    fn a_known_ring_is_used_again() {
+        let o = offsets(10_000, 4);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let known: Vec<u64> = (0..RING_SIZE as u64).map(|i| 1_000 + i * 997).collect();
+        let r = real(known[5]);
+        let mut answer = daemon(|_| false);
+        let rings = get_outs(
+            &p,
+            &mut Lcg(21),
+            &[r],
+            RING_SIZE,
+            Some(std::slice::from_ref(&known)),
+            &mut answer,
+        )
+        .expect("a ring");
+        assert_eq!(rings[0].0.indices, known);
+        assert_eq!(rings[0].0.real_index, 5);
+
+        let too_large: Vec<u64> = (0..RING_SIZE as u64 + 1).collect();
+        assert_eq!(
+            get_outs(
+                &p,
+                &mut Lcg(21),
+                &[r],
+                RING_SIZE,
+                Some(std::slice::from_ref(&too_large)),
+                &mut answer,
+            ),
+            Err(DecoyError::KnownRingTooLarge {
+                size: RING_SIZE + 1,
+                ring_size: RING_SIZE
+            })
+        );
+    }
+
+    /// `tx_sanity_check`: too few members or too young a chain passes; too
+    /// many repeats, or a median too far down the chain, fails.
+    #[test]
+    fn the_sanity_check_is_the_references() {
+        let set = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
+
+        assert!(tx_sanity_check(&set(&[1, 2]), 10, 1_000_000), "10 is too few");
+        assert!(tx_sanity_check(&set(&[1, 2]), 22, 9_999), "a young chain");
+
+        let recent: Vec<u64> = (0..22).map(|i| 900_000 + i).collect();
+        assert!(tx_sanity_check(&set(&recent), 22, 1_000_000));
+        assert!(
+            !tx_sanity_check(&set(&recent[..16]), 22, 1_000_000),
+            "16 distinct of 22 is under 80%, as 22 * 8 / 10 rounds it"
+        );
+        assert!(tx_sanity_check(&set(&recent[..17]), 22, 1_000_000));
+
+        let old: Vec<u64> = (0..22).map(|i| 500_000 + i).collect();
+        assert!(
+            !tx_sanity_check(&set(&old), 22, 1_000_000),
+            "the median is under 60% of the chain"
+        );
+
+        assert_eq!(median(&[]), 0);
+        assert_eq!(median(&[7]), 7);
+        assert_eq!(median(&[1, 2, 9]), 2);
+        assert_eq!(median(&[1, 3, 4, 9]), 3);
+        assert_eq!(median(&[u64::MAX, u64::MAX]), u64::MAX, "without overflowing");
+    }
+
+    /// Rings that fail the sanity check are picked again, three times in all,
+    /// and then the transaction is refused, and none of them is kept.
+    #[test]
+    fn rings_that_fail_the_sanity_check_are_picked_again_three_times() {
+        // A chain whose last block holds nearly every output, where the picker
+        // cannot reach: every ring comes from the bottom half-percent of the
+        // chain, and fails.
+        let mut o: Vec<u64> = (1..=5_000).collect();
+        o.extend([5_000, 5_000, 5_000, 1_000_000]);
+        let p = GammaPicker::new(&o).expect("a picker");
+        assert_eq!(p.num_rct_outputs(), 5_000);
+
+        let mut db = crate::rings::RingDb::default();
+        let mut calls = 0;
+        let mut answer = daemon(|_| false);
+        let fetch = |indices: &[u64]| {
+            calls += 1;
+            answer(indices)
+        };
+        let e = select_rings(&o, &p, &mut Lcg(8), &[real(4_000)], RING_SIZE, &mut db, fetch)
+            .expect_err("fails every time");
+        assert_eq!(e, DecoyError::SanityCheckFailed(3));
+        assert_eq!(calls, 3, "picked and asked for again each time");
+        assert!(db.is_empty(), "a ring that failed is not kept");
+
+        // And the same rings from an ordinary chain pass the first time, and
+        // are kept.
+        let o = offsets(10_000, 4);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let mut calls = 0;
+        let mut answer = daemon(|_| false);
+        let fetch = |indices: &[u64]| {
+            calls += 1;
+            answer(indices)
+        };
+        let rings = select_rings(&o, &p, &mut Lcg(8), &[real(39_000)], RING_SIZE, &mut db, fetch)
+            .expect("passes");
+        assert_eq!(calls, 1);
+        assert_eq!(
+            db.get(&real(39_000).key_image),
+            Some(rings[0].0.indices.as_slice())
+        );
+    }
+
+    /// A key image spent before is spent again with the ring kept for it, so
+    /// two spends of it on two chains cannot be intersected. A transaction
+    /// whose inputs do not all have a kept ring picks every ring afresh, as
+    /// the C++ database answers all or nothing.
+    #[test]
+    fn a_kept_ring_is_spent_with_again() {
+        let o = offsets(10_000, 4);
+        let p = GammaPicker::new(&o).expect("a picker");
+        let mut db = crate::rings::RingDb::default();
+
+        let first = select_rings(
+            &o,
+            &p,
+            &mut Lcg(31),
+            &[real(30_000)],
+            RING_SIZE,
+            &mut db,
+            daemon(|_| false),
+        )
+        .expect("rings");
+        let again = select_rings(
+            &o,
+            &p,
+            &mut Lcg(32),
+            &[real(30_000)],
+            RING_SIZE,
+            &mut db,
+            daemon(|_| false),
+        )
+        .expect("rings");
+        assert_eq!(again[0].0, first[0].0, "the same ring, from another source");
+
+        let with_another = select_rings(
+            &o,
+            &p,
+            &mut Lcg(33),
+            &[real(30_000), real(31_000)],
+            RING_SIZE,
+            &mut db,
+            daemon(|_| false),
+        )
+        .expect("rings");
+        assert_ne!(
+            with_another[0].0, first[0].0,
+            "not every input had a ring, so none was reused"
+        );
+    }
+
+    fn answer(
+        amount: u64,
+        start_height: u64,
+        counts: &[u64],
+    ) -> wow_daemon_client::OutputDistribution {
+        wow_daemon_client::OutputDistribution {
+            amount,
+            start_height,
+            base: 0,
+            distribution: counts.to_vec(),
+        }
+    }
+
+    /// Per-block counts are summed into running totals, as
+    /// `wallet2::get_rct_distribution` sums them, and nothing else is added:
+    /// not `base`, and not the start height. Asking twice gives the same
+    /// array, which is what the cache this replaced got wrong from the second
+    /// send on.
+    #[test]
+    fn a_distribution_is_summed_as_wallet2_sums_it() {
+        let got = rct_distribution_from(vec![answer(0, 1, &[2, 0, 3, 5])]).expect("one answer");
+        assert_eq!(got.offsets, vec![2, 2, 5, 10]);
+        assert_eq!(got.start_height, 1, "kept, and not used to shift anything");
+        assert_eq!(
+            rct_distribution_from(vec![answer(0, 1, &[2, 0, 3, 5])]),
+            Ok(got),
+            "the same every time"
+        );
+    }
+
+    /// Anything but exactly one distribution, for amount 0, is refused.
+    #[test]
+    fn a_distribution_answer_must_be_one_for_amount_zero() {
+        assert!(matches!(
+            rct_distribution_from(Vec::new()),
+            Err(DecoyError::Distribution(_))
+        ));
+        assert!(matches!(
+            rct_distribution_from(vec![answer(0, 1, &[1]), answer(0, 1, &[1])]),
+            Err(DecoyError::Distribution(_))
+        ));
+        assert!(matches!(
+            rct_distribution_from(vec![answer(5, 1, &[1])]),
+            Err(DecoyError::Distribution(_))
+        ));
+    }
+
+    /// The distribution has to leave something past the spendable age, and
+    /// reach past every output being spent.
+    #[test]
+    fn a_distribution_short_of_the_real_outputs_is_refused() {
+        let o = offsets(10, 5);
+        assert_eq!(check_distribution(&o, 49), Ok(()));
+        assert!(matches!(
+            check_distribution(&o, 50),
+            Err(DecoyError::Distribution(_))
+        ));
+        assert!(matches!(
+            check_distribution(&o[..4], 0),
+            Err(DecoyError::Distribution(_))
+        ));
     }
 }

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use wow_crypto::mnemonic::{self, Language, WordList};
 use wow_crypto::types::{PublicKey, SecretKey};
+use wow_crypto::Zeroizing;
 use wow_types::address::{Address, AddressKind};
 use wow_wallet::{AccountBase, KeysFile, KeysFileError};
 
@@ -106,7 +107,7 @@ fn open(paths: Paths, o: &Options) -> Result<Session, String> {
         Some(p) => p.clone(),
         None => ask_password(&paths, o.kdf_rounds)?,
     };
-    let session = Session::open(paths, password, o.kdf_rounds, Some(o.network))?;
+    let session = Session::open(paths, &password, o.kdf_rounds, Some(o.network))?;
     if o.commands.is_empty() {
         let kind = if session.is_view_only() {
             "view-only wallet"
@@ -124,7 +125,7 @@ fn open(paths: Paths, o: &Options) -> Result<Session, String> {
 /// then does again. That costs one more key derivation, and it turns a typo
 /// into a second chance rather than starting over. After the last try the
 /// password is returned anyway, so `Session::open` reports why it failed.
-fn ask_password(paths: &Paths, kdf_rounds: u64) -> Result<String, String> {
+fn ask_password(paths: &Paths, kdf_rounds: u64) -> Result<Zeroizing<String>, String> {
     let blob = std::fs::read(paths.keys())
         .map_err(|e| format!("cannot read {}: {e}", paths.keys().display()))?;
     let mut tries = 0;
@@ -156,7 +157,7 @@ fn create(paths: Paths, o: &Options) -> Result<Session, String> {
 
     let (account, seed_list) = build_account(o, session::now())?;
 
-    let password = match &o.password {
+    let password: Zeroizing<String> = match &o.password {
         Some(p) => p.clone(),
         None => term::read_new_password().ok_or("no password given")?,
     };
@@ -182,7 +183,7 @@ fn create(paths: Paths, o: &Options) -> Result<Session, String> {
     let session = Session::create(
         paths,
         o.network,
-        password,
+        &password,
         o.kdf_rounds,
         account,
         language.name,
@@ -231,17 +232,20 @@ fn build_account(
             Ok((deterministic(spend, created)?, list))
         }
         Source::SpendKey => {
-            let spend = given_or_asked(o.spend_key.as_deref(), "Secret spend key: ", true, |s| {
+            let given = secret_option(&o.spend_key);
+            let spend = given_or_asked(given, "Secret spend key: ", true, |s| {
                 secret_from_hex(s, "spend key")
             })?;
             Ok((deterministic(spend, created)?, None))
         }
         Source::Keys => {
             let address = standard_address(o)?;
-            let spend = given_or_asked(o.spend_key.as_deref(), "Secret spend key: ", true, |s| {
+            let given = secret_option(&o.spend_key);
+            let spend = given_or_asked(given, "Secret spend key: ", true, |s| {
                 key_for(s, "spend key", &address.keys.spend_public_key)
             })?;
-            let view = given_or_asked(o.view_key.as_deref(), "Secret view key: ", true, |s| {
+            let given = secret_option(&o.view_key);
+            let view = given_or_asked(given, "Secret view key: ", true, |s| {
                 key_for(s, "view key", &address.keys.view_public_key)
             })?;
             let account =
@@ -250,7 +254,8 @@ fn build_account(
         }
         Source::ViewKey => {
             let address = standard_address(o)?;
-            let view = given_or_asked(o.view_key.as_deref(), "Secret view key: ", true, |s| {
+            let given = secret_option(&o.view_key);
+            let view = given_or_asked(given, "Secret view key: ", true, |s| {
                 key_for(s, "view key", &address.keys.view_public_key)
             })?;
             let account = AccountBase::view_only(address.keys, view, created);
@@ -268,6 +273,14 @@ fn build_account(
 fn deterministic(spend: SecretKey, created: u64) -> Result<AccountBase, String> {
     AccountBase::from_spend_key(spend, created)
         .ok_or_else(|| "that spend key does not make a valid wallet".into())
+}
+
+/// A secret option's text, if it was given.
+///
+/// `Option::as_deref` on a wiped option yields `Option<&String>`, which is one
+/// deref short of what the prompts take.
+fn secret_option(given: &Option<Zeroizing<String>>) -> Option<&str> {
+    given.as_ref().map(|s| s.as_str())
 }
 
 /// The value of an option if it was given, and otherwise the answer to
@@ -358,7 +371,9 @@ fn seed_key(o: &Options) -> Result<(SecretKey, &'static WordList), String> {
 /// Read a seed a line at a time until it has enough words, so a seed pasted
 /// over two lines is not refused as a short one (`might_be_partial_seed`).
 fn ask_seed() -> Result<(SecretKey, &'static WordList), String> {
-    let mut phrase = String::new();
+    // The 25 words are the wallet. They are wiped when this returns, as the
+    // C++ reads a seed into a `wipeable_string`.
+    let mut phrase = Zeroizing::new(String::new());
     loop {
         let prompt = if phrase.is_empty() {
             "Seed (25 words): "

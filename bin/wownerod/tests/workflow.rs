@@ -96,13 +96,14 @@ fn version_and_help_work_without_a_database() {
     assert!(text.contains("--check-difficulty-checkpoints"));
     assert!(text.contains("--db-readonly"));
     // The help says plainly what is built and what is missing, so nobody
-    // expects background mining or i2p/Tor from it.
+    // expects background mining or pruning from it.
     assert!(text.contains("NOT YET IMPLEMENTED"));
     assert!(text.contains("--sync-from"));
     assert!(text.contains("--start-mining") && text.contains("--spendkey"));
     assert!(text.contains("--rpc-ssl") && text.contains("--zmq-pub"));
+    assert!(text.contains("--tx-proxy") && text.contains("--anonymous-inbound"));
     assert!(
-        text.contains("background mining") && text.contains("i2p/Tor"),
+        text.contains("background mining") && text.contains("pruning"),
         "the help must still name what is not built"
     );
 }
@@ -280,7 +281,7 @@ fn the_checkpoint_check_says_when_there_are_none() {
 fn unimplemented_options_are_refused_by_the_binary() {
     for (opt, expect) in [
         ("--limit-rate", "rate limiting"),
-        ("--proxy", "proxy"),
+        ("--prune-blockchain", "pruning"),
         ("--bg-mining-enable", "background mining"),
     ] {
         let o = wownerod(&[opt]);

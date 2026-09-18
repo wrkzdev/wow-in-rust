@@ -152,6 +152,15 @@ impl BatchSize {
 ///
 /// The bound matters: a peer that keeps reporting a higher height would
 /// otherwise hold the caller forever.
+///
+/// # This is the diagnostic path, not the node
+///
+/// Request, wait, apply, request: strictly one thing at a time, from one peer,
+/// which is what makes it useful for `--sync-from` — a failure has one peer
+/// and one batch to blame. It is also why most of its time is spent waiting.
+/// `--serve` does not come through here at all; it reserves spans across every
+/// connection ([`crate::queue`]) and applies them in height order while others
+/// are still arriving. A rate measured here says nothing about that.
 pub fn sync_from<C: ChainTip>(
     chain: &mut C,
     peer: &mut Peer,

@@ -65,17 +65,48 @@ macro_rules! byte_array_type {
             }
         }
 
-        impl fmt::Debug for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}({})", stringify!($name), crate::hex::encode(&self.0))
-            }
-        }
-
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(&crate::hex::encode(&self.0))
             }
         }
+    };
+}
+
+/// `Debug` printing the bytes as hex, for the types that are public anyway: a
+/// public key, a key image and a ring member are all on the chain already.
+macro_rules! debug_hex {
+    ($($name:ident),* $(,)?) => {
+        $(
+            impl fmt::Debug for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    write!(f, "{}({})", stringify!($name), crate::hex::encode(&self.0))
+                }
+            }
+        )*
+    };
+}
+
+/// `Debug` printing the type's name and nothing else.
+///
+/// For key material. `{:?}` is what ends up in a log line, an `assert!`
+/// message or a panic, none of which are written with a secret in mind: a
+/// struct holding one of these derives `Debug` and prints every field, so
+/// hex here means the key reaches a log file the first time anybody debugs
+/// around it. Deliberate printing -- `viewkey`, `spendkey`, `query_key` --
+/// goes through [`crate::hex::encode`], which says what it is doing.
+///
+/// `Display` still prints hex: writing `{}` on a secret key is a choice, the
+/// way `simple_wallet::print_secret_key` is.
+macro_rules! debug_redacted {
+    ($($name:ident),* $(,)?) => {
+        $(
+            impl fmt::Debug for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    write!(f, "{}(<redacted>)", stringify!($name))
+                }
+            }
+        )*
     };
 }
 
@@ -105,6 +136,13 @@ byte_array_type!(
     32,
     "An uninterpreted scalar. `crypto::ec_scalar`."
 );
+
+debug_hex!(PublicKey, KeyImage, EcPoint, EcScalar);
+// A secret key spends. A key derivation is `8 a R`, the shared secret an
+// output was found under: it does not spend, but it says which transaction
+// public key paid which output, which is exactly what a wallet must not hand
+// to whatever reads its logs.
+debug_redacted!(SecretKey, KeyDerivation);
 
 /// A Schnorr signature `(c, r)`, 64 bytes on the wire: `c` then `r`.
 ///
@@ -219,3 +257,34 @@ const _: () = {
     assert!(core::mem::size_of::<Signature>() == 64);
     assert!(core::mem::size_of::<ViewTag>() == 1);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `{:?}` on key material says nothing, and on the public types says what
+    /// it is. A struct holding a secret derives `Debug` and prints every
+    /// field, so this is what keeps a key out of a log line nobody wrote with
+    /// a key in mind.
+    #[test]
+    fn debug_hides_key_material() {
+        let secret = SecretKey([0xab; 32]);
+        let derivation = KeyDerivation([0xcd; 32]);
+        for shown in [format!("{secret:?}"), format!("{derivation:?}")] {
+            assert!(!shown.contains("ab"), "{shown}");
+            assert!(!shown.contains("cd"), "{shown}");
+            assert!(shown.contains("<redacted>"), "{shown}");
+        }
+        assert_eq!(format!("{secret:?}"), "SecretKey(<redacted>)");
+
+        // Display is a deliberate print, as `print_secret_key` is.
+        assert_eq!(secret.to_string(), "ab".repeat(32));
+
+        // What the chain carries anyway still prints.
+        assert_eq!(
+            format!("{:?}", PublicKey([0x01; 32])),
+            format!("PublicKey({})", "01".repeat(32))
+        );
+        assert!(format!("{:?}", KeyImage([0x02; 32])).contains(&"02".repeat(32)));
+    }
+}

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use wow_crypto::Zeroizing;
 use wow_types::Network;
 use wow_wallet::files::{Paths, Session};
 use wow_wallet::AccountBase;
@@ -38,7 +39,12 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
 /// How the server was told to find wallets.
 pub enum WalletSource {
     /// One wallet, opened at startup and held.
-    File { paths: Paths, password: String },
+    File {
+        paths: Paths,
+        /// `--password` or `--password-file`, needed again whenever this one
+        /// wallet is reopened. Wiped when the server stops.
+        password: Zeroizing<String>,
+    },
     /// A directory; the client opens and creates within it.
     Dir(std::path::PathBuf),
 }
@@ -58,6 +64,21 @@ pub struct State {
     /// afterwards came up with no daemon and `refresh` answered "no daemon is
     /// set" -- on a server that had been given one on the command line.
     daemon_address: Mutex<String>,
+    /// `--daemon-login`, for a node started with `--rpc-login`. Applied to
+    /// every wallet this server points at a daemon.
+    daemon_login: Option<wow_daemon_client::digest::Credentials>,
+    /// `--daemon-ssl` and the options beside it, or what `set_daemon` last
+    /// said instead: applied as `daemon_login` is.
+    daemon_options: Mutex<wow_daemon_client::ConnectOptions>,
+    /// `--proxy` was given: `set_daemon` may not name a proxy of its own.
+    proxy_option: AtomicBool,
+    /// `--trusted-daemon` or `--untrusted-daemon`, or what `set_daemon` last
+    /// said: `None` when neither, and a daemon on this machine is trusted.
+    trusted_daemon: Mutex<Option<bool>>,
+    /// `--offline`, `wallet2::m_offline`: no wallet this server opens will
+    /// contact a node. What a server acting as the cold half of a
+    /// cold-signing pair is started with.
+    offline: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -68,6 +89,7 @@ impl State {
         kdf_rounds: u64,
         login: Option<(String, String)>,
         daemon_address: String,
+        daemon_login: Option<wow_daemon_client::digest::Credentials>,
     ) -> State {
         State {
             wallet: Mutex::new(None),
@@ -76,8 +98,67 @@ impl State {
             kdf_rounds,
             login,
             daemon_address: Mutex::new(daemon_address),
+            daemon_login,
+            daemon_options: Mutex::new(Default::default()),
+            proxy_option: AtomicBool::new(false),
+            trusted_daemon: Mutex::new(None),
+            offline: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         }
+    }
+
+    /// `wallet2::is_offline`.
+    pub fn is_offline(&self) -> bool {
+        self.offline.load(Ordering::SeqCst)
+    }
+
+    pub fn set_offline(&self, offline: bool) {
+        self.offline.store(offline, Ordering::SeqCst);
+    }
+
+    /// Whether the daemon at `address` is trusted: as told, or else when it is
+    /// on this machine, as `make_basic` decides.
+    pub fn trusted_daemon_for(&self, address: &str) -> bool {
+        let told = *self
+            .trusted_daemon
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        told.unwrap_or_else(|| wow_daemon_client::is_local_address(address))
+    }
+
+    pub fn set_trusted_daemon(&self, trusted: Option<bool>) {
+        *self
+            .trusted_daemon
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = trusted;
+    }
+
+    /// `wallet2::has_proxy_option`: whether `--proxy` was given.
+    pub fn has_proxy_option(&self) -> bool {
+        self.proxy_option.load(Ordering::SeqCst)
+    }
+
+    pub fn set_proxy_option(&self, on: bool) {
+        self.proxy_option.store(on, Ordering::SeqCst);
+    }
+
+    /// How newly opened wallets reach the daemon.
+    pub fn daemon_options(&self) -> wow_daemon_client::ConnectOptions {
+        self.daemon_options
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Remember how to reach the daemon, for wallets opened later too.
+    ///
+    /// Called with the startup options first, whose proxy, if any, is
+    /// `--proxy`.
+    pub fn set_daemon_options(&self, options: wow_daemon_client::ConnectOptions) {
+        *self
+            .daemon_options
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = options;
     }
 
     /// The daemon address newly opened wallets are pointed at.
@@ -104,11 +185,20 @@ impl State {
     /// reported on stderr rather than swallowed, because "why is my balance
     /// zero" has exactly this shape.
     pub fn attach_daemon(&self, session: &mut Session) {
+        // `--offline`: nothing is attached, ever. The reference makes every
+        // HTTP call fail without trying; here there is nothing to fail.
+        if self.is_offline() {
+            session.offline = true;
+            return;
+        }
         let address = self.daemon_address();
         if address.is_empty() {
             return;
         }
-        let client = wow_daemon_client::DaemonClient::new(&address);
+        session.daemon_login = self.daemon_login.clone();
+        session.daemon_options = self.daemon_options();
+        session.state.trusted_daemon = self.trusted_daemon_for(&address);
+        let client = session.client_for(&address);
         match client.get_info() {
             Ok(info) => {
                 session.daemon_height = info.height;
@@ -136,12 +226,8 @@ impl State {
         let WalletSource::File { paths, password } = &self.source else {
             return Ok(());
         };
-        let mut session = Session::open(
-            paths.clone(),
-            password.clone(),
-            self.kdf_rounds,
-            Some(self.network),
-        )?;
+        let mut session =
+            Session::open(paths.clone(), password, self.kdf_rounds, Some(self.network))?;
         self.attach_daemon(&mut session);
         *self.wallet() = Some(session);
         Ok(())
@@ -184,17 +270,19 @@ impl State {
             .get("filename")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(errors::UNKNOWN_ERROR, "filename is missing"))?;
-        let password = params
-            .get("password")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let password = Zeroizing::new(
+            params
+                .get("password")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
 
         let paths = self.path_for(name)?;
         // The wallet already open here holds its own keys file, and opening it
         // again would find it locked by this server. So that one closes first.
         self.close_if_open(&paths)?;
-        let mut session = Session::open(paths, password, self.kdf_rounds, Some(self.network))
+        let mut session = Session::open(paths, &password, self.kdf_rounds, Some(self.network))
             .map_err(|e| Error::new(errors::INVALID_PASSWORD, e))?;
         self.attach_daemon(&mut session);
         *self.wallet() = Some(session);
@@ -312,17 +400,22 @@ impl State {
         self.install(paths, password, account, &language, restore_height)
     }
 
-    fn creation_params(&self, params: &Value) -> Result<(String, String, String), Error> {
+    fn creation_params(
+        &self,
+        params: &Value,
+    ) -> Result<(String, Zeroizing<String>, String), Error> {
         let name = params
             .get("filename")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(errors::UNKNOWN_ERROR, "filename is missing"))?
             .to_string();
-        let password = params
-            .get("password")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let password = Zeroizing::new(
+            params
+                .get("password")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
         let language = params
             .get("language")
             .and_then(Value::as_str)
@@ -334,7 +427,7 @@ impl State {
     fn install(
         &self,
         paths: Paths,
-        password: String,
+        password: Zeroizing<String>,
         account: AccountBase,
         language: &str,
         restore_height: u64,
@@ -348,7 +441,7 @@ impl State {
         let mut session = Session::create(
             paths,
             self.network,
-            password,
+            &password,
             self.kdf_rounds,
             account,
             language,
@@ -625,6 +718,7 @@ mod tests {
             1,
             login.map(|(u, p)| (u.to_string(), p.to_string())),
             String::new(),
+            None,
         )
     }
 

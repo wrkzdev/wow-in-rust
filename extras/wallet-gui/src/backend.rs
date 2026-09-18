@@ -20,7 +20,7 @@ use wow_wallet::{AccountBase, EntryKind, RefreshEvent};
 use crate::format;
 use crate::nodes::NodeAddress;
 use crate::protocol::{
-    Bytes, Command, Event, Net, NewWallet, NodeReport, OpenWallet, Preview, Restore, Row,
+    Bytes, Command, Event, Link, Net, NewWallet, NodeReport, OpenWallet, Preview, Restore, Row,
     SendForm, Status, Summary,
 };
 
@@ -59,9 +59,17 @@ pub trait Platform {
     fn in_browser(&self) -> bool;
     /// Whether a browser loaded the wallet over https.
     fn secure_page(&self) -> bool;
-    /// A client for `node`. `any_certificate` accepts an https node's
+    /// A client for `node`. `any_certificate` accepts the node's TLS
     /// certificate whoever signed it, where the platform decides that.
-    fn connect(&self, node: &NodeAddress, any_certificate: bool) -> DaemonClient;
+    /// `login` is for a node started with `--rpc-login`, and `proxy` what to
+    /// reach it through, where the platform can use them.
+    fn connect(
+        &self,
+        node: &NodeAddress,
+        any_certificate: bool,
+        login: Option<&wow_daemon_client::digest::Credentials>,
+        proxy: Option<&wow_daemon_client::Proxy>,
+    ) -> DaemonClient;
     /// A clock for timing a node's answer, in milliseconds from any start.
     fn millis(&self) -> f64;
     /// Where the log is written, when it is written to a file; `None` where
@@ -90,8 +98,14 @@ pub struct Backend<P: Platform> {
     wallet: Option<Open>,
     /// Whether the command being handled said it was working.
     working: bool,
-    /// [`Command::AcceptAnyCertificate`], for the next connection.
-    any_certificate: bool,
+    /// [`Command::AcceptAnyCertificate`]: the nodes, as `host:port`, whose
+    /// certificate is accepted as it is, from the next connection.
+    any_certificate: Vec<String>,
+    /// [`Command::SetNodeLogin`], for a node started with `--rpc-login`. In
+    /// memory only, and never written with the settings.
+    node_login: Option<wow_daemon_client::digest::Credentials>,
+    /// [`Command::SetProxy`], with a login of this run's own.
+    proxy: Option<wow_daemon_client::Proxy>,
 }
 
 impl<P: Platform> Backend<P> {
@@ -101,7 +115,9 @@ impl<P: Platform> Backend<P> {
             emit: Box::new(emit),
             wallet: None,
             working: false,
-            any_certificate: false,
+            any_certificate: Vec::new(),
+            node_login: None,
+            proxy: None,
         }
     }
 
@@ -172,8 +188,35 @@ impl<P: Platform> Backend<P> {
                 self.send(Event::NodeTested { address, result });
                 Ok(())
             }
-            Command::AcceptAnyCertificate(on) => {
-                self.any_certificate = on;
+            Command::AcceptAnyCertificate(nodes) => {
+                self.any_certificate = nodes;
+                Ok(())
+            }
+            Command::SetProxy(text) => {
+                self.proxy = match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    None => None,
+                    Some(text) => {
+                        let proxy = wow_daemon_client::Proxy::parse(text)?;
+                        // A login of this run's own, so Tor keeps this
+                        // wallet's circuits apart from other programs'.
+                        let mut token = [0u8; 16];
+                        wow_wallet::entropy::seeded_rng()?.fill(&mut token);
+                        Some(proxy.isolated(&token))
+                    }
+                };
+                let in_use = self
+                    .wallet
+                    .as_ref()
+                    .and_then(|w| w.session.daemon.as_ref())
+                    .map(|d| d.address().to_string());
+                match in_use {
+                    Some(address) => self.use_node(&address),
+                    None => Ok(()),
+                }
+            }
+            Command::SetNodeLogin(login) => {
+                self.node_login = login
+                    .map(|(user, pass)| wow_daemon_client::digest::Credentials { user, pass });
                 Ok(())
             }
             Command::SetLog { level, to_file } => {
@@ -229,7 +272,7 @@ impl<P: Platform> Backend<P> {
             }
             Command::ShowViewKey { password } => {
                 let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
-                if password != w.session.password {
+                if !w.session.verify_password(&password) {
                     return Err("that is not this wallet's password".into());
                 }
                 let key = w.session.view_key_hex();
@@ -239,7 +282,7 @@ impl<P: Platform> Backend<P> {
             Command::ChangePassword { old, new } => {
                 match &self.wallet {
                     None => return Err(NO_WALLET.into()),
-                    Some(w) if old != w.session.password => {
+                    Some(w) if !w.session.verify_password(&old) => {
                         return Err("that is not this wallet's password".into())
                     }
                     Some(_) => {}
@@ -247,7 +290,7 @@ impl<P: Platform> Backend<P> {
                 // Two CryptoNight hashes, one for each file's key: a moment.
                 self.working("Changing the password…");
                 let w = self.wallet.as_mut().ok_or(NO_WALLET)?;
-                w.session.change_password(new)?;
+                w.session.change_password(&new)?;
                 let name = w.name.clone();
                 self.platform.saved(&name);
                 self.send(Event::PasswordChanged);
@@ -258,7 +301,7 @@ impl<P: Platform> Backend<P> {
                 copy_password,
             } => {
                 let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
-                if password != w.session.password {
+                if !w.session.verify_password(&password) {
                     return Err("that is not this wallet's password".into());
                 }
                 let keys = w.session.view_only_keys(&copy_password)?;
@@ -302,7 +345,7 @@ impl<P: Platform> Backend<P> {
             }
             Command::ShowSeed { password } => {
                 let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
-                if password != w.session.password {
+                if !w.session.verify_password(&password) {
                     return Err("that is not this wallet's password".into());
                 }
                 let language = w
@@ -381,7 +424,7 @@ impl<P: Platform> Backend<P> {
         let session = Session::create_in(
             store,
             n.network.network(),
-            n.password,
+            &n.password,
             KDF_ROUNDS,
             account,
             language.name,
@@ -424,7 +467,7 @@ impl<P: Platform> Backend<P> {
         let session = Session::create_in(
             store,
             r.network.network(),
-            r.password,
+            &r.password,
             KDF_ROUNDS,
             account,
             language.name,
@@ -445,7 +488,7 @@ impl<P: Platform> Backend<P> {
         }
         self.working(format!("Opening {}…", o.name));
         let store = self.platform.store(&o.name)?;
-        let session = Session::open_in(store, o.password, KDF_ROUNDS, None).map_err(|e| {
+        let session = Session::open_in(store, &o.password, KDF_ROUNDS, None).map_err(|e| {
             if e.contains("not JSON") {
                 "That password does not open this wallet.".to_string()
             } else {
@@ -536,6 +579,10 @@ impl<P: Platform> Backend<P> {
             }
             Ok(Some((client, info))) => {
                 w.session.daemon_height = info.height;
+                // A node on this machine is trusted, and any other is not, as
+                // wallet-cli decides without --trusted-daemon.
+                w.session.state.trusted_daemon =
+                    wow_daemon_client::is_local_address(client.address());
                 w.session.daemon = Some(client);
                 w.node_error = None;
                 // As wallet-cli does for a new wallet: keys made moments ago
@@ -562,12 +609,15 @@ impl<P: Platform> Backend<P> {
     /// `network`.
     fn connect_checked(&self, address: &str, network: Net) -> Result<(DaemonClient, Info), String> {
         let node = NodeAddress::parse(address)?;
-        if let Some(why) =
-            node.unreachable_reason(self.platform.in_browser(), self.platform.secure_page())
-        {
+        if let Some(why) = self.unreachable(&node) {
             return Err(why.to_string());
         }
-        let client = self.platform.connect(&node, self.any_certificate);
+        let client = self.platform.connect(
+            &node,
+            self.accepts_any(&node),
+            self.node_login.as_ref(),
+            self.proxy.as_ref(),
+        );
         let info = client
             .get_info()
             .map_err(|e| self.unanswered(&node, &e.to_string()))?;
@@ -584,15 +634,18 @@ impl<P: Platform> Backend<P> {
 
     fn test_node(&self, address: &str, network: Net) -> Result<NodeReport, String> {
         let node = NodeAddress::parse(address)?;
-        if let Some(why) =
-            node.unreachable_reason(self.platform.in_browser(), self.platform.secure_page())
-        {
+        if let Some(why) = self.unreachable(&node) {
             return Err(why.to_string());
         }
         let started = self.platform.millis();
         let info = self
             .platform
-            .connect(&node, self.any_certificate)
+            .connect(
+                &node,
+                self.accepts_any(&node),
+                self.node_login.as_ref(),
+                self.proxy.as_ref(),
+            )
             .get_info()
             .map_err(|e| self.unanswered(&node, &e.to_string()))?;
         let millis = (self.platform.millis() - started).max(0.0) as u64;
@@ -607,11 +660,33 @@ impl<P: Platform> Backend<P> {
         })
     }
 
+    /// Whether `node`'s certificate is accepted whoever signed it.
+    fn accepts_any(&self, node: &NodeAddress) -> bool {
+        self.any_certificate.contains(&node.host_port())
+    }
+
+    /// Why `node` cannot be reached from here, when that is known before
+    /// trying.
+    fn unreachable(&self, node: &NodeAddress) -> Option<&'static str> {
+        node.unreachable_reason(
+            self.platform.in_browser(),
+            self.platform.secure_page(),
+            self.proxy.is_some(),
+        )
+    }
+
     fn unanswered(&self, node: &NodeAddress, error: &str) -> String {
         if self.platform.in_browser() {
             format!(
                 "{} did not answer: {error}. A browser can only use a node that allows requests \
                  from web pages (CORS), and many do not.",
+                node.url()
+            )
+        } else if self.proxy.is_some() && !node.is_onion() && !node.is_i2p() {
+            format!(
+                "{} did not answer: {error}. Through a proxy, a node that is not a .onion or \
+                 .i2p one is reached only over TLS, so whoever runs the proxy's exit can neither \
+                 read it nor pose as the node: use one that answers TLS, or an onion node.",
                 node.url()
             )
         } else {
@@ -642,6 +717,15 @@ impl<P: Platform> Backend<P> {
             priority: form.priority,
             ring_size: wow_wallet::decoys::RING_SIZE,
             payment_id,
+            // The GUI has no way to pick one output yet; sweeping there means
+            // the whole wallet.
+            sweep_output: None,
+            // Nor an account or a subaddress: account 0, every subaddress in
+            // it, and for a sweep one of them at random, as the C++ wallets
+            // do when none is named.
+            account: 0,
+            subaddr_indices: Vec::new(),
+            below_amount: 0,
         };
         let prepared = w
             .session
@@ -669,6 +753,7 @@ impl<P: Platform> Backend<P> {
             weight: plan.estimated_weight,
             priority: tier_name(prepared.priority).to_string(),
             payment_id: prepared.payment_id.map(|p| wow_crypto::hex::encode(&p)),
+            left_behind: plan.left_behind,
         };
         w.prepared = Some(prepared);
 
@@ -728,13 +813,16 @@ impl<P: Platform> Backend<P> {
             Some(w) => w.session.chain_height(),
             None => {
                 let address = NodeAddress::parse(node)?;
-                if let Some(why) = address
-                    .unreachable_reason(self.platform.in_browser(), self.platform.secure_page())
-                {
+                if let Some(why) = self.unreachable(&address) {
                     return Err(why.to_string());
                 }
                 self.platform
-                    .connect(&address, self.any_certificate)
+                    .connect(
+                        &address,
+                        self.accepts_any(&address),
+                        self.node_login.as_ref(),
+                        self.proxy.as_ref(),
+                    )
                     .get_info()
                     .map_err(|e| self.unanswered(&address, &e.to_string()))?
                     .height
@@ -751,7 +839,7 @@ impl<P: Platform> Backend<P> {
     /// `spend::plan` estimates from the weight. Returns the amount it sends
     /// and the fee.
     fn estimate_fee(&self, form: &SendForm) -> Result<(u64, u64), String> {
-        use wow_types::address::{Address, AddressKind};
+        use wow_types::address::Address;
         use wow_wallet::{priority, spend};
 
         let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
@@ -767,24 +855,32 @@ impl<P: Platform> Backend<P> {
             &tiers,
         );
         // What the address says of itself, so the estimate's extra field is
-        // the size the transaction's will be. One not yet valid estimates as a
-        // plain address.
+        // the size the transaction's will be. One payee and change never need
+        // per-output keys, a subaddress included. One not yet valid estimates
+        // as a plain address.
         let address = Address::decode_for(form.address.trim(), w.session.network).ok();
-        let subaddress = address.is_some_and(|a| a.kind == AddressKind::Subaddress);
         let payment_id = address.is_some_and(|a| a.payment_id.is_some())
             || !form.payment_id.trim().is_empty();
         let options = spend::SpendOptions {
             ring_size: wow_wallet::decoys::RING_SIZE,
             fee_per_byte: priority::fee_per_byte(&tiers, tier),
-            extra_size: spend::extra_size(2, payment_id, subaddress),
+            extra_size: spend::extra_size(2, payment_id, false),
+            // As `prepare_send` reads them: an estimate that ignored the
+            // amount range the send obeys would quote a fee for inputs the
+            // send will not pick.
+            ignore_above: w.session.keys_file.ignore_outputs_above(),
+            ignore_below: w.session.keys_file.ignore_outputs_below(),
             chain_height: w.session.chain_height(),
             now: wow_wallet::clock::now(),
             ..Default::default()
         };
         let transfers = w.session.transfers();
+        // An estimate, not the transaction: its own source, so asking what a
+        // send would cost does not consume the one the send itself will use.
+        let mut rng = wow_wallet::entropy::seeded_rng().map_err(|e| e.to_string())?;
         let plan = match form.amount {
-            Some(amount) => spend::plan(transfers, &[amount], &options),
-            None => spend::plan_sweep(transfers, &options),
+            Some(amount) => spend::plan(transfers, &[amount], &options, &mut rng),
+            None => spend::plan_sweep(transfers, &options, &mut rng),
         }
         .map_err(|e| e.to_string())?;
         Ok((plan.amounts.first().copied().unwrap_or(0), plan.fee))
@@ -801,10 +897,7 @@ impl<P: Platform> Backend<P> {
         self.working("Sending…");
 
         let w = self.wallet.as_mut().ok_or(NO_WALLET)?;
-        let relayed = w
-            .session
-            .commit_send(&prepared, false)
-            .map_err(|e| e.to_string())?;
+        let relayed = w.session.commit_send(&prepared).map_err(|e| e.to_string())?;
         let result = relayed.result;
 
         if result.accepted() {
@@ -989,14 +1082,26 @@ impl<P: Platform> Backend<P> {
         let (balance, unlocked) = w.session.balances();
         let chain = w.session.chain_height();
         let (locked, unlock_blocks) = w.session.state.locked(chain, wow_wallet::clock::now());
+        // Frozen outputs are in no balance, so the interface has to be able to
+        // say where the money went.
+        let frozen_outputs: Vec<u64> = w
+            .session
+            .transfers()
+            .iter()
+            .filter(|t| !t.spent && t.frozen)
+            .map(|t| t.amount)
+            .collect();
         let status = Status {
             balance,
             unlocked,
             locked,
             unlock_blocks,
+            frozen: frozen_outputs.iter().sum(),
+            frozen_outputs: frozen_outputs.len(),
             scanned: w.session.state.scan_height(),
             chain,
             node: w.session.daemon.as_ref().map(|d| d.address().to_string()),
+            link: link(w.session.daemon.as_ref(), self.platform.in_browser()),
             node_error: w.node_error.clone(),
             syncing: w.syncing,
         };
@@ -1046,6 +1151,30 @@ fn save<P: Platform>(platform: &mut P, w: &mut Open) -> Result<(), String> {
     w.batches = 0;
     platform.saved(&w.name);
     Ok(())
+}
+
+/// How the node in use is reached, as far as is known.
+fn link(daemon: Option<&DaemonClient>, in_browser: bool) -> Link {
+    use wow_daemon_client::Security;
+    let Some(daemon) = daemon else {
+        return Link::Unknown;
+    };
+    match daemon.security() {
+        Some(Security::Tls { verified: true }) => Link::Tls,
+        Some(Security::Tls { verified: false }) => Link::TlsUnchecked,
+        Some(Security::Plain { fell_back: false }) => Link::Plain,
+        Some(Security::Plain { fell_back: true }) => Link::PlainFallback,
+        // A browser's own requests: TLS is what the address says, and the
+        // browser checks the certificate.
+        None if in_browser => {
+            if daemon.address().starts_with("https://") {
+                Link::Tls
+            } else {
+                Link::Plain
+            }
+        }
+        None => Link::Unknown,
+    }
 }
 
 fn summary(name: &str, session: &Session) -> Summary {

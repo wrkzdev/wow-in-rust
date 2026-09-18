@@ -35,12 +35,14 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::chacha::Key;
 use crate::history::{PooledTx, SentDestination, SentState, SentTx};
 use crate::refresh::{Transfer, WalletState};
 use crate::store::{CacheRead, FileStore, Store};
 use crate::subaddress::SubaddressTable;
 use crate::{AccountBase, KeysFile};
 use wow_crypto::types::Hash256;
+use wow_crypto::Zeroizing;
 use wow_daemon_client::DaemonClient;
 use wow_types::Network;
 
@@ -84,18 +86,61 @@ pub struct Session {
     pub keys_file: KeysFile,
     pub state: WalletState,
     pub network: Network,
-    pub password: String,
     pub kdf_rounds: u64,
     pub daemon: Option<DaemonClient>,
+    /// For a daemon started with `--rpc-login`. Kept on the session rather
+    /// than on the client so that changing the node's address does not lose
+    /// it, and never written to the wallet file: a node's password is not the
+    /// wallet's to keep.
+    pub daemon_login: Option<wow_daemon_client::digest::Credentials>,
+    /// How the node is reached, whatever its address: what `--daemon-ssl`
+    /// and the options beside it say. Kept on the session for the reason
+    /// `daemon_login` is, and never written to the wallet file.
+    pub daemon_options: wow_daemon_client::ConnectOptions,
     /// The daemon's height at the last refresh, for progress reporting.
     pub daemon_height: u64,
+    /// `wallet2::m_offline`, from `--offline`: this wallet talks to no node,
+    /// ever.
+    ///
+    /// The cold half of a cold-signing pair is the reason the flag exists. In
+    /// the C++ it makes every HTTP call fail without trying
+    /// (`wallet2.h` 1742-1762), `refresh` a no-op and `check_connection`
+    /// report nothing there; here a front end reads it and does not attach a
+    /// daemon at all. Not written to the wallet file: it is how this run was
+    /// started, not a property of the wallet.
+    pub offline: bool,
     /// Set when anything has changed since the last save.
     pub dirty: bool,
     /// Where the keys file and the cache are read from and written to.
     store: Box<dyn Store>,
-    /// The key the cache is sealed under, derived from the password once
-    /// rather than by a CryptoNight on every save.
-    cache_key: crate::chacha::Key,
+    /// The key the keys file is encrypted under: `generate_chacha_key` of the
+    /// password, derived once at open rather than by a CryptoNight on every
+    /// save.
+    ///
+    /// This is here instead of the password, which is not kept. It is still
+    /// key material -- it opens this wallet's files -- but it is not the
+    /// password: not reversible to it, and worth nothing anywhere else. The
+    /// reason it has to be kept at all is [`save`](Self::save), which rewrites
+    /// the keys file; `wallet2` takes the password again at each `rewrite` and
+    /// derives the same key there.
+    keys_key: Zeroizing<crate::chacha::Key>,
+    /// The key the cache is sealed under, `derive_cache_key(keys_key)`. Also
+    /// the verifier [`verify_password`](Self::verify_password) checks a
+    /// password against, as `wallet2::verify_password_with_cached_key` does.
+    cache_key: Zeroizing<crate::chacha::Key>,
+}
+
+/// The two keys a password opens a wallet with.
+fn keys_from_password(password: &str, kdf_rounds: u64) -> (Zeroizing<Key>, Zeroizing<Key>) {
+    let keys_key = Zeroizing::new(crate::chacha::generate_chacha_key(
+        password.as_bytes(),
+        kdf_rounds,
+    ));
+    let cache_key = Zeroizing::new(crate::chacha::derive_cache_key(
+        &keys_key,
+        crate::chacha::HASH_KEY_WALLET_CACHE,
+    ));
+    (keys_key, cache_key)
 }
 
 impl Session {
@@ -103,7 +148,7 @@ impl Session {
     pub fn create(
         paths: Paths,
         network: Network,
-        password: String,
+        password: &str,
         kdf_rounds: u64,
         account: AccountBase,
         seed_language: &str,
@@ -124,7 +169,7 @@ impl Session {
     pub fn create_in(
         store: Box<dyn Store>,
         network: Network,
-        password: String,
+        password: &str,
         kdf_rounds: u64,
         account: AccountBase,
         seed_language: &str,
@@ -153,18 +198,21 @@ impl Session {
             restore_height,
             network,
         );
-        let cache_key = KeysFile::cache_key(password.as_bytes(), kdf_rounds);
+        let (keys_key, cache_key) = keys_from_password(password, kdf_rounds);
 
         let mut s = Session {
             keys_file,
             state,
             network,
-            password,
             kdf_rounds,
             daemon: None,
+            daemon_login: None,
+            daemon_options: Default::default(),
             daemon_height: 0,
+            offline: false,
             dirty: true,
             store,
+            keys_key,
             cache_key,
         };
         s.save()?;
@@ -176,7 +224,7 @@ impl Session {
     /// Open an existing wallet from files at `paths`.
     pub fn open(
         paths: Paths,
-        password: String,
+        password: &str,
         kdf_rounds: u64,
         network: Option<Network>,
     ) -> Result<Session, String> {
@@ -191,12 +239,15 @@ impl Session {
     /// Open the wallet in `store`.
     pub fn open_in(
         mut store: Box<dyn Store>,
-        password: String,
+        password: &str,
         kdf_rounds: u64,
         network: Option<Network>,
     ) -> Result<Session, String> {
         let blob = store.open_keys()?;
-        let keys_file = KeysFile::open(&blob, password.as_bytes(), kdf_rounds)
+        // Derived once. From here on the session holds these two keys and not
+        // the password.
+        let (keys_key, cache_key) = keys_from_password(password, kdf_rounds);
+        let keys_file = KeysFile::open_with_key(&blob, &keys_key)
             .map_err(|e| format!("cannot open the wallet: {e}"))?;
 
         // A wallet knows its own network. Opening a mainnet wallet as testnet
@@ -231,7 +282,6 @@ impl Session {
         );
 
         // Load the cache if there is one; otherwise the wallet rescans.
-        let cache_key = KeysFile::cache_key(password.as_bytes(), kdf_rounds);
         match store.read_cache()? {
             CacheRead::Found(raw) => cache::load_sealed(&mut state, &raw, &cache_key)?,
             CacheRead::WrittenByCpp { ours } => {
@@ -249,12 +299,15 @@ impl Session {
             keys_file,
             state,
             network: file_network,
-            password,
             kdf_rounds,
             daemon: None,
+            daemon_login: None,
+            daemon_options: Default::default(),
             daemon_height: 0,
+            offline: false,
             dirty: false,
             store,
+            keys_key,
             cache_key,
         })
     }
@@ -268,12 +321,32 @@ impl Session {
 
         let blob = self
             .keys_file
-            .to_blob(self.password.as_bytes(), self.kdf_rounds, iv, key_iv)
+            .to_blob_with_key(&self.keys_key, iv, key_iv)
             .map_err(|e| format!("cannot serialize the wallet: {e}"))?;
         self.store.write_keys(&blob)?;
         let sealed = cache::seal(&cache::store(&self.state), &self.cache_key, cache_iv);
         self.store.write_cache(&sealed)?;
         Ok(())
+    }
+
+    /// Whether `password` is this wallet's.
+    ///
+    /// `wallet2::verify_password_with_cached_key`: "we use `m_cache_key` as a
+    /// deterministic test to see if given key corresponds to original
+    /// password". Deriving the cache key from the answer and comparing needs
+    /// no stored password and touches no file, which is what lets the
+    /// password be asked for again -- before showing a secret key, before a
+    /// send, or to unlock a wallet left alone -- without one being kept.
+    ///
+    /// Compared byte by byte without an early exit: how much of a guess was
+    /// right is not something to hand back in a timing.
+    pub fn verify_password(&self, password: &str) -> bool {
+        let candidate = Zeroizing::new(KeysFile::cache_key(password.as_bytes(), self.kdf_rounds));
+        candidate
+            .iter()
+            .zip(self.cache_key.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
     }
 
     /// Where the wallet is kept: its keys file's path, or the name its store
@@ -337,22 +410,21 @@ impl Session {
     /// The two are written one after the other, so if the second fails the
     /// first is put back under the old password: keys and cache under
     /// different passwords would leave a wallet that does not open.
-    pub fn change_password(&mut self, new: String) -> Result<(), String> {
+    pub fn change_password(&mut self, new: &str) -> Result<(), String> {
         let mut rng = crate::entropy::seeded_rng()?;
-        let serialize = |password: &str, rng: &mut wow_crypto::random::Rng| {
+        let (new_keys_key, new_cache_key) = keys_from_password(new, self.kdf_rounds);
+        let serialize = |key: &Key, rng: &mut wow_crypto::random::Rng| {
             self.keys_file
-                .to_blob(
-                    password.as_bytes(),
-                    self.kdf_rounds,
-                    random_iv(rng),
-                    random_iv(rng),
-                )
+                .to_blob_with_key(key, random_iv(rng), random_iv(rng))
                 .map_err(|e| format!("cannot serialize the wallet: {e}"))
         };
-        let keys = serialize(&new, &mut rng)?;
-        let old_keys = serialize(&self.password, &mut rng)?;
-        let cache_key = KeysFile::cache_key(new.as_bytes(), self.kdf_rounds);
-        let sealed = cache::seal(&cache::store(&self.state), &cache_key, random_iv(&mut rng));
+        let keys = serialize(&new_keys_key, &mut rng)?;
+        let old_keys = serialize(&self.keys_key, &mut rng)?;
+        let sealed = cache::seal(
+            &cache::store(&self.state),
+            &new_cache_key,
+            random_iv(&mut rng),
+        );
 
         self.store.write_keys(&keys)?;
         if let Err(e) = self.store.write_cache(&sealed) {
@@ -365,8 +437,8 @@ impl Session {
                 ),
             });
         }
-        self.password = new;
-        self.cache_key = cache_key;
+        self.keys_key = new_keys_key;
+        self.cache_key = new_cache_key;
         self.dirty = false;
         Ok(())
     }
@@ -442,6 +514,7 @@ impl Session {
         let start = height - 1;
         self.keys_file.set_refresh_height(start);
         self.state.start_height = start;
+        self.state.refresh_from_height = start;
         // The genesis anchor belongs to height zero and this wallet no longer
         // starts there. Leaving it would claim a hash for the wrong height.
         self.state.hashes.clear();
@@ -452,6 +525,22 @@ impl Session {
     /// otherwise how far it has scanned.
     pub fn chain_height(&self) -> u64 {
         self.daemon_height.max(self.state.scan_height())
+    }
+
+    /// A client for `address`, carrying this session's daemon login if it has
+    /// one, and reaching the node as [`daemon_options`](Self::daemon_options)
+    /// say.
+    ///
+    /// Every place that points a wallet at a node goes through here, so a
+    /// login survives `set_daemon` and is not something each front end has to
+    /// remember to apply.
+    pub fn client_for(&self, address: &str) -> DaemonClient {
+        let mut endpoint =
+            wow_daemon_client::Endpoint::new(address).with_options(&self.daemon_options);
+        if let Some(c) = &self.daemon_login {
+            endpoint = endpoint.with_login(c.clone());
+        }
+        DaemonClient::with_endpoint(endpoint)
     }
 
     pub fn describe_progress(&self) -> String {
@@ -480,13 +569,12 @@ impl Session {
     /// ([`WalletState::update_pending`]).
     ///
     /// Only once a refresh has caught up; `update_pending` says why.
+    ///
+    /// Always, whatever the wallet holds: a view-only wallet and an empty one
+    /// included. `wallet2::refresh` reads the pool on every refresh. A wallet
+    /// that only started asking once it owned a key image told the daemon,
+    /// by the first request, which block had just paid it.
     pub fn check_pending(&mut self) -> Result<PoolCheck, String> {
-        // A view-only wallet has no key images to find, and nothing pending.
-        if self.state.by_key_image.is_empty()
-            && self.state.sent.iter().all(|s| s.height().is_some())
-        {
-            return Ok(PoolCheck::default());
-        }
         let pool = self.read_pool()?;
         let ids: HashSet<Hash256> = pool.iter().map(|p| p.txid).collect();
         let noted = self.state.note_pool_spends(&pool, now());
@@ -598,6 +686,14 @@ pub mod cache {
                     "is_coinbase": t.is_coinbase,
                     "timestamp": t.timestamp,
                     "payment_id": t.payment_id.map(|p| wow_crypto::hex::encode(&p)),
+                    "frozen": t.frozen,
+                    "tx_public_key": wow_crypto::hex::encode(&t.tx_public_key.0),
+                    "additional_tx_keys": t
+                        .additional_tx_keys
+                        .iter()
+                        .map(|k| wow_crypto::hex::encode(&k.0))
+                        .collect::<Vec<_>>(),
+                    "key_image_request": t.key_image_request,
                 })
             })
             .collect();
@@ -608,12 +704,23 @@ pub mod cache {
             .map(|h| wow_crypto::hex::encode(h))
             .collect();
 
+        // Rings, sealed with the rest: which outputs this wallet hid its
+        // spends among is exactly what it must not leave in the clear.
+        let rings: Vec<Value> = state
+            .rings
+            .iter()
+            .map(|(k, ring)| json!({ "key_image": wow_crypto::hex::encode(&k.0), "ring": ring }))
+            .collect();
+
         json!({
             "version": VERSION,
             "start_height": state.start_height,
+            "refresh_from_height": state.refresh_from_height,
+            "ever_refreshed": state.ever_refreshed,
             "hashes": hashes,
             "transfers": transfers,
             "sent": state.sent.iter().map(sent_to_json).collect::<Vec<_>>(),
+            "rings": rings,
         })
         .to_string()
         .into_bytes()
@@ -679,6 +786,25 @@ pub mod cache {
             .get("start_height")
             .and_then(Value::as_u64)
             .unwrap_or(state.start_height);
+        // Added without a version bump: a cache from before has hashes from
+        // where scanning started, and the restore height stands for it.
+        state.refresh_from_height = v
+            .get("refresh_from_height")
+            .and_then(Value::as_u64)
+            .unwrap_or(state.refresh_from_height);
+        // Also added without a version bump. A cache from before was written
+        // by a build that had no offline signing, so the flag is only read to
+        // refuse an output import; more than one block hash stands in for it,
+        // since a wallet that starts at zero holds genesis before it has asked
+        // a node anything.
+        state.ever_refreshed = v
+            .get("ever_refreshed")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                v.get("hashes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| a.len() > 1)
+            });
 
         state.hashes = v
             .get("hashes")
@@ -705,6 +831,25 @@ pub mod cache {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(sent_from_json).collect())
             .unwrap_or_default();
+
+        // Also added without a version bump: a cache from before has no rings.
+        state.rings = Default::default();
+        for entry in v.get("rings").and_then(Value::as_array).into_iter().flatten() {
+            let key_image = entry
+                .get("key_image")
+                .and_then(Value::as_str)
+                .and_then(wow_crypto::hex::decode)
+                .and_then(|b| <[u8; 32]>::try_from(b).ok());
+            let ring: Option<Vec<u64>> = entry
+                .get("ring")
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().map(Value::as_u64).collect());
+            if let (Some(k), Some(ring)) = (key_image, ring) {
+                state
+                    .rings
+                    .set_ring(wow_crypto::types::KeyImage(k), &ring, false);
+            }
+        }
 
         state.reindex();
         Ok(())
@@ -739,6 +884,33 @@ pub mod cache {
                 .and_then(Value::as_str)
                 .and_then(wow_crypto::hex::decode)
                 .and_then(|b| b.try_into().ok()),
+            // Absent from a cache written before outputs could be frozen.
+            frozen: v.get("frozen").and_then(Value::as_bool).unwrap_or(false),
+            // Absent from a cache written before cold signing needed them. A
+            // wallet that reads one cannot export outputs until it rescans,
+            // and says so rather than exporting a zero key
+            // ([`crate::offline`]).
+            tx_public_key: wow_crypto::types::PublicKey(
+                bytes32("tx_public_key").unwrap_or([0u8; 32]),
+            ),
+            additional_tx_keys: v
+                .get("additional_tx_keys")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .filter_map(wow_crypto::hex::decode)
+                        .filter_map(|b| <[u8; 32]>::try_from(b).ok())
+                        .map(wow_crypto::types::PublicKey)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // A cache from before has no record, and "the key image is not
+            // known" stands for it.
+            key_image_request: v
+                .get("key_image_request")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| bytes32("key_image").is_none()),
         })
     }
 
@@ -856,7 +1028,7 @@ mod tests {
         Session::create(
             Paths::new(dir.join("w")),
             Network::Mainnet,
-            String::new(),
+            "",
             1,
             account,
             "English",
@@ -885,6 +1057,40 @@ mod tests {
             "the tip block, not the block count"
         );
         assert_eq!(s.keys_file.refresh_height(), 873_426);
+        assert_eq!(s.state.refresh_from_height, 873_426, "and scanning starts there");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Where scanning starts survives the cache apart from where the hashes
+    /// begin, and a cache from before it was kept takes the restore height.
+    #[test]
+    fn where_scanning_starts_survives_the_cache() {
+        let dir = scratch("refresh-from");
+        let mut s = fresh_session(&dir, 0);
+        s.state.start_height = 838_800;
+        s.state.refresh_from_height = 850_000;
+        s.state.hashes.push([7u8; 32]);
+        let raw = cache::store(&s.state);
+
+        let fresh = || {
+            let keys = &s.keys_file.account.keys;
+            let table = SubaddressTable::new(&keys.account_address, &keys.view_secret_key, 1, 1);
+            WalletState::new(s.keys_file.account.clone(), table, 42, Network::Mainnet)
+        };
+        let mut back = fresh();
+        cache::load(&mut back, &raw).expect("loads");
+        assert_eq!(back.start_height, 838_800);
+        assert_eq!(back.refresh_from_height, 850_000);
+
+        let mut older: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        older
+            .as_object_mut()
+            .expect("an object")
+            .remove("refresh_from_height");
+        let mut old = fresh();
+        cache::load(&mut old, older.to_string().as_bytes()).expect("loads");
+        assert_eq!(old.refresh_from_height, 42, "the restore height");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -942,8 +1148,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An output's payment id survives the cache, and an output from a cache
-    /// written before it was kept reads back with none.
+    /// The rings a wallet spent with survive the cache, and a cache from
+    /// before they were kept reads back with none.
+    #[test]
+    fn rings_survive_the_cache() {
+        let dir = scratch("rings");
+        let mut s = fresh_session(&dir, 0);
+        s.state
+            .rings
+            .set_ring(wow_crypto::types::KeyImage([5u8; 32]), &[9, 4, 70], false);
+        let raw = cache::store(&s.state);
+
+        let keys = &s.keys_file.account.keys;
+        let table = SubaddressTable::new(&keys.account_address, &keys.view_secret_key, 1, 1);
+        let mut back = WalletState::new(s.keys_file.account.clone(), table, 0, Network::Mainnet);
+        cache::load(&mut back, &raw).expect("loads");
+        assert_eq!(back.rings, s.state.rings);
+        assert_eq!(
+            back.rings.get(&wow_crypto::types::KeyImage([5u8; 32])),
+            Some(&[4u64, 9, 70][..])
+        );
+
+        let mut older: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        older.as_object_mut().expect("an object").remove("rings");
+        cache::load(&mut back, older.to_string().as_bytes()).expect("loads");
+        assert!(back.rings.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An output's payment id, and whether it is frozen, survive the cache,
+    /// and an output from a cache written before the id was kept reads back
+    /// with none.
     #[test]
     fn a_payment_id_survives_the_cache() {
         let dir = scratch("payment-id");
@@ -965,6 +1201,10 @@ mod tests {
             is_coinbase: false,
             timestamp: 1_700_000_000,
             payment_id: Some([0xf9, 0x33, 0x77, 0x88, 0xdd, 0x75, 0x25, 0x55]),
+            frozen: true,
+            tx_public_key: wow_crypto::types::PublicKey([9u8; 32]),
+            additional_tx_keys: vec![wow_crypto::types::PublicKey([10u8; 32])],
+            key_image_request: false,
         });
         let raw = cache::store(&s.state);
 
@@ -987,6 +1227,24 @@ mod tests {
         cache::load(&mut old, older.to_string().as_bytes()).expect("loads");
         assert_eq!(old.transfers.len(), 1, "the output is kept");
         assert_eq!(old.transfers[0].payment_id, None);
+
+        // And a cache from before the transaction public keys were kept: the
+        // output is still there, with no keys, and its key image is known so
+        // nothing is asked for.
+        let mut older: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        let entry = older["transfers"][0].as_object_mut().expect("an object");
+        entry.remove("tx_public_key");
+        entry.remove("additional_tx_keys");
+        entry.remove("key_image_request");
+        let mut old = fresh();
+        cache::load(&mut old, older.to_string().as_bytes()).expect("loads");
+        assert_eq!(old.transfers.len(), 1);
+        assert_eq!(
+            old.transfers[0].tx_public_key,
+            wow_crypto::types::PublicKey::ZERO
+        );
+        assert!(old.transfers[0].additional_tx_keys.is_empty());
+        assert!(!old.transfers[0].key_image_request, "the image is known");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1044,7 +1302,7 @@ mod tests {
     fn an_open_wallet_is_held() {
         let dir = scratch("held");
         let mut s = fresh_session(&dir, 0);
-        let reopen = || Session::open(Paths::new(dir.join("w")), String::new(), 1, None);
+        let reopen = || Session::open(Paths::new(dir.join("w")), "", 1, None);
 
         match reopen() {
             Ok(_) => panic!("opened a wallet that is already open"),
@@ -1070,7 +1328,7 @@ mod tests {
         let mut s = Session::create_in(
             Box::new(kept.clone()),
             Network::Mainnet,
-            "old".into(),
+            "old",
             1,
             account,
             "English",
@@ -1078,8 +1336,12 @@ mod tests {
         )
         .expect("create");
         s.state.hashes.push([9u8; 32]);
-        s.change_password("new".into()).expect("changed");
-        assert_eq!(s.password, "new");
+        s.change_password("new").expect("changed");
+        assert!(
+            s.verify_password("new"),
+            "the new password is this wallet's"
+        );
+        assert!(!s.verify_password("old"), "and the old one is not");
 
         let files = kept.files();
         let open = |password: &str| {
@@ -1088,7 +1350,7 @@ mod tests {
                 files.keys.clone().expect("a keys file"),
                 files.cache.clone(),
             );
-            Session::open_in(Box::new(store), password.into(), 1, None)
+            Session::open_in(Box::new(store), password, 1, None)
         };
         assert!(open("old").is_err(), "the old password no longer opens it");
         let back = open("new").expect("the new one does");
@@ -1097,6 +1359,33 @@ mod tests {
             back.state.hashes, s.state.hashes,
             "and the cache came with it"
         );
+    }
+
+    /// A session can tell its own password from any other without keeping it:
+    /// the stored cache key is the verifier, as
+    /// `wallet2::verify_password_with_cached_key` uses `m_cache_key`.
+    #[test]
+    fn a_password_is_checked_against_the_cache_key() {
+        let dir = scratch("verify");
+        let spend = wow_crypto::types::SecretKey(wow_crypto::ops::sc_reduce32(&[8u8; 32]));
+        let account = crate::account::AccountBase::from_spend_key(spend, 0).expect("keys");
+        let s = Session::create(
+            Paths::new(dir.join("w")),
+            Network::Mainnet,
+            "correct horse",
+            1,
+            account,
+            "English",
+            0,
+        )
+        .expect("create");
+
+        assert!(s.verify_password("correct horse"));
+        assert!(!s.verify_password("correct hors"));
+        assert!(!s.verify_password("correct horses"));
+        assert!(!s.verify_password(""));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A view-only copy has the wallet's address and view key and no spend
@@ -1108,7 +1397,7 @@ mod tests {
         let blob = s.view_only_keys("watch").expect("a view-only keys file");
         let copy = Session::open_in(
             Box::new(MemoryStore::holding("copy", blob, None)),
-            "watch".into(),
+            "watch",
             1,
             None,
         )
@@ -1134,7 +1423,7 @@ mod tests {
         let mut s = Session::create_in(
             Box::new(kept.clone()),
             Network::Mainnet,
-            "pw".into(),
+            "pw",
             1,
             account.clone(),
             "English",
@@ -1151,7 +1440,7 @@ mod tests {
 
         let keys = files.keys.expect("a keys file");
         let reopened = MemoryStore::holding("browser", keys, files.cache);
-        let back = Session::open_in(Box::new(reopened), "pw".into(), 1, None).expect("open");
+        let back = Session::open_in(Box::new(reopened), "pw", 1, None).expect("open");
         assert_eq!(back.primary_address(), s.primary_address());
         assert_eq!(back.state.hashes, s.state.hashes, "the cache came back");
         assert_eq!(back.location(), "browser");
@@ -1159,7 +1448,7 @@ mod tests {
         let over = Session::create_in(
             Box::new(kept),
             Network::Mainnet,
-            "pw".into(),
+            "pw",
             1,
             account,
             "English",

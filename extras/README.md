@@ -42,9 +42,16 @@ bash extras/wallet-web/build.sh
 python3 -m http.server -d extras/wallet-web/dist 8080   # then open http://localhost:8080
 ```
 
-The first build writes `extras/Cargo.lock`. A Docker build leaves a copy in
-`dist/<platform>/extras-Cargo.lock`. Commit it, so later builds resolve the
-same dependency versions.
+`extras/Cargo.lock` is committed, and every build command above passes
+`--locked`, so a build here resolves the same dependency versions as the one
+that was reviewed rather than whatever is newest that day. A Docker build also
+leaves a copy in `dist/<platform>/extras-Cargo.lock`, so a release archive can
+be matched against what actually went into it.
+
+To move a dependency, change it deliberately — `cargo update -p <crate>
+--manifest-path extras/Cargo.toml` — and commit the result. Then run
+`bash scripts/check-no-c.sh`, which is what notices if the new version drags
+in a C toolchain.
 
 ## Nodes
 
@@ -68,6 +75,10 @@ same dependency versions.
   folder, with a folder chooser, and shows it in the file manager.
 - An open wallet is locked: wallet-cli and the C++ wallet cannot open it at the
   same time.
+- A node started with `--rpc-login` needs a user name and password: Settings,
+  Node. They are kept until the window closes and are never written to the
+  settings file, so a node's password does not end up on disk. The web wallet
+  has no such field — a browser's `fetch` does not do HTTP Digest.
 - Nodes over plain HTTP or TLS. An https node's certificate is checked against
   the Mozilla roots. A node with a self-signed certificate, as `wownerod` makes
   one, needs "Accept an https node's certificate whoever signed it" in

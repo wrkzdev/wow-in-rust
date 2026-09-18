@@ -7,16 +7,17 @@
 //! between, wallet-rpc does not, and a GUI shows a dialog.
 
 use curve25519_dalek::scalar::Scalar;
-use wow_crypto::types::{Hash256, KeyImage};
+use wow_crypto::types::{AccountPublicAddress, Hash256, KeyImage, SecretKey};
 use wow_daemon_client::{DaemonError, SendResult};
 use wow_types::address::{Address, AddressKind};
 use wow_types::Network;
 
 use crate::decoys::{self, DecoyError, GammaPicker, RandomSource};
 use crate::files::{now, Session};
+use crate::history::SentState;
 use crate::priority::{self, PrioritySettings};
 use crate::spend::{self, SpendError, SpendOptions, SpendPlan};
-use crate::transfer::{self, Destination, SettleError, SpendableOutput, TransferError};
+use crate::transfer::{self, Destination, Outputs, SettleError, SpendableOutput, TransferError};
 
 /// What to send.
 #[derive(Clone, Debug)]
@@ -32,6 +33,30 @@ pub struct SendRequest<'a> {
     /// A payment id given apart from the address. An integrated address
     /// carries its own, and giving both is refused.
     pub payment_id: Option<[u8; 8]>,
+    /// Sweep exactly this one output and nothing else (`sweep_single`).
+    ///
+    /// Only read when `amount` is `None`; an amount says what to send, and
+    /// which outputs pay for it is the wallet's business.
+    pub sweep_output: Option<wow_crypto::types::KeyImage>,
+    /// The subaddress account to spend from, `account_index`. Change goes
+    /// back to its main address.
+    pub account: u32,
+    /// `subaddr_indices`: the minor indices in `account` to spend from. Empty
+    /// is every one holding anything, or for a sweep one at random
+    /// ([`spend::plan_sweep`]).
+    pub subaddr_indices: Vec<u32>,
+    /// A sweep's `below_amount`: only outputs worth less. Zero is all of them.
+    pub below_amount: u64,
+}
+
+/// A number among the settings the keys file keeps for `wallet2`, or
+/// `default` when the file has none.
+fn setting(keys_file: &crate::KeysFile, name: &str, default: u64) -> u64 {
+    keys_file
+        .settings
+        .get(name)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(default)
 }
 
 /// A transaction built and signed, and not yet relayed.
@@ -88,7 +113,7 @@ pub enum SendError {
     #[error("cannot get a fee estimate: {0}")]
     FeeEstimate(DaemonError),
     #[error("cannot get the output distribution: {0}")]
-    Distribution(DaemonError),
+    Distribution(DecoyError),
     #[error(transparent)]
     Plan(#[from] SpendError),
     #[error("cannot build a ring: {0}")]
@@ -105,6 +130,71 @@ pub enum SendError {
     Relay(DaemonError),
 }
 
+/// A plan, its rings, and its inputs: everything a transaction needs before it
+/// is built, and all of it within reach of a watch-only wallet.
+///
+/// [`Session::plan_send`] gets this far and [`Planned::settle`] turns it into a
+/// transaction. They are separate because the two halves of a cold-signing
+/// pair part company here: the watch-only half plans and writes the plan out
+/// ([`crate::offline`]), and the half that holds the spend key does the rest.
+pub struct Planned {
+    /// Which of this wallet's outputs pay, and how much goes where.
+    pub plan: SpendPlan,
+    /// The subaddress account the inputs came from. Change goes to its main
+    /// address.
+    pub account: u32,
+    /// The fee tier it pays, after [`priority::adjust_priority`].
+    pub priority: u32,
+    pub fee_per_byte: u64,
+    pub payment_id: Option<[u8; 8]>,
+    pub payee: AccountPublicAddress,
+    pub payee_is_subaddress: bool,
+    /// `{account, 0}`, where change goes back to.
+    pub change_to: AccountPublicAddress,
+    pub change_is_subaddress: bool,
+    /// Where an output of nothing goes when there is no change: a throwaway
+    /// address nobody holds the key to.
+    pub dummy: AccountPublicAddress,
+    /// One per `plan.inputs`, in that order, each carrying its ring.
+    pub inputs: Vec<SpendableOutput>,
+    /// The key images the inputs spend, in `plan.inputs` order.
+    pub key_images: Vec<KeyImage>,
+    /// The one source of randomness for this transaction: already used for the
+    /// ring choices, and still needed for the build.
+    pub rng: wow_crypto::random::Rng,
+    pub noted_in_pool: Vec<Hash256>,
+    pub pool_unread: Option<String>,
+}
+
+impl Planned {
+    /// Build and sign the transaction, at the fee its own weight needs.
+    ///
+    /// `view_secret_key` is the sender's, which change is derived from
+    /// ([`transfer::Change`]).
+    pub fn settle(&mut self, view_secret_key: &SecretKey) -> Result<transfer::Settled, SendError> {
+        let payee = (self.payee, self.payee_is_subaddress);
+        let change_to = (self.change_to, self.change_is_subaddress);
+        let dummy = self.dummy;
+        let outputs = |p: &SpendPlan| outputs_for(p, payee, change_to, dummy);
+        // Disjoint fields: the inputs and the plan are read while the
+        // generator is borrowed mutably.
+        let rng = &mut self.rng;
+        transfer::construct_settled(
+            &self.inputs,
+            &self.plan,
+            self.fee_per_byte,
+            self.payment_id,
+            &outputs,
+            view_secret_key,
+            &mut || random_scalar(rng),
+        )
+        .map_err(|e| match e {
+            SettleError::Plan(e) => SendError::Plan(e),
+            SettleError::Build(e) => SendError::Build(e),
+        })
+    }
+}
+
 impl Session {
     /// Plan, ring, build and sign a transaction, and relay nothing.
     ///
@@ -115,6 +205,39 @@ impl Session {
         if self.is_view_only() {
             return Err(SendError::ViewOnly);
         }
+        let mut planned = self.plan_send(request, true)?;
+        let settled = planned.settle(&self.keys_file.account.keys.view_secret_key)?;
+
+        Ok(PreparedSend {
+            address: request.address.to_string(),
+            txid: transfer::transaction_hash(&settled.built.tx),
+            plan: settled.plan,
+            priority: planned.priority,
+            payment_id: planned.payment_id,
+            blob: settled.blob,
+            key_images: planned.key_images,
+            noted_in_pool: planned.noted_in_pool,
+            pool_unread: planned.pool_unread,
+        })
+    }
+
+    /// Everything up to the build: the fee tier, the plan, the rings, and one
+    /// [`SpendableOutput`] per input.
+    ///
+    /// `with_spend_key` is false for a watch-only wallet, which has no one-time
+    /// secret keys and does not need them in order to plan. Its inputs get
+    /// zeros, and a transaction built from them is good for its weight and
+    /// nothing else. The C++ does the same:
+    /// `generate_key_image_helper_precomp` has "for watch-only wallet, simply
+    /// copy the known output pubkey" and leaves the secret null, so
+    /// `create_transactions_2` on a watch-only wallet builds a
+    /// garbage-signed transaction, reads its weight, and writes out only the
+    /// construction data ([`crate::offline`]).
+    pub fn plan_send(
+        &mut self,
+        request: &SendRequest<'_>,
+        with_spend_key: bool,
+    ) -> Result<Planned, SendError> {
         let client = self.daemon.clone().ok_or(SendError::NoDaemon)?;
 
         let decoded = Address::decode_for(request.address, self.network)
@@ -127,10 +250,8 @@ impl Session {
             (Some(p), None) => Some(p),
             (None, other) => other,
         };
-        // A transaction paying a subaddress gives each output a key of its own,
-        // and the id is encrypted under the payee's; the payee decrypts under
-        // the transaction's main key. The C++ takes an id only in an integrated
-        // address, which is never a subaddress.
+        // The C++ takes an id only in an integrated address, which is never a
+        // subaddress: a subaddress is what replaced payment ids.
         if payment_id.is_some() && decoded.kind == AddressKind::Subaddress {
             return Err(SendError::PaymentIdToSubaddress);
         }
@@ -157,52 +278,129 @@ impl Session {
         };
 
         let subaddress = decoded.kind == AddressKind::Subaddress;
+        let pending_change: u64 = self
+            .state
+            .sent
+            .iter()
+            .filter(|s| s.state == SentState::Pending && s.account == request.account)
+            .map(|s| s.change)
+            .sum();
         let options = SpendOptions {
             ring_size: request.ring_size,
             fee_per_byte,
-            extra_size: spend::extra_size(2, payment_id.is_some(), subaddress),
+            // One payee and change: no per-output keys, even to a subaddress.
+            extra_size: spend::extra_size(2, payment_id.is_some(), false),
+            account: request.account,
+            subaddr_indices: request.subaddr_indices.clone(),
+            // `set ignore-outputs-above` and `-below`, which `wallet2` applies
+            // to every selection path. Read here rather than in each front end
+            // so a send and a sweep honour them alike.
+            ignore_above: self.keys_file.ignore_outputs_above(),
+            ignore_below: self.keys_file.ignore_outputs_below(),
+            ignore_fractional_outputs: setting(&self.keys_file, "ignore_fractional_outputs", 1)
+                != 0,
+            min_output_count: setting(&self.keys_file, "min_output_count", 0) as u32,
+            min_output_value: setting(&self.keys_file, "min_output_value", 0),
+            pending_change,
+            sweep_below: request.below_amount,
             chain_height: self.chain_height(),
             now: now(),
             ..Default::default()
         };
-        let plan = match request.amount {
-            Some(amount) => spend::plan(&self.state.transfers, &[amount], &options),
-            None => spend::plan_sweep(&self.state.transfers, &options),
+        // One source for the whole transaction: which of this wallet's outputs
+        // pay, and which of the chain's outputs hide them. Both are choices an
+        // observer must not be able to make for us.
+        let mut rng = crate::entropy::seeded_rng().map_err(SendError::Entropy)?;
+
+        let plan = match (request.amount, &request.sweep_output) {
+            (Some(amount), _) => {
+                spend::plan(&self.state.transfers, &[amount], &options, &mut rng)
+            }
+            (None, Some(k)) => spend::plan_sweep_single(&self.state.transfers, k, &options),
+            (None, None) => spend::plan_sweep(&self.state.transfers, &options, &mut rng),
         }?;
+        // "the tx uses funds from multiple accounts": never, the way the plans
+        // pick, and refused rather than built if it ever did.
+        let account = plan
+            .inputs
+            .first()
+            .map_or(request.account, |&i| self.state.transfers[i].subaddress.major);
+        if plan
+            .inputs
+            .iter()
+            .any(|&i| self.state.transfers[i].subaddress.major != account)
+        {
+            return Err(SendError::Plan(SpendError::MultipleAccounts));
+        }
 
         // A ring for each input, of members the chain has unlocked, or no node
         // will take the transaction.
-        let distribution = client
-            .get_output_distribution(0, 0, self.chain_height().saturating_sub(1))
+        //
+        // The distribution is asked for whole, to the node's tip, as
+        // `wallet2::get_rct_distribution` asks for it before every
+        // transaction, and checked as `get_outs` checks it.
+        let distribution = decoys::rct_distribution(&client).map_err(SendError::Distribution)?;
+        let max_real_index = plan
+            .inputs
+            .iter()
+            .map(|&i| self.state.transfers[i].global_output_index)
+            .max()
+            .unwrap_or(0);
+        decoys::check_distribution(&distribution.offsets, max_real_index)
             .map_err(SendError::Distribution)?;
-        let picker = GammaPicker::new(&distribution).map_err(SendError::Ring)?;
-        let mut rng = crate::entropy::seeded_rng().map_err(SendError::Entropy)?;
+        let picker = GammaPicker::new(&distribution.offsets).map_err(SendError::Ring)?;
+
+        // Every input's ring in one request of the reference's shape, checked
+        // member by member and then as a whole, and the ring database
+        // consulted and kept (`decoys::select_rings`).
+        let mut masks = Vec::with_capacity(plan.inputs.len());
+        let mut reals = Vec::with_capacity(plan.inputs.len());
+        for &i in &plan.inputs {
+            let t = &self.state.transfers[i];
+            let mask = wow_crypto::ops::decode_scalar(&t.mask)
+                .ok_or(SendError::Damaged("its stored mask is not a scalar"))?;
+            reals.push(decoys::RealOutput {
+                global_index: t.global_output_index,
+                public_key: t.public_key.0,
+                commitment: wow_crypto::rct::commit(t.amount, &mask).0,
+                key_image: t.key_image.ok_or(SendError::Damaged("no key image"))?,
+            });
+            masks.push(mask);
+        }
+        // Rings are kept from the moment they are chosen, relayed or not.
+        self.dirty = true;
+        let rings = decoys::select_rings(
+            &distribution.offsets,
+            &picker,
+            &mut rng,
+            &reals,
+            request.ring_size,
+            &mut self.state.rings,
+            |indices| decoys::fetch_members(&client, indices),
+        )
+        .map_err(|e| match e {
+            DecoyError::RealOutputNotReturned(_) => SendError::RingMismatch(e),
+            other => SendError::Ring(other),
+        })?;
 
         let mut inputs = Vec::with_capacity(plan.inputs.len());
         let mut key_images = Vec::with_capacity(plan.inputs.len());
-        for &i in &plan.inputs {
+        for ((&i, (ring, keys)), mask) in plan.inputs.iter().zip(&rings).zip(masks) {
             let t = &self.state.transfers[i];
-            let (ring, keys) = decoys::select_unlocked_ring(
-                &picker,
-                &mut rng,
-                t.global_output_index,
-                request.ring_size,
-                |indices| decoys::fetch_members(&client, indices),
-            )
-            .map_err(SendError::Ring)?;
-
-            let mask = wow_crypto::ops::decode_scalar(&t.mask)
-                .ok_or(SendError::Damaged("its stored mask is not a scalar"))?;
             let assembled = decoys::assemble_ring(
-                &ring,
-                &keys,
+                ring,
+                keys,
                 &t.public_key,
                 &wow_crypto::rct::commit(t.amount, &mask),
             )
             .map_err(SendError::RingMismatch)?;
 
-            let secret_key = crate::refresh::one_time_secret_key(&self.keys_file.account, t)
-                .ok_or(SendError::ViewOnly)?;
+            let secret_key = if with_spend_key {
+                crate::refresh::one_time_secret_key(&self.keys_file.account, t)
+                    .ok_or(SendError::ViewOnly)?
+            } else {
+                SecretKey::ZERO
+            };
             let key_image = t.key_image.ok_or(SendError::Damaged("no key image"))?;
             key_images.push(key_image);
 
@@ -218,44 +416,48 @@ impl Session {
             });
         }
 
-        // Outputs: the payee, then change back to the primary address.
+        // Outputs: the payee, and change back to the main address of the
+        // account the inputs came from, `{subaddr_account, 0}`, named as
+        // change. The builder shuffles them.
+        //
+        // A transaction still needs two outputs when there is no change, as
+        // after a sweep or a send of exactly what an output holds, and
+        // `transfer_selected_rct` sends that zero "to a random address, to
+        // avoid confusing the sender with a 0 amount output". An output of
+        // nothing back to this wallet would be one more thing on chain that
+        // is always the sender's. The address is a throwaway account's, and
+        // the output is derived from this wallet's view key as change is, so
+        // nobody holds the key to it.
         let payee = decoded.keys;
-        let change_to = self.keys_file.account.keys.account_address;
-        let destinations = |p: &SpendPlan| {
-            vec![
-                Destination {
-                    address: payee,
-                    is_subaddress: subaddress,
-                    amount: p.amounts[0],
-                },
-                Destination {
-                    address: change_to,
-                    is_subaddress: false,
-                    amount: p.change,
-                },
-            ]
-        };
-        let settled = transfer::construct_settled(
-            &inputs,
-            &plan,
+        let keys = &self.keys_file.account.keys;
+        let change_to = wow_crypto::get_subaddress(
+            &keys.account_address,
+            &keys.view_secret_key,
+            wow_crypto::types::SubaddressIndex::new(account, 0),
+        )
+        .ok_or(SendError::Damaged("its change address does not derive"))?;
+        let dummy = crate::account::AccountBase::from_spend_key(
+            SecretKey(rng.random_scalar()),
+            0,
+        )
+        .ok_or_else(|| SendError::Entropy("cannot make an address for zero change".into()))?
+        .keys
+        .account_address;
+
+        Ok(Planned {
+            plan,
+            account,
+            priority,
             fee_per_byte,
             payment_id,
-            &destinations,
-            &mut || random_scalar(&mut rng),
-        )
-        .map_err(|e| match e {
-            SettleError::Plan(e) => SendError::Plan(e),
-            SettleError::Build(e) => SendError::Build(e),
-        })?;
-
-        Ok(PreparedSend {
-            address: request.address.to_string(),
-            txid: transfer::transaction_hash(&settled.built.tx),
-            plan: settled.plan,
-            priority,
-            payment_id,
-            blob: settled.blob,
+            payee,
+            payee_is_subaddress: subaddress,
+            change_to,
+            change_is_subaddress: account != 0,
+            dummy,
+            inputs,
             key_images,
+            rng,
             noted_in_pool,
             pool_unread,
         })
@@ -263,19 +465,20 @@ impl Session {
 
     /// Relay a prepared transaction and, once a daemon has taken it, record
     /// it: its inputs spent, and where it went when `store-tx-info` is on.
+    /// `wallet2::commit_tx`.
     ///
-    /// With `do_not_relay` the daemon checks the transaction without passing
-    /// it on, and nothing is recorded, as `wallet2::commit_tx` does not run.
+    /// A caller asked not to relay does not call this at all. That is what
+    /// `do_not_relay` means in `wallet_rpc_server::fill_response`, which then
+    /// skips `commit_tx` entirely: the transaction is built and handed back,
+    /// and no node hears of it until someone relays it. Showing it to a node
+    /// "without passing it on" would still show it to that node.
+    ///
     /// Saving is the caller's to do, and soon: a wallet that forgot a send
     /// would offer the same inputs to the next one.
-    pub fn commit_send(
-        &mut self,
-        prepared: &PreparedSend,
-        do_not_relay: bool,
-    ) -> Result<Relayed, SendError> {
+    pub fn commit_send(&mut self, prepared: &PreparedSend) -> Result<Relayed, SendError> {
         let client = self.daemon.clone().ok_or(SendError::NoDaemon)?;
         let result = client
-            .send_raw_transaction(&prepared.blob, do_not_relay)
+            .send_raw_transaction(&prepared.blob, false)
             .map_err(SendError::Relay)?;
 
         if !result.accepted() {
@@ -293,21 +496,19 @@ impl Session {
             });
         }
 
-        if !do_not_relay {
-            let store = self.keys_file.store_tx_info();
-            let payees = if store {
-                vec![prepared.address.as_str()]
-            } else {
-                Vec::new()
-            };
-            self.state.record_sent(
-                prepared.txid,
-                &prepared.plan,
-                &payees,
-                prepared.payment_id.filter(|_| store),
-                now(),
-            );
-        }
+        let store = self.keys_file.store_tx_info();
+        let payees = if store {
+            vec![prepared.address.as_str()]
+        } else {
+            Vec::new()
+        };
+        self.state.record_sent(
+            prepared.txid,
+            &prepared.plan,
+            &payees,
+            prepared.payment_id.filter(|_| store),
+            now(),
+        );
         self.dirty = true;
         Ok(Relayed {
             result,
@@ -316,8 +517,44 @@ impl Session {
     }
 }
 
+/// The outputs of a plan paying one address: the payee, and change to
+/// `change_to`, or, when there is no change, nothing to `dummy`
+/// (`transfer_selected_rct`). Whichever of the two takes the change is named
+/// as change, so its output is derived from the sender's view key. Each
+/// address comes with whether it is a subaddress.
+fn outputs_for(
+    plan: &SpendPlan,
+    (payee, payee_is_subaddress): (AccountPublicAddress, bool),
+    (change_to, change_is_subaddress): (AccountPublicAddress, bool),
+    dummy: AccountPublicAddress,
+) -> Outputs {
+    let (change, is_subaddress, amount) = if plan.change > 0 {
+        (change_to, change_is_subaddress, plan.change)
+    } else {
+        (dummy, false, 0)
+    };
+    Outputs {
+        destinations: vec![
+            Destination {
+                address: payee,
+                is_subaddress: payee_is_subaddress,
+                amount: plan.amounts[0],
+            },
+            Destination {
+                address: change,
+                is_subaddress,
+                amount,
+            },
+        ],
+        change: Some(change),
+    }
+}
+
 /// A uniform scalar from 256 bits of `rng`.
-fn random_scalar(rng: &mut wow_crypto::random::Rng) -> Scalar {
+///
+/// Shared with [`crate::offline`], so the cold half of a pair draws its
+/// randomness exactly as this one does.
+pub(crate) fn random_scalar(rng: &mut wow_crypto::random::Rng) -> Scalar {
     let mut b = [0u8; 32];
     for chunk in b.chunks_mut(8) {
         chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
@@ -343,7 +580,7 @@ mod tests {
         Session::create_in(
             Box::new(MemoryStore::new("test")),
             Network::Mainnet,
-            String::new(),
+            "",
             1,
             account,
             "English",
@@ -359,6 +596,10 @@ mod tests {
             priority: 0,
             ring_size: decoys::RING_SIZE,
             payment_id: None,
+            sweep_output: None,
+            account: 0,
+            subaddr_indices: Vec::new(),
+            below_amount: 0,
         }
     }
 
@@ -404,5 +645,43 @@ mod tests {
             s.prepare_send(&request(&own)),
             Err(SendError::ViewOnly)
         ));
+    }
+
+    /// Change goes back to this wallet, and no change goes, as nothing, to
+    /// the throwaway address, named as change either way.
+    #[test]
+    fn zero_change_goes_to_a_throwaway_address() {
+        let payee = wallet(5).keys_file.account.keys.account_address;
+        let me = wallet(6).keys_file.account.keys.account_address;
+        let dummy = wallet(7).keys_file.account.keys.account_address;
+        let mut plan = SpendPlan {
+            inputs: vec![0],
+            amounts: vec![700],
+            change: 250,
+            fee: 50,
+            estimated_weight: 0,
+            sweep: false,
+            left_behind: 0,
+        };
+
+        let o = outputs_for(&plan, (payee, true), (me, true), dummy);
+        assert_eq!(o.change, Some(me));
+        assert_eq!(o.destinations[0].address, payee);
+        assert!(o.destinations[0].is_subaddress);
+        assert_eq!(
+            (o.destinations[1].address, o.destinations[1].amount),
+            (me, 250)
+        );
+        assert!(o.destinations[1].is_subaddress, "an account's main address");
+
+        plan.change = 0;
+        let o = outputs_for(&plan, (payee, false), (me, true), dummy);
+        assert!(!o.destinations[1].is_subaddress);
+        assert_eq!(o.change, Some(dummy));
+        assert_eq!(
+            (o.destinations[1].address, o.destinations[1].amount),
+            (dummy, 0)
+        );
+        assert_eq!(o.destinations.len(), 2, "still two outputs");
     }
 }

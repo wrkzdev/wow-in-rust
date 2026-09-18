@@ -23,6 +23,28 @@
 //! height above zero from that height whatever the history says, so a wallet
 //! that kept naming one was answered from the same place every time.
 //!
+//! # What a history must not say
+//!
+//! A daemon sees every history a wallet sends, from wherever it connects. A
+//! history that ends at the block the wallet was restored at names the wallet
+//! across sessions and addresses, and so does a first request for exactly that
+//! height. `wallet2` sends neither, and this copies how:
+//!
+//! * the hashes a wallet holds begin where every wallet's begin: at the last
+//!   hard-coded checkpoint for a wallet restored above it, and at genesis for
+//!   any other. The ones between there and the restore height are listed with
+//!   `gethashes.bin` rather than downloaded as blocks
+//!   (`wallet2::fast_refresh`), and scanning still starts at the restore
+//!   height (`should_skip_block`);
+//! * the first request of a session to an untrusted daemon goes by the hashes
+//!   up to the last whole 1,024 blocks (`FIRST_REFRESH_GRANULARITY`), so it
+//!   says where the wallet is only to that; the blocks between are sent again
+//!   and compared.
+//!
+//! `wallet2::trim_hashchain` also moves the start of the hashes up to just
+//! below the wallet's first payment, to save memory. That is not copied: it
+//! would put the block before the wallet's first payment in every history.
+//!
 //! # What is checked, and what is taken on trust
 //!
 //! Blocks arrive as blobs from a node the wallet did not write. Every one is
@@ -38,13 +60,15 @@
 
 use std::collections::HashMap;
 
-use wow_crypto::types::{Hash256, Hash8, KeyDerivation, KeyImage, PublicKey, SubaddressIndex};
+use wow_crypto::types::{
+    Hash256, Hash8, KeyDerivation, KeyImage, PublicKey, SecretKey, SubaddressIndex,
+};
 use wow_types::block::Block;
 use wow_types::tx::{Transaction, TxIn};
 
 use crate::account::AccountBase;
 use crate::history::{SeenSpend, SentTx};
-use crate::scan::{scan_transaction, ScanKeys};
+use crate::scan::ScanKeys;
 use crate::subaddress::SubaddressTable;
 
 /// `COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT`.
@@ -53,6 +77,10 @@ pub const MAX_BLOCKS_PER_CALL: u64 = 1_000;
 /// The fewest blocks a batch is cut down to. A reply starts with a block the
 /// wallet already holds, so one block alone would never bring anything new.
 const MIN_BLOCKS_PER_CALL: u64 = 2;
+
+/// `FIRST_REFRESH_GRANULARITY`: how finely the first request of a session
+/// tells an untrusted daemon how far the wallet has got.
+pub const FIRST_REFRESH_GRANULARITY: u64 = 1_024;
 
 /// `wallet2`'s log category, so one `--log-level` means the same to both.
 const LOG: &str = "wallet.wallet2";
@@ -83,7 +111,29 @@ pub struct Transfer {
     /// that holds the output's public key and transaction id already links the
     /// two. It is not enough to spend with; that needs the spend key.
     pub derivation: KeyDerivation,
+    /// The transaction's own public key, `R`, and its per-output keys.
+    ///
+    /// Kept because `export_outputs` sends them to the cold half of a
+    /// cold-signing pair, which has the spend key and so can turn them back
+    /// into key images: `exported_transfer_details` carries `m_tx_pubkey` and
+    /// `m_additional_tx_keys` and nothing else would supply them. The C++
+    /// keeps the whole `transaction_prefix` on every `transfer_details` and
+    /// reads them back out of `extra`; these two fields are the part of it
+    /// that is used.
+    ///
+    /// `derivation` is not enough: it is `8*a*R`, which cannot be turned back
+    /// into `R` without knowing which of the transaction's keys it came from.
+    pub tx_public_key: PublicKey,
+    pub additional_tx_keys: Vec<PublicKey>,
     pub key_image: Option<KeyImage>,
+    /// `m_key_image_request`: this output's key image is wanted from the other
+    /// half of a cold-signing pair.
+    ///
+    /// Set on a watch-only wallet, which cannot compute one, and on a cold
+    /// wallet for the outputs it has just imported, which is how
+    /// `export_key_images` knows which ones were asked for
+    /// ([`crate::offline`]).
+    pub key_image_request: bool,
     pub mask: [u8; 32],
     pub amount: u64,
     pub subaddress: SubaddressIndex,
@@ -98,6 +148,9 @@ pub struct Transfer {
     /// files its `payment_details` under. `None` for none, and when read from
     /// a cache written before it was kept.
     pub payment_id: Option<Hash8>,
+    /// `m_frozen`: set aside by `freeze`, so that nothing spends it, and not
+    /// counted in the balance, until `thaw`.
+    pub frozen: bool,
 }
 
 impl Transfer {
@@ -161,6 +214,15 @@ pub struct Batch {
     pub current_height: u64,
 }
 
+/// Block hashes, as `gethashes.bin` lists them.
+#[derive(Clone, Debug, Default)]
+pub struct Hashes {
+    /// From `start_height` up.
+    pub hashes: Vec<Hash256>,
+    pub start_height: u64,
+    pub current_height: u64,
+}
+
 /// Where blocks come from.
 ///
 /// A trait rather than a `DaemonClient` directly, so the loop can be driven by
@@ -182,6 +244,20 @@ pub trait BlockSource {
     /// fewer blocks might get past.
     fn cut_short(_error: &Self::Error) -> bool {
         false
+    }
+
+    /// Block hashes from where `block_ids` meets the source's chain, that
+    /// block included: `gethashes.bin`.
+    ///
+    /// `None` for a source that cannot list hashes on their own. A wallet
+    /// restored above zero then names its height, and its hashes begin
+    /// there, as they did before hashes could be listed; a daemon lists them,
+    /// and only a fixture says `None`.
+    fn get_hashes(
+        &self,
+        _block_ids: &[Hash256],
+    ) -> std::result::Result<Option<Hashes>, Self::Error> {
+        Ok(None)
     }
 }
 
@@ -207,6 +283,15 @@ pub enum RefreshError {
         "the daemon answered from height {from} with no block this wallet could add, though its chain reaches {current}"
     )]
     NoProgress { from: u64, current: u64 },
+    #[error(
+        "the daemon listed block hashes from height {got}, not from a block it was asked about: \
+         it is still syncing, or on another chain"
+    )]
+    UnaskedHashes { got: u64 },
+    #[error(
+        "the daemon's chain stops at height {top}, below the blocks this wallet holds from {held}"
+    )]
+    ShortChain { top: u64, held: u64 },
 }
 
 type Result<T> = std::result::Result<T, RefreshError>;
@@ -275,8 +360,15 @@ pub struct WalletState {
     /// block, which is a few megabytes for this chain, and it is what makes the
     /// short chain history and reorg detection possible without a round trip.
     pub hashes: Vec<Hash256>,
-    /// The height `hashes[0]` sits at.
+    /// The height `hashes[0]` sits at: `m_blockchain.offset()`. Once filled
+    /// in, a height every wallet shares (the module documentation says why).
     pub start_height: u64,
+    /// `m_refresh_from_block_height`: nothing below it is scanned. The hashes
+    /// below it are still kept.
+    pub refresh_from_height: u64,
+    /// `trusted_daemon`: the first request of a session goes by every hash
+    /// held, not by the last whole [`FIRST_REFRESH_GRANULARITY`] of them.
+    pub trusted_daemon: bool,
     pub transfers: Vec<Transfer>,
     /// Key image → index into `transfers`, for spotting our own outputs being
     /// spent.
@@ -287,6 +379,9 @@ pub struct WalletState {
     /// Transactions that spent this wallet's outputs, sent from here or found
     /// in a block ([`crate::history`]).
     pub sent: Vec<SentTx>,
+    /// The rings this wallet has spent with ([`crate::rings`]). Kept across a
+    /// rescan and a reorganisation, which is when they matter.
+    pub rings: crate::rings::RingDb,
     /// `max_reorg_depth`. Zero means unlimited, as in the reference.
     pub max_reorg_depth: u64,
     /// This chain's genesis hash.
@@ -298,6 +393,24 @@ pub struct WalletState {
     /// doubled back after one that arrives whole. Not saved; each run starts
     /// at the most a daemon sends.
     batch_size: u64,
+    /// This network's last hard-coded checkpoint: where the hashes of a
+    /// wallet restored above it begin.
+    checkpoint: Option<(u64, Hash256)>,
+    /// Hashes listed from where the held ones should begin, while they are
+    /// being filled in below. Not saved.
+    fill: Vec<Hash256>,
+    /// `m_first_refresh_done`. Not saved: the first request of every session
+    /// is the coarse one, as it is in the reference.
+    first_refresh_done: bool,
+    /// `m_has_ever_refreshed_from_node`: this wallet has asked a node for
+    /// blocks at least once, ever.
+    ///
+    /// Saved, because it is what `import_outputs` refuses on -- "Hot wallets
+    /// cannot import outputs" (`wallet2.cpp` 14999). Importing outputs
+    /// overwrites the whole output list with entries that have no block
+    /// height, no transaction id and no mask, so doing it to a wallet that has
+    /// scanned the chain would throw away what it scanned.
+    pub ever_refreshed: bool,
 }
 
 impl WalletState {
@@ -323,12 +436,21 @@ impl WalletState {
                 Vec::new()
             },
             start_height,
+            refresh_from_height: start_height,
+            trusted_daemon: false,
             transfers: Vec::new(),
             by_key_image: HashMap::new(),
             by_public_key: HashMap::new(),
             sent: Vec::new(),
+            rings: Default::default(),
             max_reorg_depth: 0,
             batch_size: MAX_BLOCKS_PER_CALL,
+            checkpoint: wow_consensus::checkpoints::table(network)
+                .last()
+                .map(|c| (c.height, c.hash)),
+            fill: Vec::new(),
+            first_refresh_done: false,
+            ever_refreshed: false,
         }
     }
 
@@ -342,10 +464,12 @@ impl WalletState {
     ///
     /// `wallet2::balance` counts that change too. Without it, a send looks as
     /// if it took the whole of its inputs until a block carries it.
+    ///
+    /// A frozen output is not in it, as `balance_per_subaddress` leaves it out.
     pub fn balance(&self) -> u64 {
         self.transfers
             .iter()
-            .filter(|t| !t.spent)
+            .filter(|t| !t.spent && !t.frozen)
             .map(|t| t.amount)
             .sum::<u64>()
             + self.pending_change()
@@ -359,7 +483,7 @@ impl WalletState {
     pub fn unlocked_balance(&self, chain_height: u64, now: u64) -> u64 {
         self.transfers
             .iter()
-            .filter(|t| !t.spent && t.unlocked(chain_height, now))
+            .filter(|t| !t.spent && !t.frozen && t.unlocked(chain_height, now))
             .map(|t| t.amount)
             .sum()
     }
@@ -371,7 +495,7 @@ impl WalletState {
     pub fn locked(&self, chain_height: u64, now: u64) -> (u64, Option<u64>) {
         self.transfers
             .iter()
-            .filter(|t| !t.spent && !t.unlocked(chain_height, now))
+            .filter(|t| !t.spent && !t.frozen && !t.unlocked(chain_height, now))
             .fold((0, None), |(total, soonest): (u64, Option<u64>), t| {
                 let blocks =
                     blocks_until_unlocked(t.unlock_time, t.block_height, chain_height, now);
@@ -382,12 +506,63 @@ impl WalletState {
             })
     }
 
+    /// `wallet2::get_transfer_details(ki)`: which output has this key image.
+    ///
+    /// The C++ walks every transfer and skips one whose key image is not
+    /// known; this reads the index it keeps for the same question while
+    /// scanning, which only ever holds outputs that have one. The message is
+    /// the one `wallet2` throws, because `simple_wallet::freeze_thaw` prints
+    /// it as it comes.
+    pub fn transfer_details(
+        &self,
+        key_image: &KeyImage,
+    ) -> std::result::Result<usize, &'static str> {
+        self.by_key_image
+            .get(key_image)
+            .copied()
+            .ok_or("Key image not found")
+    }
+
+    /// `wallet2::freeze(const key_image&)`: set one output aside, so that
+    /// nothing spends it and no balance counts it, until [`thaw`](Self::thaw).
+    ///
+    /// The defence against a dust attack: a stranger pays a wallet a tiny
+    /// output in the hope of seeing it spent alongside real ones, and so
+    /// learning what belongs together.
+    pub fn freeze(&mut self, key_image: &KeyImage) -> std::result::Result<(), &'static str> {
+        let i = self.transfer_details(key_image)?;
+        self.transfers[i].frozen = true;
+        Ok(())
+    }
+
+    /// `wallet2::thaw(const key_image&)`: let it be spent again.
+    pub fn thaw(&mut self, key_image: &KeyImage) -> std::result::Result<(), &'static str> {
+        let i = self.transfer_details(key_image)?;
+        self.transfers[i].frozen = false;
+        Ok(())
+    }
+
+    /// `wallet2::frozen(const key_image&)`.
+    pub fn frozen(&self, key_image: &KeyImage) -> std::result::Result<bool, &'static str> {
+        let i = self.transfer_details(key_image)?;
+        Ok(self.transfers[i].frozen)
+    }
+
     /// The short chain history: the last ten hashes, then exponentially spaced
     /// ones, then genesis (`specs/12` §3.1).
     ///
     /// Newest first. The gaps are what make a deep reorg cost one round trip
     /// instead of one per block.
     pub fn short_chain_history(&self) -> Vec<Hash256> {
+        self.history_at(1)
+    }
+
+    /// `wallet2::get_short_chain_history(ids, granularity)`: the history of
+    /// the hashes held up to the last whole `granularity` blocks of the chain,
+    /// and never fewer than the first. The first request of a session to an
+    /// untrusted daemon goes by [`FIRST_REFRESH_GRANULARITY`], so its newest
+    /// hash says where the wallet is only to the nearest 1,024 blocks.
+    fn history_at(&self, granularity: u64) -> Vec<Hash256> {
         let mut out = Vec::new();
         // A wallet that has scanned nothing still sends genesis, never an
         // empty list. `wallet2::get_short_chain_history` does the same:
@@ -410,7 +585,8 @@ impl WalletState {
             return out;
         }
 
-        let len = self.hashes.len();
+        let whole = self.scan_height() / granularity.max(1) * granularity.max(1);
+        let len = (whole.saturating_sub(self.start_height) as usize).min(self.hashes.len());
         let mut i = 0usize; // how far back from the tip
         let mut step = 1usize;
         while i < len {
@@ -430,6 +606,151 @@ impl WalletState {
             }
         }
         out
+    }
+
+    /// Where this wallet's hashes begin once they are filled in:
+    /// `wallet2::fast_refresh`.
+    ///
+    /// The last checkpoint, for a wallet that starts scanning above it, and
+    /// genesis for any other. Every wallet on the network begins at one of
+    /// the two, so the oldest hash in a history says nothing about which
+    /// wallet sent it.
+    fn history_base(&self) -> u64 {
+        match self.checkpoint {
+            Some((height, _)) if self.refresh_from_height > height => height,
+            _ => 0,
+        }
+    }
+
+    /// Where the held hashes should reach down to, when they do not reach
+    /// [`history_base`](Self::history_base) yet: the first held one, or where
+    /// scanning starts when none is held.
+    fn fill_target(&self) -> Option<u64> {
+        let base = self.history_base();
+        let target = if self.hashes.is_empty() {
+            self.refresh_from_height.max(self.start_height)
+        } else {
+            self.start_height
+        };
+        (target > base && (self.hashes.is_empty() || self.start_height > base))
+            .then_some(target)
+    }
+
+    /// One `gethashes.bin` toward [`fill_target`](Self::fill_target), as a
+    /// turn of `wallet2::fast_refresh`'s loop.
+    ///
+    /// Hashes are gathered apart from the held ones, and put under them once
+    /// they reach them. `None` when the source cannot list hashes, and the
+    /// refresh carries on without.
+    fn fill_below<S: BlockSource>(
+        &mut self,
+        source: &S,
+        target: u64,
+    ) -> Result<Option<RefreshSummary>> {
+        let base = self.history_base();
+        if self.fill.is_empty() {
+            self.fill.push(match self.checkpoint {
+                // Checked against the hard-coded one: a daemon that disagrees
+                // is on another chain.
+                Some((height, hash)) if base > 0 && height == base => hash,
+                _ => self.genesis,
+            });
+        }
+        // The newest three gathered, then where they began, then genesis.
+        // `fast_refresh` keeps three for the reason given there: a block or two
+        // reorganised away since the last call.
+        let mut history: Vec<Hash256> = self.fill.iter().rev().take(3).copied().collect();
+        for anchor in [self.fill[0], self.genesis] {
+            if history.last() != Some(&anchor) {
+                history.push(anchor);
+            }
+        }
+        let listed = source
+            .get_hashes(&history)
+            .map_err(|e| RefreshError::Source(e.to_string()))?;
+        let Some(listed) = listed else {
+            self.fill.clear();
+            return Ok(None);
+        };
+
+        let top = base + self.fill.len() as u64;
+        if listed.start_height < base || listed.start_height >= top {
+            self.fill.clear();
+            return Err(RefreshError::UnaskedHashes {
+                got: listed.start_height,
+            });
+        }
+        let before = self.fill.len();
+        let mut at_target = None;
+        for (i, hash) in listed.hashes.iter().enumerate() {
+            let height = listed.start_height + i as u64;
+            if height >= target {
+                at_target = Some(*hash);
+                break;
+            }
+            let at = (height - base) as usize;
+            if at < self.fill.len() {
+                if self.fill[at] == *hash {
+                    continue;
+                }
+                if at == 0 {
+                    let expected = self.fill[0];
+                    self.fill.clear();
+                    return Err(RefreshError::BrokenChain {
+                        height,
+                        names: wow_crypto::hex::encode(hash),
+                        expected: wow_crypto::hex::encode(&expected),
+                    });
+                }
+                // Reorganised away since it was listed.
+                self.fill.truncate(at);
+            }
+            self.fill.push(*hash);
+        }
+        let reached = at_target.is_some() || base + self.fill.len() as u64 >= target;
+        wow_log::debug!(
+            LOG,
+            "{} block hash(es) listed from {}, filled in from {base} to {}",
+            listed.hashes.len(),
+            listed.start_height,
+            base + self.fill.len() as u64
+        );
+        let mut summary = RefreshSummary {
+            current_height: listed.current_height,
+            ..Default::default()
+        };
+        if !reached && self.fill.len() > before {
+            return Ok(Some(summary));
+        }
+
+        // Reached the held hashes, or the daemon has no more to list.
+        let gathered = std::mem::take(&mut self.fill);
+        if !self.hashes.is_empty() {
+            if !reached {
+                return Err(RefreshError::ShortChain {
+                    top: base + gathered.len() as u64,
+                    held: self.start_height,
+                });
+            }
+            if at_target.is_some_and(|h| h != self.hashes[0]) {
+                // The chain changed below the first block held since it was
+                // scanned: what was scanned from there goes, and is scanned
+                // again.
+                self.check_reorg_depth(self.scan_height() - self.start_height)?;
+                wow_log::info!(
+                    LOG,
+                    "the chain changed below height {}; detaching from there",
+                    self.start_height
+                );
+                summary.reorg_to = Some(self.start_height);
+                self.detach(self.start_height);
+            }
+        }
+        let mut hashes = gathered;
+        hashes.append(&mut self.hashes);
+        self.hashes = hashes;
+        self.start_height = base;
+        Ok(Some(summary))
     }
 
     pub(crate) fn keys(&self) -> ScanKeys<'_> {
@@ -463,9 +784,10 @@ impl WalletState {
         self.detach_sent(height);
     }
 
-    /// Rebuild the lookups over `transfers`, after it was cut short or read
-    /// back from a cache.
-    pub(crate) fn reindex(&mut self) {
+    /// Rebuild the lookups over `transfers`, after it was cut short, read
+    /// back from a cache, or set up by hand -- which a test does, and which
+    /// is why this is public.
+    pub fn reindex(&mut self) {
         self.by_key_image = self
             .transfers
             .iter()
@@ -496,6 +818,8 @@ impl WalletState {
         self.by_key_image.clear();
         self.by_public_key.clear();
         self.start_height = height;
+        self.refresh_from_height = height;
+        self.fill.clear();
         self.detach_sent(height);
     }
 
@@ -503,8 +827,24 @@ impl WalletState {
     ///
     /// Returns what happened. Call it until
     /// [`caught_up`](RefreshSummary::caught_up).
+    ///
+    /// A wallet whose hashes do not yet begin where every wallet's begin gets
+    /// hashes rather than blocks, a call at a time, until they do: no blocks
+    /// are scanned by those calls, and they are not caught up.
     pub fn refresh_once<S: BlockSource>(&mut self, source: &S) -> Result<RefreshSummary> {
-        let history = self.short_chain_history();
+        if let Some(target) = self.fill_target() {
+            if let Some(summary) = self.fill_below(source, target)? {
+                return Ok(summary);
+            }
+        }
+        // `wallet2::refresh`: coarse for the first request of a session,
+        // unless the daemon is trusted.
+        let granularity = if self.first_refresh_done || self.trusted_daemon {
+            1
+        } else {
+            FIRST_REFRESH_GRANULARITY
+        };
+        let history = self.history_at(granularity);
         // A start height above zero makes the reference answer from there and
         // ignore the history, so it is only named while there is no history to
         // go by. After that it is zero and the hashes decide, as
@@ -540,6 +880,10 @@ impl WalletState {
         };
         // Back toward the most, after a reply that arrived whole.
         self.batch_size = (self.batch_size * 2).min(MAX_BLOCKS_PER_CALL);
+        self.first_refresh_done = true;
+        // `pull_blocks`: a node has been asked, so this is no longer a wallet
+        // that could import an output list ([`crate::offline`]).
+        self.ever_refreshed = true;
 
         let mut summary = RefreshSummary {
             current_height: batch.current_height,
@@ -583,6 +927,15 @@ impl WalletState {
             return Ok(summary);
         }
 
+        // The scalar multiplications for the whole batch, on every core, before
+        // anything is decided. See `precompute_derivations`. Not for blocks
+        // held already, nor below where scanning starts: neither is scanned.
+        let ready = precompute_derivations(
+            &batch,
+            &self.account.keys.view_secret_key,
+            self.scan_height().max(self.refresh_from_height),
+        );
+
         for (n, bundle) in batch.blocks.iter().enumerate() {
             let height = batch.start_height + n as u64;
             // Below where this wallet starts, from a daemon that did not answer
@@ -606,7 +959,7 @@ impl WalletState {
                 self.detach(height);
                 summary.reorg_to = Some(height);
             }
-            self.process_block(height, &block, block_hash, bundle, &mut summary)?;
+            self.process_block(height, &block, block_hash, bundle, &mut summary, &ready)?;
             summary.blocks_scanned += 1;
         }
 
@@ -617,7 +970,10 @@ impl WalletState {
             summary.blocks_scanned,
             self.scan_height()
         );
-        if summary.blocks_scanned == 0 && !summary.caught_up {
+        // A coarse request is answered from up to 1,023 blocks below the tip
+        // of what is held, which can be a whole batch of nothing new. The
+        // next request goes by every hash, and does get further.
+        if summary.blocks_scanned == 0 && !summary.caught_up && granularity == 1 {
             // Asking again would get the same answer, forever.
             return Err(RefreshError::NoProgress {
                 from: batch.start_height,
@@ -671,6 +1027,7 @@ impl WalletState {
         block_hash: Hash256,
         bundle: &BlockBundle,
         summary: &mut RefreshSummary,
+        ready: &Derivations,
     ) -> Result<()> {
         // The chain must be continuous. A daemon that serves a block whose
         // parent we do not have at the height below is serving a different
@@ -683,6 +1040,17 @@ impl WalletState {
                     expected: wow_crypto::hex::encode(previous),
                 });
             }
+        }
+
+        // Below where this wallet starts scanning, only the hash is kept, for
+        // the history: `wallet2::should_skip_block`. Such a block arrives after
+        // a reorg below the restore height, or when the hashes could not be
+        // listed up to it.
+        if height < self.refresh_from_height {
+            if height == self.scan_height() {
+                self.hashes.push(block_hash);
+            }
+            return Ok(());
         }
 
         // Each transaction's id is the block's, as `wallet2` takes it: a pruned
@@ -711,6 +1079,7 @@ impl WalletState {
             wow_types::hashes::transaction_hash(&block.miner_tx).unwrap_or(wow_crypto::NULL_HASH),
             &coinbase_indices,
             summary,
+            ready.get(height, 0),
         );
 
         for (i, (blob, &txid)) in bundle.txs.iter().zip(&block.tx_hashes).enumerate() {
@@ -728,7 +1097,15 @@ impl WalletState {
                 .get(i + 1)
                 .cloned()
                 .unwrap_or_default();
-            self.process_transaction(height, timestamp, &tx, txid, &indices, summary);
+            self.process_transaction(
+                height,
+                timestamp,
+                &tx,
+                txid,
+                &indices,
+                summary,
+                ready.get(height, i + 1),
+            );
         }
 
         if height == self.scan_height() {
@@ -737,6 +1114,7 @@ impl WalletState {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_transaction(
         &mut self,
         height: u64,
@@ -745,6 +1123,7 @@ impl WalletState {
         txid: Hash256,
         global_indices: &[u64],
         summary: &mut RefreshSummary,
+        ready: Option<&crate::scan::Derivations>,
     ) {
         let is_coinbase = matches!(tx.prefix.vin.first(), Some(TxIn::Gen { .. }));
 
@@ -781,13 +1160,26 @@ impl WalletState {
         // Then receipts. A scan failure is a fact about the transaction, not
         // about the wallet: a malformed transaction on chain must not stop a
         // refresh, and the reference logs and moves on too.
-        let found = scan_transaction(tx, &self.keys()).unwrap_or_default();
+        let found = crate::scan::scan_transaction_with(tx, &self.keys(), ready).unwrap_or_default();
         // Decrypting the payment id costs a scalar multiplication, so only a
         // transaction that paid this wallet is asked for one.
         let payment_id = if found.is_empty() {
             None
         } else {
             crate::scan::payment_id(tx, &self.account.keys.view_secret_key)
+        };
+
+        // The transaction's public keys, kept on every output this wallet
+        // owns so that `export_outputs` can hand them to a cold wallet. Cheap:
+        // `extra` has already been parsed by the scan above.
+        let (tx_public_key, additional_tx_keys) = if found.is_empty() {
+            (PublicKey::ZERO, Vec::new())
+        } else {
+            let extra = wow_types::tx_extra::parse_tx_extra(&tx.prefix.extra);
+            (
+                extra.tx_pubkey().unwrap_or(PublicKey::ZERO),
+                extra.additional_pubkeys().unwrap_or(&[]).to_vec(),
+            )
         };
 
         let mut received = 0u64;
@@ -800,6 +1192,8 @@ impl WalletState {
                 block_height: height,
                 txid,
                 derivation: r.derivation,
+                tx_public_key,
+                additional_tx_keys: additional_tx_keys.clone(),
                 internal_output_index: r.output_index,
                 global_output_index: global_indices
                     .get(r.output_index as usize)
@@ -807,6 +1201,11 @@ impl WalletState {
                     .unwrap_or(0),
                 public_key: r.public_key,
                 key_image,
+                // A wallet that cannot compute a key image wants one from the
+                // half that can: `process_new_transaction`'s
+                // `td.m_key_image_request = key_image_request`, which is set
+                // for a watch-only wallet.
+                key_image_request: key_image.is_none(),
                 mask: r.mask,
                 amount: r.amount,
                 subaddress: r.subaddress,
@@ -816,6 +1215,7 @@ impl WalletState {
                 is_coinbase,
                 timestamp,
                 payment_id,
+                frozen: false,
             });
             let burnt = match receipt {
                 Receipt::Ignored => continue,
@@ -838,6 +1238,10 @@ impl WalletState {
         }
 
         if let Some(account) = account {
+            // `process_outgoing` keeps the rings of a spend of ours
+            // (`add_rings`), so an output spent again elsewhere is spent with
+            // the same ring.
+            self.rings.add_rings(&tx.prefix);
             minors.sort_unstable();
             minors.dedup();
             self.spend_seen(SeenSpend {
@@ -872,8 +1276,13 @@ impl WalletState {
             }
             let burnt = held.amount;
             // The key image is the same: it depends only on the one-time key.
+            // And an output set aside stays set aside: the C++ updates the
+            // held entry in place and leaves `m_frozen` as it was.
+            let key_image = held.key_image.or(t.key_image);
             *held = Transfer {
-                key_image: held.key_image.or(t.key_image),
+                key_image,
+                key_image_request: key_image.is_none(),
+                frozen: held.frozen,
                 ..t
             };
             return Receipt::Replaced { burnt };
@@ -889,6 +1298,124 @@ impl WalletState {
 }
 
 /// Parse a block a source sent, and hash it.
+/// Every transaction's key derivations in a batch, by height and slot.
+///
+/// Slot 0 is the coinbase and slot `i + 1` the `i`th transaction, the same
+/// numbering `output_indices` uses.
+///
+/// # Why this exists
+///
+/// Scanning a transaction is one scalar multiplication and then some very
+/// cheap arithmetic: the view tag rejects almost every output after a single
+/// hash. So a refresh is, to within rounding, one curve multiplication per
+/// transaction — and they are all independent of each other and of the wallet.
+///
+/// A derivation is a pure function of the transaction's public keys and the
+/// view secret key, so computing them all in advance cannot change what a scan
+/// finds. It only decides when the work happens, which is the same argument
+/// `wownerod` makes for hashing a sync batch's proofs of work before it takes
+/// the chain lock, and what `wallet2` does with its thread pool.
+///
+/// A miss is not an error. Anything absent — a browser build, where there are
+/// no threads, or a transaction that did not parse here — is computed by the
+/// scan itself, exactly as before.
+#[derive(Debug, Default)]
+struct Derivations {
+    by_slot: std::collections::HashMap<(u64, usize), crate::scan::Derivations>,
+}
+
+impl Derivations {
+    fn get(&self, height: u64, slot: usize) -> Option<&crate::scan::Derivations> {
+        self.by_slot.get(&(height, slot))
+    }
+}
+
+/// One batch's worth of transactions, as `(height, slot, blob)`, from the
+/// block at `from` up.
+///
+/// The blobs are borrowed from the batch; the coinbase is re-serialized,
+/// because it arrives inside the block rather than beside it.
+fn batch_transactions(
+    batch: &Batch,
+    from: u64,
+) -> Vec<(u64, usize, bool, std::borrow::Cow<'_, [u8]>)> {
+    use std::borrow::Cow;
+    let mut out = Vec::new();
+    for (n, bundle) in batch.blocks.iter().enumerate() {
+        let height = batch.start_height + n as u64;
+        if height < from {
+            continue;
+        }
+        if let Ok(block) = Block::from_blob(&bundle.block) {
+            let mut w = wow_serialize::binary::Writer::with_capacity(1024);
+            block.miner_tx.write(&mut w);
+            // A coinbase is never pruned: it arrives inside the block.
+            out.push((height, 0, false, Cow::Owned(w.as_slice().to_vec())));
+        }
+        for (i, blob) in bundle.txs.iter().enumerate() {
+            out.push((height, i + 1, bundle.pruned, Cow::Borrowed(blob.as_slice())));
+        }
+    }
+    out
+}
+
+/// Compute a batch's derivations on every core, from the block at `from` up.
+#[cfg(not(target_arch = "wasm32"))]
+fn precompute_derivations(batch: &Batch, view_secret_key: &SecretKey, from: u64) -> Derivations {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let work = batch_transactions(batch, from);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(work.len());
+    if threads <= 1 {
+        // One core, or one transaction: the scan does it itself and saves a
+        // parse.
+        return Derivations::default();
+    }
+
+    let out = Mutex::new(std::collections::HashMap::with_capacity(work.len()));
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut mine = Vec::new();
+                while let Some((height, slot, pruned, blob)) =
+                    work.get(next.fetch_add(1, Ordering::Relaxed))
+                {
+                    let parsed = if *pruned {
+                        Transaction::from_blob_base_only(blob)
+                    } else {
+                        Transaction::from_blob(blob)
+                    };
+                    // A blob that does not parse is left out. The serial pass
+                    // parses it again and reports the failure with the height
+                    // and the reason, which this cannot.
+                    if let Ok(tx) = parsed {
+                        if let Some(d) = crate::scan::derivations_for(&tx, view_secret_key) {
+                            mine.push(((*height, *slot), d));
+                        }
+                    }
+                }
+                let mut held = out.lock().unwrap_or_else(|e| e.into_inner());
+                held.extend(mine);
+            });
+        }
+    });
+
+    Derivations {
+        by_slot: out.into_inner().unwrap_or_else(|e| e.into_inner()),
+    }
+}
+
+/// A browser has no threads to spread this over, so the scan does its own
+/// derivations as it always did.
+#[cfg(target_arch = "wasm32")]
+fn precompute_derivations(_batch: &Batch, _view_secret_key: &SecretKey, _from: u64) -> Derivations {
+    Derivations::default()
+}
+
 fn parse_block(height: u64, bundle: &BlockBundle) -> Result<(Block, Hash256)> {
     let block = Block::from_blob(&bundle.block).map_err(|e| RefreshError::BadBlock {
         height,
@@ -979,6 +1506,18 @@ impl BlockSource for wow_daemon_client::DaemonClient {
             error,
             wow_daemon_client::DaemonError::Http(wow_daemon_client::HttpError::Truncated { .. })
         )
+    }
+
+    fn get_hashes(
+        &self,
+        block_ids: &[Hash256],
+    ) -> std::result::Result<Option<Hashes>, Self::Error> {
+        let res = wow_daemon_client::DaemonClient::get_hashes(self, block_ids)?;
+        Ok(Some(Hashes {
+            hashes: res.hashes,
+            start_height: res.start_height,
+            current_height: res.current_height,
+        }))
     }
 }
 
@@ -1083,9 +1622,15 @@ mod tests {
             Scalar::from_bytes_mod_order(b)
         };
 
-        crate::transfer::construct(
+        // The sender's own output named as change, as a wallet names it: a
+        // payment id is encrypted to the one payee there is.
+        crate::transfer::construct_with_change(
             std::slice::from_ref(&input),
             &destinations,
+            Some(crate::transfer::Change {
+                address: sender.keys.account_address,
+                view_secret_key: &sender.keys.view_secret_key,
+            }),
             fee,
             payment_id,
             &mut rand,
@@ -1667,6 +2212,10 @@ mod tests {
             is_coinbase: false,
             timestamp: 0,
             payment_id: None,
+            frozen: false,
+            tx_public_key: PublicKey::ZERO,
+            additional_tx_keys: Vec::new(),
+            key_image_request: false,
         };
 
         let now = 1_700_000_000;
@@ -1755,6 +2304,10 @@ mod tests {
             is_coinbase: false,
             timestamp: 0,
             payment_id: None,
+            frozen: false,
+            tx_public_key: PublicKey::ZERO,
+            additional_tx_keys: Vec::new(),
+            key_image_request: false,
         };
         assert_eq!(w.add_transfer(first.clone()), Receipt::New);
 
@@ -1864,6 +2417,7 @@ mod tests {
             fee: 500,
             estimated_weight: 0,
             sweep: false,
+            left_behind: 0,
         };
         w.record_sent(txid, &plan, &["Wo1payee"], None, 1_700_000_000);
         assert!(w.transfers[0].spent, "spent from the moment it is relayed");
@@ -1934,10 +2488,10 @@ mod tests {
         assert_eq!(w.hashes, chain.hashes);
     }
 
-    /// A wallet restored above zero names its height only while it holds no
-    /// hashes. The reference answers a start height above zero from that
-    /// height whatever the history says, so a wallet that went on naming it
-    /// was sent the same blocks on every call.
+    /// A wallet restored above zero, from a source that cannot list hashes,
+    /// names its height only while it holds no hashes. The reference answers a
+    /// start height above zero from that height whatever the history says, so
+    /// a wallet that went on naming it was sent the same blocks on every call.
     #[test]
     fn a_restored_wallet_names_its_height_only_until_it_has_a_history() {
         use std::cell::RefCell;
@@ -2180,5 +2734,211 @@ mod tests {
         w.rescan_from(40);
         assert!(w.hashes.is_empty());
         assert_eq!(w.scan_height(), 40);
+        assert_eq!(w.refresh_from_height, 40, "and scanning starts there");
+    }
+
+    /// A daemon over a [`Chain`] that lists hashes too, at most a thousand a
+    /// call as this node's `gethashes.bin` does, and writes down what it was
+    /// asked.
+    struct Listing<'a> {
+        chain: &'a Chain,
+        blocks_asked: std::cell::RefCell<Vec<(Vec<Hash256>, u64)>>,
+        hashes_asked: std::cell::RefCell<Vec<Vec<Hash256>>>,
+    }
+
+    impl<'a> Listing<'a> {
+        fn new(chain: &'a Chain) -> Listing<'a> {
+            Listing {
+                chain,
+                blocks_asked: Default::default(),
+                hashes_asked: Default::default(),
+            }
+        }
+    }
+
+    impl BlockSource for Listing<'_> {
+        type Error = Never;
+
+        fn get_blocks(
+            &self,
+            ids: &[Hash256],
+            start: u64,
+            max: u64,
+        ) -> std::result::Result<Batch, Never> {
+            self.blocks_asked.borrow_mut().push((ids.to_vec(), start));
+            self.chain.get_blocks(ids, start, max)
+        }
+
+        fn get_hashes(&self, ids: &[Hash256]) -> std::result::Result<Option<Hashes>, Never> {
+            self.hashes_asked.borrow_mut().push(ids.to_vec());
+            let from = ids
+                .iter()
+                .find_map(|h| self.chain.hashes.iter().position(|x| x == h))
+                .unwrap_or(0);
+            let end = self
+                .chain
+                .hashes
+                .len()
+                .min(from + MAX_BLOCKS_PER_CALL as usize);
+            Ok(Some(Hashes {
+                hashes: self.chain.hashes[from..end].to_vec(),
+                start_height: from as u64,
+                current_height: self.chain.hashes.len() as u64,
+            }))
+        }
+    }
+
+    /// A wallet restored at 1,500 on a chain whose last checkpoint is at
+    /// 1,000, as `wallet2` would be: its hashes begin at the checkpoint and
+    /// are listed rather than downloaded, the first request goes by the last
+    /// whole 1,024 blocks, and no request names the restore height or carries
+    /// the block there. Scanning still starts at 1,500, so a payment below it
+    /// is not found.
+    #[test]
+    fn a_restored_wallet_shows_a_daemon_only_what_every_wallet_shares() {
+        let mut w = state(7, 1_500);
+        let to = w.account.keys.account_address;
+        let mut chain = Chain::new();
+        for height in 0..2_100u64 {
+            match height {
+                1_200 => chain.push(&[payment(&to, 1_000, 31)], vec![vec![], vec![5]]),
+                1_800 => chain.push(&[payment(&to, 2_000, 32)], vec![vec![], vec![6]]),
+                _ => chain.push(&[], Vec::new()),
+            }
+        }
+        w.genesis = chain.hashes[0];
+        w.checkpoint = Some((1_000, chain.hashes[1_000]));
+
+        let daemon = Listing::new(&chain);
+        let s = w.refresh(&daemon, 50).expect("refresh");
+        assert!(s.caught_up);
+        assert_eq!(s.reorg_to, None);
+        assert_eq!(w.start_height, 1_000, "the hashes begin at the checkpoint");
+        assert_eq!(w.hashes, chain.hashes[1_000..]);
+        assert_eq!(w.balance(), 2_000, "nothing below the restore height");
+
+        let restore = chain.hashes[1_500];
+        let blocks = daemon.blocks_asked.into_inner();
+        assert_eq!(
+            blocks[0].0[0],
+            chain.hashes[1_023],
+            "the first request goes by the last whole 1,024 blocks"
+        );
+        for (ids, start) in &blocks {
+            assert_eq!(*start, 0, "no height is named");
+            assert!(!ids.contains(&restore), "the restore block is never sent");
+            assert_eq!(
+                ids[ids.len() - 2..],
+                [chain.hashes[1_000], chain.hashes[0]],
+                "every history ends where every wallet's does"
+            );
+        }
+        let hashes = daemon.hashes_asked.into_inner();
+        assert!(!hashes.is_empty(), "the hashes were listed");
+        assert!(hashes.iter().all(|ids| !ids.contains(&restore)));
+    }
+
+    /// A trusted daemon is shown the whole history on the first request, as
+    /// `wallet2::refresh` shows one.
+    #[test]
+    fn a_trusted_daemon_is_shown_every_hash_at_once() {
+        let mut chain = Chain::new();
+        for _ in 0..1_300 {
+            chain.push(&[], Vec::new());
+        }
+
+        let mut w = state_on(7, &chain);
+        w.hashes = chain.hashes[..1_100].to_vec();
+        let untrusted = Listing::new(&chain);
+        w.refresh_once(&untrusted).expect("refresh");
+        assert_eq!(untrusted.blocks_asked.borrow()[0].0[0], chain.hashes[1_023]);
+        // The next request of the session goes by every hash.
+        w.refresh_once(&untrusted).expect("refresh");
+        assert_eq!(untrusted.blocks_asked.borrow()[1].0[0], chain.hashes[1_299]);
+
+        let mut w = state_on(7, &chain);
+        w.hashes = chain.hashes[..1_100].to_vec();
+        w.trusted_daemon = true;
+        let trusted = Listing::new(&chain);
+        w.refresh_once(&trusted).expect("refresh");
+        assert_eq!(trusted.blocks_asked.borrow()[0].0[0], chain.hashes[1_099]);
+    }
+
+    /// A cache written before hashes were filled in holds them from the
+    /// restore height. They are filled in below, and nothing is scanned again.
+    #[test]
+    fn hashes_held_from_the_restore_height_are_filled_in_below() {
+        let mut chain = Chain::new();
+        for _ in 0..1_700 {
+            chain.push(&[], Vec::new());
+        }
+        let mut w = state(7, 1_500);
+        w.genesis = chain.hashes[0];
+        w.checkpoint = Some((1_000, chain.hashes[1_000]));
+        w.hashes = chain.hashes[1_500..1_600].to_vec();
+
+        let s = w.refresh(&Listing::new(&chain), 10).expect("refresh");
+        assert!(s.caught_up);
+        assert_eq!(s.reorg_to, None);
+        assert_eq!(w.start_height, 1_000);
+        assert_eq!(w.hashes, chain.hashes[1_000..]);
+
+        // Held hashes the chain no longer has are dropped, and the blocks
+        // scanned again.
+        let mut w = state(7, 1_500);
+        w.genesis = chain.hashes[0];
+        w.checkpoint = Some((1_000, chain.hashes[1_000]));
+        w.hashes = vec![[0xee; 32]; 100];
+        let s = w.refresh(&Listing::new(&chain), 10).expect("refresh");
+        assert!(s.caught_up);
+        assert_eq!(s.reorg_to, Some(1_500));
+        assert_eq!(w.hashes, chain.hashes[1_000..]);
+    }
+
+    /// `freeze` sets an output aside by its key image and `thaw` gives it
+    /// back, `frozen` says which, and a key image this wallet does not hold is
+    /// the error `wallet2::get_transfer_details` throws.
+    #[test]
+    fn an_output_is_frozen_and_thawed_by_its_key_image() {
+        let mut w = state(7, 0);
+        let to = w.account.keys.account_address;
+        let mut chain = Chain::new();
+        chain.push(&[payment(&to, 5_000, 21)], vec![vec![], vec![8]]);
+        w.refresh(&chain, 10).expect("refresh");
+
+        let key_image = w.transfers[0].key_image.expect("a key image");
+        assert_eq!(w.balance(), 5_000);
+        assert!(!w.frozen(&key_image).expect("known"));
+
+        w.freeze(&key_image).expect("frozen");
+        assert!(w.frozen(&key_image).expect("known"));
+        assert_eq!(w.balance(), 0, "and it leaves the balance");
+
+        w.thaw(&key_image).expect("thawed");
+        assert!(!w.frozen(&key_image).expect("known"));
+        assert_eq!(w.balance(), 5_000);
+
+        let stranger = KeyImage([0xab; 32]);
+        assert_eq!(w.freeze(&stranger), Err("Key image not found"));
+        assert_eq!(w.thaw(&stranger), Err("Key image not found"));
+        assert_eq!(w.frozen(&stranger), Err("Key image not found"));
+    }
+
+    /// A daemon whose chain does not hold the checkpoint is on another chain,
+    /// and its hashes are refused.
+    #[test]
+    fn hashes_from_a_chain_without_the_checkpoint_are_refused() {
+        let mut chain = Chain::new();
+        for _ in 0..1_200 {
+            chain.push(&[], Vec::new());
+        }
+        let mut w = state(7, 1_100);
+        w.genesis = chain.hashes[0];
+        w.checkpoint = Some((1_000, [0xcd; 32]));
+        let e = w
+            .refresh_once(&Listing::new(&chain))
+            .expect_err("another chain");
+        assert!(matches!(e, RefreshError::UnaskedHashes { got: 0 }), "{e}");
+        assert!(w.hashes.is_empty(), "nothing was taken from it");
     }
 }

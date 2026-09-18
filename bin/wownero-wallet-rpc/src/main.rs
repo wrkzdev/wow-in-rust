@@ -19,6 +19,7 @@ mod server;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use wow_crypto::Zeroizing;
 use wow_types::Network;
 use wow_wallet::files::Paths;
 
@@ -39,8 +40,30 @@ wownero-wallet-rpc — the Wownero wallet RPC (specs/14)
   --rpc-login <user:pass>           HTTP Basic
   --disable-rpc-login               explicitly run without authentication
 
+  --daemon-login <user>:<pass>      for a daemon started with --rpc-login
   --daemon-address <address>        host:port, or https://host:port for TLS;
                                     default 127.0.0.1:34568
+  --daemon-ssl <autodetect|enabled|disabled>
+                                    TLS to a daemon given without https://;
+                                    default autodetect: TLS if it speaks it,
+                                    plain HTTP with a warning if not
+  --daemon-ssl-allowed-fingerprints <sha256>
+                                    accept only this certificate; repeatable
+  --daemon-ssl-ca-certificates <path>
+                                    or one in this PEM file
+  --daemon-ssl-allow-chained        or one chained to a certificate in it
+  --daemon-ssl-allow-any-cert       accept any certificate
+  --daemon-ssl-certificate <path> --daemon-ssl-private-key <path>
+                                    a certificate to show a daemon that asks
+  --proxy [socks5://][<user>:<pass>@][<host>:]<port>
+                                    reach the daemon through a SOCKS5 proxy,
+                                    Tor's say; its name is not looked up here
+  --trusted-daemon / --untrusted-daemon
+                                    whether the daemon may see what reveals
+                                    the wallet; default: trusted only on
+                                    this machine
+  --offline                         do not connect to a daemon, nor use DNS.
+                                    How a server that only signs is run
   --testnet / --stagenet
   --kdf-rounds <n>                  default 1
   --no-initial-sync
@@ -62,10 +85,24 @@ struct Options {
     confirm_external_bind: bool,
     wallet_file: Option<PathBuf>,
     wallet_dir: Option<PathBuf>,
-    password: Option<String>,
+    /// `--password` or `--password-file`. Wiped when the options go.
+    password: Option<Zeroizing<String>>,
     login: Option<(String, String)>,
     disable_login: bool,
     daemon: String,
+    /// `--daemon-login <user>:<password>`, for a node started with
+    /// `--rpc-login`.
+    daemon_login: Option<String>,
+    /// `--daemon-ssl` and the options beside it, as given.
+    ssl: wow_daemon_client::SslFlags,
+    /// `--proxy`, as given: it may carry a password.
+    proxy: Option<String>,
+    /// `--trusted-daemon` and `--untrusted-daemon`: `None` when neither was
+    /// given, and a daemon on this machine is trusted.
+    trusted_daemon: Option<bool>,
+    /// `--offline`: contact no node. A server started this way is the cold
+    /// half of a cold-signing pair.
+    offline: bool,
     network: Network,
     kdf_rounds: u64,
     no_initial_sync: bool,
@@ -94,6 +131,11 @@ impl std::fmt::Debug for Options {
             )
             .field("disable_login", &self.disable_login)
             .field("daemon", &self.daemon)
+            .field("daemon_login", &self.daemon_login.as_ref().map(|_| "<redacted>"))
+            .field("ssl", &self.ssl)
+            .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
+            .field("trusted_daemon", &self.trusted_daemon)
+            .field("offline", &self.offline)
             .field("network", &self.network)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("no_initial_sync", &self.no_initial_sync)
@@ -117,6 +159,11 @@ impl Default for Options {
             login: None,
             disable_login: false,
             daemon: "127.0.0.1:34568".into(),
+            daemon_login: None,
+            ssl: Default::default(),
+            proxy: None,
+            trusted_daemon: None,
+            offline: false,
             network: Network::Mainnet,
             kdf_rounds: 1,
             no_initial_sync: false,
@@ -148,12 +195,19 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             "--confirm-external-bind" => o.confirm_external_bind = true,
             "--wallet-file" => o.wallet_file = Some(PathBuf::from(next("--wallet-file")?)),
             "--wallet-dir" => o.wallet_dir = Some(PathBuf::from(next("--wallet-dir")?)),
-            "--password" => o.password = Some(next("--password")?),
+            "--password" => o.password = Some(Zeroizing::new(next("--password")?)),
             "--password-file" => {
                 let path = next("--password-file")?;
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("cannot read {path}: {e}"))?;
-                o.password = Some(text.trim_end_matches(['\r', '\n']).to_string());
+                // Both the file's contents and the trimmed copy are wiped: the
+                // whole point of a password file is that the password is not on
+                // the command line, so it should not outlive the read either.
+                let text = Zeroizing::new(
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| format!("cannot read {path}: {e}"))?,
+                );
+                o.password = Some(Zeroizing::new(
+                    text.trim_end_matches(['\r', '\n']).to_string(),
+                ));
             }
             "--rpc-login" => {
                 let value = next("--rpc-login")?;
@@ -164,6 +218,34 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             }
             "--disable-rpc-login" => o.disable_login = true,
             "--daemon-address" => o.daemon = next("--daemon-address")?,
+            "--daemon-login" => o.daemon_login = Some(next("--daemon-login")?),
+            "--daemon-ssl" => o.ssl.ssl = Some(next("--daemon-ssl")?),
+            "--daemon-ssl-private-key" => {
+                o.ssl.private_key = Some(PathBuf::from(next("--daemon-ssl-private-key")?))
+            }
+            "--daemon-ssl-certificate" => {
+                o.ssl.certificate = Some(PathBuf::from(next("--daemon-ssl-certificate")?))
+            }
+            "--daemon-ssl-ca-certificates" => {
+                o.ssl.ca_certificates = Some(PathBuf::from(next("--daemon-ssl-ca-certificates")?))
+            }
+            "--daemon-ssl-allowed-fingerprints" => o
+                .ssl
+                .allowed_fingerprints
+                .push(next("--daemon-ssl-allowed-fingerprints")?),
+            "--daemon-ssl-allow-any-cert" => o.ssl.allow_any_cert = true,
+            "--daemon-ssl-allow-chained" => o.ssl.allow_chained = true,
+            "--proxy" => o.proxy = Some(next("--proxy")?),
+            "--trusted-daemon" | "--untrusted-daemon" => {
+                let trusted = arg == "--trusted-daemon";
+                if o.trusted_daemon.is_some_and(|t| t != trusted) {
+                    return Err("--trusted-daemon and --untrusted-daemon contradict each other; \
+                                give one"
+                        .into());
+                }
+                o.trusted_daemon = Some(trusted);
+            }
+            "--offline" => o.offline = true,
             "--testnet" => o.network = Network::Testnet,
             "--stagenet" => o.network = Network::Stagenet,
             "--kdf-rounds" => {
@@ -288,6 +370,35 @@ fn run(options: Options) -> Result<(), String> {
         _ => unreachable!("validated above"),
     };
 
+    let daemon_login = match &options.daemon_login {
+        Some(text) => Some(
+            wow_daemon_client::digest::Credentials::parse(text)
+                .ok_or("--daemon-login takes <user>:<password>")?,
+        ),
+        None => None,
+    };
+    // Refused where `make_basic` refuses it, before any wallet is opened.
+    let mut daemon_options = wow_daemon_client::ConnectOptions::from_flags(&options.ssl)?;
+    if let Some(text) = &options.proxy {
+        let proxy = wow_daemon_client::Proxy::parse(text).map_err(|e| format!("--proxy: {e}"))?;
+        // A login of this server's own, so Tor keeps its circuits apart.
+        let mut token = [0u8; 16];
+        wow_wallet::entropy::seeded_rng()?.fill(&mut token);
+        daemon_options.proxy = Some(proxy.isolated(&token));
+    }
+    if daemon_options.lacks_strong_verification(&options.daemon) {
+        let flag = if daemon_options.proxy.is_some() {
+            "--proxy"
+        } else {
+            "--daemon-ssl"
+        };
+        return Err(format!(
+            "Enabling {flag} requires --daemon-ssl-allow-any-cert or \
+             --daemon-ssl-ca-certificates or --daemon-ssl-allowed-fingerprints or use of a \
+             .onion/.i2p domain"
+        ));
+    }
+
     let state = Arc::new(State::new(
         source,
         options.network,
@@ -297,13 +408,26 @@ fn run(options: Options) -> Result<(), String> {
         // no wallet yet, and every wallet a client opens or creates later must
         // reach the same daemon.
         options.daemon.clone(),
+        daemon_login,
     ));
+    state.set_proxy_option(daemon_options.proxy.is_some());
+    state.set_daemon_options(daemon_options);
+    state.set_trusted_daemon(options.trusted_daemon);
+    state.set_offline(options.offline);
 
     state.open_at_startup()?;
 
-    // Point the wallet at a daemon, and sync, if one is open.
-    if state.wallet().is_some() {
-        let params = serde_json::json!({ "address": options.daemon });
+    if options.offline {
+        eprintln!("Offline: no wallet this server opens will contact a daemon.");
+    }
+
+    // Point the wallet at a daemon, and sync, if one is open. Not when
+    // `--offline` was given: there is nothing to point at.
+    if !options.offline && state.wallet().is_some() {
+        let params = serde_json::json!({
+            "address": options.daemon,
+            "trusted": state.trusted_daemon_for(&options.daemon),
+        });
         match methods::dispatch(&state, "set_daemon", &params) {
             Ok(_) => {
                 if !options.no_initial_sync {
@@ -447,6 +571,38 @@ mod tests {
         args.push("--mine-please");
         let e = opts(&args).expect_err("rejected");
         assert!(e.contains("--mine-please"), "{e}");
+    }
+
+    /// `--proxy` and the `--daemon-ssl` options, by the C++'s names, and a
+    /// proxy kept out of `{:?}`: it can carry a password.
+    #[test]
+    fn the_proxy_and_ssl_options_parse() {
+        let mut args = MINIMUM.to_vec();
+        args.extend_from_slice(&[
+            "--proxy",
+            "socks5://u:hunter2@127.0.0.1:9050",
+            "--daemon-ssl",
+            "enabled",
+            "--daemon-ssl-allowed-fingerprints",
+            "aa",
+            "--daemon-ssl-allow-any-cert",
+        ]);
+        let o = opts(&args).expect("parses");
+        assert_eq!(
+            o.proxy.as_deref(),
+            Some("socks5://u:hunter2@127.0.0.1:9050")
+        );
+        assert_eq!(o.ssl.ssl.as_deref(), Some("enabled"));
+        assert_eq!(o.ssl.allowed_fingerprints, ["aa"]);
+        assert!(o.ssl.allow_any_cert);
+        assert!(!format!("{o:?}").contains("hunter2"));
+
+        assert_eq!(o.trusted_daemon, None);
+        let mut trusted = MINIMUM.to_vec();
+        trusted.push("--untrusted-daemon");
+        assert_eq!(opts(&trusted).expect("parses").trusted_daemon, Some(false));
+        trusted.push("--trusted-daemon");
+        assert!(opts(&trusted).is_err(), "not both");
     }
 
     /// The log options, with the C++'s rotation defaults.

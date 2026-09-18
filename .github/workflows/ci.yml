@@ -70,9 +70,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: extras
-      - run: cargo check --manifest-path extras/Cargo.toml -p wownero-wallet-gui
-      - run: cargo test --manifest-path extras/Cargo.toml -p wownero-wallet-gui --lib
-      - run: cargo check --manifest-path extras/Cargo.toml --target wasm32-unknown-unknown -p wownero-wallet-web
+      # --locked: extras/Cargo.lock is committed, and CI is where a build that
+      # ignored it would otherwise go unnoticed.
+      - run: cargo check --locked --manifest-path extras/Cargo.toml -p wownero-wallet-gui
+      - run: cargo test --locked --manifest-path extras/Cargo.toml -p wownero-wallet-gui --lib
+      - run: cargo check --locked --manifest-path extras/Cargo.toml --target wasm32-unknown-unknown -p wownero-wallet-web
+
+  # What is not Rust here, and is it still only what we chose? LMDB is
+  # compiled on purpose -- data.mdb must stay byte-compatible with the C++
+  # node -- and the desktop GUI's Wayland support brings one more
+  # (docs/daemon-review.md §G). RandomWOW was a C++ submodule and ring was C
+  # and assembly under the RPC TLS; both are Rust now. Nothing but a job like
+  # this notices when a dependency bump brings a toolchain back, and by then
+  # a cross-build is failing for reasons nobody asked for.
+  no-c:
+    name: only the C we chose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: no C, C++ or assembly sources in the tree
+        run: |
+          found=$(find . -path ./target -prune -o -path ./.git -prune -o \
+            \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
+               -o -name '*.h' -o -name '*.hpp' -o -name '*.S' -o -name '*.asm' \) -print)
+          if [ -n "$found" ]; then echo "$found"; exit 1; fi
+      - name: no dependency compiles C that we did not choose
+        run: bash scripts/check-no-c.sh
 
   # Guards against a silently truncated or swapped corpus: the M1 gate is only
   # meaningful if the vectors are the ones the reference tree ships.

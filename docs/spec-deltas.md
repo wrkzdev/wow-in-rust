@@ -1150,3 +1150,41 @@ agreed with the wallet.
 `wallet_sync::a_wallet_restored_above_zero_syncs_and_stays_synced`, and
 `wow-daemon-client`'s
 `live_node::a_second_batch_starts_at_the_last_block_of_the_first`.
+
+---
+
+## 27. The crate layout grew three crates and left two empty
+
+`specs/00-overview.md` §4.1 lists twelve crates under `crates/`. The tree has
+fifteen, and two of the twelve are empty.
+
+**Added, each one replacing what would otherwise be a dependency:**
+
+| crate | instead of |
+|---|---|
+| `wow-log` | `tracing`, for the C++'s `0`–`4` levels and `category:LEVEL` syntax |
+| `wow-zmq` | `libzmq`, which is C++ and the thing this project exists not to link |
+| `wow-tls` | `ring` or `aws-lc-rs` under `rustls`, both of which are C and assembly ([§25](#25-randomwow-changes-more-than-configurationh--and-is-now-rust) is the same story for RandomWOW) |
+
+**Empty, and the work went elsewhere:**
+
+`wow-rpc-types` and `wow-rpc-server` are still the placeholders §4.1 asks for.
+The daemon's RPC is `bin/wownerod/src/rpc/`, because nothing but that one
+binary serves it and a crate with a single caller buys nothing. The wallet
+side's request and response types live with the client that parses them, in
+`wow-daemon-client`, for the same reason: they are only ever constructed by it.
+
+They are kept rather than deleted so the difference from the spec is visible
+instead of silent. Deleting them would make the layout *look* like §4.1 with
+none of §4.1's separation.
+
+**Why it matters:** §4.1 opens the part of the spec people read before writing
+anything, and a reader who takes it literally will go looking for the daemon's
+RPC in an empty crate. It is also the section that quietly stopped being true
+first: three of the four departures — `wow-log`, `wow-zmq`, `wow-tls` — came
+from decisions about *dependencies*, not about layout, and nobody revisits a
+layout section when choosing a crate.
+
+**Pinned by:** nothing, and it cannot be — a layout is not a behaviour. The
+README's layout listing names all fifteen and says which two are empty, which
+is the nearest thing to a check there is.

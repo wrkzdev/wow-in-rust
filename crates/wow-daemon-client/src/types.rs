@@ -27,6 +27,10 @@ use crate::{DaemonClient, DaemonError};
 
 type Result<T> = std::result::Result<T, DaemonError>;
 
+/// `COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT`: the most blocks one
+/// `getblocks.bin` answer carries, whatever the request asks.
+const GET_BLOCKS_MAX_BLOCK_COUNT: u64 = 1_000;
+
 /// One block as `get_blocks.bin` returns it: the block blob and its
 /// transactions' blobs, unparsed.
 ///
@@ -52,6 +56,24 @@ pub struct GetBlocks {
     pub daemon_time: u64,
 }
 
+/// What `gethashes.bin` answers: block hashes, from `start_height` up.
+#[derive(Clone, Debug, Default)]
+pub struct GetHashes {
+    pub hashes: Vec<Hash256>,
+    pub start_height: u64,
+    pub current_height: u64,
+}
+
+/// One transaction in the pool, as `get_txpool_backlog` reports it:
+/// `tx_backlog_entry`. No id and no blob, which is the point of asking this
+/// rather than for the pool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BacklogEntry {
+    pub weight: u64,
+    pub fee: u64,
+    pub time_in_pool: u64,
+}
+
 /// One ring member, as `get_outs.bin` returns it.
 #[derive(Clone, Copy, Debug)]
 pub struct OutKey {
@@ -62,6 +84,22 @@ pub struct OutKey {
     pub unlocked: bool,
     pub height: u64,
     pub txid: Hash256,
+}
+
+/// One amount's distribution, as `/get_output_distribution.bin` answers it:
+/// `COMMAND_RPC_GET_OUTPUT_DISTRIBUTION::distribution`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputDistribution {
+    pub amount: u64,
+    /// The height `distribution[0]` is for. A C++ node never answers below the
+    /// first block RingCT outputs could be in, which on mainnet is height 1,
+    /// so this can be above the `from_height` asked for.
+    pub start_height: u64,
+    /// How many outputs there are below `start_height`.
+    pub base: u64,
+    /// One entry per block from `start_height`: running totals if the request
+    /// asked for `cumulative`, and each block's own count if it did not.
+    pub distribution: Vec<u64>,
 }
 
 /// What `get_info` says that a wallet cares about.
@@ -169,19 +207,27 @@ impl DaemonClient {
         })
     }
 
-    /// `/send_raw_transaction` (`specs/11` §3.1).
+    /// `/sendrawtransaction` (`specs/11` §3.1).
     ///
     /// `do_not_relay` submits without broadcasting, which is how a wallet
     /// checks a transaction would be accepted before committing to it.
+    ///
+    /// By the name and with the fields `wallet2::commit_tx` sends, so a node
+    /// sees the request a C++ wallet makes: `do_not_relay` and
+    /// `do_sanity_checks` are `KV_SERIALIZE_OPT`, which epee leaves out at
+    /// their defaults, false and true. `client` is left out altogether: it is
+    /// a signature under a key the C++ wallet keeps in its cache
+    /// (`m_rpc_client_secret_key`), which names the wallet across sessions
+    /// rather than being a fingerprint worth copying.
     pub fn send_raw_transaction(&self, blob: &[u8], do_not_relay: bool) -> Result<SendResult> {
-        let params = json!({
-            "tx_as_hex": wow_crypto::hex::encode(blob),
-            "do_not_relay": do_not_relay,
-        });
+        let mut params = json!({ "tx_as_hex": wow_crypto::hex::encode(blob) });
+        if do_not_relay {
+            params["do_not_relay"] = Json::Bool(true);
+        }
         // The status here is the *transaction's*, not the daemon's, so a
         // rejection must come back as a value rather than an error.
         let body = params.to_string();
-        let raw = self.endpoint_post("/send_raw_transaction", body.as_bytes())?;
+        let raw = self.endpoint_post("/sendrawtransaction", body.as_bytes())?;
         let v: Json = serde_json::from_slice(&raw)?;
 
         Ok(SendResult {
@@ -228,7 +274,7 @@ impl DaemonClient {
 
     // -- binary -------------------------------------------------------------
 
-    /// `/get_blocks.bin` — the refresh workhorse (`specs/11` §5.1).
+    /// `/getblocks.bin` — the refresh workhorse (`specs/11` §5.1).
     ///
     /// `block_ids` is the wallet's short chain history, newest first, genesis
     /// last. The daemon answers from the newest block in it that it has, that
@@ -237,6 +283,13 @@ impl DaemonClient {
     ///
     /// `max_block_count` caps the reply below the daemon's own limit of 1000,
     /// and 0 leaves it there. A daemon that predates the field ignores it.
+    ///
+    /// The request is the one `wallet2::pull_blocks` sends, by the name it
+    /// uses: `no_miner_tx` and `max_block_count` are `KV_SERIALIZE_OPT`, so
+    /// epee leaves them out at their defaults, and `wallet2` never sets the
+    /// second at all. It is only sent here below the daemon's limit, after a
+    /// reply was cut short, when asking for fewer is worth being told apart
+    /// by. `client` is left out: `send_raw_transaction` says why.
     pub fn get_blocks(
         &self,
         block_ids: &[Hash256],
@@ -253,13 +306,35 @@ impl DaemonClient {
         );
         req.insert("start_height".into(), Value::U64(start_height));
         req.insert("prune".into(), Value::Bool(prune));
-        req.insert("no_miner_tx".into(), Value::Bool(no_miner_tx));
-        if max_block_count > 0 {
+        if no_miner_tx {
+            req.insert("no_miner_tx".into(), Value::Bool(true));
+        }
+        if max_block_count > 0 && max_block_count < GET_BLOCKS_MAX_BLOCK_COUNT {
             req.insert("max_block_count".into(), Value::U64(max_block_count));
         }
 
-        let res = self.binary("/get_blocks.bin", &req)?;
+        let res = self.binary("/getblocks.bin", &req)?;
         parse_get_blocks(&res)
+    }
+
+    /// `/gethashes.bin` — block hashes, from the newest hash in `block_ids`
+    /// the daemon has, that block included (`find_blockchain_supplement`), up
+    /// to the daemon's limit per call.
+    ///
+    /// How a wallet fills in the hashes below where it starts scanning without
+    /// downloading the blocks, as `wallet2::fast_refresh` does. `start_height`
+    /// is sent at zero, as `pull_hashes` sends it: `on_get_hashes` overwrites
+    /// it with the split it finds.
+    pub fn get_hashes(&self, block_ids: &[Hash256]) -> Result<GetHashes> {
+        let mut req = Section::new();
+        req.insert(
+            "block_ids".into(),
+            Value::String(block_ids.iter().flatten().copied().collect()),
+        );
+        // `KV_SERIALIZE`, not `_OPT`: written even at zero.
+        req.insert("start_height".into(), Value::U64(0));
+        let res = self.binary("/gethashes.bin", &req)?;
+        parse_get_hashes(&res)
     }
 
     /// `/get_o_indexes.bin` — the global output indices of one transaction.
@@ -271,6 +346,12 @@ impl DaemonClient {
     }
 
     /// `/get_outs.bin` — the ring members for a set of `(amount, index)` pairs.
+    ///
+    /// Written as epee writes `wallet2`'s request: `client` always, and
+    /// `get_txid` only when it is false, since `KV_SERIALIZE_OPT(get_txid,
+    /// true)` leaves out a field that holds its default. A wallet asks with it
+    /// false: which transaction a ring member came from is not the node's to
+    /// be told that anyone wants to know.
     pub fn get_outs(&self, wanted: &[(u64, u64)], get_txid: bool) -> Result<Vec<OutKey>> {
         let items: Vec<Value> = wanted
             .iter()
@@ -283,6 +364,7 @@ impl DaemonClient {
             .collect();
 
         let mut req = Section::new();
+        req.insert("client".into(), Value::String(Vec::new()));
         req.insert(
             "outputs".into(),
             Value::Array(Array {
@@ -290,7 +372,9 @@ impl DaemonClient {
                 items,
             }),
         );
-        req.insert("get_txid".into(), Value::Bool(get_txid));
+        if !get_txid {
+            req.insert("get_txid".into(), Value::Bool(false));
+        }
 
         let res = self.binary("/get_outs.bin", &req)?;
         let outs = res
@@ -312,63 +396,63 @@ impl DaemonClient {
         Ok(v)
     }
 
-    /// `/get_output_distribution.bin` — the per-block RingCT output counts
-    /// decoy selection is built on (`specs/12` §4.3).
+    /// `/get_output_distribution.bin` — the per-block output counts decoy
+    /// selection is built on (`specs/12` §4.3), exactly as the node sends
+    /// them.
     ///
-    /// Returns the **cumulative** count per block from `from_height`, plus the
-    /// `base` count below the window. The gamma picker wants a single
-    /// cumulative series, so the base is added back here rather than left for
-    /// the caller to forget.
+    /// Nothing is added up or shifted here. A `cumulative` answer is already
+    /// running totals from genesis, `base` included, and a per-block one has
+    /// `base` taken out of its first entry (`rpc_handler.cpp`,
+    /// `process_distribution`); adding `base` to every entry, as this once did,
+    /// counted it twice. What a wallet does with the answer is
+    /// `wallet2::get_rct_distribution`'s business, in `wow_wallet::decoys`.
+    ///
+    /// # The request is written as `wallet2` writes it
+    ///
+    /// epee leaves out a `KV_SERIALIZE_OPT` field that holds its default:
+    /// `from_height` and `to_height` of 0, `cumulative` and `compress` false.
+    /// And `binary`, whose default is **true**
+    /// (`KV_SERIALIZE_OPT(binary, true)`), so the reference wallet never sends
+    /// it and a C++ node reads its absence as true. Sent explicitly false it
+    /// is refused with `Binary only call`. `client` is a plain `KV_SERIALIZE`
+    /// and always goes, empty unless RPC payment is set up, which it is not
+    /// here.
+    ///
+    /// A `to_height` of 0 means the node's own tip, which is what a wallet
+    /// should ask for: the distribution a ring is picked from is the chain's,
+    /// not what this wallet has scanned.
     pub fn get_output_distribution(
         &self,
-        amount: u64,
+        amounts: &[u64],
         from_height: u64,
         to_height: u64,
-    ) -> Result<Vec<u64>> {
+        cumulative: bool,
+        compress: bool,
+    ) -> Result<Vec<OutputDistribution>> {
         let mut req = Section::new();
+        req.insert("client".into(), Value::String(Vec::new()));
         req.insert(
             "amounts".into(),
             Value::Array(Array {
                 elem_type: epee::ty::UINT64,
-                items: vec![Value::U64(amount)],
+                items: amounts.iter().map(|a| Value::U64(*a)).collect(),
             }),
         );
-        req.insert("from_height".into(), Value::U64(from_height));
-        req.insert("to_height".into(), Value::U64(to_height));
-        req.insert("cumulative".into(), Value::Bool(true));
-        // `binary: true` is **required** on the `.bin` endpoint --
-        // `on_get_output_distribution_bin` answers `status: "Binary only call"`
-        // and nothing else without it:
-        //
-        // ```cpp
-        // if (!req.binary) { res.status = "Binary only call"; return false; }
-        // ```
-        //
-        // It also changes the answer's shape: `distribution` comes back as
-        // `CONTAINER_POD_AS_BLOB`, one string of little-endian u64s, rather
-        // than an epee array. `u64_list` reads either.
-        req.insert("binary".into(), Value::Bool(true));
-        // `compress` would pack it with the reference's own varint scheme
-        // (`compress_integer_array`), which is a second format to implement for
-        // a saving that does not matter on one call per transaction.
-        req.insert("compress".into(), Value::Bool(false));
+        if from_height != 0 {
+            req.insert("from_height".into(), Value::U64(from_height));
+        }
+        if to_height != 0 {
+            req.insert("to_height".into(), Value::U64(to_height));
+        }
+        if cumulative {
+            req.insert("cumulative".into(), Value::Bool(true));
+        }
+        if compress {
+            req.insert("compress".into(), Value::Bool(true));
+        }
 
         let res = self.binary("/get_output_distribution.bin", &req)?;
-        let first = res
-            .get("distributions")
-            .and_then(Value::as_array)
-            .and_then(|a| a.items.first())
-            .and_then(Value::as_object)
-            .ok_or(DaemonError::Missing("distributions"))?;
-
-        let base = first.get("base").and_then(Value::as_u64).unwrap_or(0);
-        let mut d = u64_list(first.get("distribution"));
-        if base > 0 {
-            for x in d.iter_mut() {
-                *x += base;
-            }
-        }
-        Ok(d)
+        parse_output_distributions(&res)
     }
 
     /// `/get_transaction_pool_hashes.bin`.
@@ -393,6 +477,24 @@ impl DaemonClient {
     pub fn get_transaction_pool(&self) -> Result<Vec<PoolTx>> {
         let v = self.direct("/get_transaction_pool", json!({}))?;
         parse_transaction_pool(&v)
+    }
+
+    /// `get_txpool_backlog`: the weight and fee of each transaction in the
+    /// pool, and nothing else about them. What `wallet2::estimate_backlog`
+    /// asks when it chooses a fee.
+    ///
+    /// Not through [`DaemonClient::json_rpc`]: the answer is not JSON a strict
+    /// parser takes. [`parse_txpool_backlog`] says why.
+    pub fn get_txpool_backlog(&self) -> Result<Vec<BacklogEntry>> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": "0",
+            "method": "get_txpool_backlog",
+            "params": {},
+        })
+        .to_string();
+        let raw = self.raw_post("/json_rpc", crate::JSON_CONTENT_TYPE, body.as_bytes())?;
+        parse_txpool_backlog(&raw)
     }
 
     /// `/is_key_image_spent`, one status per key image, in order.
@@ -422,8 +524,137 @@ impl DaemonClient {
 
     /// A `POST` that returns the raw body regardless of the `status` field.
     fn endpoint_post(&self, path: &str, body: &[u8]) -> Result<Vec<u8>> {
-        Ok(self.raw_post(path, "application/json", body)?)
+        Ok(self.raw_post(path, crate::JSON_CONTENT_TYPE, body)?)
     }
+}
+
+/// Pull a `gethashes.bin` response apart.
+fn parse_get_hashes(res: &Section) -> Result<GetHashes> {
+    // CONTAINER_POD_AS_BLOB: packed 32-byte hashes.
+    let blob = res
+        .get("m_block_ids")
+        .and_then(Value::as_bytes)
+        .unwrap_or(&[]);
+    if !blob.len().is_multiple_of(32) {
+        return Err(DaemonError::BadField("m_block_ids"));
+    }
+    Ok(GetHashes {
+        hashes: blob.as_chunks::<32>().0.to_vec(),
+        start_height: res.get("start_height").and_then(Value::as_u64).unwrap_or(0),
+        current_height: res
+            .get("current_height")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+/// The bytes of one `tx_backlog_entry`: three `uint64_t`, little-endian.
+const BACKLOG_ENTRY_BYTES: usize = 24;
+
+/// Pull a `get_txpool_backlog` answer apart.
+///
+/// `backlog` is `KV_SERIALIZE_CONTAINER_POD_AS_BLOB`: the entries' own bytes,
+/// put into a JSON string by epee's writer, which escapes nine characters
+/// (`transform_to_escape_sequence`) and passes every other byte through as it
+/// is. So the answer is not UTF-8, and a raw control byte makes it JSON no
+/// strict parser takes. The string is cut out and unescaped here, and only
+/// what is left, with an empty string in its place, goes to `serde_json`.
+fn parse_txpool_backlog(raw: &[u8]) -> Result<Vec<BacklogEntry>> {
+    let (blob, rest) = match cut_string(raw, b"\"backlog\"") {
+        Some(cut) => cut,
+        // An empty pool can come back without the field.
+        None => (Vec::new(), raw.to_vec()),
+    };
+    let v: Json = serde_json::from_slice(&rest)?;
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+        return Err(DaemonError::Rpc {
+            code: err.get("code").and_then(Json::as_i64).unwrap_or(0),
+            message: err
+                .get("message")
+                .and_then(Json::as_str)
+                .unwrap_or("no message")
+                .to_string(),
+        });
+    }
+    let result = v.get("result").ok_or(DaemonError::Missing("result"))?;
+    crate::check_status(result)?;
+    if !blob.len().is_multiple_of(BACKLOG_ENTRY_BYTES) {
+        return Err(DaemonError::BadField("backlog"));
+    }
+    Ok(blob
+        .chunks_exact(BACKLOG_ENTRY_BYTES)
+        .map(|e| {
+            let word = |i: usize| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&e[i * 8..i * 8 + 8]);
+                u64::from_le_bytes(b)
+            };
+            BacklogEntry {
+                weight: word(0),
+                fee: word(1),
+                time_in_pool: word(2),
+            }
+        })
+        .collect())
+}
+
+/// Find the string value of `key` in raw epee JSON, and return its bytes
+/// unescaped along with the document with that string emptied.
+///
+/// `None` when `key` is not followed by a string. The escapes are epee's, and
+/// `\u00XX` besides, which is how a writer that does escape control
+/// characters writes them.
+fn cut_string(raw: &[u8], key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let at = raw.windows(key.len()).position(|w| w == key)?;
+    let skip_space = |mut i: usize| {
+        while raw.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        i
+    };
+    let mut i = skip_space(at + key.len());
+    if raw.get(i) != Some(&b':') {
+        return None;
+    }
+    i = skip_space(i + 1);
+    if raw.get(i) != Some(&b'"') {
+        return None;
+    }
+    let open = i;
+    i += 1;
+    let mut bytes = Vec::new();
+    loop {
+        let b = *raw.get(i)?;
+        i += 1;
+        match b {
+            b'"' => break,
+            b'\\' => {
+                let escaped = *raw.get(i)?;
+                i += 1;
+                bytes.push(match escaped {
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 0x0b,
+                    b'u' => {
+                        let hex = std::str::from_utf8(raw.get(i..i + 4)?).ok()?;
+                        i += 4;
+                        u8::try_from(u16::from_str_radix(hex, 16).ok()?).ok()?
+                    }
+                    // `"`, `\` and `/` stand for themselves.
+                    other => other,
+                });
+            }
+            other => bytes.push(other),
+        }
+    }
+    let mut rest = Vec::with_capacity(raw.len());
+    rest.extend_from_slice(&raw[..open]);
+    rest.extend_from_slice(b"\"\"");
+    rest.extend_from_slice(&raw[i..]);
+    Some((bytes, rest))
 }
 
 /// Pull a `get_blocks.bin` response apart.
@@ -538,6 +769,67 @@ fn u64_list(v: Option<&Value>) -> Vec<u64> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Pull a `/get_output_distribution.bin` response apart.
+///
+/// Each entry is read as `COMMAND_RPC_GET_OUTPUT_DISTRIBUTION::distribution`
+/// loads one: with `binary` and `compress` both set the counts are in
+/// `compressed_data`, and otherwise in `distribution`, as a packed blob or an
+/// array, which [`u64_list`] reads either way. No `distributions` at all is
+/// an empty list, as epee writes one, and what to make of that is the
+/// caller's.
+fn parse_output_distributions(res: &Section) -> Result<Vec<OutputDistribution>> {
+    let Some(list) = res.get("distributions") else {
+        return Ok(Vec::new());
+    };
+    let list = list
+        .as_array()
+        .ok_or(DaemonError::BadField("distributions"))?;
+    list.items
+        .iter()
+        .map(|item| {
+            let d = item
+                .as_object()
+                .ok_or(DaemonError::BadField("distributions"))?;
+            let number = |name: &str| d.get(name).and_then(Value::as_u64).unwrap_or(0);
+            let flag = |name: &str| d.get(name).and_then(Value::as_bool).unwrap_or(false);
+            let distribution = if flag("binary") && flag("compress") {
+                decompress_integer_array(
+                    d.get("compressed_data")
+                        .and_then(Value::as_bytes)
+                        .unwrap_or(&[]),
+                )?
+            } else {
+                u64_list(d.get("distribution"))
+            };
+            Ok(OutputDistribution {
+                amount: number("amount"),
+                start_height: number("start_height"),
+                base: number("base"),
+                distribution,
+            })
+        })
+        .collect()
+}
+
+/// `decompress_integer_array`: base-128 varints back to back, as
+/// `compress_integer_array` in `core_rpc_server_commands_defs.h` packs them.
+///
+/// Read with the consensus varint reader, which is `tools::read_varint`
+/// quirks included: an over-long or overflowing encoding is refused, and one
+/// cut off by the end of the data is taken as far as it goes, as the C++
+/// takes it.
+fn decompress_integer_array(bytes: &[u8]) -> Result<Vec<u64>> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let read = wow_serialize::varint::read_varint_bits(rest, 64)
+            .map_err(|_| DaemonError::BadField("compressed_data"))?;
+        out.push(read.value);
+        rest = &rest[read.len..];
+    }
+    Ok(out)
 }
 
 /// Pull a `/get_transaction_pool` response apart.
@@ -769,6 +1061,77 @@ mod tests {
         assert!(u64_list(Some(&Value::Bool(true))).is_empty());
     }
 
+    /// A distribution is read in each shape a node sends it: compressed, as a
+    /// packed blob, and as an array. Nothing is added to the counts: `base`
+    /// is reported beside them, never folded in.
+    #[test]
+    fn an_output_distribution_parses_in_every_shape() {
+        let counts = [3u64, 0, 127, 128, 300, 1 << 40];
+
+        let mut compressed = Vec::new();
+        for c in counts {
+            wow_serialize::varint::write_varint(&mut compressed, c);
+        }
+        let mut packed = Vec::new();
+        for c in counts {
+            packed.extend_from_slice(&c.to_le_bytes());
+        }
+        let array = Value::Array(Array {
+            elem_type: epee::ty::UINT64,
+            items: counts.iter().map(|c| Value::U64(*c)).collect(),
+        });
+
+        let entry = |binary: bool, compress: bool, field: &str, value: Value| {
+            let mut s = Section::new();
+            s.insert("amount".into(), Value::U64(0));
+            s.insert("start_height".into(), Value::U64(1));
+            s.insert("binary".into(), Value::Bool(binary));
+            s.insert("compress".into(), Value::Bool(compress));
+            s.insert(field.into(), value);
+            s.insert("base".into(), Value::U64(9));
+            Value::Object(s)
+        };
+        let mut res = Section::new();
+        res.insert(
+            "distributions".into(),
+            Value::Array(Array {
+                elem_type: epee::ty::OBJECT,
+                items: vec![
+                    entry(true, true, "compressed_data", Value::String(compressed)),
+                    entry(true, false, "distribution", Value::String(packed)),
+                    entry(false, false, "distribution", array),
+                ],
+            }),
+        );
+
+        let got = parse_output_distributions(&res).expect("parses");
+        assert_eq!(got.len(), 3);
+        for d in got {
+            assert_eq!(d.distribution, counts, "the counts as sent");
+            assert_eq!((d.amount, d.start_height, d.base), (0, 1, 9));
+        }
+
+        // epee leaves an empty list out, and that is not a malformed answer.
+        assert!(parse_output_distributions(&Section::new())
+            .expect("parses")
+            .is_empty());
+    }
+
+    /// Compressed data is read as `tools::read_varint` reads it: an over-long
+    /// encoding is refused, not taken as a count.
+    #[test]
+    fn compressed_counts_refuse_an_over_long_varint() {
+        assert_eq!(
+            decompress_integer_array(&[0x01, 0xac, 0x02]).expect("valid"),
+            vec![1, 300]
+        );
+        assert!(matches!(
+            decompress_integer_array(&[0x80, 0x00]),
+            Err(DaemonError::BadField("compressed_data"))
+        ));
+        assert!(decompress_integer_array(&[]).expect("empty").is_empty());
+    }
+
     /// A missing block blob is an error rather than an empty block.
     #[test]
     fn a_block_without_a_blob_is_an_error() {
@@ -831,6 +1194,100 @@ mod tests {
         assert!(matches!(
             parse_transaction_pool(&json!({"transactions": [{"id_hash": "zz", "tx_blob": "00"}]})),
             Err(DaemonError::BadField("id_hash"))
+        ));
+    }
+
+    /// Hashes come back packed, from the height the daemon found, and a blob
+    /// that is not whole hashes is refused.
+    #[test]
+    fn a_hashes_response_parses() {
+        let mut res = Section::new();
+        let mut packed = vec![1u8; 32];
+        packed.extend_from_slice(&[2u8; 32]);
+        res.insert("m_block_ids".into(), Value::String(packed));
+        res.insert("start_height".into(), Value::U64(838_800));
+        res.insert("current_height".into(), Value::U64(880_000));
+        let got = parse_get_hashes(&res).expect("parses");
+        assert_eq!(got.hashes, vec![[1u8; 32], [2u8; 32]]);
+        assert_eq!(got.start_height, 838_800);
+        assert_eq!(got.current_height, 880_000);
+
+        res.insert("m_block_ids".into(), Value::String(vec![0u8; 33]));
+        assert!(matches!(
+            parse_get_hashes(&res),
+            Err(DaemonError::BadField("m_block_ids"))
+        ));
+    }
+
+    /// epee's JSON writer as `transform_to_escape_sequence` has it: nine
+    /// characters escaped, every other byte as it is.
+    fn epee_escape(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            match b {
+                0x08 => out.extend_from_slice(b"\\b"),
+                0x0c => out.extend_from_slice(b"\\f"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                0x0b => out.extend_from_slice(b"\\v"),
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'/' => out.extend_from_slice(b"\\/"),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// The backlog is read from the raw bytes epee writes into a JSON string:
+    /// escapes, a NUL, bytes that are not UTF-8 and a quote among them.
+    #[test]
+    fn a_backlog_is_read_from_the_bytes_epee_writes() {
+        let entries = [
+            BacklogEntry {
+                weight: 0x2f5c_220a,
+                fee: 0x0d0b_0c09_0800_ff80,
+                time_in_pool: 12,
+            },
+            BacklogEntry {
+                weight: 1_500,
+                fee: 390_000_000,
+                time_in_pool: 0,
+            },
+        ];
+        let mut blob = Vec::new();
+        for e in &entries {
+            blob.extend_from_slice(&e.weight.to_le_bytes());
+            blob.extend_from_slice(&e.fee.to_le_bytes());
+            blob.extend_from_slice(&e.time_in_pool.to_le_bytes());
+        }
+        let mut raw = b"{\r\n  \"id\": \"0\",\r\n  \"jsonrpc\": \"2.0\",\r\n  \"result\": {\r\n    \"backlog\": \"".to_vec();
+        raw.extend_from_slice(&epee_escape(&blob));
+        raw.extend_from_slice(
+            b"\",\r\n    \"credits\": 0,\r\n    \"status\": \"OK\",\r\n    \"top_hash\": \"\",\r\n    \"untrusted\": false\r\n  }\r\n}",
+        );
+        assert!(serde_json::from_slice::<Json>(&raw).is_err(), "not JSON as it stands");
+        assert_eq!(parse_txpool_backlog(&raw).expect("parses"), entries);
+
+        // An empty pool, with the field or without it.
+        let empty = br#"{"id": "0", "jsonrpc": "2.0", "result": {"backlog": "", "status": "OK"}}"#;
+        assert!(parse_txpool_backlog(empty).expect("parses").is_empty());
+        let absent = br#"{"id": "0", "jsonrpc": "2.0", "result": {"status": "OK"}}"#;
+        assert!(parse_txpool_backlog(absent).expect("parses").is_empty());
+
+        // A node that does not serve it says so as an error, not as a backlog.
+        let refused = br#"{"id": "0", "jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}}"#;
+        assert!(matches!(
+            parse_txpool_backlog(refused),
+            Err(DaemonError::Rpc { code: -32601, .. })
+        ));
+        let busy = br#"{"id": "0", "jsonrpc": "2.0", "result": {"status": "BUSY"}}"#;
+        assert!(matches!(parse_txpool_backlog(busy), Err(DaemonError::Status(_))));
+        let torn = br#"{"id": "0", "jsonrpc": "2.0", "result": {"backlog": "abc", "status": "OK"}}"#;
+        assert!(matches!(
+            parse_txpool_backlog(torn),
+            Err(DaemonError::BadField("backlog"))
         ));
     }
 }

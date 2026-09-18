@@ -29,7 +29,7 @@ use wow_core::{Added, BlockError, Blockchain, PowError, Rejection};
 use wow_crypto::random::Rng;
 use wow_crypto::types::{Hash256, KeyImage};
 use wow_p2p::messages::{BlockEntry, CoreSyncData, BLOCK_IDS_DEFAULT_COUNT};
-use wow_p2p::node::{BlockVerdict, ChainReply, Core, TxVerdict};
+use wow_p2p::node::{BlockVerdict, ChainReply, Core, TxRelay, TxVerdict};
 use wow_storage::db::BlockchainDb;
 use wow_storage::lmdb::LmdbDb;
 use wow_types::address::Address;
@@ -37,8 +37,8 @@ use wow_types::block::Block;
 use wow_types::tx::{Transaction, TxIn};
 use wow_types::Network;
 
-use crate::mempool::{Rejection as PoolRejection, TxPool};
-use crate::netsync::{ChainPow, LocalChain, Refusal, Submitted};
+use crate::mempool::{Rejection as PoolRejection, RelayMethod, TxPool};
+use crate::netsync::{ChainPow, ChainTxs, LocalChain, PendingTx, Refusal, Submitted};
 use crate::template::{ExtraNonce, NextBlock, Template, TemplateError};
 
 const LOG: &str = "blockchain";
@@ -106,6 +106,8 @@ pub struct NodeCore {
     chain: Mutex<LocalChain>,
     /// The chain's proof-of-work verifier, reachable without the chain lock.
     pow: Arc<ChainPow>,
+    /// The chain's transaction verifier, reachable for the same reason.
+    txs: Arc<ChainTxs>,
     pool: Arc<Mutex<TxPool>>,
     /// A snapshot of what fee checks read, refreshed after every block, so an
     /// RPC fee estimate does not wait on a sync holding the chain.
@@ -113,7 +115,17 @@ pub struct NodeCore {
     listener: OnceLock<Arc<dyn Listener>>,
     /// When the pool is next walked for transactions due to go out again.
     next_relay_check: AtomicU64,
+    /// Recent `(when, height)` pairs, for the sync speed `status` reports.
+    ///
+    /// A window rather than an average since start-up, for the reason the
+    /// wallets measure the same way: blocks near the tip carry far more
+    /// transactions than the early chain, so an average over a whole sync
+    /// promises a finish the rest of it does not keep.
+    progress: Mutex<std::collections::VecDeque<(std::time::Instant, u64)>>,
 }
+
+/// How far back the sync speed is measured.
+const RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl NodeCore {
     pub fn new(
@@ -124,15 +136,18 @@ impl NodeCore {
         let chain = LocalChain::new(db.clone(), network)?;
         let fee = fee_context_of(&chain);
         let pow = chain.pow();
+        let txs = chain.txs();
         Ok(Arc::new(NodeCore {
             db,
             hardfork: HardFork::new(network),
             chain: Mutex::new(chain),
             pow,
+            txs,
             pool,
             fee: Mutex::new(fee),
             listener: OnceLock::new(),
             next_relay_check: AtomicU64::new(0),
+            progress: Mutex::new(std::collections::VecDeque::new()),
         }))
     }
 
@@ -146,9 +161,14 @@ impl NodeCore {
         self.listener.get().map(|l| &**l).filter(|l| l.wants(event))
     }
 
-    /// Transactions just admitted to the pool, announced. One kept from relay
-    /// is not: a subscriber hears what goes out to the network, as the C++'s
-    /// `relay_category::legacy` has it.
+    /// Transactions just admitted to the pool, or just made public, announced.
+    ///
+    /// Only those the pool holds as `relay_category::legacy`, as the C++
+    /// notifies (`core::add_new_tx`): public, or kept from relay by whoever
+    /// submitted them. One submitted here to go out, or arriving through a
+    /// stem, is announced when it goes public and not before
+    /// ([`Core::tx_relayed`]); a subscriber that heard of it on admission
+    /// learned what the stem was there to hide.
     pub fn announce_pool_txs(&self, ids: &[Hash256]) {
         let Some(listener) = self.listening(Event::TxpoolAdd) else {
             return;
@@ -157,7 +177,7 @@ impl NodeCore {
             let pool = lock(&self.pool);
             ids.iter()
                 .filter_map(|id| {
-                    let e = pool.get(id).filter(|e| !e.do_not_relay)?;
+                    let e = pool.get(id).filter(|e| e.is_legacy())?;
                     Some((*id, e.blob.clone(), e.weight, e.fee))
                 })
                 .collect()
@@ -392,10 +412,11 @@ impl NodeCore {
 
     /// `send_miner_notifications`, for the tip `chain` has now.
     ///
-    /// The backlog is `get_block_template_backlog`'s: what may be relayed,
-    /// best paying first, up to 112.5% of the median weight -- enough for a
-    /// full block. The C++ also drops transactions whose key images collide;
-    /// the pool here admits no such pair in the first place.
+    /// The backlog is `get_block_template_backlog`'s without sensitive
+    /// transactions: public ones only, best paying first, up to 112.5% of the
+    /// median weight -- enough for a full block. The C++ also drops
+    /// transactions whose key images collide; the pool here admits no such
+    /// pair in the first place.
     fn miner_data(&self, chain: &LocalChain) -> Option<MinerData> {
         let next = next_block_of(chain.blockchain()).ok()?;
         let (seed_height, _) = wow_randomwow::seed::rx_seedheights(next.height);
@@ -408,7 +429,7 @@ impl NodeCore {
         let mut tx_backlog = Vec::new();
         let mut weight = 0u64;
         for (id, e) in lock(&self.pool).by_fee() {
-            if e.do_not_relay {
+            if !e.is_public() {
                 continue;
             }
             tx_backlog.push((id, e.weight, e.fee));
@@ -555,6 +576,13 @@ fn verdict(r: Rejection) -> BlockVerdict {
             false
         }
         BlockError::Storage(_) | BlockError::MissingTx { .. } => false,
+        // A transaction shape this node has no verifier for is this node's
+        // gap. The block is still refused; the peer that sent it is not
+        // blamed for a rule nobody here has written.
+        BlockError::TxSignature {
+            error: wow_core::TxCheckError::Unsupported(_),
+            ..
+        } => false,
         BlockError::Timestamp(wow_consensus::timestamp::TimestampError::TooFarInTheFuture {
             ..
         }) => false,
@@ -563,6 +591,20 @@ fn verdict(r: Rejection) -> BlockVerdict {
     BlockVerdict::Rejected {
         reason: r.to_string(),
         ban,
+    }
+}
+
+/// A pool relay method as the network layer acts on it, or `None` for one
+/// that goes nowhere.
+fn relay_of(method: RelayMethod) -> Option<TxRelay> {
+    match method {
+        RelayMethod::Local => Some(TxRelay::Local),
+        RelayMethod::Stem => Some(TxRelay::Stem),
+        RelayMethod::Fluff | RelayMethod::Block => Some(TxRelay::Fluff),
+        // A forward waits out its delay in the peer-to-peer layer and then
+        // goes on as a public stem.
+        RelayMethod::Forward => Some(TxRelay::Forward),
+        RelayMethod::None => None,
     }
 }
 
@@ -675,9 +717,13 @@ impl Core for NodeCore {
     }
 
     fn apply_blocks(&self, blocks: &[BlockEntry]) -> (usize, Option<BlockVerdict>) {
-        // The proofs first, on every core and without the chain lock.
+        // The proofs and the ring signatures first, on every core and without
+        // the chain lock. Between them they are nearly all of the cost of
+        // applying a batch, and neither needs the chain to be still.
         let work = self.pow_work(blocks);
         self.pow.prehash(&work);
+        let tx_work = self.tx_work(blocks);
+        self.txs.prevalidate(&tx_work, unix_now());
         let taken = {
             let mut chain = lock(&self.chain);
             blocks
@@ -692,6 +738,8 @@ impl Core for NodeCore {
                 .unwrap_or((blocks.len(), None))
         };
         self.pow.forget(&work);
+        self.txs.forget(&tx_work);
+        self.note_progress();
         taken
     }
 
@@ -725,34 +773,55 @@ impl Core for NodeCore {
         })
     }
 
-    fn incoming_txs(&self, txs: &[Vec<u8>]) -> Vec<TxVerdict> {
-        let verdicts = self.admit_txs(txs);
-        let accepted: Vec<Hash256> = verdicts
-            .iter()
-            .filter_map(|v| match v {
-                TxVerdict::Accepted { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        if !accepted.is_empty() {
-            self.announce_pool_txs(&accepted);
-        }
-        verdicts
+    fn incoming_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
+        let method = if fluff {
+            RelayMethod::Fluff
+        } else {
+            RelayMethod::Stem
+        };
+        self.take_txs(txs, method)
+    }
+
+    /// The relay method is `Forward` unless the sender fluffed
+    /// (`handle_notify_new_transactions`: `zone == public ? stem : forward`,
+    /// then `if (arg.dandelionpp_fluff) tx_relay = fluff`).
+    fn incoming_txs_anonymous(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
+        let method = if fluff {
+            RelayMethod::Fluff
+        } else {
+            RelayMethod::Forward
+        };
+        self.take_txs(txs, method)
     }
 
     fn pool_txs_except(&self, known: &HashSet<Hash256>) -> Vec<Vec<u8>> {
-        lock(&self.pool).public_txs_except(known, unix_now())
+        lock(&self.pool).public_txs_except(known)
     }
 
     fn pool_hashes(&self) -> Vec<Hash256> {
-        lock(&self.pool).relayable_ids()
+        lock(&self.pool).ids(false)
     }
 
-    fn tx_relayed(&self, ids: &[Hash256]) {
-        lock(&self.pool).mark_relayed(ids, unix_now());
+    /// Marked in the pool, and announced for whatever that made public.
+    fn tx_relayed(&self, ids: &[Hash256], how: TxRelay) {
+        let method = match how {
+            TxRelay::Stem => RelayMethod::Stem,
+            TxRelay::Fluff => RelayMethod::Fluff,
+            // `on_transactions_relayed(txs, relay_method::local)`: sent over
+            // an anonymity network, and **still private**. Calling it fluffed
+            // would show it to everyone reading this node's pool when only
+            // one hidden peer has it.
+            TxRelay::Local => RelayMethod::Local,
+            TxRelay::Forward => RelayMethod::Forward,
+        };
+        // The guard ends with the statement: announcing reads the pool again.
+        let public = lock(&self.pool).set_relayed(ids, method, unix_now());
+        if !public.is_empty() {
+            self.announce_pool_txs(&public);
+        }
     }
 
-    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>)> {
+    fn due_for_relay(&self) -> Vec<(Hash256, Vec<u8>, TxRelay)> {
         use std::sync::atomic::Ordering::Relaxed;
         // Asked every tick; the pool is walked every two minutes.
         let now = unix_now();
@@ -761,11 +830,49 @@ impl Core for NodeCore {
         }
         self.next_relay_check
             .store(now + crate::mempool::RELAY_CHECK_SECS, Relaxed);
-        lock(&self.pool).due_for_relay(now)
+        lock(&self.pool)
+            .due_for_relay(now)
+            .into_iter()
+            .map(|(id, blob, method)| (id, blob, relay_of(method).unwrap_or(TxRelay::Fluff)))
+            .collect()
     }
 }
 
 impl NodeCore {
+    /// Note where the chain has reached, for [`NodeCore::blocks_per_second`].
+    ///
+    /// Called after blocks are applied rather than on a timer: a sample that
+    /// repeats the same height says nothing about the speed, and a run of them
+    /// during a stall would drag the estimate towards zero when the right
+    /// answer is "no idea".
+    fn note_progress(&self) {
+        let now = std::time::Instant::now();
+        let height = self.db.height();
+        let mut held = lock(&self.progress);
+        if held.back().is_some_and(|(_, h)| *h == height) {
+            return;
+        }
+        held.push_back((now, height));
+        while held.len() > 2 && now.duration_since(held[0].0) > RATE_WINDOW {
+            held.pop_front();
+        }
+    }
+
+    /// Blocks per second over the last [`RATE_WINDOW`], once there is a second
+    /// of it to measure.
+    pub fn blocks_per_second(&self) -> Option<f64> {
+        let held = lock(&self.progress);
+        let (t0, h0) = *held.front()?;
+        let (t1, h1) = *held.back()?;
+        let secs = t1.duration_since(t0).as_secs_f64();
+        // And nothing at all if the last sample is stale: a speed measured
+        // over blocks that stopped arriving a minute ago is not a speed.
+        if t1.elapsed() > RATE_WINDOW {
+            return None;
+        }
+        (secs >= 1.0 && h1 > h0).then(|| (h1 - h0) as f64 / secs)
+    }
+
     /// The `(seed, hashing blob)` of each block in a sync batch whose proof the
     /// chain is going to compute: RandomWOW blocks at or above both the tip and
     /// the trusted range. A seed at or above the tip is an earlier block of the
@@ -806,8 +913,66 @@ impl NodeCore {
         work
     }
 
-    /// Transactions from a peer, into the pool.
-    fn admit_txs(&self, txs: &[Vec<u8>]) -> Vec<TxVerdict> {
+    /// Every transaction of a batch that the chain will actually check, with
+    /// the major version of the block carrying it.
+    ///
+    /// The same shape as [`NodeCore::pow_work`], and the same boundary: below
+    /// `trusted_below` the chain does not run these rules, so hashing rings
+    /// there would be work for nothing. A blob that does not parse is left
+    /// out rather than reported -- the chain refuses it, with the height and
+    /// the index this cannot know.
+    fn tx_work(&self, blocks: &[BlockEntry]) -> Vec<PendingTx> {
+        let from = self.db.height().max(self.pow.trusted_below());
+        let mut work = Vec::new();
+        for entry in blocks {
+            let Ok(block) = Block::from_blob(&entry.block) else {
+                break;
+            };
+            let height = match block.miner_tx.prefix.vin.as_slice() {
+                [TxIn::Gen { height }] => *height,
+                _ => break,
+            };
+            if height < from {
+                continue;
+            }
+            for blob in &entry.txs {
+                let Ok(tx) = Transaction::from_blob(blob) else {
+                    continue;
+                };
+                let Some(id) = wow_types::hashes::transaction_hash_from_blob(&tx, blob) else {
+                    continue;
+                };
+                work.push((id, tx, block.major_version));
+            }
+        }
+        work
+    }
+
+    /// Transactions from a peer, into the pool: through a stem, or fluffed.
+    ///
+    /// One the pool holds privately is not "known" here. It goes to the pool
+    /// again, which moves it on as far as this copy takes it -- to fluff, for
+    /// a fluffed copy or a stem that looped back (`tx_memory_pool::add_tx`).
+    /// Transactions from a peer, taken into the pool as `method`, with
+    /// whatever became public announced.
+    fn take_txs(&self, txs: &[Vec<u8>], method: RelayMethod) -> Vec<TxVerdict> {
+        let verdicts = self.admit_txs(txs, method);
+        let accepted: Vec<Hash256> = verdicts
+            .iter()
+            .filter_map(|v| match v {
+                TxVerdict::Accepted { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        // Only a public transaction is announced; `announce_pool_txs` reads
+        // the pool again and leaves a private one alone.
+        if !accepted.is_empty() {
+            self.announce_pool_txs(&accepted);
+        }
+        verdicts
+    }
+
+    fn admit_txs(&self, txs: &[Vec<u8>], method: RelayMethod) -> Vec<TxVerdict> {
         let ctx = self.fee_context();
         let now = unix_now();
         let mut pool = lock(&self.pool);
@@ -822,11 +987,11 @@ impl NodeCore {
                         ban: true,
                     };
                 };
-                if pool.contains(&id) || self.db.tx_exists(&id).unwrap_or(false) {
-                    return TxVerdict::Known { id };
-                }
-                match pool.add(&self.db, blob, &ctx, now, false) {
-                    Ok(id) => TxVerdict::Accepted { id, relay: true },
+                match pool.add(&self.db, blob, &ctx, now, method) {
+                    Ok(admitted) => TxVerdict::Accepted {
+                        id: admitted.id,
+                        how: relay_of(admitted.relay),
+                    },
                     Err(PoolRejection::AlreadyInPool) => TxVerdict::Known { id },
                     // A refusal here is policy, or a ring this node cannot
                     // resolve yet while it catches up; neither is proof the
@@ -850,6 +1015,20 @@ mod tests {
             step: wow_core::Step::Transactions,
             error,
         }
+    }
+
+    /// The pool's relay method reaches the network layer as the way a
+    /// transaction goes on: kept from relay goes nowhere, and one that came
+    /// back out of a block goes as fluff.
+    #[test]
+    fn a_relay_method_says_how_a_transaction_goes_on() {
+        assert_eq!(relay_of(RelayMethod::None), None);
+        assert_eq!(relay_of(RelayMethod::Local), Some(TxRelay::Local));
+        assert_eq!(relay_of(RelayMethod::Stem), Some(TxRelay::Stem));
+        assert_eq!(relay_of(RelayMethod::Fluff), Some(TxRelay::Fluff));
+        assert_eq!(relay_of(RelayMethod::Block), Some(TxRelay::Fluff));
+        // One from an anonymity network: held, then stemmed in the clear.
+        assert_eq!(relay_of(RelayMethod::Forward), Some(TxRelay::Forward));
     }
 
     /// Only evidence of misbehaviour bans; this node's own limits do not.
@@ -878,6 +1057,22 @@ mod tests {
                 BlockError::Timestamp(
                     wow_consensus::timestamp::TimestampError::TooFarInTheFuture { limit: 1 },
                 ),
+                false,
+            ),
+            // A ring signature that does not verify is the sender's fault.
+            (
+                BlockError::TxSignature {
+                    index: 0,
+                    error: wow_core::TxCheckError::Invalid("input 0: bad CLSAG".into()),
+                },
+                true,
+            ),
+            // A shape this node has no verifier for is not.
+            (
+                BlockError::TxSignature {
+                    index: 0,
+                    error: wow_core::TxCheckError::Unsupported("RCT type Null".into()),
+                },
                 false,
             ),
         ] {

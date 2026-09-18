@@ -154,9 +154,11 @@ pub struct NodeAddress {
 
 impl NodeAddress {
     /// Read an address as typed: `host`, `host:port`, `http://host:port`,
-    /// `https://host:port` or `[::1]:34568`. No scheme means plain HTTP, as
-    /// wallet-cli's `--daemon-address` means it. No port means the scheme's,
-    /// 80 or 443, when a scheme was typed, and 34568 when none was.
+    /// `https://host:port` or `[::1]:34568`. No scheme means `http://`, as
+    /// wallet-cli's `--daemon-address` means it: on the desktop, TLS is tried
+    /// first and plain HTTP taken only if the node does not answer it. No port
+    /// means the scheme's, 80 or 443, when a scheme was typed, and 34568 when
+    /// none was.
     pub fn parse(text: &str) -> Result<NodeAddress, String> {
         let text = text.trim();
         if text.is_empty() {
@@ -245,8 +247,14 @@ impl NodeAddress {
     }
 
     /// Why this program cannot reach the node, when that is known before
-    /// trying. `secure_page` is whether a browser loaded the wallet over https.
-    pub fn unreachable_reason(&self, in_browser: bool, secure_page: bool) -> Option<&'static str> {
+    /// trying. `secure_page` is whether a browser loaded the wallet over https,
+    /// and `proxy` whether the desktop reaches nodes through a proxy.
+    pub fn unreachable_reason(
+        &self,
+        in_browser: bool,
+        secure_page: bool,
+        proxy: bool,
+    ) -> Option<&'static str> {
         if in_browser {
             // Tor Browser reaches .onion from any page; mixed-content rules
             // leave it alone.
@@ -257,11 +265,22 @@ impl NodeAddress {
             }
             return None;
         }
+        // Through a proxy the name goes to the proxy, which Tor's or I2P's
+        // reaches.
+        if proxy {
+            return None;
+        }
         if self.is_onion() {
-            return Some("a .onion node is reached through Tor, which this wallet does not use yet");
+            return Some(
+                "a .onion node is reached through Tor: set Tor's SOCKS proxy, as 127.0.0.1:9050, \
+                 under Proxy",
+            );
         }
         if self.is_i2p() {
-            return Some("an .i2p node is reached through I2P, which this wallet does not use yet");
+            return Some(
+                "an .i2p node is reached through I2P: set its SOCKS proxy, as 127.0.0.1:4447, \
+                 under Proxy",
+            );
         }
         None
     }
@@ -321,15 +340,16 @@ mod tests {
         let https = NodeAddress::parse("https://node:34568").expect("ok");
         let onion = NodeAddress::parse("http://abc.onion:34568").expect("ok");
 
-        // The desktop speaks both.
-        assert!(http.unreachable_reason(false, false).is_none());
-        assert!(https.unreachable_reason(false, false).is_none());
-        assert!(onion.unreachable_reason(false, false).is_some());
+        // The desktop speaks both, and onion only through a proxy.
+        assert!(http.unreachable_reason(false, false, false).is_none());
+        assert!(https.unreachable_reason(false, false, false).is_none());
+        assert!(onion.unreachable_reason(false, false, false).is_some());
+        assert!(onion.unreachable_reason(false, false, true).is_none());
 
-        assert!(http.unreachable_reason(true, true).is_some());
-        assert!(http.unreachable_reason(true, false).is_none());
-        assert!(https.unreachable_reason(true, true).is_none());
-        assert!(onion.unreachable_reason(true, true).is_none());
+        assert!(http.unreachable_reason(true, true, false).is_some());
+        assert!(http.unreachable_reason(true, false, false).is_none());
+        assert!(https.unreachable_reason(true, true, false).is_none());
+        assert!(onion.unreachable_reason(true, true, false).is_none());
     }
 
     #[test]

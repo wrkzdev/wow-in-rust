@@ -37,8 +37,9 @@ impl Progress {
         }
     }
 
-    /// The wallet has scanned up to `height`, of `target`.
-    pub fn update(&mut self, height: u64, target: u64) {
+    /// The wallet has scanned up to `height`, of `target`, having started at
+    /// `from`.
+    pub fn update(&mut self, from: u64, height: u64, target: u64) {
         let now = Instant::now();
         self.samples.push_back((now, height));
         while self.samples.len() > 2 && now.duration_since(self.samples[0].0) > RATE_WINDOW {
@@ -52,7 +53,7 @@ impl Progress {
         {
             return;
         }
-        let line = describe(height, target, self.rate());
+        let line = describe(from, height, target, self.rate());
         if self.live {
             let mut out = std::io::stdout().lock();
             let _ = write!(out, "\r{line:<width$}", width = self.shown);
@@ -95,12 +96,19 @@ impl Drop for Progress {
 }
 
 /// `height 512001 / 873792 (58.6%), 1240 blocks/s, 4m 52s left`.
-fn describe(height: u64, target: u64, rate: Option<f64>) -> String {
+///
+/// The percentage is over the blocks this wallet has to scan, not over the
+/// chain: `from` is where it starts. A wallet restored at 800,000 on an
+/// 874,000 chain would otherwise open at 91% and creep, which says nothing
+/// useful about either how much is done or how much is left.
+fn describe(from: u64, height: u64, target: u64, rate: Option<f64>) -> String {
     let target = target.max(height);
-    let percent = if target == 0 {
+    let from = from.min(height);
+    let span = target - from;
+    let percent = if span == 0 {
         100.0
     } else {
-        height as f64 * 100.0 / target as f64
+        (height - from) as f64 * 100.0 / span as f64
     };
     let mut line = format!("height {height} / {target} ({percent:.1}%)");
     if let Some(rate) = rate {
@@ -120,14 +128,38 @@ mod tests {
     #[test]
     fn the_line_gains_a_speed_and_a_time_left_once_measured() {
         assert_eq!(
-            describe(512_001, 873_792, None),
+            describe(0, 512_001, 873_792, None),
             "height 512001 / 873792 (58.6%)"
         );
         assert_eq!(
-            describe(512_001, 873_792, Some(1_000.0)),
+            describe(0, 512_001, 873_792, Some(1_000.0)),
             "height 512001 / 873792 (58.6%), 1000 blocks/s, 6m 2s left"
         );
         // A daemon that fell behind the wallet is not shown as past 100%.
-        assert_eq!(describe(10, 5, None), "height 10 / 10 (100.0%)");
+        assert_eq!(describe(0, 10, 5, None), "height 10 / 10 (100.0%)");
+    }
+
+    /// The percentage is over what this wallet has to scan. A wallet restored
+    /// near the tip is not 91% done before it has read a block.
+    #[test]
+    fn the_percentage_counts_from_where_the_wallet_starts() {
+        assert_eq!(
+            describe(800_000, 800_000, 874_000, None),
+            "height 800000 / 874000 (0.0%)"
+        );
+        assert_eq!(
+            describe(800_000, 837_000, 874_000, None),
+            "height 837000 / 874000 (50.0%)"
+        );
+        assert_eq!(
+            describe(800_000, 874_000, 874_000, None),
+            "height 874000 / 874000 (100.0%)"
+        );
+        // A restore height above where the wallet has reached cannot make the
+        // percentage negative or the span zero.
+        assert_eq!(
+            describe(900_000, 10, 874_000, None),
+            "height 10 / 874000 (0.0%)"
+        );
     }
 }

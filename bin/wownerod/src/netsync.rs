@@ -6,7 +6,7 @@
 //! and a layer that conflated them would blame the peer for our own bug or
 //! the other way round.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -123,6 +123,16 @@ impl ChainPow {
     }
 }
 
+thread_local! {
+    /// One light-mode VM per thread, for [`ChainPow::pow_hash`]'s miss path.
+    ///
+    /// Not shared: a `Vm` is mutated by hashing, and a lock around one would
+    /// serialise the very thing `ChainPow::prehash` spreads over every core.
+    /// A thread that never verifies a proof never builds one.
+    static VM: std::cell::RefCell<Option<wow_randomwow::vm::Vm>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl wow_core::pow::PowVerifier for ChainPow {
     /// `specs/06` §2 step 6 allows the proof to be skipped "unless a
     /// precomputed hash covers this height". Below the last checkpoint, one
@@ -153,12 +163,48 @@ impl wow_core::pow::PowVerifier for ChainPow {
                 .seeds
                 .get(seed_hash)
                 .map_err(|e| wow_core::pow::PowError::RandomWow(e.to_string()))?;
-            // Light mode: a cache rather than the 2 GiB dataset. Verification
-            // is one hash per block, where mining is millions, so the dataset's
-            // build cost would dwarf what it saves.
-            let mut vm = wow_randomwow::vm::Vm::light(wow_randomwow::vm::verify_flags(), cache)
-                .map_err(|e| wow_core::pow::PowError::RandomWow(e.to_string()))?;
-            return Ok(vm.hash(hashing_blob));
+            // Light mode: a cache rather than the 2 GiB dataset, and not a
+            // thing to "improve" later.
+            //
+            // The dataset makes a hash roughly ten times faster and has to be
+            // rebuilt every time the seed changes, which is every
+            // `SEEDHASH_EPOCH_BLOCKS` -- 2,048 blocks. Verifying is one hash
+            // per block, so the arithmetic goes the wrong way at every
+            // plausible build time:
+            //
+            // | range | blocks | epochs | light, 16 cores | dataset builds |
+            // |---|---|---|---|---|
+            // | above the last checkpoint | 35,540 | 17 | ~170 s | 520-2,080 s |
+            // | every RandomWOW block | 759,372 | 371 | ~3,600 s | 11,000-44,000 s |
+            //
+            // Three to twelve times *slower*, before counting 2 GiB of memory.
+            // This is why `monerod` verifies in light mode too and builds a
+            // dataset only for mining, where the same seed does millions of
+            // hashes. The lever that would actually help is a JIT for the VM,
+            // which is in `docs/daemon-review.md`.
+            //
+            // Kept per thread rather than built per call. A VM carries a 2 MiB
+            // scratchpad and its program buffers, and this path runs once for
+            // every block that arrives outside a sync batch -- a new block
+            // every few minutes, forever, each one allocating and freeing all
+            // of it. `set_cache` is a pointer swap when the seed has not
+            // changed, and the seed changes once an epoch.
+            return VM.with(|held| {
+                let mut held = held.borrow_mut();
+                if held.is_none() {
+                    *held = Some(
+                        wow_randomwow::vm::Vm::light(wow_randomwow::vm::verify_flags(), cache)
+                            .map_err(|e| wow_core::pow::PowError::RandomWow(e.to_string()))?,
+                    );
+                } else {
+                    let vm = held.as_mut().expect("present");
+                    if vm.seed() != seed_hash {
+                        vm.set_cache(cache);
+                    }
+                }
+                let vm = held.as_mut().expect("present");
+                Ok(vm.hash(hashing_blob))
+            });
         }
 
         match major_version {
@@ -169,6 +215,128 @@ impl wow_core::pow::PowVerifier for ChainPow {
                 variant: if v >= 11 { "variant 4" } else { "variant 2" },
             }),
         }
+    }
+}
+
+/// One transaction of a sync batch, ready to be verified: its id, itself, and
+/// the major version of the block carrying it.
+pub(crate) type PendingTx = (Hash256, Transaction, u8);
+
+/// The transaction checks `specs/06` §5.11 and §5.4 ask for, over this node's
+/// store: every ring signature, the range proof, the commitment sum, and each
+/// ring member's lock and age.
+///
+/// The work itself is [`crate::mempool::verify`] -- the same function that
+/// guards the pool, deliberately. A transaction inside a block and the same
+/// transaction in the pool must be judged identically, or this node disagrees
+/// with itself about the same bytes.
+///
+/// What this adds is *when*. A CLSAG over a ring of 22 is the most expensive
+/// thing in the block path, and running one under the chain lock would stop
+/// the rest of the node for the length of a sync batch. So a batch is verified
+/// side by side beforehand and the chain finds the answers waiting -- exactly
+/// the arrangement [`ChainPow::prehash`] uses for proofs of work, and correct
+/// for the same reason: nothing here decides validity that the chain would
+/// decide differently.
+///
+/// The one thing that *is* height-dependent -- whether a ring member is
+/// unlocked and old enough -- is checked ahead at a **lower** height than the
+/// block lands at, because the batch has not been applied yet. Both rules are
+/// monotone in the height, so a pass there is a pass here; see
+/// [`wow_core::txcheck`]. A transaction that does not pass ahead of time is
+/// simply not cached, and the chain verifies it in full.
+pub(crate) struct ChainTxs {
+    db: Arc<LmdbDb>,
+    /// Ids of transactions already verified, waiting for the chain to ask.
+    ready: Mutex<HashSet<Hash256>>,
+}
+
+impl ChainTxs {
+    fn new(db: Arc<LmdbDb>) -> ChainTxs {
+        ChainTxs {
+            db,
+            ready: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Verify a batch's transactions on every core, without the chain lock.
+    ///
+    /// Failures are dropped rather than recorded. A ring member created
+    /// earlier in this same batch is not in the store yet, so its transaction
+    /// cannot verify here and resolves by the time the chain reaches it --
+    /// and a transaction that is genuinely bad is refused there, with the
+    /// height and the index this cannot know.
+    pub(crate) fn prevalidate(&self, work: &[PendingTx], now: u64) {
+        let todo: Vec<&PendingTx> = {
+            let ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+            work.iter().filter(|w| !ready.contains(&w.0)).collect()
+        };
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(todo.len());
+        let height = self.db.height();
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while let Some((id, tx, version)) =
+                        todo.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        if crate::mempool::verify(&self.db, tx, *version, height, now).is_ok() {
+                            self.ready
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(*id);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Drop whatever [`ChainTxs::prevalidate`] verified for `work` that the
+    /// chain did not use.
+    pub(crate) fn forget(&self, work: &[PendingTx]) {
+        let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, _, _) in work {
+            ready.remove(id);
+        }
+    }
+}
+
+impl wow_core::txcheck::TxVerifier for ChainTxs {
+    fn verify(
+        &self,
+        hash: &Hash256,
+        tx: &Transaction,
+        hf_version: u8,
+        chain_height: u64,
+        now: u64,
+    ) -> Result<(), wow_core::txcheck::TxCheckError> {
+        use crate::mempool::Rejection;
+        use wow_core::txcheck::TxCheckError;
+
+        // Taken, not copied. A block whose transactions the chain refuses for
+        // some other reason may be offered again, and the second time it is
+        // verified again rather than waved through on a stale answer.
+        if self
+            .ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(hash)
+        {
+            return Ok(());
+        }
+        crate::mempool::verify(&self.db, tx, hf_version, chain_height, now).map_err(|r| {
+            let reason = r.reason();
+            // A shape this node has no verifier for is this node's gap, never
+            // the sender's fault.
+            if matches!(r, Rejection::UnsupportedRctType { .. }) {
+                TxCheckError::Unsupported(reason)
+            } else {
+                TxCheckError::Invalid(reason)
+            }
+        })
     }
 }
 
@@ -185,6 +353,8 @@ pub struct LocalChain {
     /// The chain's verifier, shared so a batch's proofs can be computed before
     /// the chain lock is taken.
     pow: Arc<ChainPow>,
+    /// The chain's transaction verifier, shared for the same reason.
+    txs: Arc<ChainTxs>,
 }
 
 impl LocalChain {
@@ -200,9 +370,20 @@ impl LocalChain {
     ///
     /// This node has 39 checkpoints rather than a hash per block, so between
     /// two of them it is trusting the `prev_id` chain and finds a forgery at
-    /// the next checkpoint rather than immediately. Above the last checkpoint
-    /// -- the range where a reorg is still possible and where this node's
-    /// answers actually matter -- every rule is enforced.
+    /// the next checkpoint rather than immediately.
+    ///
+    /// Above the last checkpoint -- the range where a reorg is still possible
+    /// and where this node's answers actually matter -- every rule is
+    /// enforced, transactions included: [`ChainTxs`] runs `specs/06` §5.11
+    /// and §5.4 over each one, which is the same [`crate::mempool::verify`]
+    /// the pool is guarded by.
+    ///
+    /// The one remaining gap is narrow and explicit: a RingCT shape this node
+    /// has no verifier for is **refused**, not waved through
+    /// (`Rejection::UnsupportedRctType`). Everything on mainnet above the last
+    /// checkpoint is Bulletproofs+, so it does not arise there; on a chain
+    /// replayed from genesis it stops the sync, as the missing CryptoNight
+    /// variants already do.
     pub fn new(db: Arc<LmdbDb>, network: Network) -> Result<LocalChain, String> {
         let checkpoints = wow_consensus::checkpoints::Checkpoints::new(network);
         // `last_height` is the last checkpointed block, and it is itself
@@ -211,24 +392,28 @@ impl LocalChain {
         let trusted_below = checkpoints.last_height().map(|h| h + 1).unwrap_or(0);
 
         let pow = Arc::new(ChainPow::new(trusted_below));
+        let txs = Arc::new(ChainTxs::new(db.clone()));
         let mut chain = Blockchain::new(db.clone(), pow.clone(), network)
             .map_err(|e| format!("cannot open the chain: {e:?}"))?;
         chain.trust_below(trusted_below);
+        // `specs/06` §2 step 9. Above `trusted_below` only: the chain below
+        // contains transactions today's rules reject, which is the whole
+        // reason that boundary exists.
+        chain.verify_transactions_with(txs.clone());
 
+        // One cursor walk, not one read transaction per block: on a chain of
+        // this length the difference is seconds of start-up.
         let height = db.height();
-        let mut hashes = Vec::with_capacity(height as usize);
-        for h in 0..height {
-            hashes.push(
-                db.get_block_hash(h)
-                    .map_err(|e| format!("cannot read the block at height {h}: {e}"))?,
-            );
-        }
+        let hashes = db
+            .block_hashes(0, height)
+            .map_err(|e| format!("cannot read the chain's block hashes: {e}"))?;
 
         Ok(LocalChain {
             chain,
             db,
             hashes,
             pow,
+            txs,
         })
     }
 
@@ -241,6 +426,11 @@ impl LocalChain {
     /// The chain's proof-of-work verifier, for hashing ahead of it.
     pub(crate) fn pow(&self) -> Arc<ChainPow> {
         self.pow.clone()
+    }
+
+    /// The chain's transaction verifier, for checking a batch ahead of it.
+    pub(crate) fn txs(&self) -> Arc<ChainTxs> {
+        self.txs.clone()
     }
 
     /// Validate and add a block from outside, returning what it became.
@@ -337,13 +527,12 @@ impl LocalChain {
                 }
             }
         }
-        for h in self.hashes.len() as u64..height {
-            self.hashes.push(
-                self.db
-                    .get_block_hash(h)
-                    .map_err(|e| format!("cannot read the block at height {h}: {e}"))?,
-            );
-        }
+        let from = self.hashes.len() as u64;
+        self.hashes.extend(
+            self.db
+                .block_hashes(from, height)
+                .map_err(|e| format!("cannot read block hashes from {from}: {e}"))?,
+        );
         Ok(())
     }
 
@@ -475,7 +664,9 @@ pub fn run(db: LmdbDb, network: Network, address: &str, max_batches: usize) -> R
         println!(
             "Blocks below {trusted} are covered by hard-coded checkpoints: their proof of work
              and transaction rules are not re-checked, which is what the C++ node also does
-             (docs/spec-deltas.md §23). Everything from {trusted} up is fully verified."
+             (docs/spec-deltas.md §23). Everything from {trusted} up is fully verified: the
+             proof of work, the difficulty, the coinbase, and every transaction's ring
+             signatures, range proof, commitment sum and ring members."
         );
     }
     println!("Connecting to {address}...");

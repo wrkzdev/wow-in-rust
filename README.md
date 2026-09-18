@@ -97,9 +97,14 @@ Against public nodes — `https://wow-node.0z.network:443`,
   continuously, and has reached and held the network's tip: a full mainnet
   chain of its own in LMDB, 6.64 GiB at height 874,341. Proofs of work are
   checked above the last checkpoint only, until CryptoNight v2 and v4 land.
-  A sync from scratch is many hours — roughly 11 blocks/s, ~78% of it waiting
-  on the peer — so point a wallet at a public node unless you specifically want
-  your own chain.
+  Above it every rule is enforced, transactions included: each one's ring
+  signatures, range proof, commitment sum and ring members are checked with the
+  same code that guards the pool, a whole sync batch at a time on every core.
+  A sync from scratch is many hours, so point a wallet at a public node unless
+  you specifically want your own chain. (The often-quoted 11 blocks/s with 78%
+  spent waiting is `--sync-from`, the single-peer diagnostic path, which
+  deliberately does one thing at a time. `--serve` reserves spans across every
+  connection and applies them while others are still arriving.)
 
 Run the live checks yourself:
 
@@ -107,8 +112,10 @@ Run the live checks yourself:
 WOW_LIVE_NODE=node2.monerodevs.org:34568   cargo test -p wow-daemon-client --test live_node -- --ignored --nocapture
 ```
 
-**Not verified:** sweeps — `sweep_all`, and sweeping a single output. Both are
-built; neither has been run against mainnet.
+**Not verified:** sweeps — `sweep_all`, and `sweep_single`, which sends one
+output named by the key image `unspent_outputs` prints. Both are built, in
+`wownero-wallet-cli` and `wownero-wallet-rpc`; neither has been run against
+mainnet. The GUI sweeps the whole wallet only.
 
 **Built, and run on mainnet:** `wownerod --serve` as a long-running node —
 outbound peers, syncing from several at once, fluffy blocks, the peer store, and
@@ -118,10 +125,29 @@ at least one alternative block filed off the main chain.
 Dandelion++ relay, reorgs, the admin and mining RPC, HTTP Digest login, RPC over
 TLS, the ZMQ RPC and publisher — and the miner, on regtest.
 
-**Not built:** in the wallets, transaction proofs, key-image import/export and
-multiple accounts; in the daemon, proxies and i2p/Tor, rate limits, pruning,
+**Built, not yet run against the C++ wallet:** cold signing — keeping the spend
+key on a machine that never touches a network. A watch-only wallet exports its
+outputs and writes an unsigned transfer, the offline half imports the outputs,
+signs the key images and signs the transfer, and the watch-only half submits
+it: `export_outputs`, `import_outputs`, `export_key_images`,
+`import_key_images`, `sign_transfer`, `submit_transfer` and
+`describe_transfer`, in `wownero-wallet-cli` and `wownero-wallet-rpc`, plus
+`--offline`. The four files use the formats Wownero 0.11 writes — its own
+binary archive, not the Boost one the older versions used — but no file has
+been handed to a C++ wallet yet, so read that as *written to the format*
+rather than *checked against it*. The GUI and web wallet do not expose any of
+it.
+
+**Not built:** in the web wallet, a daemon login — a browser's `fetch` does
+not do HTTP Digest, so a node started with `--rpc-login` is out of reach from
+one; the other three front ends can log in. In the wallets, transaction
+proofs, multisig and multiple accounts; in the daemon, rate
+limits, pruning,
 bootstrap daemons, background mining, extra messages in mined blocks, and ZMQ
-over `ipc://` or with CURVE/PLAIN security. The daemon's `--help` names what is
+over `ipc://` or with CURVE/PLAIN security. i2p and Tor -- `--proxy`,
+`--tx-proxy` and `--anonymous-inbound` -- are built, but have only been
+exercised against a proxy written for their tests, never against tor, i2pd or
+a C++ node. The daemon's `--help` names what is
 missing rather than accepting options it cannot honour.
 [`docs/daemon-review.md`](docs/daemon-review.md) tracks the daemon review item
 by item, with the known gaps in what is built.
@@ -255,8 +281,11 @@ so the gate stays open until v2 and v4 land.
 
 ## Layout
 
-Per [`specs/00-overview.md`](specs/00-overview.md) §4.1. Crates not yet
-implemented exist as documented placeholders so the layout is stable.
+Mostly [`specs/00-overview.md`](specs/00-overview.md) §4.1. Three crates the
+spec does not name were added as the work went on — `wow-log`, `wow-zmq` and
+`wow-tls`, each replacing something that would otherwise have been a
+dependency. Two the spec *does* name are still empty, and what they were meant
+to hold went elsewhere; the note under the listing says where.
 
 ```
 crates/
@@ -270,18 +299,28 @@ crates/
   wow-p2p/           levin, peer lists, multi-peer sync, the node, Dandelion++
   wow-zmq/           ZMTP 3.1 without libzmq: REP/PUB servers, REQ/SUB clients
   wow-log/           C++-style log levels and categories, file rotation
-  wow-rpc-types/     shared RPC request/response types                [M3]
-  wow-rpc-server/    daemon HTTP server                               [M3]
-  wow-wallet/        wallet core                                      [M4]
-  wow-daemon-client/ wallet-side daemon RPC client                    [M4]
+  wow-tls/           a rustls CryptoProvider of pure-Rust crates; no ring
+  wow-rpc-types/     empty; see below
+  wow-rpc-server/    empty; see below
+  wow-wallet/        wallet core: keys, scanning, selection, building, files
+  wow-daemon-client/ wallet-side daemon RPC client, with TLS and a login
 bin/
   wownerod/  wownero-wallet-cli/  wownero-wallet-rpc/
 extras/              a Cargo workspace of its own; see extras/README.md
   wallet-gui/        the desktop wallet on egui: Linux, Windows, macOS
   wallet-web/        the same interface as wasm: static files, no server
 tests/corpus/        test vectors and blobs; see tests/corpus/README.md
-scripts/             corpus generation (blocks, difficulty windows, weights, unlock ids)
+scripts/             corpus generation, and scripts/check-no-c.sh
+docker/              release builds: linux, windows, macos, android
 ```
+
+`wow-rpc-types` and `wow-rpc-server` are still the placeholders `specs/00` §4.1
+asks for, and the daemon's RPC did not land in them: it is
+[`bin/wownerod/src/rpc/`](bin/wownerod/src/rpc/), because nothing else needs to
+serve it and splitting it out would have meant a crate whose only caller is one
+binary. The wallet side's types live with the client that uses them, in
+`wow-daemon-client`. The two crates are kept rather than deleted so the
+difference from the spec is visible instead of silent.
 
 ## Building and testing
 
@@ -295,12 +334,41 @@ cargo fmt --all --check
 cargo test -p wow-randomwow --release -- --ignored   # ~2.3 GiB dataset build
 ```
 
-The desktop and web wallets are built separately, in Docker or by hand:
-[`extras/README.md`](extras/README.md) has both.
+### Release builds
+
+Everything ships from one script, in Docker, so a build does not depend on
+what happens to be installed. Output lands in `dist/<platform>/`, with hashes
+in `dist/SHA256SUMS`.
+
+```sh
+bash docker/build-dist.sh              # linux windows macos android
+bash docker/build-dist.sh linux        # x86_64 and aarch64, glibc >= 2.36
+bash docker/build-dist.sh windows      # x86_64, static, no DLLs
+bash docker/build-dist.sh macos        # arm64 and x86_64, macOS 13+, unsigned
+bash docker/build-dist.sh android      # arm64 and x86_64, API 24+
+bash docker/build-dist.sh extras       # web, gui-linux, gui-windows, gui-macos
+```
+
+**Android is `wownerod`, `wownero-wallet-cli` and `wownero-wallet-rpc` as
+command-line binaries** — for Termux or `adb shell`, not an APK, and there is
+no mobile interface. No `armeabi-v7a`: `wow-storage` does not compile for a
+32-bit target yet, so there is nothing to package until it does.
+
+`gui-macos` builds natively on a Mac and is skipped anywhere else: the GUI
+needs Apple's SDK, which no container has. The desktop and web wallets are a
+workspace of their own — [`extras/README.md`](extras/README.md) has the
+without-Docker route for both.
 
 A Rust toolchain and a C compiler are all it needs. LMDB, built by
-`lmdb-master-sys`, is the only code that is not Rust; RandomWOW, which used to
-need CMake and a C++ toolchain, is Rust now.
+`lmdb-master-sys`, is the only code in the node and the command-line wallets
+that is not Rust; RandomWOW, which used to need CMake and a C++ toolchain, is
+Rust now. The desktop wallet adds one more on Linux — `wayland-backend`
+compiles a small shim, reached from eframe's defaults — and nothing else
+anywhere compiles C. That is checked rather than asserted:
+
+```sh
+bash scripts/check-no-c.sh   # also a CI job; per target, both workspaces
+```
 
 The workspace pins `opt-level = 3` for dependencies even in the test profile:
 an unoptimised `curve25519-dalek` makes the vector suite take minutes rather
@@ -315,11 +383,10 @@ Three rules, in order of importance.
 
 **1. The C++ tree is the specification where the two disagree.** The spec
 documents cite `src/...` paths in the reference tree, not this repository. Keep
-a checkout to hand. Seventeen places where the spec's summary turned out to be
-imprecise are collected in [`docs/spec-deltas.md`](docs/spec-deltas.md) —
-twenty-five of them so far — each
-with the C++ that settles it; they are also flagged at the code that depends on
-them.
+a checkout to hand. **Twenty-eight** places where the spec's summary turned out
+to be imprecise are collected in [`docs/spec-deltas.md`](docs/spec-deltas.md),
+each with the C++ that settles it; they are also flagged at the code that
+depends on them.
 
 Findings in the C++ *itself* — as opposed to in the spec's description of it —
 go in [`docs/cpp-findings.md`](docs/cpp-findings.md), each with the C++ test
@@ -331,8 +398,11 @@ chain split. Each one this milestone touches has a test naming it.
 
 **3. A parse failure is a `Result`, never a panic.** The epee parser faces the
 network before any authentication; a panic there is a remote crash
-([`specs/15`](specs/15-testing-and-conformance.md) §4.4). Every parser here has
-a `never_panics` test. `wow-crypto`, `wow-serialize` and `wow-types` set
+([`specs/15`](specs/15-testing-and-conformance.md) §4.4). Every parser that
+reads from a socket has a test that throws arbitrary bytes at it: the epee
+and consensus archives, varints, base58, mnemonics, addresses, `tx_extra`,
+blocks and transactions, the Levin codec and its reassembly, the daemon's
+HTTP request line, and ZMTP. `wow-crypto`, `wow-serialize` and `wow-types` set
 `#![forbid(unsafe_code)]`; `wow-randomwow` cannot, since it uses AES-NI and
 runs SuperscalarHash as machine code, so it sets
 `#![deny(unsafe_op_in_unsafe_fn)]` and every `unsafe` block carries a `SAFETY`
