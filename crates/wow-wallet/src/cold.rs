@@ -1,4 +1,4 @@
-//! The files a watch-only wallet and a cold wallet exchange (`specs/12` §6).
+//! The files a watch-only wallet and a cold wallet exchange (`specs/12` §8).
 //!
 //! Cold signing splits one wallet in two. The **watch-only** half has the view
 //! key, sees the chain, and can plan a transaction but not sign it. The

@@ -1,4 +1,4 @@
-//! Cold signing, as operations on a wallet (`specs/12` §6).
+//! Cold signing, as operations on a wallet (`specs/12` §8).
 //!
 //! [`crate::cold`] has the four file formats; this has what the two halves of
 //! a pair do with them. A **watch-only** wallet holds the view key, watches the
