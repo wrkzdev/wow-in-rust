@@ -45,6 +45,9 @@ use crate::chacha::{self, Iv, Key};
 /// allocation.
 const MAX_ACCOUNT_DATA: usize = 1 << 20;
 
+/// `DEFAULT_INACTIVITY_LOCK_TIMEOUT`: five minutes.
+pub const DEFAULT_INACTIVITY_LOCK_TIMEOUT: u64 = 300;
+
 #[derive(Debug, thiserror::Error)]
 pub enum KeysFileError {
     #[error("the outer container is malformed: {0}")]
@@ -272,6 +275,46 @@ impl KeysFile {
             .insert("auto_low_priority".into(), Json::from(u64::from(on)));
     }
 
+    /// `ignore_outputs_above`: nothing worth more is picked to pay a
+    /// transfer.
+    ///
+    /// `MONEY_SUPPLY` unless set, which on this chain is the whole `u64`
+    /// range, so the filter is off until somebody turns it on. Somebody who
+    /// does is keeping a large output out of the everyday ones on purpose.
+    pub fn ignore_outputs_above(&self) -> u64 {
+        u64_member(&self.settings, "ignore_outputs_above")
+            .unwrap_or(wow_consensus::constants::MONEY_SUPPLY)
+    }
+
+    pub fn set_ignore_outputs_above(&mut self, amount: u64) {
+        self.settings
+            .insert("ignore_outputs_above".into(), Json::from(amount));
+    }
+
+    /// `ignore_outputs_below`: nothing worth less is picked. Zero unless set.
+    pub fn ignore_outputs_below(&self) -> u64 {
+        u64_member(&self.settings, "ignore_outputs_below").unwrap_or(0)
+    }
+
+    pub fn set_ignore_outputs_below(&mut self, amount: u64) {
+        self.settings
+            .insert("ignore_outputs_below".into(), Json::from(amount));
+    }
+
+    /// `inactivity_lock_timeout`: how long a wallet may sit untouched before
+    /// it locks itself, in seconds. Zero turns it off.
+    ///
+    /// `DEFAULT_INACTIVITY_LOCK_TIMEOUT` is 300 (src/wallet/wallet2.cpp:149).
+    pub fn inactivity_lock_timeout(&self) -> u64 {
+        u64_member(&self.settings, "inactivity_lock_timeout")
+            .unwrap_or(DEFAULT_INACTIVITY_LOCK_TIMEOUT)
+    }
+
+    pub fn set_inactivity_lock_timeout(&mut self, seconds: u64) {
+        self.settings
+            .insert("inactivity_lock_timeout".into(), Json::from(seconds));
+    }
+
     /// `(major, minor)` lookahead — how many unused subaddresses to precompute.
     pub fn subaddress_lookahead(&self) -> (u32, u32) {
         (
@@ -451,6 +494,27 @@ mod tests {
             Some(7)
         );
         assert_eq!(back.network(), Network::Testnet);
+    }
+
+    /// The amount range a send picks inside, and the inactivity timeout, come
+    /// back from the keys file, and a file that never had them reads the
+    /// reference's defaults: the whole money supply, nothing, and 300 seconds.
+    #[test]
+    fn the_spend_range_and_lock_timeout_survive_a_rewrite() {
+        let mut kf = KeysFile::new(account(), Network::Mainnet, "English");
+        assert_eq!(kf.ignore_outputs_above(), u64::MAX, "MONEY_SUPPLY");
+        assert_eq!(kf.ignore_outputs_below(), 0);
+        assert_eq!(kf.inactivity_lock_timeout(), 300);
+
+        kf.set_ignore_outputs_above(500_000_000_000);
+        kf.set_ignore_outputs_below(1_000);
+        kf.set_inactivity_lock_timeout(0);
+
+        let blob = kf.to_blob(b"pw", 1, [3; 8], [4; 8]).expect("write");
+        let back = KeysFile::open(&blob, b"pw", 1).expect("read");
+        assert_eq!(back.ignore_outputs_above(), 500_000_000_000);
+        assert_eq!(back.ignore_outputs_below(), 1_000);
+        assert_eq!(back.inactivity_lock_timeout(), 0, "turned off, not absent");
     }
 
     /// A watch-only wallet has no spend key, and still opens.

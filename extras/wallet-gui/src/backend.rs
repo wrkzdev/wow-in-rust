@@ -865,6 +865,11 @@ impl<P: Platform> Backend<P> {
             ring_size: wow_wallet::decoys::RING_SIZE,
             fee_per_byte: priority::fee_per_byte(&tiers, tier),
             extra_size: spend::extra_size(2, payment_id, false),
+            // As `prepare_send` reads them: an estimate that ignored the
+            // amount range the send obeys would quote a fee for inputs the
+            // send will not pick.
+            ignore_above: w.session.keys_file.ignore_outputs_above(),
+            ignore_below: w.session.keys_file.ignore_outputs_below(),
             chain_height: w.session.chain_height(),
             now: wow_wallet::clock::now(),
             ..Default::default()

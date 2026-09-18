@@ -1372,7 +1372,7 @@ fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
         println!("usage: set <option> <value>");
         println!(
             "known: refresh-from-block-height, subaddress-lookahead, seed-language, store-tx-info, \
-             priority, auto-low-priority"
+             priority, auto-low-priority, ignore-outputs-above, ignore-outputs-below"
         );
         return Ok(());
     };
@@ -1430,6 +1430,23 @@ fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
                 _ => return Err("auto-low-priority is 0 or 1".into()),
             };
             session.keys_file.set_auto_low_priority(on);
+        }
+        // `set_ignore_outputs_above` and `set_ignore_outputs_below`: keep an
+        // output out of everyday sends by what it is worth. Somebody who was
+        // paid one very large output does not want it picked to pay for
+        // coffee, because that one output is recognisable.
+        //
+        // "Value 0 is translated to the maximum value (18 million) which
+        // disables this filter" -- on this chain the maximum is `MONEY_SUPPLY`,
+        // the whole `u64` range.
+        "ignore-outputs-above" => {
+            let amount = fmt::parse_amount(value).map_err(|_| "Invalid amount")?;
+            let amount = if amount == 0 { u64::MAX } else { amount };
+            session.keys_file.set_ignore_outputs_above(amount);
+        }
+        "ignore-outputs-below" => {
+            let amount = fmt::parse_amount(value).map_err(|_| "Invalid amount")?;
+            session.keys_file.set_ignore_outputs_below(amount);
         }
         other => return Err(format!("`{other}` is not a setting this build knows")),
     }

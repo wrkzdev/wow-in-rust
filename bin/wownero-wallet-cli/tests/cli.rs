@@ -342,6 +342,29 @@ fn freezing_takes_a_key_image() {
     assert!(!stdout(&out).contains("Frozen:"), "{}", stdout(&out));
 }
 
+/// `set ignore-outputs-above` and `-below` take an amount in WOW and refuse
+/// anything else with the C++'s wording. That the value reaches the keys file
+/// is `wow_wallet::keys_file`'s own test; this is the command line's side.
+#[test]
+fn the_spend_range_is_settable() {
+    let s = Scratch::new("ignorerange");
+    create(&s, "w", &["--command", "address"]);
+
+    let names = stdout(&run_in(&s, "w", &["set"]));
+    assert!(names.contains("ignore-outputs-above"), "{names}");
+    assert!(names.contains("ignore-outputs-below"), "{names}");
+
+    for option in ["ignore-outputs-above", "ignore-outputs-below"] {
+        let bad = run_in(&s, "w", &["set", option, "sixpence"]);
+        assert!(!bad.status.success(), "{}", all_output(&bad));
+        assert!(stdout(&bad).contains("Invalid amount"), "{}", stdout(&bad));
+
+        let out = run_in(&s, "w", &["set", option, "1.5"]);
+        assert!(out.status.success(), "{}", all_output(&out));
+        assert!(stdout(&out).contains("Set."), "{}", stdout(&out));
+    }
+}
+
 /// A command that fails exits non-zero, which is what lets a script tell.
 #[test]
 fn a_failing_command_exits_non_zero() {

@@ -194,6 +194,11 @@ impl Session {
             extra_size: spend::extra_size(2, payment_id.is_some(), false),
             account: request.account,
             subaddr_indices: request.subaddr_indices.clone(),
+            // `set ignore-outputs-above` and `-below`, which `wallet2` applies
+            // to every selection path. Read here rather than in each front end
+            // so a send and a sweep honour them alike.
+            ignore_above: self.keys_file.ignore_outputs_above(),
+            ignore_below: self.keys_file.ignore_outputs_below(),
             ignore_fractional_outputs: setting(&self.keys_file, "ignore_fractional_outputs", 1)
                 != 0,
             min_output_count: setting(&self.keys_file, "min_output_count", 0) as u32,
