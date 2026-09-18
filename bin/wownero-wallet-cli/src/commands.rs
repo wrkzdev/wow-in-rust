@@ -142,6 +142,9 @@ pub fn run_one(session: &mut Session, line: &str) -> Result<Outcome, String> {
         "show_transfers" => show_transfers(session, &args),
         "payments" => payments(session, &args),
         "unspent_outputs" => unspent_outputs(session),
+        "freeze" => freeze_thaw(session, &args, true),
+        "thaw" => freeze_thaw(session, &args, false),
+        "frozen" => frozen(session, &args),
         "fee" => fee(session),
         "transfer" => transfer_cmd(session, &args),
         "sweep_all" => sweep_all(session, &args),
@@ -185,6 +188,12 @@ History
   show_transfers [in|out|pending|failed|coinbase|all] [<min_height> [<max_height>]]
   payments <payment_id> [<payment_id> ...]
   unspent_outputs
+
+Frozen outputs
+  freeze <key_image>            set one output aside, so nothing spends it
+  thaw <key_image>              let it be spent again
+  frozen [<key_image>]          whether that output is set aside, or, given
+                                none, every output that is
 
 Sending
   fee                           the current fee estimate
@@ -605,8 +614,13 @@ fn incoming_transfers(session: &mut Session, args: &[&str]) -> Result<(), String
     );
     for t in session.transfers() {
         let unlocked = t.unlocked(height, now);
+        // `show_incoming_transfers` prints `[frozen]` where it would otherwise
+        // print unlocked or locked: an output set aside is not available
+        // however old it is.
         let state = if t.spent {
             "spent"
+        } else if t.frozen {
+            "frozen"
         } else if unlocked {
             "available"
         } else {
@@ -794,6 +808,72 @@ fn unspent_outputs(session: &mut Session) -> Result<(), String> {
     }
     println!("{} unspent", fmt::amount(total));
     Ok(())
+}
+
+// -- frozen outputs --------------------------------------------------------
+
+/// `simple_wallet::freeze_thaw`: set one output aside by its key image, or let
+/// it be spent again.
+///
+/// The defence against a dust attack. A stranger pays a wallet a tiny output
+/// and watches for it to be spent alongside real ones, which says the two
+/// belong to one wallet; freezing it means nothing will pick it. The key image
+/// is what `incoming_transfers` prints in its last column.
+///
+/// The C++ takes a key image and nothing else. Its usage line also mentions a
+/// public key and `wallet2` has a `freeze(size_t)` that takes an index, but
+/// `freeze_thaw` only ever runs `hex_to_pod` into a `key_image`, so neither
+/// form reaches the prompt there, and neither is accepted here.
+fn freeze_thaw(session: &mut Session, args: &[&str], freeze: bool) -> Result<(), String> {
+    let what = if freeze { "freeze" } else { "thaw" };
+    let Some(text) = args.first() else {
+        return Err(format!("usage: {what} <key_image>|<pubkey>"));
+    };
+    let key_image = key_image_arg(text)?;
+    if freeze {
+        session.state.freeze(&key_image)?;
+    } else {
+        session.state.thaw(&key_image)?;
+    }
+    // `wallet2::freeze` sets the flag and nothing else: the C++ writes it out
+    // at the next `save`, or when the wallet closes. So does this, as
+    // `set_ring` does with a ring.
+    session.dirty = true;
+    Ok(())
+}
+
+/// `simple_wallet::frozen`: whether one output is set aside, or, given
+/// nothing, every output that is, with what it holds.
+fn frozen(session: &mut Session, args: &[&str]) -> Result<(), String> {
+    let Some(text) = args.first() else {
+        for t in session.transfers().iter().filter(|t| t.frozen) {
+            let key_image = t
+                .key_image
+                .map(|k| wow_crypto::hex::encode(&k.0))
+                .unwrap_or_else(|| "(view-only)".into());
+            println!("Frozen: {key_image} {}", fmt::amount(t.amount));
+        }
+        return Ok(());
+    };
+    // The key image as it was parsed, not as it was typed: the C++ prints the
+    // `crypto::key_image` it decoded, which is always lower case.
+    let key_image = key_image_arg(text)?;
+    let hex = wow_crypto::hex::encode(&key_image.0);
+    if session.state.frozen(&key_image)? {
+        println!("Frozen: {hex}");
+    } else {
+        println!("Not frozen: {hex}");
+    }
+    Ok(())
+}
+
+/// A key image as `freeze`, `thaw` and `frozen` take one: 64 hex characters,
+/// and the C++'s message for anything `epee::string_tools::hex_to_pod`
+/// refuses.
+fn key_image_arg(text: &str) -> Result<wow_crypto::types::KeyImage, String> {
+    parse_hash(text)
+        .map(wow_crypto::types::KeyImage)
+        .ok_or_else(|| "failed to parse key image".to_string())
 }
 
 // -- sending ---------------------------------------------------------------
@@ -1473,6 +1553,24 @@ mod tests {
             "abcd absolute 1 2".to_string(),
         ] {
             assert!(ring_from_line(&bad).is_err(), "{bad}");
+        }
+    }
+
+    /// `freeze`, `thaw` and `frozen` take 64 hex characters and nothing else,
+    /// and say what the C++ says about anything else.
+    #[test]
+    fn a_key_image_is_read_as_the_cpp_reads_one() {
+        let image = "ab".repeat(32);
+        assert_eq!(key_image_arg(&image).expect("a key image").0, [0xab; 32]);
+        // Upper case decodes to the same bytes, which is what is printed back.
+        let upper = image.to_uppercase();
+        assert_eq!(key_image_arg(&upper).expect("a key image").0, [0xab; 32]);
+
+        let short = "ab".repeat(31);
+        let long = "ab".repeat(33);
+        for bad in ["", "3", "not hex", short.as_str(), long.as_str()] {
+            let e = key_image_arg(bad).expect_err("not a key image");
+            assert_eq!(e, "failed to parse key image", "`{bad}`");
         }
     }
 

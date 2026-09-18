@@ -301,6 +301,47 @@ fn a_fresh_wallet_is_empty() {
     assert_eq!(stdout(&out).trim(), "1", "{}", all_output(&out));
 }
 
+/// `freeze`, `thaw` and `frozen` take a key image, say so when given none,
+/// and refuse one this wallet does not hold with `wallet2`'s message. A fresh
+/// wallet has nothing frozen.
+#[test]
+fn freezing_takes_a_key_image() {
+    let s = Scratch::new("freeze");
+    create(&s, "w", &["--command", "address"]);
+
+    for name in ["freeze", "thaw"] {
+        let out = run_in(&s, "w", &[name]);
+        assert!(!out.status.success(), "{}", all_output(&out));
+        assert!(
+            stdout(&out).contains(&format!("usage: {name} <key_image>")),
+            "{}",
+            stdout(&out)
+        );
+    }
+
+    let image = "ab".repeat(32);
+    for name in ["freeze", "thaw", "frozen"] {
+        let out = run_in(&s, "w", &[name, "not-hex"]);
+        assert!(
+            stdout(&out).contains("failed to parse key image"),
+            "{name}: {}",
+            stdout(&out)
+        );
+
+        let out = run_in(&s, "w", &[name, image.as_str()]);
+        assert!(
+            stdout(&out).contains("Key image not found"),
+            "{name}: {}",
+            stdout(&out)
+        );
+    }
+
+    // Nothing is frozen, so `frozen` on its own lists nothing and succeeds.
+    let out = run_in(&s, "w", &["frozen"]);
+    assert!(out.status.success(), "{}", all_output(&out));
+    assert!(!stdout(&out).contains("Frozen:"), "{}", stdout(&out));
+}
+
 /// A command that fails exits non-zero, which is what lets a script tell.
 #[test]
 fn a_failing_command_exits_non_zero() {

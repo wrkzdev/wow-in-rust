@@ -135,6 +135,9 @@ pub fn dispatch(state: &State, method: &str, params: &Value) -> MethodResult {
         "split_integrated_address" => split_integrated_address(session, params),
         "get_balance" | "getbalance" => get_balance(session, params),
         "incoming_transfers" => incoming_transfers(session, params),
+        "freeze" => freeze_thaw(session, params, true),
+        "thaw" => freeze_thaw(session, params, false),
+        "frozen" => frozen(session, params),
         "get_transfers" => get_transfers(session, params),
         "get_transfer_by_txid" => get_transfer_by_txid(session, params),
         "get_payments" => get_payments(session, params),
@@ -481,7 +484,7 @@ fn incoming_transfers(session: &Session, params: &Value) -> MethodResult {
                 "subaddr_index": { "major": t.subaddress.major, "minor": t.subaddress.minor },
                 "key_image": t.key_image.map(|k| wow_crypto::hex::encode(&k.0)).unwrap_or_default(),
                 "block_height": t.block_height,
-                "frozen": false,
+                "frozen": t.frozen,
                 "unlocked": t.unlocked(height, now),
                 "pubkey": wow_crypto::hex::encode(&t.public_key.0),
             })
@@ -489,6 +492,58 @@ fn incoming_transfers(session: &Session, params: &Value) -> MethodResult {
         .collect();
 
     Ok(json!({ "transfers": transfers }))
+}
+
+/// `on_freeze` and `on_thaw`: set one output aside by its key image, so that
+/// nothing spends it and no balance counts it, or give it back.
+///
+/// The response carries nothing, as `COMMAND_RPC_FREEZE::response` does.
+fn freeze_thaw(session: &mut Session, params: &Value, freeze: bool) -> MethodResult {
+    let key_image = key_image_param(params, if freeze { "freeze" } else { "thaw" })?;
+    let outcome = if freeze {
+        session.state.freeze(&key_image)
+    } else {
+        session.state.thaw(&key_image)
+    };
+    // `handle_rpc_exception(..., WALLET_RPC_ERROR_CODE_UNKNOWN_ERROR)`: what
+    // `wallet2::get_transfer_details` throws has no code of its own.
+    outcome.map_err(|e| Error::new(errors::UNKNOWN_ERROR, e))?;
+    // As in the CLI: the flag is written out by the next `store`, which the
+    // C++ RPC also leaves to its caller.
+    session.dirty = true;
+    Ok(json!({}))
+}
+
+/// `on_frozen`: whether one output is set aside.
+fn frozen(session: &Session, params: &Value) -> MethodResult {
+    let key_image = key_image_param(params, "check if frozen")?;
+    let frozen = session
+        .state
+        .frozen(&key_image)
+        .map_err(|e| Error::new(errors::UNKNOWN_ERROR, e))?;
+    Ok(json!({ "frozen": frozen }))
+}
+
+/// `key_image`, as `freeze`, `thaw` and `frozen` take it.
+///
+/// Absent or empty is `-1` with the C++'s wording, which names the method
+/// (`"Must specify key image to freeze"`); anything else that is not 64 hex
+/// characters is `-10 WRONG_KEY_IMAGE`.
+fn key_image_param(params: &Value, what: &str) -> Result<wow_crypto::types::KeyImage, Error> {
+    let text = params
+        .get("key_image")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Err(Error::new(
+            errors::UNKNOWN_ERROR,
+            format!("Must specify key image to {what}"),
+        ));
+    }
+    wow_crypto::hex::decode(text)
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .map(wow_crypto::types::KeyImage)
+        .ok_or_else(|| Error::new(errors::WRONG_KEY_IMAGE, "failed to parse key image"))
 }
 
 fn get_transfers(session: &Session, params: &Value) -> MethodResult {
