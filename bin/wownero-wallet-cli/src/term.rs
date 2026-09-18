@@ -13,6 +13,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use rustyline::DefaultEditor;
+use wow_crypto::Zeroizing;
 
 pub use wow_wallet::entropy::seeded_rng;
 
@@ -81,7 +82,12 @@ pub fn confirm(prompt: &str) -> bool {
 /// when input is a pipe, for instance, where there is nothing to echo to. When
 /// there *is* a terminal that will show the input, it says so, rather than
 /// letting a user type a password onto a visible line believing otherwise.
-pub fn read_password(prompt: &str) -> Option<String> {
+///
+/// Returned in a [`Zeroizing`], as `contrib/epee/include/wipeable_string.h`
+/// holds one: the line the password was read into is wiped as well, so what
+/// was typed is not left in the process's memory to be read out of a core
+/// dump or the next allocation.
+pub fn read_password(prompt: &str) -> Option<Zeroizing<String>> {
     print!("{prompt}");
     let _ = std::io::stdout().flush();
 
@@ -92,14 +98,16 @@ pub fn read_password(prompt: &str) -> Option<String> {
         let _ = std::io::stdout().flush();
     }
 
-    let mut line = String::new();
+    let mut line = Zeroizing::new(String::new());
     let read = std::io::stdin().lock().read_line(&mut line);
     drop(guard);
     println!();
 
     match read {
         Ok(0) | Err(_) => None,
-        Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
+        Ok(_) => Some(Zeroizing::new(
+            line.trim_end_matches(['\r', '\n']).to_string(),
+        )),
     }
 }
 
@@ -108,7 +116,7 @@ pub fn read_password(prompt: &str) -> Option<String> {
 /// Nobody can see what they typed, and a mistyped password on a new wallet
 /// locks its owner out of it. A pipe is asked once: a script has no typo to
 /// catch, and should not have to send the same line twice.
-pub fn read_new_password() -> Option<String> {
+pub fn read_new_password() -> Option<Zeroizing<String>> {
     const PROMPT: &str = "Enter a new password for the wallet: ";
     if !interactive() {
         return read_password(PROMPT);
@@ -116,7 +124,7 @@ pub fn read_new_password() -> Option<String> {
     loop {
         let first = read_password(PROMPT)?;
         let second = read_password("Confirm password: ")?;
-        if first == second {
+        if *first == *second {
             return Some(first);
         }
         println!("Passwords do not match. Please try again.");
@@ -137,10 +145,12 @@ pub fn ask<T>(
     mut parse: impl FnMut(&str) -> Result<Option<T>, String>,
 ) -> Result<T, String> {
     loop {
+        // Wiped whichever way it was read: a hidden answer is a seed or a
+        // secret key, and wiping a visible one costs nothing.
         let answer = if hidden {
             read_password(prompt)
         } else {
-            read_line(prompt)
+            read_line(prompt).map(Zeroizing::new)
         }
         .ok_or("no answer; cancelled")?;
         match parse(answer.trim()) {

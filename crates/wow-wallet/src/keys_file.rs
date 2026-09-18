@@ -118,9 +118,18 @@ impl KeysFile {
     ///
     /// `kdf_rounds` must match what wrote the file; the CLI uses 1.
     pub fn open(blob: &[u8], password: &[u8], kdf_rounds: u64) -> Result<KeysFile> {
-        let (iv, ciphertext) = parse_container(blob)?;
         let key = chacha::generate_chacha_key(password, kdf_rounds);
-        let plaintext = chacha::chacha20(ciphertext, &key, &iv);
+        KeysFile::open_with_key(blob, &key)
+    }
+
+    /// [`open`](Self::open) under the key the password derives to.
+    ///
+    /// Taking the key lets a caller run the KDF once -- it is a CryptoNight
+    /// evaluation -- and then keep the key rather than the password, which is
+    /// what [`crate::files::Session`] does.
+    pub fn open_with_key(blob: &[u8], key: &Key) -> Result<KeysFile> {
+        let (iv, ciphertext) = parse_container(blob)?;
+        let plaintext = chacha::chacha20(ciphertext, key, &iv);
 
         let mut settings = parse_json(&plaintext).ok_or(KeysFileError::NotJson)?;
 
@@ -143,7 +152,7 @@ impl KeysFile {
         // `encrypted_secret_keys` is written as 1 by every current writer, but
         // a file old enough to lack it holds the keys in the clear.
         if u64_member(&settings, "encrypted_secret_keys").unwrap_or(0) != 0 {
-            account.keys.decrypt(&key);
+            account.keys.decrypt(key);
         }
         account.keys.verify()?;
 
@@ -158,9 +167,14 @@ impl KeysFile {
     /// pass fresh random bytes.
     pub fn to_blob(&self, password: &[u8], kdf_rounds: u64, iv: Iv, key_iv: Iv) -> Result<Vec<u8>> {
         let key = chacha::generate_chacha_key(password, kdf_rounds);
+        self.to_blob_with_key(&key, iv, key_iv)
+    }
 
+    /// [`to_blob`](Self::to_blob) under the key the password derives to, for
+    /// the same reason [`open_with_key`](Self::open_with_key) exists.
+    pub fn to_blob_with_key(&self, key: &Key, iv: Iv, key_iv: Iv) -> Result<Vec<u8>> {
         let mut account = self.account.clone();
-        account.keys.encrypt(&key, key_iv);
+        account.keys.encrypt(key, key_iv);
         let key_data = account.to_key_data()?;
 
         let mut json = self.settings.clone();
@@ -170,7 +184,7 @@ impl KeysFile {
 
         let text = serde_json::to_string(&Json::Object(json)).expect("a JSON object serializes");
         let plaintext = latin1_to_bytes(&text);
-        let ciphertext = chacha::chacha20(&plaintext, &key, &iv);
+        let ciphertext = chacha::chacha20(&plaintext, key, &iv);
 
         let mut w = Writer::new();
         w.write_bytes(&iv);

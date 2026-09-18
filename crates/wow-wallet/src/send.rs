@@ -485,7 +485,7 @@ mod tests {
         Session::create_in(
             Box::new(MemoryStore::new("test")),
             Network::Mainnet,
-            String::new(),
+            "",
             1,
             account,
             "English",

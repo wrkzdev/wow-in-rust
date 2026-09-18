@@ -19,6 +19,7 @@ mod server;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use wow_crypto::Zeroizing;
 use wow_types::Network;
 use wow_wallet::files::Paths;
 
@@ -82,7 +83,8 @@ struct Options {
     confirm_external_bind: bool,
     wallet_file: Option<PathBuf>,
     wallet_dir: Option<PathBuf>,
-    password: Option<String>,
+    /// `--password` or `--password-file`. Wiped when the options go.
+    password: Option<Zeroizing<String>>,
     login: Option<(String, String)>,
     disable_login: bool,
     daemon: String,
@@ -186,12 +188,19 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             "--confirm-external-bind" => o.confirm_external_bind = true,
             "--wallet-file" => o.wallet_file = Some(PathBuf::from(next("--wallet-file")?)),
             "--wallet-dir" => o.wallet_dir = Some(PathBuf::from(next("--wallet-dir")?)),
-            "--password" => o.password = Some(next("--password")?),
+            "--password" => o.password = Some(Zeroizing::new(next("--password")?)),
             "--password-file" => {
                 let path = next("--password-file")?;
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("cannot read {path}: {e}"))?;
-                o.password = Some(text.trim_end_matches(['\r', '\n']).to_string());
+                // Both the file's contents and the trimmed copy are wiped: the
+                // whole point of a password file is that the password is not on
+                // the command line, so it should not outlive the read either.
+                let text = Zeroizing::new(
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| format!("cannot read {path}: {e}"))?,
+                );
+                o.password = Some(Zeroizing::new(
+                    text.trim_end_matches(['\r', '\n']).to_string(),
+                ));
             }
             "--rpc-login" => {
                 let value = next("--rpc-login")?;

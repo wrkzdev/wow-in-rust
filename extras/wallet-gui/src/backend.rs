@@ -272,7 +272,7 @@ impl<P: Platform> Backend<P> {
             }
             Command::ShowViewKey { password } => {
                 let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
-                if password != w.session.password {
+                if !w.session.verify_password(&password) {
                     return Err("that is not this wallet's password".into());
                 }
                 let key = w.session.view_key_hex();
@@ -282,7 +282,7 @@ impl<P: Platform> Backend<P> {
             Command::ChangePassword { old, new } => {
                 match &self.wallet {
                     None => return Err(NO_WALLET.into()),
-                    Some(w) if old != w.session.password => {
+                    Some(w) if !w.session.verify_password(&old) => {
                         return Err("that is not this wallet's password".into())
                     }
                     Some(_) => {}
@@ -290,7 +290,7 @@ impl<P: Platform> Backend<P> {
                 // Two CryptoNight hashes, one for each file's key: a moment.
                 self.working("Changing the password…");
                 let w = self.wallet.as_mut().ok_or(NO_WALLET)?;
-                w.session.change_password(new)?;
+                w.session.change_password(&new)?;
                 let name = w.name.clone();
                 self.platform.saved(&name);
                 self.send(Event::PasswordChanged);
@@ -301,7 +301,7 @@ impl<P: Platform> Backend<P> {
                 copy_password,
             } => {
                 let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
-                if password != w.session.password {
+                if !w.session.verify_password(&password) {
                     return Err("that is not this wallet's password".into());
                 }
                 let keys = w.session.view_only_keys(&copy_password)?;
@@ -345,7 +345,7 @@ impl<P: Platform> Backend<P> {
             }
             Command::ShowSeed { password } => {
                 let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
-                if password != w.session.password {
+                if !w.session.verify_password(&password) {
                     return Err("that is not this wallet's password".into());
                 }
                 let language = w
@@ -424,7 +424,7 @@ impl<P: Platform> Backend<P> {
         let session = Session::create_in(
             store,
             n.network.network(),
-            n.password,
+            &n.password,
             KDF_ROUNDS,
             account,
             language.name,
@@ -467,7 +467,7 @@ impl<P: Platform> Backend<P> {
         let session = Session::create_in(
             store,
             r.network.network(),
-            r.password,
+            &r.password,
             KDF_ROUNDS,
             account,
             language.name,
@@ -488,7 +488,7 @@ impl<P: Platform> Backend<P> {
         }
         self.working(format!("Opening {}…", o.name));
         let store = self.platform.store(&o.name)?;
-        let session = Session::open_in(store, o.password, KDF_ROUNDS, None).map_err(|e| {
+        let session = Session::open_in(store, &o.password, KDF_ROUNDS, None).map_err(|e| {
             if e.contains("not JSON") {
                 "That password does not open this wallet.".to_string()
             } else {

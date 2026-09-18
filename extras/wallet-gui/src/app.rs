@@ -12,6 +12,7 @@ use egui::{
 };
 use serde::{Deserialize, Serialize};
 use wow_crypto::mnemonic::{self, Language, WordList};
+use wow_crypto::{Zeroize, Zeroizing};
 
 use crate::format;
 use crate::nodes::{self, Node, NodeAddress};
@@ -223,7 +224,8 @@ pub struct WalletApp {
     start: StartForm,
     wallet: Option<WalletView>,
     nodes: NodePicker,
-    new_seed: Option<String>,
+    /// A new wallet's seed phrase, shown once. Wiped when it is hidden.
+    new_seed: Option<Zeroizing<String>>,
     seed_written: bool,
     risk_understood: bool,
     /// A wallet waiting for a yes before it is deleted.
@@ -284,14 +286,16 @@ enum StartTab {
 struct StartForm {
     tab: StartTab,
     selected: String,
-    password: String,
+    /// What is typed into a password or seed field. Overwritten as soon as it
+    /// has been handed over, and again when the form is dropped.
+    password: Zeroizing<String>,
     folder: String,
     name: String,
-    new_password: String,
-    confirm: String,
+    new_password: Zeroizing<String>,
+    confirm: Zeroizing<String>,
     language: String,
-    seed: String,
-    passphrase: String,
+    seed: Zeroizing<String>,
+    passphrase: Zeroizing<String>,
     height: String,
     /// The date the restore height is to be found for, as typed.
     date: String,
@@ -349,8 +353,10 @@ struct WalletView {
     preview: Option<Preview>,
     sent: Option<String>,
     rejected: Option<Vec<String>>,
-    seed: Option<String>,
-    seed_password: String,
+    /// The seed phrase while it is on screen, and the password asked for
+    /// before it is shown. Both wiped when they go.
+    seed: Option<Zeroizing<String>>,
+    seed_password: Zeroizing<String>,
     subaddress_index: u32,
     subaddress: Option<(u32, String)>,
     /// Why the last send could not be prepared, shown beside the form.
@@ -369,15 +375,15 @@ struct WalletView {
     history_filter: HistoryFilter,
     /// The transfer whose details are open, by transaction ID.
     selected_tx: Option<String>,
-    view_key: Option<String>,
-    view_key_password: String,
-    old_password: String,
-    new_password: String,
-    new_password_again: String,
+    view_key: Option<Zeroizing<String>>,
+    view_key_password: Zeroizing<String>,
+    old_password: Zeroizing<String>,
+    new_password: Zeroizing<String>,
+    new_password_again: Zeroizing<String>,
     /// A view-only copy: this wallet's password, and the copy's.
-    copy_wallet_password: String,
-    copy_password: String,
-    copy_password_again: String,
+    copy_wallet_password: Zeroizing<String>,
+    copy_password: Zeroizing<String>,
+    copy_password_again: Zeroizing<String>,
     /// Recent `(seconds since the frame clock started, height scanned)`, for
     /// the speed and the time left beside the progress bar.
     ///
@@ -404,7 +410,7 @@ impl WalletView {
             sent: None,
             rejected: None,
             seed: None,
-            seed_password: String::new(),
+            seed_password: Zeroizing::default(),
             subaddress_index: 1,
             subaddress: None,
             send_error: None,
@@ -417,13 +423,13 @@ impl WalletView {
             history_filter: HistoryFilter::All,
             selected_tx: None,
             view_key: None,
-            view_key_password: String::new(),
-            old_password: String::new(),
-            new_password: String::new(),
-            new_password_again: String::new(),
-            copy_wallet_password: String::new(),
-            copy_password: String::new(),
-            copy_password_again: String::new(),
+            view_key_password: Zeroizing::default(),
+            old_password: Zeroizing::default(),
+            new_password: Zeroizing::default(),
+            new_password_again: Zeroizing::default(),
+            copy_wallet_password: Zeroizing::default(),
+            copy_password: Zeroizing::default(),
+            copy_password_again: Zeroizing::default(),
             sync_samples: std::collections::VecDeque::new(),
         }
     }
@@ -731,16 +737,19 @@ impl WalletApp {
             Event::Opened(summary) => {
                 self.settings.last_wallet = summary.name.clone();
                 let form = &mut self.start;
+                // Overwritten rather than cleared: `String::clear` only sets
+                // the length to zero and leaves the bytes in the allocation,
+                // where a seed phrase would sit for the rest of the run.
                 for field in [
                     &mut form.password,
                     &mut form.new_password,
                     &mut form.confirm,
                     &mut form.seed,
                     &mut form.passphrase,
-                    &mut form.name,
-                    &mut form.height,
-                    &mut form.date,
                 ] {
+                    field.zeroize();
+                }
+                for field in [&mut form.name, &mut form.height, &mut form.date] {
                     field.clear();
                 }
                 self.awaiting = None;
@@ -753,7 +762,7 @@ impl WalletApp {
                 self.wallet = Some(WalletView::new(summary));
             }
             Event::NewSeed(seed) => {
-                self.new_seed = Some(seed);
+                self.new_seed = Some(Zeroizing::new(seed));
                 self.seed_written = false;
             }
             Event::Closed => {
@@ -849,20 +858,20 @@ impl WalletApp {
             Event::Seed(seed) => {
                 self.awaiting = None;
                 if let Some(w) = &mut self.wallet {
-                    w.seed = Some(seed);
+                    w.seed = Some(Zeroizing::new(seed));
                 }
             }
             Event::ViewKey(key) => {
                 self.awaiting = None;
                 if let Some(w) = &mut self.wallet {
-                    w.view_key = Some(key);
+                    w.view_key = Some(Zeroizing::new(key));
                 }
             }
             Event::PasswordChanged => {
                 self.awaiting = None;
                 if let Some(w) = &mut self.wallet {
-                    w.new_password.clear();
-                    w.new_password_again.clear();
+                    w.new_password.zeroize();
+                    w.new_password_again.zeroize();
                 }
                 self.notice("The password is changed: the wallet's files are under the new one.");
             }
@@ -1268,7 +1277,7 @@ impl WalletApp {
         let mut open = false;
         ui.horizontal(|ui| {
             let field = ui.add(
-                TextEdit::singleline(&mut self.start.password)
+                TextEdit::singleline(&mut *self.start.password)
                     .password(true)
                     .hint_text("Password")
                     .desired_width(240.0),
@@ -1289,7 +1298,7 @@ impl WalletApp {
         if open {
             let command = Command::Open(OpenWallet {
                 name: self.start.selected.clone(),
-                password: std::mem::take(&mut self.start.password),
+                password: take_secret(&mut self.start.password),
                 node: self.settings.node.clone(),
             });
             self.send_from(Place::Start, command);
@@ -1313,14 +1322,14 @@ impl WalletApp {
                 ui.end_row();
                 ui.label("Password");
                 ui.add(
-                    TextEdit::singleline(&mut f.new_password)
+                    TextEdit::singleline(&mut *f.new_password)
                         .password(true)
                         .desired_width(260.0),
                 );
                 ui.end_row();
                 ui.label("Again");
                 ui.add(
-                    TextEdit::singleline(&mut f.confirm)
+                    TextEdit::singleline(&mut *f.confirm)
                         .password(true)
                         .desired_width(260.0),
                 );
@@ -1355,7 +1364,7 @@ impl WalletApp {
         {
             let command = Command::Create(NewWallet {
                 name: f.name.clone(),
-                password: f.new_password.clone(),
+                password: f.new_password.as_str().to_owned(),
                 network: self.settings.network,
                 language: f.language.clone(),
                 node: self.settings.node.clone(),
@@ -1374,7 +1383,7 @@ impl WalletApp {
             .show(ui, |ui| {
                 ui.label("Seed phrase");
                 ui.add(
-                    TextEdit::multiline(&mut f.seed)
+                    TextEdit::multiline(&mut *f.seed)
                         .hint_text("25 words")
                         .desired_rows(3)
                         .desired_width(420.0),
@@ -1382,7 +1391,7 @@ impl WalletApp {
                 ui.end_row();
                 ui.label("Seed passphrase");
                 ui.add(
-                    TextEdit::singleline(&mut f.passphrase)
+                    TextEdit::singleline(&mut *f.passphrase)
                         .password(true)
                         .hint_text("only if the seed was written with one")
                         .desired_width(260.0),
@@ -1416,14 +1425,14 @@ impl WalletApp {
                 ui.end_row();
                 ui.label("Password");
                 ui.add(
-                    TextEdit::singleline(&mut f.new_password)
+                    TextEdit::singleline(&mut *f.new_password)
                         .password(true)
                         .desired_width(260.0),
                 );
                 ui.end_row();
                 ui.label("Again");
                 ui.add(
-                    TextEdit::singleline(&mut f.confirm)
+                    TextEdit::singleline(&mut *f.confirm)
                         .password(true)
                         .desired_width(260.0),
                 );
@@ -1475,10 +1484,10 @@ impl WalletApp {
             if let Ok(restore_height) = height {
                 let command = Command::Restore(Restore {
                     name: f.name.clone(),
-                    password: f.new_password.clone(),
+                    password: f.new_password.as_str().to_owned(),
                     network: self.settings.network,
-                    seed: f.seed.clone(),
-                    passphrase: f.passphrase.clone(),
+                    seed: f.seed.as_str().to_owned(),
+                    passphrase: f.passphrase.as_str().to_owned(),
                     restore_height,
                     node: self.settings.node.clone(),
                 });
@@ -2552,7 +2561,7 @@ fn wallet_settings(
     } else {
         ui.horizontal(|ui| {
             ui.add(
-                TextEdit::singleline(&mut w.seed_password)
+                TextEdit::singleline(&mut *w.seed_password)
                     .password(true)
                     .hint_text("wallet password")
                     .desired_width(200.0),
@@ -2561,7 +2570,7 @@ fn wallet_settings(
                 *error = None;
                 *awaiting = Some(Place::Wallet);
                 host.send(Command::ShowSeed {
-                    password: std::mem::take(&mut w.seed_password),
+                    password: take_secret(&mut w.seed_password),
                 });
             }
         });
@@ -2589,7 +2598,7 @@ fn wallet_settings(
     } else {
         ui.horizontal(|ui| {
             ui.add(
-                TextEdit::singleline(&mut w.view_key_password)
+                TextEdit::singleline(&mut *w.view_key_password)
                     .password(true)
                     .hint_text("wallet password")
                     .desired_width(200.0),
@@ -2598,7 +2607,7 @@ fn wallet_settings(
                 *error = None;
                 *awaiting = Some(Place::Wallet);
                 host.send(Command::ShowViewKey {
-                    password: std::mem::take(&mut w.view_key_password),
+                    password: take_secret(&mut w.view_key_password),
                 });
             }
         });
@@ -2615,27 +2624,27 @@ fn wallet_settings(
         .show(ui, |ui| {
             ui.label("Now");
             ui.add(
-                TextEdit::singleline(&mut w.old_password)
+                TextEdit::singleline(&mut *w.old_password)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
             ui.label("New");
             ui.add(
-                TextEdit::singleline(&mut w.new_password)
+                TextEdit::singleline(&mut *w.new_password)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
             ui.label("Again");
             ui.add(
-                TextEdit::singleline(&mut w.new_password_again)
+                TextEdit::singleline(&mut *w.new_password_again)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
         });
-    let mismatch = w.new_password != w.new_password_again;
+    let mismatch = *w.new_password != *w.new_password_again;
     if mismatch && !w.new_password_again.is_empty() {
         ui.colored_label(t.bad, "The new passwords do not match.");
     }
@@ -2653,8 +2662,8 @@ fn wallet_settings(
         *error = None;
         *awaiting = Some(Place::Wallet);
         host.send(Command::ChangePassword {
-            old: std::mem::take(&mut w.old_password),
-            new: w.new_password.clone(),
+            old: take_secret(&mut w.old_password),
+            new: w.new_password.as_str().to_owned(),
         });
     }
 
@@ -2673,27 +2682,27 @@ fn wallet_settings(
         .show(ui, |ui| {
             ui.label("This wallet's password");
             ui.add(
-                TextEdit::singleline(&mut w.copy_wallet_password)
+                TextEdit::singleline(&mut *w.copy_wallet_password)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
             ui.label("The copy's password");
             ui.add(
-                TextEdit::singleline(&mut w.copy_password)
+                TextEdit::singleline(&mut *w.copy_password)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
             ui.label("Again");
             ui.add(
-                TextEdit::singleline(&mut w.copy_password_again)
+                TextEdit::singleline(&mut *w.copy_password_again)
                     .password(true)
                     .desired_width(220.0),
             );
             ui.end_row();
         });
-    let copy_mismatch = w.copy_password != w.copy_password_again;
+    let copy_mismatch = *w.copy_password != *w.copy_password_again;
     if copy_mismatch && !w.copy_password_again.is_empty() {
         ui.colored_label(t.bad, "The copy's passwords do not match.");
     }
@@ -2704,10 +2713,10 @@ fn wallet_settings(
         *error = None;
         *awaiting = Some(Place::Wallet);
         host.send(Command::ExportViewOnly {
-            password: std::mem::take(&mut w.copy_wallet_password),
-            copy_password: std::mem::take(&mut w.copy_password),
+            password: take_secret(&mut w.copy_wallet_password),
+            copy_password: take_secret(&mut w.copy_password),
         });
-        w.copy_password_again.clear();
+        w.copy_password_again.zeroize();
     }
 
     // Reading the chain again, from a height or from the height on a date.
@@ -3472,6 +3481,20 @@ fn network_combo(ui: &mut Ui, network: &mut Net) {
                 ui.selectable_value(network, n, n.name());
             }
         });
+}
+
+/// Take what was typed into a field, leaving it empty and overwritten.
+///
+/// `std::mem::take` alone would move the bytes out and leave the field's
+/// allocation behind untouched. What comes back is a plain `String`, because
+/// a [`Command`] crosses `postMessage` as JSON in a browser and cannot be
+/// wiped on the way; this at least does not leave a second copy in the form.
+fn take_secret(field: &mut Zeroizing<String>) -> String {
+    let taken = field.as_str().to_owned();
+    // `Zeroize for String` overwrites the whole allocation and then empties
+    // it, which is both halves of what is wanted here.
+    field.zeroize();
+    taken
 }
 
 /// Shows what is wrong with a new wallet's name and password, and says

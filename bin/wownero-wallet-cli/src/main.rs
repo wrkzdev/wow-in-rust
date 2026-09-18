@@ -26,6 +26,7 @@ mod term;
 use std::path::PathBuf;
 
 use wow_crypto::mnemonic::Language;
+use wow_crypto::Zeroizing;
 use wow_types::Network;
 
 /// How the wallet gets its keys.
@@ -56,11 +57,14 @@ struct Options {
     wallet: Option<PathBuf>,
     source: Source,
     network: Network,
-    password: Option<String>,
-    seed: Option<String>,
+    /// The secrets an option can carry, held so they are wiped when the
+    /// options go rather than left in the process's memory for the rest of
+    /// the session.
+    password: Option<Zeroizing<String>>,
+    seed: Option<Zeroizing<String>>,
     address: Option<String>,
-    view_key: Option<String>,
-    spend_key: Option<String>,
+    view_key: Option<Zeroizing<String>>,
+    spend_key: Option<Zeroizing<String>>,
     daemon: Option<String>,
     /// `--daemon-login <user>:<password>`, for a node started with
     /// `--rpc-login`.
@@ -90,7 +94,9 @@ struct Options {
 /// cannot reach a log through a `{:?}`.
 impl std::fmt::Debug for Options {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redacted = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        fn redacted<T>(v: &Option<T>) -> Option<&'static str> {
+            v.as_ref().map(|_| "<redacted>")
+        }
         f.debug_struct("Options")
             .field("wallet", &self.wallet)
             .field("source", &self.source)
@@ -244,16 +250,23 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             "--restore-from-keys" => {
                 restore_from(&mut restore, Source::Keys, "--restore-from-keys")?
             }
-            "--electrum-seed" => o.seed = Some(next("--electrum-seed")?),
+            "--electrum-seed" => o.seed = Some(Zeroizing::new(next("--electrum-seed")?)),
             "--address" => o.address = Some(next("--address")?),
-            "--viewkey" => o.view_key = Some(next("--viewkey")?),
-            "--spendkey" => o.spend_key = Some(next("--spendkey")?),
-            "--password" => o.password = Some(next("--password")?),
+            "--viewkey" => o.view_key = Some(Zeroizing::new(next("--viewkey")?)),
+            "--spendkey" => o.spend_key = Some(Zeroizing::new(next("--spendkey")?)),
+            "--password" => o.password = Some(Zeroizing::new(next("--password")?)),
             "--password-file" => {
                 let path = next("--password-file")?;
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("cannot read {path}: {e}"))?;
-                o.password = Some(text.trim_end_matches(['\r', '\n']).to_string());
+                // Both the contents and the trimmed copy are wiped: the point
+                // of a password file is that the password is not on the
+                // command line, so it should not outlive the read either.
+                let text = Zeroizing::new(
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| format!("cannot read {path}: {e}"))?,
+                );
+                o.password = Some(Zeroizing::new(
+                    text.trim_end_matches(['\r', '\n']).to_string(),
+                ));
             }
             "--daemon-address" => o.daemon = Some(next("--daemon-address")?),
             "--daemon-login" => o.daemon_login = Some(next("--daemon-login")?),
