@@ -1,6 +1,6 @@
 //! Coinbase and transaction validation.
 //!
-//! `specs/06-consensus-rules.md` §5.
+//! `specs/06-consensus-rules.md` §4 and §5.
 //!
 //! Everything here is a pure function of a transaction, a hard-fork version and
 //! whatever chain context the rule needs, passed explicitly. Nothing reaches
@@ -12,7 +12,8 @@
 //! here. The first belongs with the RingCT code and the second is a property of
 //! the chain, not of a transaction.
 
-use wow_types::{RctType, Transaction, TxIn, TxOut, TxOutTarget};
+use wow_types::block::MAX_VOTE;
+use wow_types::{Block, RctType, Transaction, TxIn, TxOut, TxOutTarget};
 
 use crate::constants::*;
 use crate::hardfork::gates::*;
@@ -24,6 +25,19 @@ use crate::hardfork::gates::*;
 /// message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TxError {
+    // -- §4 miner block-header signing (HF 18+) --
+    /// From HF 18 the coinbase must have **exactly one** output.
+    CoinbaseOutputCount {
+        found: usize,
+    },
+    /// `block.vote > MAX_VOTE` (`specs/06` §4.3).
+    InvalidVote {
+        vote: u16,
+    },
+    /// The HF 18 header signature does not verify against the coinbase
+    /// output's one-time key.
+    MinerSignature,
+
     // -- §5.1 coinbase --
     /// `miner_tx.vin.len() != 1` or `vin[0]` is not `txin_gen`.
     BadCoinbaseInput,
@@ -206,9 +220,88 @@ pub fn dynamic_unlock_window(block_id: &[u8; 32]) -> u64 {
     twelve_bits * 2 + MINED_MONEY_UNLOCK_WINDOW_V2
 }
 
+/// `prevalidate_miner_transaction` — the whole of it (`specs/06` §4 and §5.1).
+///
+/// The two halves are one function in the C++
+/// (`Blockchain::prevalidate_miner_transaction`) and they stay one here, so
+/// that a caller cannot run §5.1 alone and accept HF 18+ blocks signed by
+/// nobody. Both of the C++'s call sites — `handle_block_to_main_chain` and
+/// `handle_alternative_block` — go through this, and so do both of ours.
+///
+/// `hf_version` is the block's own `major_version`: `specs/06` §2 step 6 has
+/// already refused a block whose version is not the one the fork table demands.
+pub fn prevalidate_miner_tx(
+    block: &Block,
+    hf_version: u8,
+    height: u64,
+    expected_unlock_time: u64,
+) -> Result<(), TxError> {
+    check_miner_signature(block, hf_version)?;
+    check_coinbase(&block.miner_tx, hf_version, height, expected_unlock_time)
+}
+
+/// Miner block-header signing (`specs/06` §4), the first block of
+/// `prevalidate_miner_transaction`. A no-op below HF 18.
+///
+/// # This is what makes Wownero solo-mined
+///
+/// The signature is made with the **one-time secret key of the coinbase
+/// output**, which only the holder of the mining address's private spend key
+/// can derive (`specs/06` §4.1). Three rules here each rule out pooled mining
+/// on their own: the reward cannot be split, because there is exactly one
+/// output; the signature cannot be produced by a pool, because it needs the
+/// spend key; and hashing cannot be delegated, because `signature` sits inside
+/// the hashing blob and so must be remade for every nonce (§4.2).
+///
+/// Skipping this check does not fail closed. It accepts blocks the C++
+/// rejects, so a node without it follows a chain the rest of the network does
+/// not have — including one mined to an address whose keys nobody held.
+pub fn check_miner_signature(block: &Block, hf_version: u8) -> Result<(), TxError> {
+    if hf_version < HF_VERSION_BLOCK_HEADER_MINER_SIG {
+        return Ok(());
+    }
+    let vout = &block.miner_tx.prefix.vout;
+
+    // 1. Exactly one coinbase output.
+    if vout.len() != 1 {
+        return Err(TxError::CoinbaseOutputCount { found: vout.len() });
+    }
+    // 2. The output types, which §5.1 checks again at the end. The C++ calls
+    //    `check_output_types` twice as well, and the order is what matters:
+    //    this call runs before the vote and the signature, so a wrong output
+    //    type is reported as one rather than as a bad signature.
+    check_output_types(vout, hf_version)?;
+    // 3. The vote is consensus-bounded from HF 18.
+    if block.header.vote > MAX_VOTE {
+        return Err(TxError::InvalidVote {
+            vote: block.header.vote,
+        });
+    }
+    // 4, 5, 6. Verify the signature over `sig_data` with the output's key.
+    //
+    // `sig_data` is None only below HF 18, which it reads off the header's own
+    // `major_version` rather than off `hf_version`. The two agree by the time
+    // this runs. A block where they did not is one the C++ would hash without
+    // the signature field and then reject, so rejecting is right here too.
+    let Some(sig_data) = block.sig_data() else {
+        return Err(TxError::MinerSignature);
+    };
+    // Step 2 passed, so the target is a key type and this is always Some.
+    let Some(output_key) = vout[0].target.public_key() else {
+        return Err(TxError::MinerSignature);
+    };
+    if !wow_crypto::check_signature(&sig_data, &output_key, &block.header.signature) {
+        return Err(TxError::MinerSignature);
+    }
+    Ok(())
+}
+
 /// `validate_miner_transaction`'s prevalidation (`specs/06` §5.1), everything
 /// except the reward arithmetic — that is
 /// [`crate::emission::validate_miner_reward`].
+///
+/// This is the §5.1 half alone. Prefer [`prevalidate_miner_tx`], which runs
+/// the HF 18 header-signature block (§4) that has to come first.
 pub fn check_coinbase(
     tx: &Transaction,
     hf_version: u8,
@@ -699,7 +792,8 @@ pub fn check_tx_semantic(tx: &Transaction) -> Result<Option<u64>, TxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wow_types::{KeyImage, PublicKey, TransactionPrefix, ViewTag};
+    use wow_crypto::random::Rng;
+    use wow_types::{BlockHeader, KeyImage, PublicKey, TransactionPrefix, ViewTag};
 
     fn key(n: u8) -> PublicKey {
         PublicKey([n; 32])
@@ -748,6 +842,207 @@ mod tests {
             key_offsets: vec![1; ring],
             k_image: image(img),
         }
+    }
+
+    // ---- §4 miner block-header signing (HF 18+) ----
+
+    /// A block at `version` whose coinbase pays a fresh key, with a valid
+    /// header signature by that key's secret. Returns the block and the key,
+    /// so a test can re-sign after tampering.
+    fn signed_block(version: u8) -> (Block, PublicKey, wow_types::SecretKey) {
+        let mut rng = Rng::deterministic_test_seed();
+        let (public, secret) = rng.generate_keys();
+        let target = if version >= HF_VERSION_VIEW_TAGS {
+            TxOutTarget::ToTaggedKey {
+                key: public,
+                view_tag: ViewTag(9),
+            }
+        } else {
+            TxOutTarget::ToKey { key: public }
+        };
+        let mut block = Block {
+            header: BlockHeader {
+                major_version: version,
+                minor_version: version,
+                nonce: 0x0102_0304,
+                vote: 1,
+                ..Default::default()
+            },
+            miner_tx: tx(
+                2,
+                vec![TxIn::Gen { height: 5 }],
+                vec![TxOut { amount: 7, target }],
+            ),
+            tx_hashes: Vec::new(),
+        };
+        resign(&mut block, &public, &secret);
+        (block, public, secret)
+    }
+
+    fn resign(block: &mut Block, public: &PublicKey, secret: &wow_types::SecretKey) {
+        let mut rng = Rng::deterministic_test_seed();
+        let sig_data = block.sig_data().expect("HF 18+ has sig_data");
+        block.header.signature =
+            wow_crypto::generate_signature(&mut rng, &sig_data, public, secret).unwrap();
+    }
+
+    #[test]
+    fn a_signed_header_passes_from_hf_18() {
+        for version in [HF_VERSION_BLOCK_HEADER_MINER_SIG, HF_VERSION_VIEW_TAGS] {
+            let (block, ..) = signed_block(version);
+            assert_eq!(
+                check_miner_signature(&block, version),
+                Ok(()),
+                "hf {version}"
+            );
+        }
+    }
+
+    /// Below HF 18 the header carries no signature at all, so §4 must not
+    /// look: a block with a garbage signature, an out-of-range vote and two
+    /// coinbase outputs is fine at HF 17, because neither field is even
+    /// serialized there.
+    #[test]
+    fn the_rule_does_not_exist_below_hf_18() {
+        let (mut block, ..) = signed_block(HF_VERSION_BLOCK_HEADER_MINER_SIG);
+        block.header.major_version = HF_VERSION_BLOCK_HEADER_MINER_SIG - 1;
+        block.header.signature = Default::default();
+        block.header.vote = 40_000;
+        block.miner_tx.prefix.vout.push(out_to_key(3));
+        assert_eq!(
+            check_miner_signature(&block, HF_VERSION_BLOCK_HEADER_MINER_SIG - 1),
+            Ok(())
+        );
+    }
+
+    /// The check that makes pooled mining impossible: the reward cannot be
+    /// split, because there is exactly one output to split.
+    #[test]
+    fn the_coinbase_must_have_exactly_one_output_from_hf_18() {
+        let v = HF_VERSION_BLOCK_HEADER_MINER_SIG;
+        let (mut block, public, secret) = signed_block(v);
+
+        block.miner_tx.prefix.vout.push(out_to_key(3));
+        resign(&mut block, &public, &secret);
+        assert_eq!(
+            check_miner_signature(&block, v),
+            Err(TxError::CoinbaseOutputCount { found: 2 }),
+            "a pool payout coinbase, signed or not"
+        );
+
+        block.miner_tx.prefix.vout.clear();
+        assert_eq!(
+            check_miner_signature(&block, v),
+            Err(TxError::CoinbaseOutputCount { found: 0 })
+        );
+    }
+
+    /// An unsigned block is what `get_block_template` hands a pool or a
+    /// stratum miner, and what the C++ miner produces without `--spendkey`.
+    #[test]
+    fn an_unsigned_header_is_rejected() {
+        let v = HF_VERSION_BLOCK_HEADER_MINER_SIG;
+        let (mut block, ..) = signed_block(v);
+        block.header.signature = Default::default();
+        assert_eq!(
+            check_miner_signature(&block, v),
+            Err(TxError::MinerSignature)
+        );
+    }
+
+    /// Signed with a key that is not the coinbase output's: mining to an
+    /// address whose spend key the miner does not hold.
+    #[test]
+    fn a_signature_by_the_wrong_key_is_rejected() {
+        let v = HF_VERSION_BLOCK_HEADER_MINER_SIG;
+        let (mut block, ..) = signed_block(v);
+        // The same seed, so the first pair is the one signed_block used;
+        // the second is guaranteed to be a different key.
+        let mut rng = Rng::deterministic_test_seed();
+        rng.generate_keys();
+        let (other_public, other_secret) = rng.generate_keys();
+        resign(&mut block, &other_public, &other_secret);
+        assert_eq!(
+            check_miner_signature(&block, v),
+            Err(TxError::MinerSignature)
+        );
+    }
+
+    /// `specs/06` §4.2: `signature` is inside the hashing blob, so it covers
+    /// the nonce. This is what stops a miner delegating the search: every
+    /// nonce needs a fresh signature, and so needs the spend key.
+    #[test]
+    fn the_signature_covers_the_nonce() {
+        let v = HF_VERSION_BLOCK_HEADER_MINER_SIG;
+        let (mut block, ..) = signed_block(v);
+        assert_eq!(check_miner_signature(&block, v), Ok(()));
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+        assert_eq!(
+            check_miner_signature(&block, v),
+            Err(TxError::MinerSignature),
+            "a signature hoisted out of the nonce loop would verify here"
+        );
+    }
+
+    /// `sig_data` zeroes `signature` but keeps `vote`, so the signature
+    /// commits to the vote (`specs/05` §4.4).
+    #[test]
+    fn the_signature_covers_the_vote() {
+        let v = HF_VERSION_BLOCK_HEADER_MINER_SIG;
+        let (mut block, ..) = signed_block(v);
+        block.header.vote = 2;
+        assert_eq!(
+            check_miner_signature(&block, v),
+            Err(TxError::MinerSignature)
+        );
+    }
+
+    #[test]
+    fn the_vote_is_bounded_from_hf_18() {
+        let v = HF_VERSION_BLOCK_HEADER_MINER_SIG;
+        let (mut block, public, secret) = signed_block(v);
+        for vote in 0..=MAX_VOTE {
+            block.header.vote = vote;
+            resign(&mut block, &public, &secret);
+            assert_eq!(check_miner_signature(&block, v), Ok(()), "vote {vote}");
+        }
+        // The vote is checked before the signature, so a perfectly valid
+        // signature over vote 3 must not save it.
+        block.header.vote = MAX_VOTE + 1;
+        resign(&mut block, &public, &secret);
+        assert_eq!(
+            check_miner_signature(&block, v),
+            Err(TxError::InvalidVote { vote: 3 })
+        );
+    }
+
+    /// The C++ checks output types inside the §4 block as well as at the end
+    /// of §5.1, and the earlier call is what reports a wrong type. Getting
+    /// the order wrong would report a bad signature instead.
+    #[test]
+    fn a_wrong_output_type_is_reported_as_one_not_as_a_bad_signature() {
+        let v = HF_VERSION_VIEW_TAGS + 1;
+        let (mut block, public, secret) = signed_block(v);
+        block.miner_tx.prefix.vout[0].target = TxOutTarget::ToKey { key: key(1) };
+        resign(&mut block, &public, &secret);
+        assert_eq!(
+            check_miner_signature(&block, v),
+            Err(TxError::WrongOutputType { index: 0, tag: 2 })
+        );
+    }
+
+    /// §4 runs before §5.1: an unsigned block whose coinbase height is also
+    /// wrong fails on the signature, as it does in the C++.
+    #[test]
+    fn prevalidation_runs_the_signature_block_first() {
+        let v = HF_VERSION_BLOCK_HEADER_MINER_SIG;
+        let (mut block, ..) = signed_block(v);
+        block.header.signature = Default::default();
+        assert_eq!(
+            prevalidate_miner_tx(&block, v, 999, 0),
+            Err(TxError::MinerSignature),
+            "not CoinbaseHeightMismatch"
+        );
     }
 
     // ---- §5.1.1 coinbase unlock time ----

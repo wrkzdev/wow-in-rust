@@ -433,7 +433,7 @@ impl<D: BlockchainDb> Blockchain<D> {
         let unlock = self
             .coinbase_unlock_time(height, blk.header.major_version)
             .map_err(|e| reject(Step::CoinbasePrevalidation, e))?;
-        tx_rules::check_coinbase(&blk.miner_tx, blk.header.major_version, height, unlock)
+        tx_rules::prevalidate_miner_tx(blk, blk.header.major_version, height, unlock)
             .map_err(|e| reject(Step::CoinbasePrevalidation, BlockError::Coinbase(e)))?;
 
         if txs.len() != blk.tx_hashes.len() {
@@ -1021,7 +1021,7 @@ impl<D: BlockchainDb> Blockchain<D> {
         let unlock = self
             .coinbase_unlock_time(height, blk.header.major_version)
             .map_err(|e| reject(Step::CoinbasePrevalidation, e))?;
-        tx_rules::check_coinbase(&blk.miner_tx, blk.header.major_version, height, unlock)
+        tx_rules::prevalidate_miner_tx(blk, blk.header.major_version, height, unlock)
             .map_err(|e| reject(Step::CoinbasePrevalidation, BlockError::Coinbase(e)))?;
 
         // 9. Transactions.

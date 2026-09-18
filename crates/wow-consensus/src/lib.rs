@@ -41,5 +41,8 @@ pub use fee::{check_fee, get_dynamic_base_fee, required_fee, FeeContext, Require
 pub use genesis::{genesis_block, genesis_id, network_from_genesis};
 pub use hardfork::{gates, Fork, HardFork};
 pub use timestamp::{check_block_timestamp, get_adjusted_time, is_tx_spendtime_unlocked};
-pub use tx_rules::{check_coinbase, check_output_types, check_ring_size, TxError};
+pub use tx_rules::{
+    check_coinbase, check_miner_signature, check_output_types, check_ring_size,
+    prevalidate_miner_tx, TxError,
+};
 pub use weight::{next_long_term_block_weight, update_next_cumulative_weight_limit, WeightLimits};
