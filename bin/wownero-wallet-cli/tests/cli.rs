@@ -118,6 +118,13 @@ fn create(scratch: &Scratch, name: &str, extra: &[&str]) -> Output {
     cli(&args)
 }
 
+/// Run one command against a wallet, with the password on standard input.
+///
+/// `ask-password` is 1 on every wallet this creates, so `seed`, `viewkey`,
+/// `spendkey` and a transfer ask for the password again before they do
+/// anything -- as `SCOPED_WALLET_UNLOCK` does in the C++, `--command` or not.
+/// Commands that do not ask never read the line, so sending it always is
+/// harmless.
 fn run_in(scratch: &Scratch, name: &str, command: &[&str]) -> Output {
     let path = scratch.wallet(name);
     let mut args = vec![
@@ -130,7 +137,7 @@ fn run_in(scratch: &Scratch, name: &str, command: &[&str]) -> Output {
         "--command",
     ];
     args.extend_from_slice(command);
-    cli(&args)
+    cli_with_input(&args, "hunter2\n")
 }
 
 /// A new wallet writes its three files and prints a seed the user can write
@@ -363,6 +370,62 @@ fn the_spend_range_is_settable() {
         assert!(out.status.success(), "{}", all_output(&out));
         assert!(stdout(&out).contains("Set."), "{}", stdout(&out));
     }
+}
+
+/// `seed`, `viewkey` and `spendkey` ask for the wallet's password again before
+/// they show anything, which is what `ask-password` 1 means
+/// (`SCOPED_WALLET_UNLOCK`), and a wrong answer shows nothing.
+#[test]
+fn showing_a_secret_key_asks_for_the_password() {
+    let s = Scratch::new("askpassword");
+    create(&s, "w", &["--command", "address"]);
+    let path = s.wallet("w");
+    let run = |command: &str, answer: &str| {
+        cli_with_input(
+            &[
+                "--wallet-file",
+                path.to_str().expect("utf-8"),
+                "--password",
+                "hunter2",
+                "--daemon-address",
+                NO_DAEMON,
+                "--command",
+                command,
+            ],
+            answer,
+        )
+    };
+
+    for command in ["seed", "viewkey", "spendkey"] {
+        let bad = run(command, "not-it\n");
+        assert!(!bad.status.success(), "{command}: {}", all_output(&bad));
+        assert!(
+            stdout(&bad).contains("invalid password"),
+            "{command}: {}",
+            stdout(&bad)
+        );
+
+        let ok = run(command, "hunter2\n");
+        assert!(ok.status.success(), "{command}: {}", all_output(&ok));
+    }
+
+    // `lock` holds the console until the password is typed, whoever asked.
+    let ok = run("lock", "hunter2\n");
+    assert!(ok.status.success(), "{}", all_output(&ok));
+    assert!(
+        stdout(&ok).contains("required to unlock the console"),
+        "{}",
+        stdout(&ok)
+    );
+    let bad = run("lock", "not-it\n");
+    assert!(!bad.status.success(), "{}", all_output(&bad));
+    assert!(stdout(&bad).contains("invalid password"), "{}", stdout(&bad));
+
+    // The timeout it locks itself after is a setting, and 0 turns it off.
+    let out = run_in(&s, "w", &["set", "inactivity-lock-timeout", "0"]);
+    assert!(out.status.success(), "{}", all_output(&out));
+    let bad = run_in(&s, "w", &["set", "inactivity-lock-timeout", "soon"]);
+    assert!(!bad.status.success(), "{}", all_output(&bad));
 }
 
 /// A command that fails exits non-zero, which is what lets a script tell.

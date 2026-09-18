@@ -5,6 +5,7 @@
 //! "unknown command" to `export_outputs` tells a user nothing about whether it
 //! will ever work.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use wow_daemon_client::KeyImageStatus;
@@ -14,7 +15,7 @@ use wow_wallet::history::{EntryKind, PROPAGATION_TIMEOUT};
 use wow_wallet::priority::{self, PrioritySettings};
 use wow_wallet::send::SendRequest;
 use wow_wallet::spend;
-use wow_wallet::{PoolCheck, RefreshEvent};
+use wow_wallet::{AskPassword, PoolCheck, RefreshEvent};
 
 use crate::fmt;
 use crate::progress::Progress;
@@ -81,18 +82,115 @@ const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ),
 ];
 
+/// `m_last_activity_time`: when a command last ran, in seconds since 1970.
+///
+/// Zero until the first one, so a wallet that has just opened is never taken
+/// to have been left alone.
+static LAST_ACTIVITY: AtomicU64 = AtomicU64::new(0);
+
+/// `m_locked`: set by `lock`, and by the wallet having been left alone for
+/// `inactivity-lock-timeout`. Cleared when its password is typed again.
+static LOCKED: AtomicBool = AtomicBool::new(false);
+
 /// Run one command line, printing any error.
 ///
 /// Returns whether to carry on, and whether the command failed — `--command`
 /// exits non-zero on a failure, which is what lets a script tell.
+///
+/// `simple_wallet::on_command` wraps every command this way: it notes the
+/// time either side, and locks the wallet first if it has been sitting
+/// untouched.
 pub fn run(session: &mut Session, line: &str) -> (Outcome, bool) {
-    match run_one(session, line) {
+    if left_alone(session) {
+        LOCKED.store(true, Ordering::Relaxed);
+    }
+    touch();
+    if let Err(e) = check_for_inactivity_lock(session, false) {
+        // Nobody is there to type the password, so there is nothing to carry
+        // on with: the wallet stays locked and this stops.
+        println!("Error: {e}");
+        return (Outcome::Quit, true);
+    }
+
+    let outcome = match run_one(session, line) {
         Ok(outcome) => (outcome, false),
         Err(e) => {
             println!("Error: {e}");
             (Outcome::Continue, true)
         }
+    };
+    touch();
+    outcome
+}
+
+/// Note that something happened just now, so the inactivity lock counts from
+/// here: `m_last_activity_time = time(NULL)`.
+fn touch() {
+    LAST_ACTIVITY.store(now(), Ordering::Relaxed);
+}
+
+/// `simple_wallet::check_inactivity`: whether the wallet has been sitting
+/// untouched for longer than `inactivity-lock-timeout`. Zero turns it off.
+///
+/// The C++ asks this on an idle thread, so its wallet locks while nobody is
+/// looking. There is no idle thread here, so it is asked when the next
+/// command arrives — the first moment at which the lock can make a
+/// difference.
+fn left_alone(session: &Session) -> bool {
+    let timeout = session.keys_file.inactivity_lock_timeout();
+    let last = LAST_ACTIVITY.load(Ordering::Relaxed);
+    timeout != 0 && last != 0 && now().saturating_sub(last) >= timeout
+}
+
+/// `simple_wallet::check_for_inactivity_lock`: while the wallet is locked,
+/// nothing runs until its password is typed again.
+///
+/// `user` is true when `lock` asked for it; the C++ only scolds when the
+/// wallet locked itself. The screen is cleared either way, because what is on
+/// it is the wallet's — its balance, its addresses, whatever `seed` printed.
+///
+/// The C++ loops here forever. This gives up at end of input instead: a
+/// script that cannot answer would otherwise spin rather than stop.
+fn check_for_inactivity_lock(session: &Session, user: bool) -> Result<(), String> {
+    if !LOCKED.load(Ordering::Relaxed) {
+        return Ok(());
     }
+    term::clear_screen();
+    if !user {
+        println!("tis, tis.. you left the wallet unattended. you will be punished.");
+    }
+    println!("The wallet password is required to unlock the console.");
+    loop {
+        let password = term::read_password("Wallet password: ")
+            .ok_or("no password given; the wallet stays locked")?;
+        if session.verify_password(&password) {
+            break;
+        }
+        println!("invalid password");
+    }
+    LOCKED.store(false, Ordering::Relaxed);
+    touch();
+    Ok(())
+}
+
+/// `SCOPED_WALLET_UNLOCK`: ask for the wallet's password before a command
+/// that shows a secret key or spends.
+///
+/// The C++ is
+/// `if (m_wallet->ask_password() && !(pwd_container = get_and_verify_password()))`,
+/// so `ask-password` 0 asks nothing and 1 and 2 both ask. Level 2 also keeps
+/// the secret keys encrypted in memory between commands, which this build
+/// does not do, so the two behave alike here.
+fn unlock(session: &Session) -> Result<(), String> {
+    if session.keys_file.ask_password() == AskPassword::Never {
+        return Ok(());
+    }
+    let password = term::read_password("Wallet password: ").ok_or("no password given")?;
+    if !session.verify_password(&password) {
+        // `get_and_verify_password`'s wording.
+        return Err("invalid password".into());
+    }
+    Ok(())
 }
 
 /// Run one command line, returning the error instead of printing it.
@@ -154,6 +252,7 @@ pub fn run_one(session: &mut Session, line: &str) -> Result<Outcome, String> {
         "unset_ring" => unset_ring(session, &args),
         "save_known_rings" => Err("save_known_rings is deprecated".into()),
         "set" => set(session, &args),
+        "lock" => lock(session),
 
         other => Err(format!("unknown command `{other}`. Try `help`.")),
     };
@@ -215,6 +314,9 @@ Rings
 
 Settings
   set <option> <value>          persisted to the keys file
+  lock                          hold the console until the password is typed
+                                again. It is held by itself after
+                                inactivity-lock-timeout seconds, 300 by default
   help / version / exit"
     );
 }
@@ -293,11 +395,20 @@ fn seed(session: &mut Session, args: &[&str]) -> Result<(), String> {
         .or_else(|| session.keys_file.seed_language())
         .unwrap_or("English")
         .to_string();
+    // `print_seed` finds out that a wallet is view-only before it asks for
+    // anything, and finds out that it has no seed only after. Keeping that
+    // order means a view-only wallet is not asked for a password to be told
+    // it has nothing to show.
+    if session.is_view_only() {
+        return Err("a view-only wallet has no seed".into());
+    }
+    unlock(session)?;
     println!("{}", session.seed(&language)?);
     Ok(())
 }
 
 fn viewkey(session: &mut Session) -> Result<(), String> {
+    unlock(session)?;
     println!(
         "secret view key: {}",
         wow_crypto::hex::encode(&session.keys_file.account.keys.view_secret_key.0)
@@ -309,6 +420,7 @@ fn spendkey(session: &mut Session) -> Result<(), String> {
     if session.is_view_only() {
         return Err("a view-only wallet has no spend key".into());
     }
+    unlock(session)?;
     println!(
         "secret spend key: {}",
         wow_crypto::hex::encode(&session.keys_file.account.keys.spend_secret_key.0)
@@ -1014,6 +1126,10 @@ fn send(
     if session.daemon.is_none() {
         return Err("no daemon set; use `set_daemon <host:port>`".into());
     }
+    // Where `transfer_main` unlocks: after the daemon check and the arguments,
+    // before anything is built. Spending is what a password is for, and being
+    // asked for it after a failed connection would be asking for nothing.
+    unlock(session)?;
 
     let (address_text, amount) = &destinations[0];
     let explicit_pid: Option<[u8; 8]> = match payment_id {
@@ -1367,12 +1483,23 @@ fn unset_ring(session: &mut Session, args: &[&str]) -> Result<(), String> {
 
 // -- settings --------------------------------------------------------------
 
+/// `simple_wallet::lock`: hold the console until the wallet's password is
+/// typed again.
+///
+/// The C++ sets `m_locked` and calls `check_for_inactivity_lock(true)` at
+/// once, so the prompt is held from here rather than from the next command.
+fn lock(session: &mut Session) -> Result<(), String> {
+    LOCKED.store(true, Ordering::Relaxed);
+    check_for_inactivity_lock(session, true)
+}
+
 fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let Some(option) = args.first() else {
         println!("usage: set <option> <value>");
         println!(
             "known: refresh-from-block-height, subaddress-lookahead, seed-language, store-tx-info, \
-             priority, auto-low-priority, ignore-outputs-above, ignore-outputs-below"
+             priority, auto-low-priority, ignore-outputs-above, ignore-outputs-below, \
+             inactivity-lock-timeout"
         );
         return Ok(());
     };
@@ -1447,6 +1574,14 @@ fn set(session: &mut Session, args: &[&str]) -> Result<(), String> {
         "ignore-outputs-below" => {
             let amount = fmt::parse_amount(value).map_err(|_| "Invalid amount")?;
             session.keys_file.set_ignore_outputs_below(amount);
+        }
+        // `set_inactivity_lock_timeout`, whose hint is "unsigned integer
+        // (seconds, 0 to disable)".
+        "inactivity-lock-timeout" => {
+            let seconds: u64 = value
+                .parse()
+                .map_err(|_| "inactivity-lock-timeout is a number of seconds; 0 disables it")?;
+            session.keys_file.set_inactivity_lock_timeout(seconds);
         }
         other => return Err(format!("`{other}` is not a setting this build knows")),
     }

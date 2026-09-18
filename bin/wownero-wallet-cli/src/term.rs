@@ -68,6 +68,19 @@ fn read(prompt: &str, remember: bool) -> Option<String> {
     }
 }
 
+/// Clear the terminal, as `tools::clear_screen` does before the lock prompt.
+///
+/// What was on screen is the wallet's: its balance, its addresses, and
+/// whatever `seed` printed a moment ago. Only at a terminal -- writing escape
+/// sequences into a pipe would corrupt a script's output.
+pub fn clear_screen() {
+    if !interactive() {
+        return;
+    }
+    print!("\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+}
+
 /// Ask a yes/no question, defaulting to no.
 pub fn confirm(prompt: &str) -> bool {
     match read_line(&format!("{prompt} (y/N): ")) {
