@@ -333,7 +333,12 @@ fn percent_decode(s: &str) -> Result<String, String> {
         if i + 2 >= b.len() {
             return Err("a `%` with fewer than two hex digits after it".into());
         }
-        let pair = &s[i + 1..i + 3];
+        // Sliced as bytes, not as a `str`: an escape followed by a character
+        // of more than one byte would split it, and a `str` index that falls
+        // inside a character panics.
+        let Ok(pair) = std::str::from_utf8(&b[i + 1..i + 3]) else {
+            return Err("a `%` escape that is not two hex digits".into());
+        };
         let byte = wow_crypto::hex::decode(pair)
             .and_then(|v| v.first().copied())
             .ok_or_else(|| format!("`%{pair}` is not a hex escape"))?;
@@ -570,6 +575,9 @@ mod tests {
             "",
             "bob:%zz@127.0.0.1:9050",
             "bob:%4@127.0.0.1:9050",
+            // A `%` before a character of more than one byte: an error, and
+            // not a panic on a `str` index inside that character.
+            "bob:%\u{e9}@127.0.0.1:9050",
         ] {
             assert!(Proxy::parse(bad).is_err(), "`{bad}` should be refused");
         }
