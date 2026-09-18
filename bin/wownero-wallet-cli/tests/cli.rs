@@ -469,9 +469,11 @@ fn unimplemented_commands_say_so() {
     let s = Scratch::new("unimplemented");
     create(&s, "w", &["--command", "address"]);
 
+    // `export_key_images` used to be here; it is a live command now, so
+    // `sign` stands in its place.
     for (command, fragment) in [
         ("get_tx_key", "proofs"),
-        ("export_key_images", "import/export"),
+        ("sign", "message signing"),
         ("setup_background_sync", "background sync"),
         ("start_mining", "miner"),
     ] {

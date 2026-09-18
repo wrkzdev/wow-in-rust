@@ -570,9 +570,12 @@ fn disabled_methods_say_so() {
     let s = start("disabled", false);
     create_wallet(&s, "w");
 
+    // `export_key_images` used to be here; it is a live method now, so the
+    // stand-in for "import and export" is gone and these three are what is
+    // left of the kinds of refusal.
     for (method, fragment) in [
         ("get_tx_proof", "proofs"),
-        ("export_key_images", "import/export"),
+        ("get_reserve_proof", "reserve proofs"),
         ("start_mining", "miner"),
     ] {
         let v = call(&s, method, json!({}));

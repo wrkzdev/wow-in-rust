@@ -1785,9 +1785,11 @@ mod tests {
         let e = hex_param(&params, "tx_data_hex").expect_err("missing");
         assert_eq!(e.code, errors::BAD_HEX);
 
+        // `.ok()` rather than `.expect()`: `errors::Error` has no `Debug`, on
+        // purpose, so an RPC error cannot reach a log through a `{:?}`.
         assert_eq!(
-            hex_param(&json!({ "a": "0a0b" }), "a").expect("hex"),
-            vec![0x0a, 0x0b]
+            hex_param(&json!({ "a": "0a0b" }), "a").ok(),
+            Some(vec![0x0a, 0x0b])
         );
     }
 

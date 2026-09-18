@@ -82,7 +82,7 @@ codes! {
     BAD_MULTISIG_TX_DATA = -34, "A multisig transfer set that does not parse.";
     NOT_ENOUGH_UNLOCKED_MONEY = -37, "The balance is there but locked. Retry later.";
     NO_DAEMON_CONNECTION = -38, "No daemon is set, or it cannot be reached.";
-    BAD_UNSIGNED_TX_DATA = -39, "An unsigned transfer set that does not parse, or claims change it does not pay.";
+    BAD_UNSIGNED_TX_DATA = -39, "An unsigned transfer set that does not parse, or lies about its change.";
     BAD_SIGNED_TX_DATA = -40, "A signed transfer set that does not parse.";
     SIGNED_SUBMISSION = -41, "A signed transfer set that could not be relayed.";
     SIGN_UNSIGNED = -42, "An unsigned transfer set that could not be signed.";

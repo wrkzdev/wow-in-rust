@@ -1134,11 +1134,16 @@ impl Session {
                 desc.ring_size = desc.ring_size.min(src.outputs.len() as u32);
             }
 
+            // Two outputs to one address are one destination, as the C++'s
+            // `dests` map makes them. The index is taken first and the entry
+            // reached through it: an iterator held across a `push` would keep
+            // the list borrowed.
             let mut dests: Vec<(AccountPublicAddress, String, u64)> = Vec::new();
             for d in &cd.splitted_dsts {
                 let address = self.describe_address_with(d, payment_id);
-                match dests.iter_mut().find(|(a, _, _)| *a == d.address) {
-                    Some((_, _, amount)) => *amount += d.amount,
+                let at = dests.iter().position(|(a, _, _)| *a == d.address);
+                match at {
+                    Some(i) => dests[i].2 += d.amount,
                     None => dests.push((d.address, address, d.amount)),
                 }
                 desc.amount_out += d.amount;
@@ -1157,19 +1162,16 @@ impl Session {
                     }
                     Some(_) => {}
                 }
-                let left = {
-                    let claimed = dests
-                        .iter_mut()
-                        .find(|(a, _, _)| *a == cd.change_dts.address)
-                        .ok_or(OfflineError::ChangeNotPaid)?;
-                    if claimed.2 < cd.change_dts.amount {
-                        return Err(OfflineError::ChangeTooLarge);
-                    }
-                    claimed.2 -= cd.change_dts.amount;
-                    claimed.2
-                };
+                let at = dests
+                    .iter()
+                    .position(|(a, _, _)| *a == cd.change_dts.address)
+                    .ok_or(OfflineError::ChangeNotPaid)?;
+                if dests[at].2 < cd.change_dts.amount {
+                    return Err(OfflineError::ChangeTooLarge);
+                }
+                dests[at].2 -= cd.change_dts.amount;
                 desc.change_amount += cd.change_dts.amount;
-                if left == 0 {
+                if dests[at].2 == 0 {
                     dests.retain(|(a, _, _)| *a != cd.change_dts.address);
                 }
             }
@@ -1183,8 +1185,9 @@ impl Session {
                     address: text.clone(),
                     amount,
                 });
-                match all_dests.iter_mut().find(|(a, _, _)| *a == address) {
-                    Some((_, _, total)) => *total += amount,
+                let at = all_dests.iter().position(|(a, _, _)| *a == address);
+                match at {
+                    Some(i) => all_dests[i].2 += amount,
                     None => all_dests.push((address, text, amount)),
                 }
             }
@@ -1511,7 +1514,7 @@ mod tests {
         Session::create_in(
             Box::new(MemoryStore::new("cold-test")),
             Network::Mainnet,
-            String::new(),
+            "",
             1,
             account,
             "English",

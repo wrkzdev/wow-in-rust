@@ -34,11 +34,11 @@ use wow_crypto::types::{EcPoint, KeyImage, PublicKey, SecretKey, SubaddressIndex
 use wow_types::rct::RctType;
 use wow_types::tx::TxIn;
 use wow_types::Network;
-use wow_wallet::decoys::RandomSource;
 use wow_wallet::cold::{
     ExportedKeyImages, ExportedOutputs, RctConfig, RingEntry, SignedTxSet, TxConstructionData,
     TxDestinationEntry, TxSourceEntry, UnsignedTxSet,
 };
+use wow_wallet::decoys::RandomSource;
 use wow_wallet::files::Session;
 use wow_wallet::refresh::Transfer;
 use wow_wallet::scan::{scan_transaction, ScanKeys};
@@ -60,7 +60,7 @@ fn wallet(account: AccountBase, name: &str) -> Session {
     Session::create_in(
         Box::new(MemoryStore::new(name)),
         Network::Mainnet,
-        String::new(),
+        "",
         1,
         account,
         "English",
@@ -243,7 +243,10 @@ fn the_whole_cold_signing_path() {
         .export_outputs_to_file(false, 0, u32::MAX)
         .expect("export outputs");
     assert!(outputs_file.starts_with(wow_wallet::cold::OUTPUT_EXPORT_MAGIC));
-    assert_eq!(cold.import_outputs_from_file(&outputs_file).expect("import"), 1);
+    assert_eq!(
+        cold.import_outputs_from_file(&outputs_file).expect("import"),
+        1
+    );
 
     let key_image = cold.state.transfers[0].key_image.expect("computed");
     assert_eq!(cold.state.transfers[0].public_key, t.public_key);
