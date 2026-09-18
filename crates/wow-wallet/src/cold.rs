@@ -114,6 +114,10 @@ const MAX_ENTRIES: usize = 1_000_000;
 /// How long a `std::string` field may be.
 const MAX_STRING: usize = 1_000_000;
 
+/// `m_kdf_rounds` for these files. See [`encrypt_with_iv`] for why it is a
+/// constant here and a setting there.
+const KDF_ROUNDS: u64 = 1;
+
 /// `rct::identity()`, which is what `import_outputs` puts in `m_mask`.
 ///
 /// The field is a scalar and this is the encoding of the identity *point*,
@@ -195,11 +199,18 @@ pub fn encrypt_with_iv(
     iv: chacha::Iv,
     rng: &mut Rng,
 ) -> Result<Vec<u8>> {
-    // The key is CryptoNight over the 32 secret-key bytes, `kdf_rounds` times.
-    // `kdf_rounds` is the wallet's, and it is 1 for every wallet the CLI
-    // writes; a wallet opened with a different one cannot exchange these files
-    // with one that was not, which is true of the C++ too.
-    let key = chacha::generate_chacha_key(&skey.0, 1);
+    // The key is CryptoNight over the 32 secret-key bytes, `m_kdf_rounds`
+    // times.
+    //
+    // **One round, always**, where the C++ uses the wallet's `--kdf-rounds`.
+    // That is 1 for every wallet either implementation writes by default, and
+    // both halves of a pair must agree on it anyway -- but a wallet opened
+    // with `--kdf-rounds 2` would seal these files differently in the C++ and
+    // the same as any other wallet here, so such a pair cannot mix the two
+    // implementations. Nothing else about the files depends on it, and the
+    // keys file, where it really matters, does honour the setting
+    // ([`crate::keys_file`]).
+    let key = chacha::generate_chacha_key(&skey.0, KDF_ROUNDS);
 
     let mut out = Vec::with_capacity(plaintext.len() + chacha::IV_SIZE + Signature::LEN);
     out.extend_from_slice(&iv);
@@ -220,7 +231,7 @@ pub fn decrypt(ciphertext: &[u8], skey: &SecretKey, authenticated: bool) -> Resu
     if ciphertext.len() < prefix {
         return Err(ColdError::ShortCiphertext);
     }
-    let key = chacha::generate_chacha_key(&skey.0, 1);
+    let key = chacha::generate_chacha_key(&skey.0, KDF_ROUNDS);
     let iv: chacha::Iv = ciphertext[..chacha::IV_SIZE]
         .try_into()
         .expect("IV_SIZE bytes");
