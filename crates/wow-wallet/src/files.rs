@@ -137,7 +137,7 @@ fn keys_from_password(password: &str, kdf_rounds: u64) -> (Zeroizing<Key>, Zeroi
         kdf_rounds,
     ));
     let cache_key = Zeroizing::new(crate::chacha::derive_cache_key(
-        &*keys_key,
+        &keys_key,
         crate::chacha::HASH_KEY_WALLET_CACHE,
     ));
     (keys_key, cache_key)
@@ -324,7 +324,7 @@ impl Session {
             .to_blob_with_key(&self.keys_key, iv, key_iv)
             .map_err(|e| format!("cannot serialize the wallet: {e}"))?;
         self.store.write_keys(&blob)?;
-        let sealed = cache::seal(&cache::store(&self.state), &*self.cache_key, cache_iv);
+        let sealed = cache::seal(&cache::store(&self.state), &self.cache_key, cache_iv);
         self.store.write_cache(&sealed)?;
         Ok(())
     }

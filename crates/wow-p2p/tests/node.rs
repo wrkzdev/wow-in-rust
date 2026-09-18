@@ -947,7 +947,7 @@ fn a_transaction_of_this_nodes_goes_over_its_tor_zone() {
     let id = tx_id(&blob);
     // In `b`'s pool as well, so the node offers it again each tick until the
     // zone has a connection to carry it (`due_for_relay`).
-    b_core.incoming_txs(&[blob.clone()], true);
+    b_core.incoming_txs(std::slice::from_ref(&blob), true);
     b.relay_transaction(id, blob);
 
     wait_until("the transaction over the zone", 60, || a_core.has_tx(&id));

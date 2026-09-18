@@ -296,7 +296,7 @@ impl Session {
         } else {
             transfers
                 .iter()
-                .position(|t| !(t.key_image.is_some() && !t.key_image_request))
+                .position(|t| t.key_image.is_none() || t.key_image_request)
                 .unwrap_or(transfers.len())
         };
 
@@ -1892,7 +1892,9 @@ mod tests {
         );
         let cd = construction(&cold.keys_file.account, &t0, mask, payee, decoy);
 
-        let described = cold.describe(&[cd.clone()]).expect("describe");
+        let described = cold
+            .describe(std::slice::from_ref(&cd))
+            .expect("describe");
         assert_eq!(described.txs.len(), 1);
         let d = &described.txs[0];
         assert_eq!(d.amount_in, 1_000_000);
