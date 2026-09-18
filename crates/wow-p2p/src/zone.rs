@@ -41,7 +41,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -54,8 +54,8 @@ use wow_types::Network;
 use crate::frame::{encode, FrameReader};
 use crate::levin::{self, command, Header, Kind};
 use crate::messages::{
-    self, BasicNodeData, HandshakeResponse, NetworkAddress, NewTransactions, PeerlistEntry,
-    TimedSync,
+    self, BasicNodeData, HandshakeRequest, HandshakeResponse, NetworkAddress, NewTransactions,
+    PeerlistEntry, TimedSync,
 };
 use crate::node::{lock, poisson_from, Core, StemMap, TxBatch, TxRelay, TxVerdict};
 use crate::socks::{self, Proxy};
@@ -82,6 +82,9 @@ const MAX_FRAGMENTS: usize = 20;
 pub const DEFAULT_MAX_OUT: usize = 12;
 /// `P2P_DEFAULT_HANDSHAKE_INTERVAL`.
 const TIMED_SYNC_INTERVAL: Duration = Duration::from_secs(60);
+/// `P2P_DEFAULT_HANDSHAKE_INVOKE_TIMEOUT`: how long an inbound connection has
+/// to send its handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// `P2P_DEFAULT_INVOKE_TIMEOUT`: a timed sync unanswered this long drops the
 /// peer.
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -222,6 +225,29 @@ impl HiddenAddr {
         Err(bad("a .onion or .b32.i2p address"))
     }
 
+    /// `tor_address::unknown()`: the peer at the other end of an inbound
+    /// connection, whose address the proxy does not pass on.
+    ///
+    /// The C++ hands the same placeholder to `set_default_remote`, and the
+    /// host it uses is what this prints. Such an address is never dialled and
+    /// never goes into a peer list.
+    pub fn unknown(zone: Zone) -> HiddenAddr {
+        let host = match zone {
+            Zone::I2p => "<unknown i2p host>",
+            _ => "<unknown tor host>",
+        };
+        HiddenAddr {
+            zone,
+            host: host.to_string(),
+            port: 0,
+        }
+    }
+
+    /// Whether this is [`HiddenAddr::unknown`], which is not an address.
+    pub fn is_unknown(&self) -> bool {
+        self.host.starts_with('<')
+    }
+
     /// Whether `value` looks like an address for one of these networks, so a
     /// caller can tell it from a clearnet one before parsing.
     pub fn is_hidden(value: &str) -> bool {
@@ -259,11 +285,12 @@ impl HiddenAddr {
 }
 
 impl std::fmt::Display for HiddenAddr {
-    /// `tor_address::str`: the host, with the port when there is one. An i2p
-    /// address prints as the host alone.
+    /// `tor_address::str`: the host, and the port after it when there is one.
+    /// An i2p address, and one with no port at all, print as the host alone.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.zone {
             Zone::I2p => f.write_str(&self.host),
+            _ if self.port == 0 => f.write_str(&self.host),
             _ => write!(f, "{}:{}", self.host, self.port),
         }
     }
@@ -271,6 +298,35 @@ impl std::fmt::Display for HiddenAddr {
 
 fn is_base32(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| BASE32.contains(c))
+}
+
+/// `P2P_DEFAULT_PEERS_IN_HANDSHAKE`: what a timed sync may carry, this node's
+/// own address included.
+const MAX_PEERS_IN_SYNC: usize = messages::MAX_PEERS_IN_HANDSHAKE;
+
+/// `ours` put at position `at` of `peers`, with the list one shorter to make
+/// room for it.
+///
+/// The C++ inserts it rather than appending so that its place says nothing:
+/// "Insert into `local_peerlist_new` so that it is only sent once like the
+/// other peers."
+fn with_our_address(
+    mut peers: Vec<PeerlistEntry>,
+    ours: &HiddenAddr,
+    at: usize,
+) -> Vec<PeerlistEntry> {
+    peers.truncate(MAX_PEERS_IN_SYNC - 1);
+    let entry = PeerlistEntry {
+        address: ours.to_network_address(),
+        // `zone.m_config.m_peer_id`, which is 1 in every anonymity zone.
+        id: 1,
+        last_seen: 0,
+        pruning_seed: 0,
+        rpc_port: 0,
+    };
+    let at = at.min(peers.len());
+    peers.insert(at, entry);
+    peers
 }
 
 /// One zone's configuration: what `--tx-proxy` says about it.
@@ -290,19 +346,45 @@ pub struct ZoneConfig {
     /// addresses in this zone. Wownero has no Tor or i2p seed nodes, so
     /// without these a zone has nowhere to start.
     pub peers: Vec<HiddenAddr>,
+    /// `--anonymous-inbound`'s hidden address: what this node is called on
+    /// this network.
+    ///
+    /// It goes out in the peer list of a timed sync answered on an outgoing
+    /// connection, and nowhere else. A peer reached through a proxy cannot see
+    /// the address it is talking to, so this is the only way it can pass it
+    /// on.
+    pub our_address: Option<HiddenAddr>,
+    /// Where the hidden service forwards its connections, which is where the
+    /// zone listens (`network_zone::m_bind_ip` and `m_port`).
+    pub bind: Option<SocketAddr>,
+    /// `--anonymous-inbound`'s `max_connections`. `usize::MAX` for the
+    /// C++'s default of no limit.
+    pub max_in: usize,
 }
 
 impl ZoneConfig {
     /// The defaults for `zone` behind `proxy`: the C++'s connection count,
-    /// noise on, no peers.
+    /// noise on, no peers, and no inbound service.
     pub fn new(zone: Zone, proxy: Proxy) -> ZoneConfig {
         ZoneConfig {
-            zone,
             proxy: Some(proxy),
+            ..ZoneConfig::inbound_only(zone)
+        }
+    }
+
+    /// A zone with no proxy: it takes the connections `--anonymous-inbound`
+    /// forwards and dials nothing, as a zone whose `m_connect` is null.
+    pub fn inbound_only(zone: Zone) -> ZoneConfig {
+        ZoneConfig {
+            zone,
+            proxy: None,
             max_out: DEFAULT_MAX_OUT,
             noise: true,
             pad_transactions: false,
             peers: Vec::new(),
+            our_address: None,
+            bind: None,
+            max_in: usize::MAX,
         }
     }
 }
@@ -484,6 +566,28 @@ impl AnonZone {
             shared: shared.clone(),
             threads: Mutex::new(Vec::new()),
         });
+
+        // `--anonymous-inbound`: the hidden service forwards to this address,
+        // so this is where the zone listens.
+        if let Some(bind) = shared.cfg.bind {
+            let listener = crate::net::listen(bind)
+                .map_err(|e| format!("cannot listen for {} peers on {bind}: {e}", zone.zone()))?;
+            let s = shared.clone();
+            let name = format!("p2p-{}-listen", shared.cfg.zone.name());
+            let thread = std::thread::Builder::new()
+                .name(name)
+                .spawn(move || accept_loop(s, listener))
+                .map_err(|e| format!("cannot start the zone's listener: {e}"))?;
+            lock(&zone.threads).push(thread);
+            let ours = shared.cfg.our_address.clone();
+            wow_log::info!(
+                LOG,
+                "listening for {} peers on {bind} as {}",
+                shared.cfg.zone,
+                ours.map(|a| a.to_string()).unwrap_or_default()
+            );
+        }
+
         let name = format!("p2p-{}", shared.cfg.zone.name());
         let thread = std::thread::Builder::new()
             .name(name)
@@ -637,6 +741,25 @@ impl ZoneShared {
             .collect()
     }
 
+    /// The peer list a timed sync is answered with.
+    ///
+    /// On an **outgoing** connection, this node's own hidden address goes in
+    /// with the rest (`handle_timed_sync`): a peer reached through a proxy
+    /// cannot see the address it is talking to, so this is the only way it
+    /// learns one to pass on. Nothing is told to an inbound peer, which
+    /// reached this node by that address already.
+    fn sync_peers(&self, incoming: bool) -> Vec<PeerlistEntry> {
+        let peers = self.peer_list();
+        let Some(ours) = self.cfg.our_address.clone() else {
+            return peers;
+        };
+        if incoming {
+            return peers;
+        }
+        let at = self.rand_below(peers.len().min(MAX_PEERS_IN_SYNC - 1) + 1);
+        with_our_address(peers, &ours, at)
+    }
+
     /// Take what a peer list offered, dropping what belongs to another zone.
     ///
     /// The C++ drops the whole list in that case ("sent peerlist from another
@@ -647,7 +770,10 @@ impl ZoneShared {
         let fresh: Vec<HiddenAddr> = entries
             .iter()
             .filter_map(|e| HiddenAddr::from_network_address(&e.address))
-            .filter(|a| a.zone == self.cfg.zone)
+            .filter(|a| a.zone == self.cfg.zone && !a.is_unknown())
+            // A peer that hands this node its own address back is not a peer
+            // to dial.
+            .filter(|a| self.cfg.our_address.as_ref() != Some(a))
             .collect();
         if fresh.is_empty() {
             return;
@@ -859,6 +985,119 @@ fn make_connections(shared: &Arc<ZoneShared>) {
     }
 }
 
+/// Take the connections the hidden service forwards (`--anonymous-inbound`).
+fn accept_loop(shared: Arc<ZoneShared>, listener: TcpListener) {
+    if listener.set_nonblocking(true).is_err() {
+        wow_log::error!(
+            LOG,
+            "cannot poll the {} listener; not accepting connections",
+            shared.cfg.zone
+        );
+        return;
+    }
+    while !shared.stopping() {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let s = shared.clone();
+                let name = format!("p2p-{}-in", shared.cfg.zone.name());
+                let _ = std::thread::Builder::new()
+                    .name(name)
+                    .spawn(move || inbound(s, stream));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                wow_log::debug!(LOG, "{} accept failed: {e}", shared.cfg.zone);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// One forwarded connection: the handshake, then the connection itself.
+///
+/// The peer's address is not known and cannot be -- the proxy does not pass
+/// it on -- so there is nothing to ban, nothing to ping back and nothing to
+/// put in a peer list. Two hidden peers are also indistinguishable by id,
+/// since every id in a zone is 1, so the public zone's rule of one connection
+/// per peer id has no place here.
+fn inbound(shared: Arc<ZoneShared>, mut stream: TcpStream) {
+    let taken = shared.snapshot().iter().filter(|c| c.incoming).count();
+    if taken >= shared.cfg.max_in {
+        return;
+    }
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_nodelay(true);
+    if stream.set_read_timeout(Some(READ_TICK)).is_err() {
+        return;
+    }
+    if stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
+        return;
+    }
+
+    let mut reader = FrameReader::new(levin::INITIAL_MAX_PACKET_SIZE);
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let request = loop {
+        if Instant::now() >= deadline {
+            return;
+        }
+        match reader.poll(&mut stream) {
+            // A zone speaks nothing before a handshake, so anything else
+            // ends the connection rather than waiting for one.
+            Ok(Some((h, body))) => {
+                if h.command != command::HANDSHAKE || h.kind() != Kind::Request {
+                    return;
+                }
+                match HandshakeRequest::parse(&body) {
+                    Ok(r) => break r,
+                    Err(e) => {
+                        wow_log::debug!(LOG, "a malformed inbound handshake: {e}");
+                        return;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return,
+        }
+    };
+    if request.node_data.network_id != messages::network_id(shared.network) {
+        return;
+    }
+
+    let peers = shared.peer_list();
+    let sync = shared.core.sync_data();
+    let body = messages::handshake_response(&shared.node_data(), &sync, &peers);
+    let header = Header::response(command::HANDSHAKE, body.len() as u64, 1);
+    if stream.write_all(&encode(&header, &body)).is_err() {
+        return;
+    }
+    // A handshake request carries no peer list, so there is nothing to merge.
+    reader.set_limit(levin::DEFAULT_MAX_PACKET_SIZE);
+
+    let Ok(socket) = stream.try_clone() else {
+        return;
+    };
+    let conn = Arc::new(ZoneConn {
+        id: shared.next_id.fetch_add(1, Ordering::Relaxed),
+        peer: HiddenAddr::unknown(shared.cfg.zone),
+        incoming: true,
+        height: AtomicU64::new(request.payload_data.current_height),
+        outbox: Mutex::new(VecDeque::new()),
+        socket,
+        closed: AtomicBool::new(false),
+        timed_sync_sent: Mutex::new(None),
+    });
+    lock(&shared.conns).insert(conn.id, conn.clone());
+    wow_log::info!(
+        LOG,
+        "an inbound {} connection, at height {}",
+        shared.cfg.zone,
+        request.payload_data.current_height
+    );
+    run_connection(shared, conn, stream, reader);
+}
+
 /// Dial a peer through the proxy and handshake with it.
 ///
 /// The address goes to the proxy as a **name**: a hidden service has no
@@ -994,7 +1233,7 @@ fn handle(shared: &Arc<ZoneShared>, conn: &Arc<ZoneConn>, header: &Header, body:
                     return;
                 }
             }
-            let peers = shared.peer_list();
+            let peers = shared.sync_peers(conn.incoming);
             let sync = shared.core.sync_data();
             let out = messages::timed_sync_response_with_peers(&sync, &peers);
             conn.respond(command::TIMED_SYNC, 1, &out);
@@ -1313,6 +1552,58 @@ mod tests {
         assert_eq!(HiddenAddr::from_network_address(&clearnet), None);
     }
 
+    /// An inbound connection's peer has no address at all, and the C++ says
+    /// so in the same words.
+    #[test]
+    fn an_inbound_peer_has_no_address() {
+        let tor = HiddenAddr::unknown(Zone::Tor);
+        assert!(tor.is_unknown());
+        assert_eq!(tor.to_string(), "<unknown tor host>");
+        let i2p = HiddenAddr::unknown(Zone::I2p);
+        assert!(i2p.is_unknown());
+        assert_eq!(i2p.to_string(), "<unknown i2p host>");
+
+        let real = HiddenAddr::parse(ONION_V2, 0).expect("an address");
+        assert!(!real.is_unknown());
+        // `tor_address::str` leaves a zero port off, which is what
+        // `--anonymous-inbound x.onion` with no port gives.
+        assert_eq!(real.to_string(), ONION_V2);
+    }
+
+    /// **What `--anonymous-inbound` is for.** A timed sync answered on an
+    /// outgoing connection carries this node's own hidden address among the
+    /// peers, since the peer cannot see the address it is talking to.
+    #[test]
+    fn a_timed_sync_carries_this_nodes_hidden_address() {
+        let ours = HiddenAddr::parse("rveahdfho7wo4b2m.onion:28083", 0).expect("ours");
+        let other = HiddenAddr::parse(ONION_V3, 34_567).expect("a peer");
+        let entry = |a: &HiddenAddr| PeerlistEntry {
+            address: a.to_network_address(),
+            id: 1,
+            last_seen: 0,
+            pruning_seed: 0,
+            rpc_port: 0,
+        };
+
+        let peers = vec![entry(&other), entry(&other)];
+        let with = with_our_address(peers.clone(), &ours, 1);
+        assert_eq!(with.len(), 3);
+        assert_eq!(with[1].address, ours.to_network_address());
+        assert_eq!(with[1].id, 1, "every node in a zone is peer 1");
+        assert_eq!(with[1].last_seen, 0);
+
+        // At either end, and never past it.
+        let first = with_our_address(peers.clone(), &ours, 0);
+        assert_eq!(first[0].address, ours.to_network_address());
+        let end = with_our_address(peers.clone(), &ours, 99);
+        assert_eq!(end[2].address, ours.to_network_address());
+
+        // The list is one shorter to make room, so a sync still carries at
+        // most `P2P_DEFAULT_PEERS_IN_HANDSHAKE` of them.
+        let many = vec![entry(&other); MAX_PEERS_IN_SYNC];
+        assert_eq!(with_our_address(many, &ours, 0).len(), MAX_PEERS_IN_SYNC);
+    }
+
     /// A channel that moves drops what it was sending: the rest of a message
     /// on a new connection would say the frames were a message.
     #[test]
@@ -1324,14 +1615,14 @@ mod tests {
 
         set_channel(&mut channel, Some(7));
         assert_eq!(channel.conn, Some(7));
-        assert!(channel.active.is_empty(), "the message in flight is dropped");
+        assert!(channel.active.is_empty(), "what was in flight is dropped");
         assert_eq!(channel.queue.len(), 1, "what was queued still waits");
 
         set_channel(&mut channel, Some(7));
-        assert_eq!(channel.queue.len(), 1, "the same connection changes nothing");
+        assert_eq!(channel.queue.len(), 1, "the same connection: no change");
 
         set_channel(&mut channel, None);
         assert!(channel.conn.is_none());
-        assert!(channel.queue.is_empty(), "with no connection, nothing waits");
+        assert!(channel.queue.is_empty(), "with no connection, none waits");
     }
 }

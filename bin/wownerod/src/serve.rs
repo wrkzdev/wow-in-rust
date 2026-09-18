@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use wow_p2p::addressbook::{parse_ban_list, STATE_FILENAME};
 use wow_p2p::node::{Core, Node, SyncStatus};
-use wow_p2p::zone::HiddenAddr;
+use wow_p2p::zone::{HiddenAddr, ZoneConfig};
 use wow_storage::db::BlockchainDb;
 use wow_storage::lmdb::LmdbDb;
 
@@ -396,9 +396,8 @@ fn split_hidden(
     let mut hidden = Vec::new();
     for entry in list {
         if HiddenAddr::is_hidden(entry) {
-            let addr =
-                HiddenAddr::parse(entry, default_port).map_err(|e| format!("{flag}: {e}"))?;
-            hidden.push(addr);
+            let bad = |e| format!("{flag}: {e}");
+            hidden.push(HiddenAddr::parse(entry, default_port).map_err(bad)?);
         } else {
             clear.push(entry.clone());
         }
@@ -508,6 +507,22 @@ fn start_p2p(cfg: &Config, core: Arc<NodeCore>) -> Result<Node, String> {
                 ))
             }
         }
+    }
+
+    // `--anonymous-inbound` joins its zone, or makes one that only listens:
+    // the C++ calls `add_zone` for it and leaves `m_connect` null, so such a
+    // zone takes connections and dials nothing.
+    for inbound in &cfg.anonymous_inbound {
+        let zone = inbound.our_address.zone;
+        if p.tx_proxies.iter().all(|z| z.zone != zone) {
+            p.tx_proxies.push(ZoneConfig::inbound_only(zone));
+        }
+        let Some(existing) = p.tx_proxies.iter_mut().find(|z| z.zone == zone) else {
+            continue;
+        };
+        existing.our_address = Some(inbound.our_address.clone());
+        existing.bind = Some(inbound.bind);
+        existing.max_in = inbound.max_in;
     }
     p.allow_local_ip = cfg.allow_local_ip;
     p.no_sync = cfg.no_sync;

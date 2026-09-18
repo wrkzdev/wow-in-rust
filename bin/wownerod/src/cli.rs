@@ -129,6 +129,9 @@ pub struct Config {
     /// in when the node starts, from the hidden addresses the peer options
     /// name.
     pub tx_proxies: Vec<wow_p2p::zone::ZoneConfig>,
+    /// `--anonymous-inbound`: one hidden service each, folded into its zone
+    /// when the node starts.
+    pub anonymous_inbound: Vec<AnonymousInbound>,
     /// `--proxy-allow-dns-leaks`: with `--proxy`, allow a peer option to name
     /// a host this node then resolves itself.
     pub proxy_allow_dns_leaks: bool,
@@ -256,6 +259,7 @@ impl Default for Config {
             proxy: None,
             proxy_allow_dns_leaks: false,
             tx_proxies: Vec::new(),
+            anonymous_inbound: Vec::new(),
             log_level: None,
             log_file: None,
             max_log_file_size: 104_850_000,
@@ -443,6 +447,11 @@ PEER-TO-PEER (specs/08)
                               seed nodes. disable_noise gives up the covert
                               channels and fluffs to the zone's outgoing
                               peers instead
+    --anonymous-inbound <hidden-address>,<ip:port>[,max_connections]
+                              take the connections a hidden service forwards
+                              to ip:port, and tell the peers this node dialled
+                              on that network the address it answers at
+                              (needs --tx-proxy; once per network)
 
 LOGGING (specs/09 §8)
     --log-level <0-4 | category:LEVEL,...>                      (default: 0)
@@ -520,9 +529,8 @@ RPC METHODS SERVED   (R: not routed with --restricted-rpc)
                 json-minimal-txpool_add
 
 NOT YET IMPLEMENTED
-    Inbound i2p/Tor connections (--anonymous-inbound), rate limits,
-    pruning, bootstrap daemons, background mining and extra messages in
-    mined blocks are not built.
+    Rate limits, pruning, bootstrap daemons, background mining and extra
+    messages in mined blocks are not built.
 
     Proof of work is checked for RandomWOW (major version 13 and up) and
     CryptoNight variant 1 (versions 7-8). Variants 2 and 4, which cover
@@ -543,10 +551,6 @@ NOT YET IMPLEMENTED
 /// Refused explicitly: accepting and ignoring them would make a node look
 /// configured when it is not.
 const NOT_IMPLEMENTED: &[(&str, &str)] = &[
-    (
-        "--anonymous-inbound",
-        "i2p/Tor inbound connections are not implemented",
-    ),
     (
         "--enable-dns-blocklist",
         "the DNS blocklist is not implemented",
@@ -691,6 +695,61 @@ fn zmq_endpoint(v: &str, flag: &str) -> Result<std::net::SocketAddr, String> {
         host.parse().map_err(|_| shape())?
     };
     Ok(std::net::SocketAddr::new(ip, port))
+}
+
+/// One `--anonymous-inbound`: the address this node answers at on an
+/// anonymity network, and where that network's daemon forwards what it takes.
+#[derive(Clone, Debug)]
+pub struct AnonymousInbound {
+    pub our_address: wow_p2p::zone::HiddenAddr,
+    pub bind: std::net::SocketAddr,
+    /// `usize::MAX` for the C++'s default, which is no limit.
+    pub max_in: usize,
+}
+
+/// `--anonymous-inbound <hidden-address>,<ip:port>[,max_connections]`, read
+/// as `get_anonymous_inbounds` reads it (`net_node.cpp`).
+///
+/// The address is parsed with a default port of **0**, as the C++ parses it:
+/// a hidden service is reached at the port its own daemon listens on, and
+/// `x.onion` with nothing after it is a complete address.
+fn anonymous_inbound(v: &str) -> Result<AnonymousInbound, String> {
+    let mut fields = v.split(',');
+    let address = fields.next().unwrap_or_default();
+    if address.is_empty() {
+        return Err(format!("--anonymous-inbound: no address in `{v}`"));
+    }
+    let bad = |e| format!("--anonymous-inbound: {e}");
+    let our_address = wow_p2p::zone::HiddenAddr::parse(address, 0).map_err(bad)?;
+
+    let Some(bind) = fields.next().filter(|s| !s.is_empty()) else {
+        return Err(format!("--anonymous-inbound: no ip:port in `{v}`"));
+    };
+    let bind: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|_| format!("--anonymous-inbound: `{bind}` is not ip:port"))?;
+
+    let mut max_in = usize::MAX;
+    for (n, field) in fields.enumerate() {
+        if n >= 1 {
+            return Err(format!("--anonymous-inbound: too many `,` in `{v}`"));
+        }
+        if field.is_empty() {
+            continue;
+        }
+        let count: u32 = field.parse().map_err(|_| {
+            format!("--anonymous-inbound: `{field}` is not a connection count")
+        })?;
+        if count == 0 {
+            return Err("--anonymous-inbound: a connection count of 0".into());
+        }
+        max_in = count as usize;
+    }
+    Ok(AnonymousInbound {
+        our_address,
+        bind,
+        max_in,
+    })
 }
 
 /// `--tx-proxy <net>,<ip:port>[,max_connections][,disable_noise]`, read as
@@ -1061,6 +1120,18 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 }
                 cfg.tx_proxies.push(zone);
             }
+            "--anonymous-inbound" => {
+                let what = "<hidden-address>,<ip:port>[,max_connections]";
+                let v = take!(value(&mut it, &arg, what));
+                let inbound = take!(anonymous_inbound(&v));
+                let zone = inbound.our_address.zone;
+                let listed = cfg.anonymous_inbound.iter();
+                if listed.map(|i| i.our_address.zone).any(|z| z == zone) {
+                    let twice = format!("--anonymous-inbound given twice for {zone}");
+                    return ParseOutcome::Error(twice);
+                }
+                cfg.anonymous_inbound.push(inbound);
+            }
 
             "--log-level" => {
                 cfg.log_level = Some(take!(value(&mut it, &arg, "0-4 or category:LEVEL,...")));
@@ -1275,6 +1346,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
     }
     if !zmq_port_set {
         cfg.zmq_rpc_bind_port = default_zmq_rpc_port(cfg.network);
+    }
+
+    // "Listed --anonymous-inbound without listing any --tx-proxy. The latter
+    // is necessary for sending local txes over anonymity networks."
+    if !cfg.anonymous_inbound.is_empty() && cfg.tx_proxies.is_empty() {
+        return ParseOutcome::Error(
+            "--anonymous-inbound needs a --tx-proxy as well: without one this node \
+             could take transactions over the hidden service but never send its own"
+                .into(),
+        );
     }
 
     // The C++ parses these even when IPv6 is off, so a typo is found now
@@ -1504,7 +1585,7 @@ mod tests {
             assert!(e.len() > opt.len() + 2, "{opt}: no reason given");
             assert!(e.contains(": "), "{opt}: {e}");
         }
-        assert!(err(&["--anonymous-inbound"]).contains("i2p/Tor"));
+        assert!(err(&["--enable-dns-blocklist"]).contains("DNS blocklist"));
         assert!(err(&["--bg-mining-enable"]).contains("background mining"));
 
         // The RPC options are real now, so they must *not* be refused.
@@ -1962,6 +2043,48 @@ mod tests {
         assert!(err(&["--tx-proxy", "tor,example.com:9050"]).contains("--tx-proxy"));
 
         let twice = ["--tx-proxy", "tor,127.0.0.1:9050", "--tx-proxy", "tor,[::1]:1"];
+        assert!(err(&twice).contains("twice for tor"));
+    }
+
+    /// `--anonymous-inbound`, which needs a `--tx-proxy` beside it: a node
+    /// that could take transactions over a hidden service but never send its
+    /// own is not what the option is for.
+    #[test]
+    fn the_anonymous_inbound_option_parses() {
+        /// The option with the `--tx-proxy` it needs in front of it.
+        fn with(v: &str) -> Vec<&str> {
+            vec!["--tx-proxy", "tor,127.0.0.1:9050", "--anonymous-inbound", v]
+        }
+        let onion = "rveahdfho7wo4b2m.onion:28083";
+
+        assert!(run(&[]).anonymous_inbound.is_empty());
+        let c = run(&with(&format!("{onion},127.0.0.1:28083,25")));
+        assert_eq!(c.anonymous_inbound.len(), 1);
+        let inbound = &c.anonymous_inbound[0];
+        assert_eq!(inbound.our_address.to_string(), onion);
+        assert_eq!(inbound.bind, "127.0.0.1:28083".parse().unwrap());
+        assert_eq!(inbound.max_in, 25);
+
+        // No port on the address, and no count: the C++'s defaults.
+        let c = run(&with("rveahdfho7wo4b2m.onion,127.0.0.1:28083"));
+        let inbound = &c.anonymous_inbound[0];
+        assert_eq!(inbound.our_address.port, 0);
+        assert_eq!(inbound.max_in, usize::MAX);
+
+        let alone = format!("{onion},127.0.0.1:1");
+        let e = err(&["--anonymous-inbound", &alone]);
+        assert!(e.contains("needs a --tx-proxy"), "{e}");
+        assert!(err(&["--anonymous-inbound"]).contains("needs"));
+        assert!(err(&with("1.2.3.4:28083,127.0.0.1:1")).contains(".onion"));
+        assert!(err(&with(onion)).contains("no ip:port"));
+        assert!(err(&with(&format!("{onion},28083"))).contains("not ip:port"));
+        assert!(err(&with(&format!("{onion},127.0.0.1:1,0"))).contains("count of 0"));
+        assert!(err(&with(&format!("{onion},127.0.0.1:1,1,2"))).contains("too many"));
+
+        let first = format!("{onion},127.0.0.1:1");
+        let mut twice = with(&first);
+        twice.push("--anonymous-inbound");
+        twice.push("rveahdfho7wo4b2m.onion,127.0.0.1:2");
         assert!(err(&twice).contains("twice for tor"));
     }
 

@@ -24,11 +24,13 @@ use wow_crypto::keccak::HASH_STATE_BYTES;
 use wow_crypto::random::Rng;
 use wow_crypto::types::Hash256;
 use wow_p2p::addressbook::{AddressBook, BanTarget, STATE_FILENAME};
-use wow_p2p::messages::{BlockEntry, CoreSyncData};
+use wow_p2p::frame::{encode, FrameReader};
+use wow_p2p::levin::{self, command, Header};
+use wow_p2p::messages::{self, BasicNodeData, BlockEntry, CoreSyncData, HandshakeResponse};
 use wow_p2p::node::{BlockVerdict, ChainReply, Config, Core, Node, TxRelay, TxVerdict};
 use wow_p2p::socks::Proxy;
-use wow_p2p::zone::{HiddenAddr, Zone, ZoneConfig};
 use wow_p2p::sync::{self, ChainTip};
+use wow_p2p::zone::{HiddenAddr, Zone, ZoneConfig};
 use wow_p2p::{NodeIdentity, Peer};
 use wow_types::{Block, Network};
 
@@ -962,6 +964,63 @@ fn a_transaction_of_this_nodes_goes_over_its_tor_zone() {
         a.peer_lists().0.is_empty(),
         "a zone's peer advertises no port, so there is nothing to list"
     );
+}
+
+/// **What `--anonymous-inbound` sets up.** A zone told where its hidden
+/// service forwards takes the connections that arrive there, and answers the
+/// handshake as the zone it is: peer 1, no port, no RPC port and no support
+/// flags, so there is nothing about this node for the peer to pass on.
+#[test]
+fn an_anonymous_inbound_zone_answers_a_handshake() {
+    let t = template();
+    let genesis = make_block(&t, [0u8; 32], 0);
+    let core = MemCore::new(&genesis);
+
+    // The port a torrc's `HiddenServicePort` would forward to.
+    let bind: SocketAddr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let ours = HiddenAddr::parse("rveahdfho7wo4b2m.onion:28083", 0).expect("ours");
+    let mut zone = ZoneConfig::inbound_only(Zone::Tor);
+    zone.our_address = Some(ours);
+    zone.bind = Some(bind);
+    let mut cfg = config(Vec::new());
+    cfg.tx_proxies = vec![zone];
+    let node = Node::start(cfg, core.clone(), rng(3)).expect("start");
+
+    // Connect as the hidden service's daemon would, and handshake.
+    let mut stream = std::net::TcpStream::connect(bind).expect("the zone's listener");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let theirs = BasicNodeData {
+        network_id: messages::network_id(Network::Mainnet),
+        peer_id: 1,
+        my_port: 0,
+        rpc_port: 0,
+        rpc_credits_per_hash: 0,
+        support_flags: 0,
+    };
+    let body = messages::handshake_request(&theirs, &core.sync_data());
+    let header = Header::request(command::HANDSHAKE, body.len() as u64);
+    stream.write_all(&encode(&header, &body)).expect("sent");
+
+    let mut reader = FrameReader::new(levin::INITIAL_MAX_PACKET_SIZE);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        assert!(Instant::now() < deadline, "the zone did not answer");
+        if let Some((h, body)) = reader.poll(&mut stream).expect("a reply") {
+            assert_eq!(h.command, command::HANDSHAKE);
+            break HandshakeResponse::parse(&body).expect("a handshake response");
+        }
+    };
+    assert_eq!(answer.node_data.peer_id, 1, "every node in a zone is peer 1");
+    assert_eq!(answer.node_data.my_port, 0);
+    assert_eq!(answer.node_data.rpc_port, 0);
+    assert_eq!(answer.node_data.support_flags, 0);
+    // Its peer list is the zone's, which is empty, and never the public one.
+    assert!(answer.peers.is_empty());
+
+    node.stop();
 }
 
 /// A peer that goes away mid-sync gives back what it had not delivered, and
