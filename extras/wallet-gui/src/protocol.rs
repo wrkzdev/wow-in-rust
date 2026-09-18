@@ -297,6 +297,11 @@ pub struct Status {
     /// is: `None` when nothing is locked.
     pub locked: u64,
     pub unlock_blocks: Option<u64>,
+    /// What `freeze` has set aside, and how many outputs it is. None of it is
+    /// in `balance`, as `balance_per_subaddress` leaves a frozen output out,
+    /// so without this the money would simply be missing.
+    pub frozen: u64,
+    pub frozen_outputs: usize,
     /// How far the wallet has scanned, and the chain's height as last seen.
     pub scanned: u64,
     pub chain: u64,

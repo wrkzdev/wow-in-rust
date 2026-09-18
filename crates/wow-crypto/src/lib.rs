@@ -64,6 +64,20 @@ pub mod rct;
 pub mod signature;
 pub mod types;
 
+/// Wiping a secret when it goes out of scope.
+///
+/// Re-exported so that every crate holding a password, a seed or a derived key
+/// wipes it the same way, and none of them has to name the dependency itself.
+/// `src/crypto/crypto.h`'s `secret_key` is a `tools::scrubbed` and
+/// `contrib/epee/include/wipeable_string.h` is the same idea for text: memory
+/// a secret passed through is overwritten rather than left for whatever reads
+/// the page next -- a core dump, a swap file, or the next allocation.
+///
+/// It is not a guarantee. A `String` that grows reallocates and leaves the old
+/// bytes behind, and nothing here locks pages against swap (`mlock`, which the
+/// C++ does do). It closes the common case.
+pub use zeroize::{Zeroize, Zeroizing};
+
 pub use hash::{cn_fast_hash, tree_hash, NULL_HASH};
 pub use keys::{
     derivation_to_scalar, derive_public_key, derive_secret_key, derive_subaddress_public_key,

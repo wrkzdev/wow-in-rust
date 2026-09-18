@@ -49,7 +49,10 @@ wow-tls = { path = "crates/wow-tls" }
 
 curve25519-dalek = { version = "4.1.3", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 subtle = { version = "2.5", default-features = false }
-zeroize = { version = "1.7", default-features = false }
+# Wiping key material and passwords when they go out of scope. "alloc" is
+# what gives `Zeroizing<String>` and `Zeroizing<Vec<u8>>`, which is how a
+# password read at a prompt is held.
+zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
 lmdb-master-sys = "0.2"
 libc = "0.2"
 # IPv6-only listeners, so IPv4 and IPv6 can share a port (`wow-p2p::net`).

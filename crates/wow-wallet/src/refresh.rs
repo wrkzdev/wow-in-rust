@@ -506,6 +506,45 @@ impl WalletState {
             })
     }
 
+    /// `wallet2::get_transfer_details(ki)`: which output has this key image.
+    ///
+    /// The C++ walks every transfer and skips one whose key image is not
+    /// known; this reads the index it keeps for the same question while
+    /// scanning, which only ever holds outputs that have one. The message is
+    /// the one `wallet2` throws, because `simple_wallet::freeze_thaw` prints
+    /// it as it comes.
+    pub fn transfer_details(&self, key_image: &KeyImage) -> Result<usize, &'static str> {
+        self.by_key_image
+            .get(key_image)
+            .copied()
+            .ok_or("Key image not found")
+    }
+
+    /// `wallet2::freeze(const key_image&)`: set one output aside, so that
+    /// nothing spends it and no balance counts it, until [`thaw`](Self::thaw).
+    ///
+    /// The defence against a dust attack: a stranger pays a wallet a tiny
+    /// output in the hope of seeing it spent alongside real ones, and so
+    /// learning what belongs together.
+    pub fn freeze(&mut self, key_image: &KeyImage) -> Result<(), &'static str> {
+        let i = self.transfer_details(key_image)?;
+        self.transfers[i].frozen = true;
+        Ok(())
+    }
+
+    /// `wallet2::thaw(const key_image&)`: let it be spent again.
+    pub fn thaw(&mut self, key_image: &KeyImage) -> Result<(), &'static str> {
+        let i = self.transfer_details(key_image)?;
+        self.transfers[i].frozen = false;
+        Ok(())
+    }
+
+    /// `wallet2::frozen(const key_image&)`.
+    pub fn frozen(&self, key_image: &KeyImage) -> Result<bool, &'static str> {
+        let i = self.transfer_details(key_image)?;
+        Ok(self.transfers[i].frozen)
+    }
+
     /// The short chain history: the last ten hashes, then exponentially spaced
     /// ones, then genesis (`specs/12` §3.1).
     ///
@@ -2850,6 +2889,35 @@ mod tests {
         assert!(s.caught_up);
         assert_eq!(s.reorg_to, Some(1_500));
         assert_eq!(w.hashes, chain.hashes[1_000..]);
+    }
+
+    /// `freeze` sets an output aside by its key image and `thaw` gives it
+    /// back, `frozen` says which, and a key image this wallet does not hold is
+    /// the error `wallet2::get_transfer_details` throws.
+    #[test]
+    fn an_output_is_frozen_and_thawed_by_its_key_image() {
+        let mut w = state(7, 0);
+        let to = w.account.keys.account_address;
+        let mut chain = Chain::new();
+        chain.push(&[payment(&to, 5_000, 21)], vec![vec![], vec![8]]);
+        w.refresh(&chain, 10).expect("refresh");
+
+        let key_image = w.transfers[0].key_image.expect("a key image");
+        assert_eq!(w.balance(), 5_000);
+        assert!(!w.frozen(&key_image).expect("known"));
+
+        w.freeze(&key_image).expect("frozen");
+        assert!(w.frozen(&key_image).expect("known"));
+        assert_eq!(w.balance(), 0, "and it leaves the balance");
+
+        w.thaw(&key_image).expect("thawed");
+        assert!(!w.frozen(&key_image).expect("known"));
+        assert_eq!(w.balance(), 5_000);
+
+        let stranger = KeyImage([0xab; 32]);
+        assert_eq!(w.freeze(&stranger), Err("Key image not found"));
+        assert_eq!(w.thaw(&stranger), Err("Key image not found"));
+        assert_eq!(w.frozen(&stranger), Err("Key image not found"));
     }
 
     /// A daemon whose chain does not hold the checkpoint is on another chain,

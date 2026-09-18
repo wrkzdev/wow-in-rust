@@ -35,12 +35,14 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::chacha::Key;
 use crate::history::{PooledTx, SentDestination, SentState, SentTx};
 use crate::refresh::{Transfer, WalletState};
 use crate::store::{CacheRead, FileStore, Store};
 use crate::subaddress::SubaddressTable;
 use crate::{AccountBase, KeysFile};
 use wow_crypto::types::Hash256;
+use wow_crypto::Zeroizing;
 use wow_daemon_client::DaemonClient;
 use wow_types::Network;
 
@@ -84,7 +86,6 @@ pub struct Session {
     pub keys_file: KeysFile,
     pub state: WalletState,
     pub network: Network,
-    pub password: String,
     pub kdf_rounds: u64,
     pub daemon: Option<DaemonClient>,
     /// For a daemon started with `--rpc-login`. Kept on the session rather
@@ -112,9 +113,34 @@ pub struct Session {
     pub dirty: bool,
     /// Where the keys file and the cache are read from and written to.
     store: Box<dyn Store>,
-    /// The key the cache is sealed under, derived from the password once
-    /// rather than by a CryptoNight on every save.
-    cache_key: crate::chacha::Key,
+    /// The key the keys file is encrypted under: `generate_chacha_key` of the
+    /// password, derived once at open rather than by a CryptoNight on every
+    /// save.
+    ///
+    /// This is here instead of the password, which is not kept. It is still
+    /// key material -- it opens this wallet's files -- but it is not the
+    /// password: not reversible to it, and worth nothing anywhere else. The
+    /// reason it has to be kept at all is [`save`](Self::save), which rewrites
+    /// the keys file; `wallet2` takes the password again at each `rewrite` and
+    /// derives the same key there.
+    keys_key: Zeroizing<crate::chacha::Key>,
+    /// The key the cache is sealed under, `derive_cache_key(keys_key)`. Also
+    /// the verifier [`verify_password`](Self::verify_password) checks a
+    /// password against, as `wallet2::verify_password_with_cached_key` does.
+    cache_key: Zeroizing<crate::chacha::Key>,
+}
+
+/// The two keys a password opens a wallet with.
+fn keys_from_password(password: &str, kdf_rounds: u64) -> (Zeroizing<Key>, Zeroizing<Key>) {
+    let keys_key = Zeroizing::new(crate::chacha::generate_chacha_key(
+        password.as_bytes(),
+        kdf_rounds,
+    ));
+    let cache_key = Zeroizing::new(crate::chacha::derive_cache_key(
+        &*keys_key,
+        crate::chacha::HASH_KEY_WALLET_CACHE,
+    ));
+    (keys_key, cache_key)
 }
 
 impl Session {
@@ -122,7 +148,7 @@ impl Session {
     pub fn create(
         paths: Paths,
         network: Network,
-        password: String,
+        password: &str,
         kdf_rounds: u64,
         account: AccountBase,
         seed_language: &str,
@@ -143,7 +169,7 @@ impl Session {
     pub fn create_in(
         store: Box<dyn Store>,
         network: Network,
-        password: String,
+        password: &str,
         kdf_rounds: u64,
         account: AccountBase,
         seed_language: &str,
@@ -172,13 +198,12 @@ impl Session {
             restore_height,
             network,
         );
-        let cache_key = KeysFile::cache_key(password.as_bytes(), kdf_rounds);
+        let (keys_key, cache_key) = keys_from_password(password, kdf_rounds);
 
         let mut s = Session {
             keys_file,
             state,
             network,
-            password,
             kdf_rounds,
             daemon: None,
             daemon_login: None,
@@ -187,6 +212,7 @@ impl Session {
             offline: false,
             dirty: true,
             store,
+            keys_key,
             cache_key,
         };
         s.save()?;
@@ -198,7 +224,7 @@ impl Session {
     /// Open an existing wallet from files at `paths`.
     pub fn open(
         paths: Paths,
-        password: String,
+        password: &str,
         kdf_rounds: u64,
         network: Option<Network>,
     ) -> Result<Session, String> {
@@ -213,12 +239,15 @@ impl Session {
     /// Open the wallet in `store`.
     pub fn open_in(
         mut store: Box<dyn Store>,
-        password: String,
+        password: &str,
         kdf_rounds: u64,
         network: Option<Network>,
     ) -> Result<Session, String> {
         let blob = store.open_keys()?;
-        let keys_file = KeysFile::open(&blob, password.as_bytes(), kdf_rounds)
+        // Derived once. From here on the session holds these two keys and not
+        // the password.
+        let (keys_key, cache_key) = keys_from_password(password, kdf_rounds);
+        let keys_file = KeysFile::open_with_key(&blob, &keys_key)
             .map_err(|e| format!("cannot open the wallet: {e}"))?;
 
         // A wallet knows its own network. Opening a mainnet wallet as testnet
@@ -253,7 +282,6 @@ impl Session {
         );
 
         // Load the cache if there is one; otherwise the wallet rescans.
-        let cache_key = KeysFile::cache_key(password.as_bytes(), kdf_rounds);
         match store.read_cache()? {
             CacheRead::Found(raw) => cache::load_sealed(&mut state, &raw, &cache_key)?,
             CacheRead::WrittenByCpp { ours } => {
@@ -271,7 +299,6 @@ impl Session {
             keys_file,
             state,
             network: file_network,
-            password,
             kdf_rounds,
             daemon: None,
             daemon_login: None,
@@ -280,6 +307,7 @@ impl Session {
             offline: false,
             dirty: false,
             store,
+            keys_key,
             cache_key,
         })
     }
@@ -293,12 +321,32 @@ impl Session {
 
         let blob = self
             .keys_file
-            .to_blob(self.password.as_bytes(), self.kdf_rounds, iv, key_iv)
+            .to_blob_with_key(&self.keys_key, iv, key_iv)
             .map_err(|e| format!("cannot serialize the wallet: {e}"))?;
         self.store.write_keys(&blob)?;
-        let sealed = cache::seal(&cache::store(&self.state), &self.cache_key, cache_iv);
+        let sealed = cache::seal(&cache::store(&self.state), &*self.cache_key, cache_iv);
         self.store.write_cache(&sealed)?;
         Ok(())
+    }
+
+    /// Whether `password` is this wallet's.
+    ///
+    /// `wallet2::verify_password_with_cached_key`: "we use `m_cache_key` as a
+    /// deterministic test to see if given key corresponds to original
+    /// password". Deriving the cache key from the answer and comparing needs
+    /// no stored password and touches no file, which is what lets the
+    /// password be asked for again -- before showing a secret key, before a
+    /// send, or to unlock a wallet left alone -- without one being kept.
+    ///
+    /// Compared byte by byte without an early exit: how much of a guess was
+    /// right is not something to hand back in a timing.
+    pub fn verify_password(&self, password: &str) -> bool {
+        let candidate = Zeroizing::new(KeysFile::cache_key(password.as_bytes(), self.kdf_rounds));
+        candidate
+            .iter()
+            .zip(self.cache_key.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
     }
 
     /// Where the wallet is kept: its keys file's path, or the name its store
@@ -362,22 +410,21 @@ impl Session {
     /// The two are written one after the other, so if the second fails the
     /// first is put back under the old password: keys and cache under
     /// different passwords would leave a wallet that does not open.
-    pub fn change_password(&mut self, new: String) -> Result<(), String> {
+    pub fn change_password(&mut self, new: &str) -> Result<(), String> {
         let mut rng = crate::entropy::seeded_rng()?;
-        let serialize = |password: &str, rng: &mut wow_crypto::random::Rng| {
+        let (new_keys_key, new_cache_key) = keys_from_password(new, self.kdf_rounds);
+        let serialize = |key: &Key, rng: &mut wow_crypto::random::Rng| {
             self.keys_file
-                .to_blob(
-                    password.as_bytes(),
-                    self.kdf_rounds,
-                    random_iv(rng),
-                    random_iv(rng),
-                )
+                .to_blob_with_key(key, random_iv(rng), random_iv(rng))
                 .map_err(|e| format!("cannot serialize the wallet: {e}"))
         };
-        let keys = serialize(&new, &mut rng)?;
-        let old_keys = serialize(&self.password, &mut rng)?;
-        let cache_key = KeysFile::cache_key(new.as_bytes(), self.kdf_rounds);
-        let sealed = cache::seal(&cache::store(&self.state), &cache_key, random_iv(&mut rng));
+        let keys = serialize(&new_keys_key, &mut rng)?;
+        let old_keys = serialize(&self.keys_key, &mut rng)?;
+        let sealed = cache::seal(
+            &cache::store(&self.state),
+            &new_cache_key,
+            random_iv(&mut rng),
+        );
 
         self.store.write_keys(&keys)?;
         if let Err(e) = self.store.write_cache(&sealed) {
@@ -390,8 +437,8 @@ impl Session {
                 ),
             });
         }
-        self.password = new;
-        self.cache_key = cache_key;
+        self.keys_key = new_keys_key;
+        self.cache_key = new_cache_key;
         self.dirty = false;
         Ok(())
     }
@@ -981,7 +1028,7 @@ mod tests {
         Session::create(
             Paths::new(dir.join("w")),
             Network::Mainnet,
-            String::new(),
+            "",
             1,
             account,
             "English",
@@ -1255,7 +1302,7 @@ mod tests {
     fn an_open_wallet_is_held() {
         let dir = scratch("held");
         let mut s = fresh_session(&dir, 0);
-        let reopen = || Session::open(Paths::new(dir.join("w")), String::new(), 1, None);
+        let reopen = || Session::open(Paths::new(dir.join("w")), "", 1, None);
 
         match reopen() {
             Ok(_) => panic!("opened a wallet that is already open"),
@@ -1281,7 +1328,7 @@ mod tests {
         let mut s = Session::create_in(
             Box::new(kept.clone()),
             Network::Mainnet,
-            "old".into(),
+            "old",
             1,
             account,
             "English",
@@ -1289,8 +1336,12 @@ mod tests {
         )
         .expect("create");
         s.state.hashes.push([9u8; 32]);
-        s.change_password("new".into()).expect("changed");
-        assert_eq!(s.password, "new");
+        s.change_password("new").expect("changed");
+        assert!(
+            s.verify_password("new"),
+            "the new password is this wallet's"
+        );
+        assert!(!s.verify_password("old"), "and the old one is not");
 
         let files = kept.files();
         let open = |password: &str| {
@@ -1299,7 +1350,7 @@ mod tests {
                 files.keys.clone().expect("a keys file"),
                 files.cache.clone(),
             );
-            Session::open_in(Box::new(store), password.into(), 1, None)
+            Session::open_in(Box::new(store), password, 1, None)
         };
         assert!(open("old").is_err(), "the old password no longer opens it");
         let back = open("new").expect("the new one does");
@@ -1308,6 +1359,33 @@ mod tests {
             back.state.hashes, s.state.hashes,
             "and the cache came with it"
         );
+    }
+
+    /// A session can tell its own password from any other without keeping it:
+    /// the stored cache key is the verifier, as
+    /// `wallet2::verify_password_with_cached_key` uses `m_cache_key`.
+    #[test]
+    fn a_password_is_checked_against_the_cache_key() {
+        let dir = scratch("verify");
+        let spend = wow_crypto::types::SecretKey(wow_crypto::ops::sc_reduce32(&[8u8; 32]));
+        let account = crate::account::AccountBase::from_spend_key(spend, 0).expect("keys");
+        let s = Session::create(
+            Paths::new(dir.join("w")),
+            Network::Mainnet,
+            "correct horse",
+            1,
+            account,
+            "English",
+            0,
+        )
+        .expect("create");
+
+        assert!(s.verify_password("correct horse"));
+        assert!(!s.verify_password("correct hors"));
+        assert!(!s.verify_password("correct horses"));
+        assert!(!s.verify_password(""));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A view-only copy has the wallet's address and view key and no spend
@@ -1319,7 +1397,7 @@ mod tests {
         let blob = s.view_only_keys("watch").expect("a view-only keys file");
         let copy = Session::open_in(
             Box::new(MemoryStore::holding("copy", blob, None)),
-            "watch".into(),
+            "watch",
             1,
             None,
         )
@@ -1345,7 +1423,7 @@ mod tests {
         let mut s = Session::create_in(
             Box::new(kept.clone()),
             Network::Mainnet,
-            "pw".into(),
+            "pw",
             1,
             account.clone(),
             "English",
@@ -1362,7 +1440,7 @@ mod tests {
 
         let keys = files.keys.expect("a keys file");
         let reopened = MemoryStore::holding("browser", keys, files.cache);
-        let back = Session::open_in(Box::new(reopened), "pw".into(), 1, None).expect("open");
+        let back = Session::open_in(Box::new(reopened), "pw", 1, None).expect("open");
         assert_eq!(back.primary_address(), s.primary_address());
         assert_eq!(back.state.hashes, s.state.hashes, "the cache came back");
         assert_eq!(back.location(), "browser");
@@ -1370,7 +1448,7 @@ mod tests {
         let over = Session::create_in(
             Box::new(kept),
             Network::Mainnet,
-            "pw".into(),
+            "pw",
             1,
             account,
             "English",

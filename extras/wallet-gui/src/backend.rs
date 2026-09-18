@@ -272,7 +272,7 @@ impl<P: Platform> Backend<P> {
             }
             Command::ShowViewKey { password } => {
                 let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
-                if password != w.session.password {
+                if !w.session.verify_password(&password) {
                     return Err("that is not this wallet's password".into());
                 }
                 let key = w.session.view_key_hex();
@@ -282,7 +282,7 @@ impl<P: Platform> Backend<P> {
             Command::ChangePassword { old, new } => {
                 match &self.wallet {
                     None => return Err(NO_WALLET.into()),
-                    Some(w) if old != w.session.password => {
+                    Some(w) if !w.session.verify_password(&old) => {
                         return Err("that is not this wallet's password".into())
                     }
                     Some(_) => {}
@@ -290,7 +290,7 @@ impl<P: Platform> Backend<P> {
                 // Two CryptoNight hashes, one for each file's key: a moment.
                 self.working("Changing the password…");
                 let w = self.wallet.as_mut().ok_or(NO_WALLET)?;
-                w.session.change_password(new)?;
+                w.session.change_password(&new)?;
                 let name = w.name.clone();
                 self.platform.saved(&name);
                 self.send(Event::PasswordChanged);
@@ -301,7 +301,7 @@ impl<P: Platform> Backend<P> {
                 copy_password,
             } => {
                 let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
-                if password != w.session.password {
+                if !w.session.verify_password(&password) {
                     return Err("that is not this wallet's password".into());
                 }
                 let keys = w.session.view_only_keys(&copy_password)?;
@@ -345,7 +345,7 @@ impl<P: Platform> Backend<P> {
             }
             Command::ShowSeed { password } => {
                 let w = self.wallet.as_ref().ok_or(NO_WALLET)?;
-                if password != w.session.password {
+                if !w.session.verify_password(&password) {
                     return Err("that is not this wallet's password".into());
                 }
                 let language = w
@@ -424,7 +424,7 @@ impl<P: Platform> Backend<P> {
         let session = Session::create_in(
             store,
             n.network.network(),
-            n.password,
+            &n.password,
             KDF_ROUNDS,
             account,
             language.name,
@@ -467,7 +467,7 @@ impl<P: Platform> Backend<P> {
         let session = Session::create_in(
             store,
             r.network.network(),
-            r.password,
+            &r.password,
             KDF_ROUNDS,
             account,
             language.name,
@@ -488,7 +488,7 @@ impl<P: Platform> Backend<P> {
         }
         self.working(format!("Opening {}…", o.name));
         let store = self.platform.store(&o.name)?;
-        let session = Session::open_in(store, o.password, KDF_ROUNDS, None).map_err(|e| {
+        let session = Session::open_in(store, &o.password, KDF_ROUNDS, None).map_err(|e| {
             if e.contains("not JSON") {
                 "That password does not open this wallet.".to_string()
             } else {
@@ -865,6 +865,11 @@ impl<P: Platform> Backend<P> {
             ring_size: wow_wallet::decoys::RING_SIZE,
             fee_per_byte: priority::fee_per_byte(&tiers, tier),
             extra_size: spend::extra_size(2, payment_id, false),
+            // As `prepare_send` reads them: an estimate that ignored the
+            // amount range the send obeys would quote a fee for inputs the
+            // send will not pick.
+            ignore_above: w.session.keys_file.ignore_outputs_above(),
+            ignore_below: w.session.keys_file.ignore_outputs_below(),
             chain_height: w.session.chain_height(),
             now: wow_wallet::clock::now(),
             ..Default::default()
@@ -1077,11 +1082,22 @@ impl<P: Platform> Backend<P> {
         let (balance, unlocked) = w.session.balances();
         let chain = w.session.chain_height();
         let (locked, unlock_blocks) = w.session.state.locked(chain, wow_wallet::clock::now());
+        // Frozen outputs are in no balance, so the interface has to be able to
+        // say where the money went.
+        let frozen_outputs: Vec<u64> = w
+            .session
+            .transfers()
+            .iter()
+            .filter(|t| !t.spent && t.frozen)
+            .map(|t| t.amount)
+            .collect();
         let status = Status {
             balance,
             unlocked,
             locked,
             unlock_blocks,
+            frozen: frozen_outputs.iter().sum(),
+            frozen_outputs: frozen_outputs.len(),
             scanned: w.session.state.scan_height(),
             chain,
             node: w.session.daemon.as_ref().map(|d| d.address().to_string()),

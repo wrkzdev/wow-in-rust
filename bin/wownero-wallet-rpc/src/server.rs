@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use wow_crypto::Zeroizing;
 use wow_types::Network;
 use wow_wallet::files::{Paths, Session};
 use wow_wallet::AccountBase;
@@ -38,7 +39,12 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
 /// How the server was told to find wallets.
 pub enum WalletSource {
     /// One wallet, opened at startup and held.
-    File { paths: Paths, password: String },
+    File {
+        paths: Paths,
+        /// `--password` or `--password-file`, needed again whenever this one
+        /// wallet is reopened. Wiped when the server stops.
+        password: Zeroizing<String>,
+    },
     /// A directory; the client opens and creates within it.
     Dir(std::path::PathBuf),
 }
@@ -220,12 +226,8 @@ impl State {
         let WalletSource::File { paths, password } = &self.source else {
             return Ok(());
         };
-        let mut session = Session::open(
-            paths.clone(),
-            password.clone(),
-            self.kdf_rounds,
-            Some(self.network),
-        )?;
+        let mut session =
+            Session::open(paths.clone(), password, self.kdf_rounds, Some(self.network))?;
         self.attach_daemon(&mut session);
         *self.wallet() = Some(session);
         Ok(())
@@ -268,17 +270,19 @@ impl State {
             .get("filename")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(errors::UNKNOWN_ERROR, "filename is missing"))?;
-        let password = params
-            .get("password")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let password = Zeroizing::new(
+            params
+                .get("password")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
 
         let paths = self.path_for(name)?;
         // The wallet already open here holds its own keys file, and opening it
         // again would find it locked by this server. So that one closes first.
         self.close_if_open(&paths)?;
-        let mut session = Session::open(paths, password, self.kdf_rounds, Some(self.network))
+        let mut session = Session::open(paths, &password, self.kdf_rounds, Some(self.network))
             .map_err(|e| Error::new(errors::INVALID_PASSWORD, e))?;
         self.attach_daemon(&mut session);
         *self.wallet() = Some(session);
@@ -396,17 +400,22 @@ impl State {
         self.install(paths, password, account, &language, restore_height)
     }
 
-    fn creation_params(&self, params: &Value) -> Result<(String, String, String), Error> {
+    fn creation_params(
+        &self,
+        params: &Value,
+    ) -> Result<(String, Zeroizing<String>, String), Error> {
         let name = params
             .get("filename")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(errors::UNKNOWN_ERROR, "filename is missing"))?
             .to_string();
-        let password = params
-            .get("password")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let password = Zeroizing::new(
+            params
+                .get("password")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
         let language = params
             .get("language")
             .and_then(Value::as_str)
@@ -418,7 +427,7 @@ impl State {
     fn install(
         &self,
         paths: Paths,
-        password: String,
+        password: Zeroizing<String>,
         account: AccountBase,
         language: &str,
         restore_height: u64,
@@ -432,7 +441,7 @@ impl State {
         let mut session = Session::create(
             paths,
             self.network,
-            password,
+            &password,
             self.kdf_rounds,
             account,
             language,
