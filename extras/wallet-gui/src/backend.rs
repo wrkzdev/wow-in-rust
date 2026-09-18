@@ -1082,11 +1082,22 @@ impl<P: Platform> Backend<P> {
         let (balance, unlocked) = w.session.balances();
         let chain = w.session.chain_height();
         let (locked, unlock_blocks) = w.session.state.locked(chain, wow_wallet::clock::now());
+        // Frozen outputs are in no balance, so the interface has to be able to
+        // say where the money went.
+        let frozen_outputs: Vec<u64> = w
+            .session
+            .transfers()
+            .iter()
+            .filter(|t| !t.spent && t.frozen)
+            .map(|t| t.amount)
+            .collect();
         let status = Status {
             balance,
             unlocked,
             locked,
             unlock_blocks,
+            frozen: frozen_outputs.iter().sum(),
+            frozen_outputs: frozen_outputs.len(),
             scanned: w.session.state.scan_height(),
             chain,
             node: w.session.daemon.as_ref().map(|d| d.address().to_string()),

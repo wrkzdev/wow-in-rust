@@ -1862,6 +1862,9 @@ fn overview(
         if let Some(note) = unlock_note(&w.status) {
             ui.label(RichText::new(note).color(weak));
         }
+        if let Some(note) = frozen_note(&w.status) {
+            ui.label(RichText::new(note).color(weak));
+        }
     }
     ui.add_space(12.0);
     sync_bar(
@@ -1910,6 +1913,27 @@ fn overview(
             w.page = Page::History;
         }
     }
+}
+
+/// What `freeze` has set aside, which is in none of the balances.
+///
+/// The command-line wallet's `frozen` lists these; this build's interface has
+/// no per-output page to list them on, so it says how much and how many, so
+/// that money missing from the balance is money accounted for.
+fn frozen_note(status: &Status) -> Option<String> {
+    if status.frozen_outputs == 0 {
+        return None;
+    }
+    let outputs = if status.frozen_outputs == 1 {
+        "1 output is".to_string()
+    } else {
+        format!("{} outputs are", status.frozen_outputs)
+    };
+    Some(format!(
+        "{outputs} frozen, holding {} WOW. Frozen outputs are in no balance above and nothing \
+         spends them. wallet-cli's `thaw` gives one back.",
+        format::amount_short(status.frozen)
+    ))
 }
 
 /// Why money cannot be spent yet, and when the first of it can.
@@ -2060,6 +2084,9 @@ fn send_page(ui: &mut Ui, w: &mut WalletView, host: &mut dyn Host) {
         };
         ui.colored_label(t.warn, why);
         if let Some(note) = unlock_note(&w.status) {
+            ui.label(note);
+        }
+        if let Some(note) = frozen_note(&w.status) {
             ui.label(note);
         }
     }
