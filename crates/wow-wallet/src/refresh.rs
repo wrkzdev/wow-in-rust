@@ -784,9 +784,10 @@ impl WalletState {
         self.detach_sent(height);
     }
 
-    /// Rebuild the lookups over `transfers`, after it was cut short or read
-    /// back from a cache.
-    pub(crate) fn reindex(&mut self) {
+    /// Rebuild the lookups over `transfers`, after it was cut short, read
+    /// back from a cache, or set up by hand -- which a test does, and which
+    /// is why this is public.
+    pub fn reindex(&mut self) {
         self.by_key_image = self
             .transfers
             .iter()

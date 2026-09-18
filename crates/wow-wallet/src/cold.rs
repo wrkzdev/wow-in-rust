@@ -1046,7 +1046,12 @@ impl PendingTx {
             dests.push(TxDestinationEntry::read(r)?);
         }
         let construction_data = TxConstructionData::read(r)?;
-        let multisig = r.read_len(MAX_ENTRIES, "multisig signatures")?;
+        // Read as a plain count, not through `read_len`: that guard refuses a
+        // count larger than the bytes left, so a set whose signatures were cut
+        // off would be an end-of-file rather than the refusal below -- and
+        // whether this build will sign a multisig transaction does not depend
+        // on how much of the file arrived.
+        let multisig = r.read_varint()?;
         if multisig != 0 {
             return Err(ColdError::Parse(wow_serialize::Error::InvalidValue(
                 "a multisig transaction; this build does not do multisig",

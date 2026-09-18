@@ -790,7 +790,7 @@ mod tests {
         ])
         .expect("parses");
         assert_eq!(o.source, Source::Seed);
-        assert_eq!(o.seed.as_deref(), Some("one two three"));
+        assert_eq!(o.seed.as_deref().map(String::as_str), Some("one two three"));
     }
 
     #[test]
