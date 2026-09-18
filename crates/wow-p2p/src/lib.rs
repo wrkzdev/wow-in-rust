@@ -17,6 +17,8 @@
 //!
 //! [`queue`] spreads a node's sync across several peers (§5.6).
 //!
+//! [`socks`] is the SOCKS5 client a proxied connection dials through (§7.4).
+//!
 //! Not here: pruning (§9), and the i2p/Tor zones and their noise channels
 //! (§7.4).
 //!
@@ -34,6 +36,7 @@ pub mod net;
 pub mod node;
 pub mod peer;
 pub mod queue;
+pub mod socks;
 pub mod sync;
 
 pub use levin::{command, flags, Header, Kind, LevinError, Reassembler, Reassembly};
