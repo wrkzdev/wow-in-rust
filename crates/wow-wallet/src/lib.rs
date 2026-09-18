@@ -14,6 +14,7 @@
 //! | [`store`] | where an open wallet's files live: on disk, or in memory a program keeps |
 //! | [`send`] | a destination to a relayed transaction, prepared and then committed |
 //! | [`cold`] | the files a watch-only wallet and an offline wallet exchange |
+//! | [`offline`] | what the two halves of a cold-signing pair do with them |
 //!
 //! # What is here and what is not
 //!
@@ -26,7 +27,7 @@
 //! relayed transaction that every wallet front end shares ([`send`]).
 //!
 //! And cold signing: the four files a watch-only half and an offline half
-//! exchange ([`cold`]).
+//! exchange ([`cold`]), and what each half does with them ([`offline`]).
 //!
 //! The cache file (`specs/12` §2.2) is deliberately **not** the C++ format —
 //! that is a Boost portable binary archive, and §2.2 says so and says to detect
@@ -45,6 +46,7 @@ pub mod files;
 pub mod history;
 pub mod keys_file;
 pub mod lock;
+pub mod offline;
 pub mod priority;
 pub mod refresh;
 pub mod rings;

@@ -7,7 +7,7 @@
 //! between, wallet-rpc does not, and a GUI shows a dialog.
 
 use curve25519_dalek::scalar::Scalar;
-use wow_crypto::types::{AccountPublicAddress, Hash256, KeyImage};
+use wow_crypto::types::{AccountPublicAddress, Hash256, KeyImage, SecretKey};
 use wow_daemon_client::{DaemonError, SendResult};
 use wow_types::address::{Address, AddressKind};
 use wow_types::Network;
@@ -130,6 +130,71 @@ pub enum SendError {
     Relay(DaemonError),
 }
 
+/// A plan, its rings, and its inputs: everything a transaction needs before it
+/// is built, and all of it within reach of a watch-only wallet.
+///
+/// [`Session::plan_send`] gets this far and [`Planned::settle`] turns it into a
+/// transaction. They are separate because the two halves of a cold-signing
+/// pair part company here: the watch-only half plans and writes the plan out
+/// ([`crate::offline`]), and the half that holds the spend key does the rest.
+pub struct Planned {
+    /// Which of this wallet's outputs pay, and how much goes where.
+    pub plan: SpendPlan,
+    /// The subaddress account the inputs came from. Change goes to its main
+    /// address.
+    pub account: u32,
+    /// The fee tier it pays, after [`priority::adjust_priority`].
+    pub priority: u32,
+    pub fee_per_byte: u64,
+    pub payment_id: Option<[u8; 8]>,
+    pub payee: AccountPublicAddress,
+    pub payee_is_subaddress: bool,
+    /// `{account, 0}`, where change goes back to.
+    pub change_to: AccountPublicAddress,
+    pub change_is_subaddress: bool,
+    /// Where an output of nothing goes when there is no change: a throwaway
+    /// address nobody holds the key to.
+    pub dummy: AccountPublicAddress,
+    /// One per `plan.inputs`, in that order, each carrying its ring.
+    pub inputs: Vec<SpendableOutput>,
+    /// The key images the inputs spend, in `plan.inputs` order.
+    pub key_images: Vec<KeyImage>,
+    /// The one source of randomness for this transaction: already used for the
+    /// ring choices, and still needed for the build.
+    pub rng: wow_crypto::random::Rng,
+    pub noted_in_pool: Vec<Hash256>,
+    pub pool_unread: Option<String>,
+}
+
+impl Planned {
+    /// Build and sign the transaction, at the fee its own weight needs.
+    ///
+    /// `view_secret_key` is the sender's, which change is derived from
+    /// ([`transfer::Change`]).
+    pub fn settle(&mut self, view_secret_key: &SecretKey) -> Result<transfer::Settled, SendError> {
+        let payee = (self.payee, self.payee_is_subaddress);
+        let change_to = (self.change_to, self.change_is_subaddress);
+        let dummy = self.dummy;
+        let outputs = |p: &SpendPlan| outputs_for(p, payee, change_to, dummy);
+        // Disjoint fields: the inputs and the plan are read while the
+        // generator is borrowed mutably.
+        let rng = &mut self.rng;
+        transfer::construct_settled(
+            &self.inputs,
+            &self.plan,
+            self.fee_per_byte,
+            self.payment_id,
+            &outputs,
+            view_secret_key,
+            &mut || random_scalar(rng),
+        )
+        .map_err(|e| match e {
+            SettleError::Plan(e) => SendError::Plan(e),
+            SettleError::Build(e) => SendError::Build(e),
+        })
+    }
+}
+
 impl Session {
     /// Plan, ring, build and sign a transaction, and relay nothing.
     ///
@@ -140,6 +205,39 @@ impl Session {
         if self.is_view_only() {
             return Err(SendError::ViewOnly);
         }
+        let mut planned = self.plan_send(request, true)?;
+        let settled = planned.settle(&self.keys_file.account.keys.view_secret_key)?;
+
+        Ok(PreparedSend {
+            address: request.address.to_string(),
+            txid: transfer::transaction_hash(&settled.built.tx),
+            plan: settled.plan,
+            priority: planned.priority,
+            payment_id: planned.payment_id,
+            blob: settled.blob,
+            key_images: planned.key_images,
+            noted_in_pool: planned.noted_in_pool,
+            pool_unread: planned.pool_unread,
+        })
+    }
+
+    /// Everything up to the build: the fee tier, the plan, the rings, and one
+    /// [`SpendableOutput`] per input.
+    ///
+    /// `with_spend_key` is false for a watch-only wallet, which has no one-time
+    /// secret keys and does not need them in order to plan. Its inputs get
+    /// zeros, and a transaction built from them is good for its weight and
+    /// nothing else. The C++ does the same:
+    /// `generate_key_image_helper_precomp` has "for watch-only wallet, simply
+    /// copy the known output pubkey" and leaves the secret null, so
+    /// `create_transactions_2` on a watch-only wallet builds a
+    /// garbage-signed transaction, reads its weight, and writes out only the
+    /// construction data ([`crate::offline`]).
+    pub fn plan_send(
+        &mut self,
+        request: &SendRequest<'_>,
+        with_spend_key: bool,
+    ) -> Result<Planned, SendError> {
         let client = self.daemon.clone().ok_or(SendError::NoDaemon)?;
 
         let decoded = Address::decode_for(request.address, self.network)
@@ -292,8 +390,12 @@ impl Session {
             )
             .map_err(SendError::RingMismatch)?;
 
-            let secret_key = crate::refresh::one_time_secret_key(&self.keys_file.account, t)
-                .ok_or(SendError::ViewOnly)?;
+            let secret_key = if with_spend_key {
+                crate::refresh::one_time_secret_key(&self.keys_file.account, t)
+                    .ok_or(SendError::ViewOnly)?
+            } else {
+                SecretKey::ZERO
+            };
             let key_image = t.key_image.ok_or(SendError::Damaged("no key image"))?;
             key_images.push(key_image);
 
@@ -329,38 +431,28 @@ impl Session {
             wow_crypto::types::SubaddressIndex::new(account, 0),
         )
         .ok_or(SendError::Damaged("its change address does not derive"))?;
-        let view_secret_key = keys.view_secret_key;
         let dummy = crate::account::AccountBase::from_spend_key(
-            wow_crypto::types::SecretKey(rng.random_scalar()),
+            SecretKey(rng.random_scalar()),
             0,
         )
         .ok_or_else(|| SendError::Entropy("cannot make an address for zero change".into()))?
         .keys
         .account_address;
-        let change_to = (change_to, account != 0);
-        let outputs = |p: &SpendPlan| outputs_for(p, (payee, subaddress), change_to, dummy);
-        let settled = transfer::construct_settled(
-            &inputs,
-            &plan,
+
+        Ok(Planned {
+            plan,
+            account,
+            priority,
             fee_per_byte,
             payment_id,
-            &outputs,
-            &view_secret_key,
-            &mut || random_scalar(&mut rng),
-        )
-        .map_err(|e| match e {
-            SettleError::Plan(e) => SendError::Plan(e),
-            SettleError::Build(e) => SendError::Build(e),
-        })?;
-
-        Ok(PreparedSend {
-            address: request.address.to_string(),
-            txid: transfer::transaction_hash(&settled.built.tx),
-            plan: settled.plan,
-            priority,
-            payment_id,
-            blob: settled.blob,
+            payee,
+            payee_is_subaddress: subaddress,
+            change_to,
+            change_is_subaddress: account != 0,
+            dummy,
+            inputs,
             key_images,
+            rng,
             noted_in_pool,
             pool_unread,
         })
@@ -454,7 +546,10 @@ fn outputs_for(
 }
 
 /// A uniform scalar from 256 bits of `rng`.
-fn random_scalar(rng: &mut wow_crypto::random::Rng) -> Scalar {
+///
+/// Shared with [`crate::offline`], so the cold half of a pair draws its
+/// randomness exactly as this one does.
+pub(crate) fn random_scalar(rng: &mut wow_crypto::random::Rng) -> Scalar {
     let mut b = [0u8; 32];
     for chunk in b.chunks_mut(8) {
         chunk.copy_from_slice(&rng.next_u64().to_le_bytes());

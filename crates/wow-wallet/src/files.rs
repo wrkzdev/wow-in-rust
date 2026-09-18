@@ -98,6 +98,16 @@ pub struct Session {
     pub daemon_options: wow_daemon_client::ConnectOptions,
     /// The daemon's height at the last refresh, for progress reporting.
     pub daemon_height: u64,
+    /// `wallet2::m_offline`, from `--offline`: this wallet talks to no node,
+    /// ever.
+    ///
+    /// The cold half of a cold-signing pair is the reason the flag exists. In
+    /// the C++ it makes every HTTP call fail without trying
+    /// (`wallet2.h` 1742-1762), `refresh` a no-op and `check_connection`
+    /// report nothing there; here a front end reads it and does not attach a
+    /// daemon at all. Not written to the wallet file: it is how this run was
+    /// started, not a property of the wallet.
+    pub offline: bool,
     /// Set when anything has changed since the last save.
     pub dirty: bool,
     /// Where the keys file and the cache are read from and written to.
@@ -174,6 +184,7 @@ impl Session {
             daemon_login: None,
             daemon_options: Default::default(),
             daemon_height: 0,
+            offline: false,
             dirty: true,
             store,
             cache_key,
@@ -266,6 +277,7 @@ impl Session {
             daemon_login: None,
             daemon_options: Default::default(),
             daemon_height: 0,
+            offline: false,
             dirty: false,
             store,
             cache_key,
@@ -657,6 +669,7 @@ pub mod cache {
             "version": VERSION,
             "start_height": state.start_height,
             "refresh_from_height": state.refresh_from_height,
+            "ever_refreshed": state.ever_refreshed,
             "hashes": hashes,
             "transfers": transfers,
             "sent": state.sent.iter().map(sent_to_json).collect::<Vec<_>>(),
@@ -732,6 +745,19 @@ pub mod cache {
             .get("refresh_from_height")
             .and_then(Value::as_u64)
             .unwrap_or(state.refresh_from_height);
+        // Also added without a version bump. A cache from before was written
+        // by a build that had no offline signing, so the flag is only read to
+        // refuse an output import; more than one block hash stands in for it,
+        // since a wallet that starts at zero holds genesis before it has asked
+        // a node anything.
+        state.ever_refreshed = v
+            .get("ever_refreshed")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                v.get("hashes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| a.len() > 1)
+            });
 
         state.hashes = v
             .get("hashes")

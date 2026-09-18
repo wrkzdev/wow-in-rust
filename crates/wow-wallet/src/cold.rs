@@ -114,6 +114,19 @@ const MAX_ENTRIES: usize = 1_000_000;
 /// How long a `std::string` field may be.
 const MAX_STRING: usize = 1_000_000;
 
+/// `rct::identity()`, which is what `import_outputs` puts in `m_mask`.
+///
+/// The field is a scalar and this is the encoding of the identity *point*,
+/// which read as a scalar is one. It is a placeholder either way: the mask an
+/// output really has reaches the cold wallet in the `tx_source_entry` of an
+/// unsigned transfer, not here, because `exported_transfer_details` has no
+/// field for it.
+pub const IDENTITY_MASK: [u8; 32] = {
+    let mut m = [0u8; 32];
+    m[0] = 1;
+    m
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum ColdError {
     #[error("this is not a {0} file: the magic does not match")]

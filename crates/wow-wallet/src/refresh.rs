@@ -402,6 +402,15 @@ pub struct WalletState {
     /// `m_first_refresh_done`. Not saved: the first request of every session
     /// is the coarse one, as it is in the reference.
     first_refresh_done: bool,
+    /// `m_has_ever_refreshed_from_node`: this wallet has asked a node for
+    /// blocks at least once, ever.
+    ///
+    /// Saved, because it is what `import_outputs` refuses on -- "Hot wallets
+    /// cannot import outputs" (`wallet2.cpp` 14999). Importing outputs
+    /// overwrites the whole output list with entries that have no block
+    /// height, no transaction id and no mask, so doing it to a wallet that has
+    /// scanned the chain would throw away what it scanned.
+    pub ever_refreshed: bool,
 }
 
 impl WalletState {
@@ -441,6 +450,7 @@ impl WalletState {
                 .map(|c| (c.height, c.hash)),
             fill: Vec::new(),
             first_refresh_done: false,
+            ever_refreshed: false,
         }
     }
 
@@ -828,6 +838,9 @@ impl WalletState {
         // Back toward the most, after a reply that arrived whole.
         self.batch_size = (self.batch_size * 2).min(MAX_BLOCKS_PER_CALL);
         self.first_refresh_done = true;
+        // `pull_blocks`: a node has been asked, so this is no longer a wallet
+        // that could import an output list ([`crate::offline`]).
+        self.ever_refreshed = true;
 
         let mut summary = RefreshSummary {
             current_height: batch.current_height,
