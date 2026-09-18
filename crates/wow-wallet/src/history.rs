@@ -601,6 +601,7 @@ mod tests {
             is_coinbase: false,
             timestamp: 1_600_000_000,
             payment_id: None,
+            frozen: false,
         });
         w.by_key_image.insert(KeyImage([9u8; 32]), 0);
         w

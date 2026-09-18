@@ -1398,6 +1398,7 @@ mod tests {
             is_coinbase: false,
             timestamp: 0,
             payment_id: None,
+            frozen: false,
         };
 
         // Four-block age only.

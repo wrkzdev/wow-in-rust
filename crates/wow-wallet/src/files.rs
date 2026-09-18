@@ -627,6 +627,7 @@ pub mod cache {
                     "is_coinbase": t.is_coinbase,
                     "timestamp": t.timestamp,
                     "payment_id": t.payment_id.map(|p| wow_crypto::hex::encode(&p)),
+                    "frozen": t.frozen,
                 })
             })
             .collect();
@@ -803,6 +804,8 @@ pub mod cache {
                 .and_then(Value::as_str)
                 .and_then(wow_crypto::hex::decode)
                 .and_then(|b| b.try_into().ok()),
+            // Absent from a cache written before outputs could be frozen.
+            frozen: v.get("frozen").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 
@@ -1069,8 +1072,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An output's payment id survives the cache, and an output from a cache
-    /// written before it was kept reads back with none.
+    /// An output's payment id, and whether it is frozen, survive the cache,
+    /// and an output from a cache written before the id was kept reads back
+    /// with none.
     #[test]
     fn a_payment_id_survives_the_cache() {
         let dir = scratch("payment-id");
@@ -1092,6 +1096,7 @@ mod tests {
             is_coinbase: false,
             timestamp: 1_700_000_000,
             payment_id: Some([0xf9, 0x33, 0x77, 0x88, 0xdd, 0x75, 0x25, 0x55]),
+            frozen: true,
         });
         let raw = cache::store(&s.state);
 

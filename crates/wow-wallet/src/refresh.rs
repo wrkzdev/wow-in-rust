@@ -126,6 +126,9 @@ pub struct Transfer {
     /// files its `payment_details` under. `None` for none, and when read from
     /// a cache written before it was kept.
     pub payment_id: Option<Hash8>,
+    /// `m_frozen`: set aside by `freeze`, so that nothing spends it, and not
+    /// counted in the balance, until `thaw`.
+    pub frozen: bool,
 }
 
 impl Transfer {
@@ -429,10 +432,12 @@ impl WalletState {
     ///
     /// `wallet2::balance` counts that change too. Without it, a send looks as
     /// if it took the whole of its inputs until a block carries it.
+    ///
+    /// A frozen output is not in it, as `balance_per_subaddress` leaves it out.
     pub fn balance(&self) -> u64 {
         self.transfers
             .iter()
-            .filter(|t| !t.spent)
+            .filter(|t| !t.spent && !t.frozen)
             .map(|t| t.amount)
             .sum::<u64>()
             + self.pending_change()
@@ -446,7 +451,7 @@ impl WalletState {
     pub fn unlocked_balance(&self, chain_height: u64, now: u64) -> u64 {
         self.transfers
             .iter()
-            .filter(|t| !t.spent && t.unlocked(chain_height, now))
+            .filter(|t| !t.spent && !t.frozen && t.unlocked(chain_height, now))
             .map(|t| t.amount)
             .sum()
     }
@@ -458,7 +463,7 @@ impl WalletState {
     pub fn locked(&self, chain_height: u64, now: u64) -> (u64, Option<u64>) {
         self.transfers
             .iter()
-            .filter(|t| !t.spent && !t.unlocked(chain_height, now))
+            .filter(|t| !t.spent && !t.frozen && !t.unlocked(chain_height, now))
             .fold((0, None), |(total, soonest): (u64, Option<u64>), t| {
                 let blocks =
                     blocks_until_unlocked(t.unlock_time, t.block_height, chain_height, now);
@@ -1112,6 +1117,7 @@ impl WalletState {
                 is_coinbase,
                 timestamp,
                 payment_id,
+                frozen: false,
             });
             let burnt = match receipt {
                 Receipt::Ignored => continue,
@@ -1172,8 +1178,11 @@ impl WalletState {
             }
             let burnt = held.amount;
             // The key image is the same: it depends only on the one-time key.
+            // And an output set aside stays set aside: the C++ updates the
+            // held entry in place and leaves `m_frozen` as it was.
             *held = Transfer {
                 key_image: held.key_image.or(t.key_image),
+                frozen: held.frozen,
                 ..t
             };
             return Receipt::Replaced { burnt };
@@ -2103,6 +2112,7 @@ mod tests {
             is_coinbase: false,
             timestamp: 0,
             payment_id: None,
+            frozen: false,
         };
 
         let now = 1_700_000_000;
@@ -2191,6 +2201,7 @@ mod tests {
             is_coinbase: false,
             timestamp: 0,
             payment_id: None,
+            frozen: false,
         };
         assert_eq!(w.add_transfer(first.clone()), Receipt::New);
 

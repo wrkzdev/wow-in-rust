@@ -385,7 +385,7 @@ pub fn spendable<'a>(
     transfers
         .iter()
         .enumerate()
-        .filter(|(_, t)| !t.spent && t.key_image.is_some())
+        .filter(|(_, t)| !t.spent && !t.frozen && t.key_image.is_some())
         .filter(|(_, t)| t.unlocked(options.chain_height, options.now))
         .filter(|(_, t)| t.amount >= options.ignore_below && t.amount <= options.ignore_above)
         .filter(|(_, t)| t.subaddress.major == options.account)
@@ -468,6 +468,7 @@ fn pop_if_present(unused: &mut Vec<usize>, index: usize) {
 /// every selection path in `create_transactions_2` shares.
 fn eligible(t: &Transfer, options: &SpendOptions, indices: &BTreeSet<u32>) -> bool {
     !t.spent
+        && !t.frozen
         && t.key_image.is_some()
         && t.unlocked(options.chain_height, options.now)
         && t.subaddress.major == options.account
@@ -508,6 +509,7 @@ fn pick_preferred_inputs(
                 continue;
             }
             if !t2.spent
+                && !t2.frozen
                 && t2.key_image.is_some()
                 && t.amount.saturating_add(t2.amount) >= needed
                 && t2.unlocked(options.chain_height, options.now)
@@ -608,7 +610,7 @@ pub fn plan(
     let mut unlocked: BTreeMap<u32, u64> = BTreeMap::new();
     for t in transfers
         .iter()
-        .filter(|t| t.subaddress.major == options.account && !t.spent)
+        .filter(|t| t.subaddress.major == options.account && !t.spent && !t.frozen)
     {
         *balance.entry(t.subaddress.minor).or_default() += t.amount;
         let u = unlocked.entry(t.subaddress.minor).or_default();
@@ -903,7 +905,7 @@ pub fn plan_sweep(
     // "No unlocked balance in the specified account"
     let unlocked_balance: u64 = transfers
         .iter()
-        .filter(|t| t.subaddress.major == options.account && !t.spent)
+        .filter(|t| t.subaddress.major == options.account && !t.spent && !t.frozen)
         .filter(|t| t.unlocked(options.chain_height, options.now))
         .map(|t| t.amount)
         .sum();
@@ -919,6 +921,7 @@ pub fn plan_sweep(
             continue;
         }
         if !t.spent
+            && !t.frozen
             && t.key_image.is_some()
             && t.unlocked(options.chain_height, options.now)
             && t.subaddress.major == options.account
@@ -1083,6 +1086,7 @@ mod tests {
             is_coinbase: false,
             timestamp: 0,
             payment_id: None,
+            frozen: false,
         }
     }
 
