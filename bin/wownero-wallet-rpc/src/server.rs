@@ -69,6 +69,10 @@ pub struct State {
     /// `--trusted-daemon` or `--untrusted-daemon`, or what `set_daemon` last
     /// said: `None` when neither, and a daemon on this machine is trusted.
     trusted_daemon: Mutex<Option<bool>>,
+    /// `--offline`, `wallet2::m_offline`: no wallet this server opens will
+    /// contact a node. What a server acting as the cold half of a
+    /// cold-signing pair is started with.
+    offline: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -92,8 +96,18 @@ impl State {
             daemon_options: Mutex::new(Default::default()),
             proxy_option: AtomicBool::new(false),
             trusted_daemon: Mutex::new(None),
+            offline: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         }
+    }
+
+    /// `wallet2::is_offline`.
+    pub fn is_offline(&self) -> bool {
+        self.offline.load(Ordering::SeqCst)
+    }
+
+    pub fn set_offline(&self, offline: bool) {
+        self.offline.store(offline, Ordering::SeqCst);
     }
 
     /// Whether the daemon at `address` is trusted: as told, or else when it is
@@ -165,6 +179,12 @@ impl State {
     /// reported on stderr rather than swallowed, because "why is my balance
     /// zero" has exactly this shape.
     pub fn attach_daemon(&self, session: &mut Session) {
+        // `--offline`: nothing is attached, ever. The reference makes every
+        // HTTP call fail without trying; here there is nothing to fail.
+        if self.is_offline() {
+            session.offline = true;
+            return;
+        }
         let address = self.daemon_address();
         if address.is_empty() {
             return;

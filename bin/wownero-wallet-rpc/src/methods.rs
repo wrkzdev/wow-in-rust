@@ -38,13 +38,6 @@ const DISABLED: &[(&str, &str)] = &[
     ("check_reserve_proof", "reserve proofs are not built yet"),
     ("sign", "message signing is not built yet"),
     ("verify", "message signing is not built yet"),
-    ("export_outputs", "import/export is not built yet"),
-    ("import_outputs", "import/export is not built yet"),
-    ("export_key_images", "import/export is not built yet"),
-    ("import_key_images", "import/export is not built yet"),
-    ("sign_transfer", "cold signing is not built yet"),
-    ("submit_transfer", "cold signing is not built yet"),
-    ("describe_transfer", "cold signing is not built yet"),
     ("start_mining", "this wallet does not drive a miner"),
     ("stop_mining", "this wallet does not drive a miner"),
     ("make_multisig", "multisig is not built"),
@@ -162,6 +155,13 @@ pub fn dispatch(state: &State, method: &str, params: &Value) -> MethodResult {
         "sweep_all" => sweep_all(session, params),
         "sweep_single" => sweep_single(session, params),
         "relay_tx" => relay_tx(session, params),
+        "export_outputs" => export_outputs(session, params),
+        "import_outputs" => import_outputs(session, params),
+        "export_key_images" => export_key_images(session, params),
+        "import_key_images" => import_key_images(session, params),
+        "sign_transfer" => sign_transfer(session, params),
+        "submit_transfer" => submit_transfer(session, params),
+        "describe_transfer" => describe_transfer(session, params),
         "get_default_fee_priority" => get_default_fee_priority(session),
         "stop_wallet" => {
             session.save().map_err(internal)?;
@@ -772,6 +772,12 @@ const SSL_PARAMS: [&str; 6] = [
 ];
 
 fn set_daemon(session: &mut Session, params: &Value, proxy_option: bool) -> MethodResult {
+    if session.offline {
+        return Err(Error::new(
+            errors::NO_DAEMON_CONNECTION,
+            "this server was started with --offline and will not connect to a daemon",
+        ));
+    }
     let address = params
         .get("address")
         .and_then(Value::as_str)
@@ -888,6 +894,11 @@ fn daemon_options(
 }
 
 fn refresh(session: &mut Session, params: &Value) -> MethodResult {
+    // `wallet2::refresh` returns straight away when `m_offline` is set,
+    // reporting nothing fetched rather than failing.
+    if session.offline {
+        return Ok(json!({ "blocks_fetched": 0, "received_money": false }));
+    }
     let client = session
         .daemon
         .clone()
@@ -1348,6 +1359,331 @@ fn relay_tx(session: &mut Session, params: &Value) -> MethodResult {
     Ok(json!({ "tx_hash": wow_crypto::hex::encode(&id) }))
 }
 
+// -- cold signing ----------------------------------------------------------
+
+/// `export_outputs`: `all`, `start`, `count` in, `outputs_data_hex` out.
+///
+/// The hex is the whole file, magic and all, as `export_outputs_to_str`
+/// returns it — so a caller can write it to disk and a C++ wallet will read
+/// it.
+fn export_outputs(session: &mut Session, params: &Value) -> MethodResult {
+    let all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let start = u32_param(params, "start", 0);
+    let count = u32_param(params, "count", u32::MAX);
+    let blob = session
+        .export_outputs_to_file(all, start, count)
+        .map_err(offline_error)?;
+    Ok(json!({ "outputs_data_hex": wow_crypto::hex::encode(&blob) }))
+}
+
+/// `import_outputs`: `outputs_data_hex` in, `num_imported` out.
+fn import_outputs(session: &mut Session, params: &Value) -> MethodResult {
+    let blob = hex_param(params, "outputs_data_hex")?;
+    let n = session
+        .import_outputs_from_file(&blob)
+        .map_err(offline_error)?;
+    session.save().map_err(internal)?;
+    session.dirty = false;
+    Ok(json!({ "num_imported": n }))
+}
+
+/// `export_key_images`: `all` in, `offset` and `signed_key_images` out.
+///
+/// This one does **not** go through the file container: the reference's
+/// handler calls `export_key_images(req.all)` and hexes each pair, so there is
+/// no magic, no encryption and no four-byte offset header — the offset is a
+/// plain JSON number.
+fn export_key_images(session: &mut Session, params: &Value) -> MethodResult {
+    let all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let exported = session.export_key_images(all).map_err(offline_error)?;
+    let images: Vec<Value> = exported
+        .images
+        .iter()
+        .map(|i| {
+            json!({
+                "key_image": wow_crypto::hex::encode(&i.key_image.0),
+                "signature": wow_crypto::hex::encode(&i.signature.to_bytes()),
+            })
+        })
+        .collect();
+    Ok(json!({ "offset": exported.offset, "signed_key_images": images }))
+}
+
+/// `import_key_images`: `offset` and `signed_key_images` in, `height`, `spent`
+/// and `unspent` out.
+fn import_key_images(session: &mut Session, params: &Value) -> MethodResult {
+    let offset = u32_param(params, "offset", 0) as usize;
+    let list = params
+        .get("signed_key_images")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::new(
+                errors::WRONG_KEY_IMAGE,
+                "signed_key_images is missing or not a list",
+            )
+        })?;
+
+    let mut images = Vec::with_capacity(list.len());
+    for entry in list {
+        let key_image = entry
+            .get("key_image")
+            .and_then(Value::as_str)
+            .and_then(wow_crypto::hex::decode)
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(wow_crypto::types::KeyImage)
+            .ok_or_else(|| {
+                Error::new(errors::WRONG_KEY_IMAGE, "failed to parse key image")
+            })?;
+        let signature = entry
+            .get("signature")
+            .and_then(Value::as_str)
+            .and_then(wow_crypto::hex::decode)
+            .and_then(|b| wow_crypto::types::Signature::from_slice(&b))
+            .ok_or_else(|| {
+                Error::new(errors::WRONG_SIGNATURE, "failed to parse signature")
+            })?;
+        images.push(wow_wallet::cold::SignedKeyImage {
+            key_image,
+            signature,
+        });
+    }
+
+    let imported = session
+        .import_key_images(&images, offset, true)
+        .map_err(offline_error)?;
+    session.save().map_err(internal)?;
+    session.dirty = false;
+    Ok(json!({
+        "height": imported.height,
+        "spent": imported.spent,
+        "unspent": imported.unspent,
+    }))
+}
+
+/// `sign_transfer`: `unsigned_txset` in, `signed_txset`, `tx_hash_list`,
+/// `tx_raw_list` and `tx_key_list` out.
+fn sign_transfer(session: &mut Session, params: &Value) -> MethodResult {
+    if session.keys_file.is_watch_only() {
+        return Err(Error::new(
+            errors::WATCH_ONLY,
+            "command not supported by watch-only wallet",
+        ));
+    }
+    let blob = hex_param(params, "unsigned_txset")?;
+    let export_raw = params
+        .get("export_raw")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let get_tx_keys = params
+        .get("get_tx_keys")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let set = session.load_unsigned(&blob).map_err(|e| {
+        Error::new(
+            errors::BAD_UNSIGNED_TX_DATA,
+            format!("cannot load unsigned_txset: {e}"),
+        )
+    })?;
+    // No confirmation on this path: `on_sign_transfer` passes no accept
+    // callback, because there is nobody at the other end of one.
+    let signed = session.sign_unsigned(&set).map_err(|e| {
+        Error::new(
+            errors::SIGN_UNSIGNED,
+            format!("Failed to sign unsigned tx: {e}"),
+        )
+    })?;
+    session.save().map_err(internal)?;
+    session.dirty = false;
+
+    let hashes: Vec<String> = signed
+        .txids
+        .iter()
+        .map(|t| wow_crypto::hex::encode(t))
+        .collect();
+    let raw: Vec<String> = if export_raw {
+        signed
+            .raw
+            .iter()
+            .map(|b| wow_crypto::hex::encode(b))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // One entry per transaction: its key, and then its per-output keys,
+    // concatenated as the reference concatenates them.
+    let keys: Vec<String> = if get_tx_keys {
+        signed
+            .tx_keys
+            .iter()
+            .map(|ks| {
+                ks.iter()
+                    .map(|k| wow_crypto::hex::encode(&k.0))
+                    .collect::<String>()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(json!({
+        "signed_txset": wow_crypto::hex::encode(&signed.blob),
+        "tx_hash_list": hashes,
+        "tx_raw_list": raw,
+        "tx_key_list": keys,
+    }))
+}
+
+/// `submit_transfer`: `tx_data_hex` in, `tx_hash_list` out.
+fn submit_transfer(session: &mut Session, params: &Value) -> MethodResult {
+    let blob = hex_param(params, "tx_data_hex")?;
+    let set = session.load_signed(&blob).map_err(|e| {
+        Error::new(
+            errors::BAD_SIGNED_TX_DATA,
+            format!("Failed to parse signed tx: {e}"),
+        )
+    })?;
+    let submitted = session.submit_signed(&set).map_err(|e| {
+        Error::new(
+            errors::SIGNED_SUBMISSION,
+            format!("Failed to submit signed tx: {e}"),
+        )
+    })?;
+    session.save().map_err(internal)?;
+    session.dirty = false;
+
+    // A node that refused one of them is an error, not a hash list with a gap
+    // in it: the reference's `commit_tx` throws, and this is the same answer.
+    if let Some(bad) = submitted.results.iter().find(|r| !r.accepted()) {
+        return Err(Error::new(
+            errors::SIGNED_SUBMISSION,
+            format!("Failed to submit signed tx: {}", bad.reason),
+        ));
+    }
+    let hashes: Vec<String> = submitted
+        .txids
+        .iter()
+        .map(|t| wow_crypto::hex::encode(t))
+        .collect();
+    Ok(json!({ "tx_hash_list": hashes }))
+}
+
+/// `describe_transfer`: `unsigned_txset` in, `summary` and `desc` out.
+fn describe_transfer(session: &mut Session, params: &Value) -> MethodResult {
+    if params
+        .get("multisig_txset")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return Err(Error::new(
+            errors::BAD_MULTISIG_TX_DATA,
+            "cannot load multisig_txset: multisig is not built",
+        ));
+    }
+    let hex = params
+        .get("unsigned_txset")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if hex.is_empty() {
+        return Err(Error::new(errors::UNKNOWN_ERROR, "no txset provided"));
+    }
+    let blob = wow_crypto::hex::decode(hex)
+        .ok_or_else(|| Error::new(errors::BAD_HEX, "Failed to parse hex."))?;
+    let set = session.load_unsigned(&blob).map_err(|e| {
+        Error::new(
+            errors::BAD_UNSIGNED_TX_DATA,
+            format!("cannot load unsigned_txset: {e}"),
+        )
+    })?;
+    let described = session.describe(&set.txes).map_err(|e| {
+        Error::new(
+            errors::BAD_UNSIGNED_TX_DATA,
+            format!("failed to parse unsigned transfers: {e}"),
+        )
+    })?;
+
+    let recipients = |rs: &[wow_wallet::offline::DescribedRecipient]| -> Vec<Value> {
+        rs.iter()
+            .map(|r| json!({ "address": r.address, "amount": r.amount }))
+            .collect()
+    };
+    let desc: Vec<Value> = described
+        .txs
+        .iter()
+        .map(|d| {
+            json!({
+                "amount_in": d.amount_in,
+                "amount_out": d.amount_out,
+                "ring_size": d.ring_size,
+                "unlock_time": d.unlock_time,
+                "sources": d
+                    .sources
+                    .iter()
+                    .map(|s| json!({
+                        "amount": s.amount,
+                        "global_index": s.global_index,
+                        "rct": s.rct,
+                        "pubkey": wow_crypto::hex::encode(&s.public_key.0),
+                    }))
+                    .collect::<Vec<_>>(),
+                "recipients": recipients(&d.recipients),
+                "payment_id": d.payment_id,
+                "change_amount": d.change_amount,
+                "change_address": d.change_address,
+                "fee": d.fee,
+                "dummy_outputs": d.dummy_outputs,
+                "extra": wow_crypto::hex::encode(&d.extra),
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "summary": {
+            "amount_in": described.summary.amount_in,
+            "amount_out": described.summary.amount_out,
+            "recipients": recipients(&described.summary.recipients),
+            "change_amount": described.summary.change_amount,
+            "change_address": described.summary.change_address,
+            "fee": described.summary.fee,
+        },
+        "desc": desc,
+    }))
+}
+
+/// A required hex parameter, refused with `-26 BAD_HEX` as the reference
+/// refuses one: "Failed to parse hex."
+fn hex_param(params: &Value, name: &str) -> Result<Vec<u8>, Error> {
+    let text = params
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new(errors::BAD_HEX, format!("{name} is missing")))?;
+    wow_crypto::hex::decode(text)
+        .ok_or_else(|| Error::new(errors::BAD_HEX, "Failed to parse hex."))
+}
+
+/// Map a cold-signing failure to the code a client branches on.
+fn offline_error(e: wow_wallet::offline::OfflineError) -> Error {
+    use wow_wallet::offline::OfflineError as E;
+    let message = e.to_string();
+    let code = match e {
+        E::WatchOnly => errors::WATCH_ONLY,
+        // The reference's own wording for the untrusted case is
+        // "This command requires a trusted daemon.", under -1.
+        E::UntrustedDaemon => errors::UNKNOWN_ERROR,
+        E::NoDaemon | E::Daemon(_) => errors::NO_DAEMON_CONNECTION,
+        E::Cold(_) | E::HotWallet => errors::BAD_UNSIGNED_TX_DATA,
+        E::KeyImageDomain(..) => errors::WRONG_KEY_IMAGE,
+        E::BadSignature(..) => errors::WRONG_SIGNATURE,
+        E::ChangeNotPaid | E::ChangeTooLarge | E::ChangeToManyAddresses => {
+            errors::BAD_UNSIGNED_TX_DATA
+        }
+        E::NonzeroUnlockTime => errors::NONZERO_UNLOCK_TIME,
+        E::Send(e) => return send_error(e),
+        _ => errors::UNKNOWN_ERROR,
+    };
+    Error::new(code, message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,14 +1694,73 @@ mod tests {
         assert_eq!(WALLET_RPC_VERSION, (1 << 16) | 30);
     }
 
-    /// Every disabled method names itself and gives a reason.
+    /// Every disabled method names itself and gives a reason, and the
+    /// cold-signing ones are not among them any more.
     #[test]
     fn disabled_methods_explain_themselves() {
         assert!(DISABLED.iter().any(|(n, _)| *n == "get_tx_proof"));
-        assert!(DISABLED.iter().any(|(n, _)| *n == "export_key_images"));
         for (name, why) in DISABLED {
             assert!(!why.is_empty(), "{name} has no reason");
         }
+        for name in [
+            "export_outputs",
+            "import_outputs",
+            "export_key_images",
+            "import_key_images",
+            "sign_transfer",
+            "submit_transfer",
+            "describe_transfer",
+        ] {
+            assert!(
+                !DISABLED.iter().any(|(n, _)| *n == name),
+                "{name} is built now"
+            );
+        }
+    }
+
+    /// The hex parameters give `-26 BAD_HEX` with the reference's wording, for
+    /// a missing one as well as a malformed one.
+    #[test]
+    fn a_bad_hex_parameter_is_named() {
+        let params = json!({ "unsigned_txset": "not hex" });
+        let e = hex_param(&params, "unsigned_txset").expect_err("not hex");
+        assert_eq!(e.code, errors::BAD_HEX);
+        assert_eq!(e.message, "Failed to parse hex.");
+
+        let e = hex_param(&params, "tx_data_hex").expect_err("missing");
+        assert_eq!(e.code, errors::BAD_HEX);
+
+        assert_eq!(
+            hex_param(&json!({ "a": "0a0b" }), "a").expect("hex"),
+            vec![0x0a, 0x0b]
+        );
+    }
+
+    /// The codes a cold-signing client branches on: a watch-only wallet asked
+    /// to sign, and a set whose claimed change is not change.
+    #[test]
+    fn cold_signing_failures_get_their_own_codes() {
+        use wow_wallet::offline::OfflineError as E;
+        assert_eq!(offline_error(E::WatchOnly).code, errors::WATCH_ONLY);
+        assert_eq!(
+            offline_error(E::ChangeNotPaid).code,
+            errors::BAD_UNSIGNED_TX_DATA
+        );
+        assert_eq!(
+            offline_error(E::NonzeroUnlockTime).code,
+            errors::NONZERO_UNLOCK_TIME
+        );
+        assert_eq!(offline_error(E::NoDaemon).code, errors::NO_DAEMON_CONNECTION);
+        assert_eq!(
+            offline_error(E::BadSignature(0, wow_crypto::types::KeyImage::ZERO)).code,
+            errors::WRONG_SIGNATURE
+        );
+        // "Hot wallets cannot import outputs" is about the wallet, not the
+        // file, but it is the answer to an import and shares its code.
+        assert_eq!(
+            offline_error(E::HotWallet).code,
+            errors::BAD_UNSIGNED_TX_DATA
+        );
     }
 
     /// `suggested_confirmations_threshold` grows with the amount and is capped.

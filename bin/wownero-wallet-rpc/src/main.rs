@@ -61,6 +61,8 @@ wownero-wallet-rpc — the Wownero wallet RPC (specs/14)
                                     whether the daemon may see what reveals
                                     the wallet; default: trusted only on
                                     this machine
+  --offline                         do not connect to a daemon, nor use DNS.
+                                    How a server that only signs is run
   --testnet / --stagenet
   --kdf-rounds <n>                  default 1
   --no-initial-sync
@@ -96,6 +98,9 @@ struct Options {
     /// `--trusted-daemon` and `--untrusted-daemon`: `None` when neither was
     /// given, and a daemon on this machine is trusted.
     trusted_daemon: Option<bool>,
+    /// `--offline`: contact no node. A server started this way is the cold
+    /// half of a cold-signing pair.
+    offline: bool,
     network: Network,
     kdf_rounds: u64,
     no_initial_sync: bool,
@@ -128,6 +133,7 @@ impl std::fmt::Debug for Options {
             .field("ssl", &self.ssl)
             .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
             .field("trusted_daemon", &self.trusted_daemon)
+            .field("offline", &self.offline)
             .field("network", &self.network)
             .field("kdf_rounds", &self.kdf_rounds)
             .field("no_initial_sync", &self.no_initial_sync)
@@ -155,6 +161,7 @@ impl Default for Options {
             ssl: Default::default(),
             proxy: None,
             trusted_daemon: None,
+            offline: false,
             network: Network::Mainnet,
             kdf_rounds: 1,
             no_initial_sync: false,
@@ -229,6 +236,7 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
                 }
                 o.trusted_daemon = Some(trusted);
             }
+            "--offline" => o.offline = true,
             "--testnet" => o.network = Network::Testnet,
             "--stagenet" => o.network = Network::Stagenet,
             "--kdf-rounds" => {
@@ -396,11 +404,17 @@ fn run(options: Options) -> Result<(), String> {
     state.set_proxy_option(daemon_options.proxy.is_some());
     state.set_daemon_options(daemon_options);
     state.set_trusted_daemon(options.trusted_daemon);
+    state.set_offline(options.offline);
 
     state.open_at_startup()?;
 
-    // Point the wallet at a daemon, and sync, if one is open.
-    if state.wallet().is_some() {
+    if options.offline {
+        eprintln!("Offline: no wallet this server opens will contact a daemon.");
+    }
+
+    // Point the wallet at a daemon, and sync, if one is open. Not when
+    // `--offline` was given: there is nothing to point at.
+    if !options.offline && state.wallet().is_some() {
         let params = serde_json::json!({
             "address": options.daemon,
             "trusted": state.trusted_daemon_for(&options.daemon),

@@ -79,8 +79,13 @@ codes! {
     BAD_TX_METADATA = -27, "Transaction metadata that does not parse.";
     WATCH_ONLY = -29, "The wallet has no spend key.";
     NOT_MULTISIG = -31, "The wallet is not multisig.";
+    BAD_MULTISIG_TX_DATA = -34, "A multisig transfer set that does not parse.";
     NOT_ENOUGH_UNLOCKED_MONEY = -37, "The balance is there but locked. Retry later.";
     NO_DAEMON_CONNECTION = -38, "No daemon is set, or it cannot be reached.";
+    BAD_UNSIGNED_TX_DATA = -39, "An unsigned transfer set that does not parse, or claims change it does not pay.";
+    BAD_SIGNED_TX_DATA = -40, "A signed transfer set that does not parse.";
+    SIGNED_SUBMISSION = -41, "A signed transfer set that could not be relayed.";
+    SIGN_UNSIGNED = -42, "An unsigned transfer set that could not be signed.";
     NON_DETERMINISTIC = -43, "The wallet has no seed phrase (`specs/12` §1.2).";
     ATTRIBUTE_NOT_FOUND = -45, "No such attribute.";
     ZERO_AMOUNT = -46, "An amount of zero.";
