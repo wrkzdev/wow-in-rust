@@ -125,10 +125,23 @@ at least one alternative block filed off the main chain.
 Dandelion++ relay, reorgs, the admin and mining RPC, HTTP Digest login, RPC over
 TLS, the ZMQ RPC and publisher — and the miner, on regtest.
 
+**Built, not yet run against the C++ wallet:** cold signing — keeping the spend
+key on a machine that never touches a network. A watch-only wallet exports its
+outputs and writes an unsigned transfer, the offline half imports the outputs,
+signs the key images and signs the transfer, and the watch-only half submits
+it: `export_outputs`, `import_outputs`, `export_key_images`,
+`import_key_images`, `sign_transfer`, `submit_transfer` and
+`describe_transfer`, in `wownero-wallet-cli` and `wownero-wallet-rpc`, plus
+`--offline`. The four files use the formats Wownero 0.11 writes — its own
+binary archive, not the Boost one the older versions used — but no file has
+been handed to a C++ wallet yet, so read that as *written to the format*
+rather than *checked against it*. The GUI and web wallet do not expose any of
+it.
+
 **Not built:** in the web wallet, a daemon login — a browser's `fetch` does
 not do HTTP Digest, so a node started with `--rpc-login` is out of reach from
 one; the other three front ends can log in. In the wallets, transaction
-proofs, key-image import/export and multiple accounts; in the daemon, proxies and i2p/Tor, rate limits, pruning,
+proofs, multisig and multiple accounts; in the daemon, proxies and i2p/Tor, rate limits, pruning,
 bootstrap daemons, background mining, extra messages in mined blocks, and ZMQ
 over `ipc://` or with CURVE/PLAIN security. The daemon's `--help` names what is
 missing rather than accepting options it cannot honour.
