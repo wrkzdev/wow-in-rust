@@ -853,11 +853,7 @@ impl NewTransactions {
 
         let guess = epee::to_bytes(&self.section(padding)).unwrap_or_default();
         let remove = guess.len() % GRANULARITY;
-        let padding = if remove > padding {
-            0
-        } else {
-            padding - remove
-        };
+        let padding = padding.saturating_sub(remove);
         epee::to_bytes(&self.section(padding)).unwrap_or_default()
     }
 

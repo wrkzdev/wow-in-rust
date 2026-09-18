@@ -21,12 +21,13 @@
 //! # Peer id 1, and no port
 //!
 //! `config_t`'s peer id is 1 and only the public zone replaces it with a
-//! random one (`init_config`), so every node in an anonymity zone calls itself
-//! 1. An id is how the public network notices a connection to itself; over Tor
-//! it would only tie one hidden service to another. For the same reason
-//! `my_port` and `rpc_port` go out as 0, the self-connection check is skipped
-//! (`handle_handshake` tests it "only in the public zone"), and nobody is
-//! pinged back -- there is no address to ping.
+//! random one (`init_config`), so every node in an anonymity zone calls
+//! itself 1. An id is how the public network notices a connection to
+//! itself; over Tor it would only tie one hidden service to another. For
+//! the same reason `my_port` and `rpc_port` go out as 0, the
+//! self-connection check is skipped (`handle_handshake` tests it "only in
+//! the public zone"), and nobody is pinged back -- there is no address to
+//! ping.
 //!
 //! # Noise
 //!

@@ -249,6 +249,15 @@ impl SubaddressIndex {
     }
 }
 
+const _: () = {
+    assert!(core::mem::size_of::<PublicKey>() == 32);
+    assert!(core::mem::size_of::<SecretKey>() == 32);
+    assert!(core::mem::size_of::<KeyDerivation>() == 32);
+    assert!(core::mem::size_of::<KeyImage>() == 32);
+    assert!(core::mem::size_of::<Signature>() == 64);
+    assert!(core::mem::size_of::<ViewTag>() == 1);
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,12 +288,3 @@ mod tests {
         assert!(format!("{:?}", KeyImage([0x02; 32])).contains(&"02".repeat(32)));
     }
 }
-
-const _: () = {
-    assert!(core::mem::size_of::<PublicKey>() == 32);
-    assert!(core::mem::size_of::<SecretKey>() == 32);
-    assert!(core::mem::size_of::<KeyDerivation>() == 32);
-    assert!(core::mem::size_of::<KeyImage>() == 32);
-    assert!(core::mem::size_of::<Signature>() == 64);
-    assert!(core::mem::size_of::<ViewTag>() == 1);
-};
