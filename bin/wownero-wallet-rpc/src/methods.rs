@@ -1399,6 +1399,9 @@ mod tests {
             timestamp: 0,
             payment_id: None,
             frozen: false,
+            tx_public_key: wow_crypto::types::PublicKey::ZERO,
+            additional_tx_keys: Vec::new(),
+            key_image_request: false,
         };
 
         // Four-block age only.

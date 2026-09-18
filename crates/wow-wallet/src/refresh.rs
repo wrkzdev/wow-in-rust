@@ -111,7 +111,29 @@ pub struct Transfer {
     /// that holds the output's public key and transaction id already links the
     /// two. It is not enough to spend with; that needs the spend key.
     pub derivation: KeyDerivation,
+    /// The transaction's own public key, `R`, and its per-output keys.
+    ///
+    /// Kept because `export_outputs` sends them to the cold half of a
+    /// cold-signing pair, which has the spend key and so can turn them back
+    /// into key images: `exported_transfer_details` carries `m_tx_pubkey` and
+    /// `m_additional_tx_keys` and nothing else would supply them. The C++
+    /// keeps the whole `transaction_prefix` on every `transfer_details` and
+    /// reads them back out of `extra`; these two fields are the part of it
+    /// that is used.
+    ///
+    /// `derivation` is not enough: it is `8*a*R`, which cannot be turned back
+    /// into `R` without knowing which of the transaction's keys it came from.
+    pub tx_public_key: PublicKey,
+    pub additional_tx_keys: Vec<PublicKey>,
     pub key_image: Option<KeyImage>,
+    /// `m_key_image_request`: this output's key image is wanted from the other
+    /// half of a cold-signing pair.
+    ///
+    /// Set on a watch-only wallet, which cannot compute one, and on a cold
+    /// wallet for the outputs it has just imported, which is how
+    /// `export_key_images` knows which ones were asked for
+    /// ([`crate::offline`]).
+    pub key_image_request: bool,
     pub mask: [u8; 32],
     pub amount: u64,
     pub subaddress: SubaddressIndex,
@@ -1091,6 +1113,19 @@ impl WalletState {
             crate::scan::payment_id(tx, &self.account.keys.view_secret_key)
         };
 
+        // The transaction's public keys, kept on every output this wallet
+        // owns so that `export_outputs` can hand them to a cold wallet. Cheap:
+        // `extra` has already been parsed by the scan above.
+        let (tx_public_key, additional_tx_keys) = if found.is_empty() {
+            (PublicKey::ZERO, Vec::new())
+        } else {
+            let extra = wow_types::tx_extra::parse_tx_extra(&tx.prefix.extra);
+            (
+                extra.tx_pubkey().unwrap_or(PublicKey::ZERO),
+                extra.additional_pubkeys().unwrap_or(&[]).to_vec(),
+            )
+        };
+
         let mut received = 0u64;
         for r in found {
             let key_image = r.key_image;
@@ -1101,6 +1136,8 @@ impl WalletState {
                 block_height: height,
                 txid,
                 derivation: r.derivation,
+                tx_public_key,
+                additional_tx_keys: additional_tx_keys.clone(),
                 internal_output_index: r.output_index,
                 global_output_index: global_indices
                     .get(r.output_index as usize)
@@ -1108,6 +1145,11 @@ impl WalletState {
                     .unwrap_or(0),
                 public_key: r.public_key,
                 key_image,
+                // A wallet that cannot compute a key image wants one from the
+                // half that can: `process_new_transaction`'s
+                // `td.m_key_image_request = key_image_request`, which is set
+                // for a watch-only wallet.
+                key_image_request: key_image.is_none(),
                 mask: r.mask,
                 amount: r.amount,
                 subaddress: r.subaddress,
@@ -1180,8 +1222,10 @@ impl WalletState {
             // The key image is the same: it depends only on the one-time key.
             // And an output set aside stays set aside: the C++ updates the
             // held entry in place and leaves `m_frozen` as it was.
+            let key_image = held.key_image.or(t.key_image);
             *held = Transfer {
-                key_image: held.key_image.or(t.key_image),
+                key_image,
+                key_image_request: key_image.is_none(),
                 frozen: held.frozen,
                 ..t
             };
@@ -2113,6 +2157,9 @@ mod tests {
             timestamp: 0,
             payment_id: None,
             frozen: false,
+            tx_public_key: PublicKey::ZERO,
+            additional_tx_keys: Vec::new(),
+            key_image_request: false,
         };
 
         let now = 1_700_000_000;
@@ -2202,6 +2249,9 @@ mod tests {
             timestamp: 0,
             payment_id: None,
             frozen: false,
+            tx_public_key: PublicKey::ZERO,
+            additional_tx_keys: Vec::new(),
+            key_image_request: false,
         };
         assert_eq!(w.add_transfer(first.clone()), Receipt::New);
 

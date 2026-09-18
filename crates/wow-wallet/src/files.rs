@@ -628,6 +628,13 @@ pub mod cache {
                     "timestamp": t.timestamp,
                     "payment_id": t.payment_id.map(|p| wow_crypto::hex::encode(&p)),
                     "frozen": t.frozen,
+                    "tx_public_key": wow_crypto::hex::encode(&t.tx_public_key.0),
+                    "additional_tx_keys": t
+                        .additional_tx_keys
+                        .iter()
+                        .map(|k| wow_crypto::hex::encode(&k.0))
+                        .collect::<Vec<_>>(),
+                    "key_image_request": t.key_image_request,
                 })
             })
             .collect();
@@ -806,6 +813,31 @@ pub mod cache {
                 .and_then(|b| b.try_into().ok()),
             // Absent from a cache written before outputs could be frozen.
             frozen: v.get("frozen").and_then(Value::as_bool).unwrap_or(false),
+            // Absent from a cache written before cold signing needed them. A
+            // wallet that reads one cannot export outputs until it rescans,
+            // and says so rather than exporting a zero key
+            // ([`crate::offline`]).
+            tx_public_key: wow_crypto::types::PublicKey(
+                bytes32("tx_public_key").unwrap_or([0u8; 32]),
+            ),
+            additional_tx_keys: v
+                .get("additional_tx_keys")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .filter_map(wow_crypto::hex::decode)
+                        .filter_map(|b| <[u8; 32]>::try_from(b).ok())
+                        .map(wow_crypto::types::PublicKey)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // A cache from before has no record, and "the key image is not
+            // known" stands for it.
+            key_image_request: v
+                .get("key_image_request")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| bytes32("key_image").is_none()),
         })
     }
 
@@ -1097,6 +1129,9 @@ mod tests {
             timestamp: 1_700_000_000,
             payment_id: Some([0xf9, 0x33, 0x77, 0x88, 0xdd, 0x75, 0x25, 0x55]),
             frozen: true,
+            tx_public_key: wow_crypto::types::PublicKey([9u8; 32]),
+            additional_tx_keys: vec![wow_crypto::types::PublicKey([10u8; 32])],
+            key_image_request: false,
         });
         let raw = cache::store(&s.state);
 
@@ -1119,6 +1154,24 @@ mod tests {
         cache::load(&mut old, older.to_string().as_bytes()).expect("loads");
         assert_eq!(old.transfers.len(), 1, "the output is kept");
         assert_eq!(old.transfers[0].payment_id, None);
+
+        // And a cache from before the transaction public keys were kept: the
+        // output is still there, with no keys, and its key image is known so
+        // nothing is asked for.
+        let mut older: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        let entry = older["transfers"][0].as_object_mut().expect("an object");
+        entry.remove("tx_public_key");
+        entry.remove("additional_tx_keys");
+        entry.remove("key_image_request");
+        let mut old = fresh();
+        cache::load(&mut old, older.to_string().as_bytes()).expect("loads");
+        assert_eq!(old.transfers.len(), 1);
+        assert_eq!(
+            old.transfers[0].tx_public_key,
+            wow_crypto::types::PublicKey::ZERO
+        );
+        assert!(old.transfers[0].additional_tx_keys.is_empty());
+        assert!(!old.transfers[0].key_image_request, "the image is known");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

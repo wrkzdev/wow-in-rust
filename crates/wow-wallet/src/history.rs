@@ -602,6 +602,9 @@ mod tests {
             timestamp: 1_600_000_000,
             payment_id: None,
             frozen: false,
+            tx_public_key: PublicKey::ZERO,
+            additional_tx_keys: Vec::new(),
+            key_image_request: false,
         });
         w.by_key_image.insert(KeyImage([9u8; 32]), 0);
         w

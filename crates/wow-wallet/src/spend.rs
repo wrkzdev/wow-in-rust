@@ -1087,6 +1087,9 @@ mod tests {
             timestamp: 0,
             payment_id: None,
             frozen: false,
+            tx_public_key: PublicKey::ZERO,
+            additional_tx_keys: Vec::new(),
+            key_image_request: false,
         }
     }
 
