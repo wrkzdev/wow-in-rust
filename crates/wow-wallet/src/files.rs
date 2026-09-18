@@ -1258,7 +1258,10 @@ mod tests {
         .expect("create");
         s.state.hashes.push([9u8; 32]);
         s.change_password("new").expect("changed");
-        assert!(s.verify_password("new"), "the new password is this wallet's");
+        assert!(
+            s.verify_password("new"),
+            "the new password is this wallet's"
+        );
         assert!(!s.verify_password("old"), "and the old one is not");
 
         let files = kept.files();

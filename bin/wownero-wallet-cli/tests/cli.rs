@@ -419,7 +419,11 @@ fn showing_a_secret_key_asks_for_the_password() {
     );
     let bad = run("lock", "not-it\n");
     assert!(!bad.status.success(), "{}", all_output(&bad));
-    assert!(stdout(&bad).contains("invalid password"), "{}", stdout(&bad));
+    assert!(
+        stdout(&bad).contains("invalid password"),
+        "{}",
+        stdout(&bad)
+    );
 
     // The timeout it locks itself after is a setting, and 0 turns it off.
     let out = run_in(&s, "w", &["set", "inactivity-lock-timeout", "0"]);
