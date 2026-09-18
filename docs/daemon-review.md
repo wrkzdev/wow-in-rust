@@ -72,7 +72,10 @@ Statuses:
 | `--out-peers`, `--in-peers`, `--max-connections-per-ip`; drop idle connections after 300 s | Done | |
 | Bans for bad proof of work and protocol violations; `--ban-list`; `get_bans`, `set_bans` | Done | `banned` added too. Only a failed verification bans a peer; this node's own gaps (such as an unimplemented CryptoNight variant) do not |
 | IPv6: `--p2p-use-ipv6`, `--p2p-bind-ipv6-address`, `--p2p-bind-port-ipv6`, `--p2p-ignore-ipv4` | Done | The IPv6 listener sets `IPV6_V6ONLY`, so it and the IPv4 listener can share a port ([`net.rs`](../crates/wow-p2p/src/net.rs)). `--p2p-bind-ipv6-address` defaults to `::`. IPv6 peers are dialled whether or not `--p2p-use-ipv6` is given, as in the C++ ([`tests/ipv6.rs`](../bin/wownerod/tests/ipv6.rs), [`tests/node.rs`](../crates/wow-p2p/tests/node.rs)) |
-| `--limit-rate-*`, `--proxy` | Open | Refused |
+| `--proxy` | Built, not yet run against a live proxy | Every outgoing connection is dialled through a SOCKS5 proxy written by hand ([`socks.rs`](../crates/wow-p2p/src/socks.rs), RFC 1928 with RFC 1929 for the password). The listener is untouched, but the node advertises `my_port` and `rpc_port` as 0 and pings nobody back, as `m_can_pingback = false` makes the C++ do. Two departures: only SOCKS5 is spoken, where the C++ also takes SOCKS 4 and 4a and reads a bare `ip:port` as 4a; and with `--proxy`, `--add-peer` and its companions must name an address rather than a host unless `--proxy-allow-dns-leaks` is given, since resolving one here would leak what the proxy hides |
+| `--tx-proxy` (i2p/Tor zones) | Built, not yet run against a live proxy or a real hidden service | A zone per anonymity network with its own peer list, connections, noise channels and relay state, as the C++'s `network_zone` ([`zone.rs`](../crates/wow-p2p/src/zone.rs)). Peers are dialled through the zone's SOCKS5 proxy **by name**, so nothing resolves a `.onion`; the handshake uses peer id 1 with `my_port` and `rpc_port` 0, skips the self-connection check and pings nobody back; only the handshake, the timed sync and `NOTIFY_NEW_TRANSACTIONS` are spoken, and anything else is answered with `LEVIN_ERROR_CONNECTION_HANDLER_NOT_DEFINED` as `is_filtered_command` makes the C++ do. With any zone, a transaction this node originates goes only over it and never to a clearnet peer, and stays `Local` in the pool rather than being marked public. Noise: two channels, each holding one outgoing connection and sending a 3 KiB frame every 10-15 s, with a real message fragmented into frames of the same size; `disable_noise` fluffs to the zone's outgoing peers on Poisson timers instead. A transaction arriving from a zone becomes `Forward`, waits the C++'s ~22 s and is then stemmed on the public network |
+| `--anonymous-inbound` | Built, not yet run against a live hidden service | The zone listens where the hidden service forwards, answers a handshake as that zone (peer 1, no ports, no support flags) and takes transactions over it. A peer this node dialled on the same network is told the address to answer at, inserted at a random place in a timed sync's peer list with the list one shorter to make room, exactly as `handle_timed_sync` does -- a peer reached through a proxy cannot see the address it is talking to. Requires a `--tx-proxy`, as the C++ requires one |
+| `--limit-rate-*` | Open | Refused |
 | Blocking threads rather than an async runtime | Done as suggested | A reader and a writer thread per connection, with a bounded outbox |
 
 ## C. Relay and propagation
@@ -136,7 +139,11 @@ Statuses:
 
 **Daemon**
 
-* `--proxy`, `--tx-proxy` and `--anonymous-inbound` (i2p/Tor).
+* `--proxy`, `--tx-proxy` and `--anonymous-inbound` are built (see B), but
+  none of them has been run against a live proxy, hidden service or C++ peer.
+  The forward delay a transaction from an anonymity network waits is kept in
+  this process rather than in the pool, so a restart starts it again where the
+  C++ would remember it.
 * Rate limits (`--limit-rate*`).
 * Pruning, bootstrap daemons, RPC payments.
 * Background mining and extra messages in mined blocks.

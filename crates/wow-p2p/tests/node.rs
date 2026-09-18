@@ -13,6 +13,7 @@
 //! against.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,9 +24,13 @@ use wow_crypto::keccak::HASH_STATE_BYTES;
 use wow_crypto::random::Rng;
 use wow_crypto::types::Hash256;
 use wow_p2p::addressbook::{AddressBook, BanTarget, STATE_FILENAME};
-use wow_p2p::messages::{BlockEntry, CoreSyncData};
+use wow_p2p::frame::{encode, FrameReader};
+use wow_p2p::levin::{self, command, Header};
+use wow_p2p::messages::{self, BasicNodeData, BlockEntry, CoreSyncData, HandshakeResponse};
 use wow_p2p::node::{BlockVerdict, ChainReply, Config, Core, Node, TxRelay, TxVerdict};
+use wow_p2p::socks::Proxy;
 use wow_p2p::sync::{self, ChainTip};
+use wow_p2p::zone::{HiddenAddr, Zone, ZoneConfig};
 use wow_p2p::{NodeIdentity, Peer};
 use wow_types::{Block, Network};
 
@@ -775,6 +780,247 @@ fn a_node_syncs_over_ipv6() {
             .iter()
             .any(|r| Some(r.addr) == b.local_addr_v6())
     });
+}
+
+/// A SOCKS5 proxy that connects where it is asked and then pumps bytes both
+/// ways, recording each target it was given as text.
+///
+/// It understands only what the node's client sends: version 5 and no
+/// authentication. A target given by name -- which is how a hidden service is
+/// asked for -- is connected to `named` instead, standing in for the service
+/// it names.
+fn socks_proxy(seen: Arc<Mutex<Vec<String>>>, named: Option<SocketAddr>) -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the proxy");
+    let addr = listener.local_addr().expect("the proxy's address");
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(mut client) = client else {
+                continue;
+            };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut greeting = [0u8; 2];
+                let mut head = [0u8; 4];
+                if client.read_exact(&mut greeting).is_err() {
+                    return;
+                }
+                let mut methods = vec![0u8; usize::from(greeting[1])];
+                if client.read_exact(&mut methods).is_err() {
+                    return;
+                }
+                if client.write_all(&[5, 0]).is_err() {
+                    return;
+                }
+                if client.read_exact(&mut head).is_err() {
+                    return;
+                }
+                let target = match head[3] {
+                    // An address, as a public peer is asked for.
+                    1 => {
+                        let mut rest = [0u8; 6];
+                        if client.read_exact(&mut rest).is_err() {
+                            return;
+                        }
+                        let ip = std::net::Ipv4Addr::new(rest[0], rest[1], rest[2], rest[3]);
+                        let port = u16::from_be_bytes([rest[4], rest[5]]);
+                        let addr = SocketAddr::from((ip, port));
+                        seen.lock().unwrap().push(addr.to_string());
+                        Some(addr)
+                    }
+                    // A name, which this node never resolved itself.
+                    3 => {
+                        let mut len = [0u8; 1];
+                        if client.read_exact(&mut len).is_err() {
+                            return;
+                        }
+                        let mut host = vec![0u8; usize::from(len[0]) + 2];
+                        if client.read_exact(&mut host).is_err() {
+                            return;
+                        }
+                        let port = u16::from_be_bytes([host[host.len() - 2], host[host.len() - 1]]);
+                        host.truncate(usize::from(len[0]));
+                        let name = String::from_utf8_lossy(&host).into_owned();
+                        seen.lock().unwrap().push(format!("{name}:{port}"));
+                        named
+                    }
+                    _ => None,
+                };
+                let Some(target) = target else {
+                    return;
+                };
+                let Ok(upstream) = std::net::TcpStream::connect(target) else {
+                    return;
+                };
+                if client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).is_err() {
+                    return;
+                }
+
+                let mut from_client = client.try_clone().expect("clone");
+                let mut to_upstream = upstream.try_clone().expect("clone");
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut from_client, &mut to_upstream);
+                });
+                let mut from_upstream = upstream;
+                let _ = std::io::copy(&mut from_upstream, &mut client);
+            });
+        }
+    });
+    addr
+}
+
+fn plain_proxy(address: SocketAddr) -> Proxy {
+    Proxy {
+        address,
+        user: String::new(),
+        pass: String::new(),
+    }
+}
+
+/// **The reason `--proxy` exists.** A node given one opens no connection of
+/// its own: it asks the proxy for every peer, and syncs the chain over what
+/// comes back. It also advertises no port, so the peer it reached cannot list
+/// it -- the address that peer sees is the proxy's.
+#[test]
+fn a_node_with_a_proxy_syncs_through_it() {
+    let t = template();
+    let genesis = make_block(&t, [0u8; 32], 0);
+    let a_core = MemCore::new(&genesis);
+    a_core.extend(20, &t);
+    let b_core = MemCore::new(&genesis);
+
+    let a = Node::start(config(Vec::new()), a_core.clone(), rng(1)).expect("start a");
+    let a_listens = a.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let proxy = socks_proxy(seen.clone(), None);
+
+    let mut b_cfg = config(vec![a_listens]);
+    b_cfg.proxy = Some(plain_proxy(proxy));
+    let b = Node::start(b_cfg, b_core.clone(), rng(2)).expect("start b");
+
+    wait_until("the chain through the proxy", 60, || b_core.height() == 21);
+    assert_eq!(b_core.tip(), a_core.tip());
+    let asked = seen.lock().unwrap().first().cloned();
+    assert_eq!(asked.as_deref(), Some(a_listens.to_string().as_str()));
+    assert_eq!(b.sync_status().outgoing, 1);
+
+    // Nothing `b` sent advertised a port, so no ping-back can have listed it.
+    std::thread::sleep(Duration::from_millis(500));
+    let b_listens = b.local_addr().unwrap();
+    assert!(
+        !a.peer_lists().0.iter().any(|r| r.addr == b_listens),
+        "a proxied node is not listed by the peers it reaches"
+    );
+}
+
+/// **The reason `--tx-proxy` exists.** A node with a Tor zone sends the
+/// transaction it was given over that zone and over no clearnet connection at
+/// all: the proxy is asked for the hidden service by **name**, and the peer
+/// that receives it sees a node calling itself peer 1 with no port to reach
+/// it at.
+///
+/// The zone has its covert channels turned off (`disable_noise`), so the
+/// transaction goes out on a fluff timer rather than waiting for a noise slot.
+#[test]
+fn a_transaction_of_this_nodes_goes_over_its_tor_zone() {
+    let t = template();
+    let genesis = make_block(&t, [0u8; 32], 0);
+    let a_core = MemCore::new(&genesis);
+    let b_core = MemCore::new(&genesis);
+
+    let a = Node::start(config(Vec::new()), a_core.clone(), rng(1)).expect("start a");
+    let a_listens = a.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let proxy = socks_proxy(seen.clone(), Some(a_listens));
+
+    // A hidden service standing in for `a`, which the proxy connects for us.
+    let onion = "rveahdfho7wo4b2m.onion:28083";
+    let peer = HiddenAddr::parse(onion, 34_567).expect("an onion address");
+    let mut zone = ZoneConfig::new(Zone::Tor, plain_proxy(proxy));
+    zone.noise = false;
+    zone.peers = vec![peer];
+
+    let mut b_cfg = config(Vec::new());
+    b_cfg.tx_proxies = vec![zone];
+    let b = Node::start(b_cfg, b_core.clone(), rng(2)).expect("start b");
+
+    let blob = b"a transaction to send over tor".to_vec();
+    let id = tx_id(&blob);
+    // In `b`'s pool as well, so the node offers it again each tick until the
+    // zone has a connection to carry it (`due_for_relay`).
+    b_core.incoming_txs(&[blob.clone()], true);
+    b.relay_transaction(id, blob);
+
+    wait_until("the transaction over the zone", 60, || a_core.has_tx(&id));
+    let asked = seen.lock().unwrap().first().cloned();
+    assert_eq!(asked.as_deref(), Some(onion), "asked for by name");
+    assert_eq!(b.connection_count(), 0, "no clearnet peer was used");
+
+    // What `a` saw of it: peer id 1, and no port of any kind.
+    let inbound = a.connections();
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].peer_id, 1, "every peer in a zone is peer 1");
+    assert_eq!(inbound[0].rpc_port, 0);
+    assert!(
+        a.peer_lists().0.is_empty(),
+        "a zone's peer advertises no port, so there is nothing to list"
+    );
+}
+
+/// **What `--anonymous-inbound` sets up.** A zone told where its hidden
+/// service forwards takes the connections that arrive there, and answers the
+/// handshake as the zone it is: peer 1, no port, no RPC port and no support
+/// flags, so there is nothing about this node for the peer to pass on.
+#[test]
+fn an_anonymous_inbound_zone_answers_a_handshake() {
+    let t = template();
+    let genesis = make_block(&t, [0u8; 32], 0);
+    let core = MemCore::new(&genesis);
+
+    // The port a torrc's `HiddenServicePort` would forward to.
+    let bind: SocketAddr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let ours = HiddenAddr::parse("rveahdfho7wo4b2m.onion:28083", 0).expect("ours");
+    let mut zone = ZoneConfig::inbound_only(Zone::Tor);
+    zone.our_address = Some(ours);
+    zone.bind = Some(bind);
+    let mut cfg = config(Vec::new());
+    cfg.tx_proxies = vec![zone];
+    let node = Node::start(cfg, core.clone(), rng(3)).expect("start");
+
+    // Connect as the hidden service's daemon would, and handshake.
+    let mut stream = std::net::TcpStream::connect(bind).expect("the zone's listener");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let theirs = BasicNodeData {
+        network_id: messages::network_id(Network::Mainnet),
+        peer_id: 1,
+        my_port: 0,
+        rpc_port: 0,
+        rpc_credits_per_hash: 0,
+        support_flags: 0,
+    };
+    let body = messages::handshake_request(&theirs, &core.sync_data());
+    let header = Header::request(command::HANDSHAKE, body.len() as u64);
+    stream.write_all(&encode(&header, &body)).expect("sent");
+
+    let mut reader = FrameReader::new(levin::INITIAL_MAX_PACKET_SIZE);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        assert!(Instant::now() < deadline, "the zone did not answer");
+        if let Some((h, body)) = reader.poll(&mut stream).expect("a reply") {
+            assert_eq!(h.command, command::HANDSHAKE);
+            break HandshakeResponse::parse(&body).expect("a handshake response");
+        }
+    };
+    assert_eq!(answer.node_data.peer_id, 1, "every node in a zone is peer 1");
+    assert_eq!(answer.node_data.my_port, 0);
+    assert_eq!(answer.node_data.rpc_port, 0);
+    assert_eq!(answer.node_data.support_flags, 0);
+    // Its peer list is the zone's, which is empty, and never the public one.
+    assert!(answer.peers.is_empty());
+
+    node.stop();
 }
 
 /// A peer that goes away mid-sync gives back what it had not delivered, and

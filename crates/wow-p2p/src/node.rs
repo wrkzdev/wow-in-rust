@@ -44,6 +44,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use wow_crypto::keccak::HASH_STATE_BYTES;
 use wow_crypto::random::Rng;
 use wow_crypto::types::Hash256;
 use wow_types::Network;
@@ -58,7 +59,9 @@ use crate::messages::{
     SUPPORT_FLAG_FLUFFY_BLOCKS,
 };
 use crate::queue::{self, BlockQueue, SpanInfo};
+use crate::socks::{self, Proxy};
 use crate::sync::BatchSize;
+use crate::zone::{AnonZone, ZoneConfig};
 
 const LOG: &str = "net.p2p";
 
@@ -115,6 +118,14 @@ const DANDELION_EPOCH_RANGE_SECS: u64 = 30;
 const DANDELION_EMBARGO_AVERAGE: Duration = Duration::from_secs(39);
 /// `CRYPTONOTE_DANDELIONPP_FLUSH_AVERAGE`.
 const DANDELION_FLUSH_AVERAGE: Duration = Duration::from_secs(5);
+/// `CRYPTONOTE_FORWARD_DELAY_AVERAGE`: the mean wait before a transaction
+/// that arrived over an anonymity network is stemmed on the public one.
+///
+/// The C++ derives it from the noise timers --
+/// `(NOISE_MIN_DELAY + NOISE_DELAY_RANGE) * 3 / 2`, so 22 s -- the point
+/// being that in that time two or more incoming hidden connections could
+/// have been the one that sent it.
+const FORWARD_DELAY_AVERAGE_SECS: u64 = 22;
 /// The flush average for an incoming connection in the quarter seconds the
 /// C++ draws it in (`fluff_average_in`): 20.
 const FLUSH_QUARTERS_IN: u64 = DANDELION_FLUSH_AVERAGE.as_secs() * 4;
@@ -170,12 +181,18 @@ pub enum BlockVerdict {
 /// `relay_method` this layer acts on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxRelay {
-    /// Submitted to this node. Always through a stem, whatever the epoch.
+    /// Submitted to this node. Always through a stem, whatever the epoch --
+    /// or, when an anonymity network is configured, only over that.
     Local,
     /// Received through a stem: on through one, unless this epoch fluffs.
     Stem,
     /// To every peer.
     Fluff,
+    /// Received over an anonymity network. Held for a delay averaging
+    /// `CRYPTONOTE_FORWARD_DELAY_AVERAGE`, then stemmed on the public
+    /// network, so that two or more incoming hidden connections could have
+    /// been the one that sent it.
+    Forward,
 }
 
 /// What happened to a transaction a peer sent.
@@ -230,6 +247,21 @@ pub trait Core: Send + Sync {
     /// Transactions a peer sent, one verdict each. `fluff` is the message's
     /// `dandelionpp_fluff`: false for a stem.
     fn incoming_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict>;
+    /// The same, for a peer on an anonymity network
+    /// (`handle_notify_new_transactions` with a non-public zone).
+    ///
+    /// The relay method there is `forward`, not `stem`: the pool holds the
+    /// transaction privately and this node passes it on over the public
+    /// network after a delay. A `fluff` flag still means fluff -- a hidden
+    /// service with noise disabled sets it, and says by it that the receiver
+    /// should not wait.
+    ///
+    /// The default treats it as any other peer's, which is what a core
+    /// without a private pool state can do; a core that keeps relay methods
+    /// overrides this.
+    fn incoming_txs_anonymous(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
+        self.incoming_txs(txs, fluff)
+    }
     /// Public pool transactions -- fluffed or mined -- whose hashes are not in
     /// `known` (`get_complement`). Never one still private: a peer asking is
     /// not a peer the stem chose.
@@ -298,6 +330,19 @@ pub struct Config {
     /// `--pad-transactions`: relay transactions in messages padded to a
     /// multiple of a kilobyte, against traffic volume analysis.
     pub pad_transactions: bool,
+    /// `--proxy`: dial every outgoing connection through this SOCKS5 proxy.
+    ///
+    /// The listener is unaffected -- a node behind a proxy can still be
+    /// reached at a port it forwards -- but nothing it says advertises an
+    /// address any more, and it stops pinging back incoming peers, because
+    /// the address they see is the proxy's (`m_can_pingback`).
+    pub proxy: Option<Proxy>,
+    /// `--tx-proxy`: one anonymity network each, i2p before Tor.
+    ///
+    /// With any of these, a transaction this node originates goes **only**
+    /// over them and never to a clearnet peer, which is how `send_txs` routes
+    /// one whose origin is not a peer.
+    pub tx_proxies: Vec<ZoneConfig>,
 }
 
 impl Config {
@@ -327,6 +372,8 @@ impl Config {
             ban_list: Vec::new(),
             rpc_port: 0,
             pad_transactions: false,
+            proxy: None,
+            tx_proxies: Vec::new(),
         }
     }
 }
@@ -545,7 +592,7 @@ impl Proto {
 // ---------------------------------------------------------------------------
 
 /// Transactions with their ids, going to a peer together.
-type TxBatch = Vec<(Hash256, Vec<u8>)>;
+pub type TxBatch = Vec<(Hash256, Vec<u8>)>;
 
 struct Relay {
     epoch_ends: Instant,
@@ -561,6 +608,9 @@ struct Relay {
     embargo: HashMap<Hash256, (Instant, Vec<u8>)>,
     /// Fluff transactions waiting for each connection's next flush.
     queued: HashMap<u64, (Instant, TxBatch)>,
+    /// Transactions that arrived over an anonymity network, with the time
+    /// each may go out on the public one.
+    forward: HashMap<Hash256, (Instant, Vec<u8>)>,
 }
 
 /// `net::dandelionpp::connection_map`: this epoch's stem connections, and the
@@ -575,7 +625,7 @@ struct Relay {
 /// leaves its slot empty; [`StemMap::update`] refills that slot alone, and a
 /// source mapped to it is moved on the next time it sends.
 #[derive(Debug, Default)]
-struct StemMap {
+pub(crate) struct StemMap {
     /// `out_mapping_`: the connection in each stem slot, `None` where one
     /// went away.
     out: Vec<Option<u64>>,
@@ -588,7 +638,7 @@ struct StemMap {
 impl StemMap {
     /// `connection_map(out_connections, stems)`: `stems` of `connections`,
     /// chosen at random.
-    fn new(
+    pub(crate) fn new(
         mut connections: Vec<u64>,
         stems: usize,
         rand: &mut impl FnMut(usize) -> usize,
@@ -617,7 +667,11 @@ impl StemMap {
     /// slots -- or ones never filled, for a map made with fewer connections
     /// than stems -- take a connection not already a stem. Returns whether
     /// anything changed.
-    fn update(&mut self, mut current: Vec<u64>, rand: &mut impl FnMut(usize) -> usize) -> bool {
+    pub(crate) fn update(
+        &mut self,
+        mut current: Vec<u64>,
+        rand: &mut impl FnMut(usize) -> usize,
+    ) -> bool {
         current.sort_unstable();
         let mut replace = false;
         for slot in &mut self.out {
@@ -654,6 +708,12 @@ impl StemMap {
             }
         }
         replace || existing < self.out.len()
+    }
+
+    /// The connection in slot `i`, for a noise channel: the channels take one
+    /// slot each (`update_channels::post`).
+    pub(crate) fn slot(&self, i: usize) -> Option<u64> {
+        self.out.get(i).copied().flatten()
     }
 
     /// `connection_map::get_stem`: the stem for transactions from `source`,
@@ -730,9 +790,20 @@ fn poisson(mean: u64, mut uniform: impl FnMut() -> f64) -> u64 {
     k
 }
 
+/// A [`poisson`] count drawn from `rng`, as `crypto::random_poisson_duration`
+/// draws from `crypto::random_device`.
+pub(crate) fn poisson_from(rng: &mut Rng, mean: u64) -> u64 {
+    poisson(mean, || {
+        let mut b = [0u8; 8];
+        rng.fill(&mut b);
+        // 53 random bits, shifted off zero: a draw in (0, 1].
+        ((u64::from_le_bytes(b) >> 11) + 1) as f64 / (1u64 << 53) as f64
+    })
+}
+
 /// Sorted by blob, each once: the order a peer is sent transactions in must
 /// not be the order this node received them (`fluff_flush`).
-fn flush_order(txs: &mut TxBatch) {
+pub(crate) fn flush_order(txs: &mut TxBatch) {
     txs.sort_by(|(_, a), (_, b)| a.cmp(b));
     txs.dedup_by(|(_, a), (_, b)| a == b);
 }
@@ -764,6 +835,9 @@ struct Shared {
     stopping: AtomicBool,
     rng: Mutex<Rng>,
     relay: Mutex<Relay>,
+    /// The anonymity networks (`--tx-proxy`), i2p before Tor. Empty for a
+    /// node with only the public zone.
+    zones: Vec<Arc<AnonZone>>,
     out_peers: AtomicUsize,
     in_peers: AtomicUsize,
     dialing: Mutex<HashSet<SocketAddr>>,
@@ -833,6 +907,22 @@ impl Node {
             book.ban(*target, u64::MAX, 0);
         }
 
+        // The anonymity networks, in the C++'s order, each with a generator
+        // of its own seeded from this one: a zone's noise timers should not
+        // be predictable from the node's, nor the node's from a zone's.
+        let mut zone_cfgs = cfg.tx_proxies.clone();
+        zone_cfgs.sort_by_key(|z| z.zone);
+        let mut zones: Vec<Arc<AnonZone>> = Vec::new();
+        for mut zone_cfg in zone_cfgs {
+            zone_cfg.pad_transactions = cfg.pad_transactions;
+            let mut seed = [0u8; HASH_STATE_BYTES];
+            rng.fill(&mut seed);
+            let zone_rng = Rng::from_state(seed);
+            let zone = zone_cfg.zone;
+            zones.push(AnonZone::start(zone_cfg, cfg.network, core.clone(), zone_rng)?);
+            wow_log::info!(LOG, "sending this node's own transactions over {zone}");
+        }
+
         let shared = Arc::new(Shared {
             out_peers: AtomicUsize::new(cfg.out_peers),
             in_peers: AtomicUsize::new(cfg.in_peers),
@@ -856,12 +946,17 @@ impl Node {
                 stems: StemMap::default(),
                 embargo: HashMap::new(),
                 queued: HashMap::new(),
+                forward: HashMap::new(),
             }),
+            zones,
             dialing: Mutex::new(HashSet::new()),
             tried: Mutex::new(HashMap::new()),
         });
 
         let mut threads = Vec::new();
+        if let Some(proxy) = &shared.cfg.proxy {
+            wow_log::info!(LOG, "dialling peers through the proxy at {proxy}");
+        }
         for listener in [listener, listener_v6].into_iter().flatten() {
             if let Ok(a) = listener.local_addr() {
                 wow_log::info!(LOG, "listening for peers on {a}");
@@ -933,6 +1028,9 @@ impl Node {
         }
         for c in &conns {
             c.close();
+        }
+        for zone in &self.shared.zones {
+            zone.stop();
         }
         for t in lock(&self.threads).drain(..) {
             let _ = t.join();
@@ -1086,13 +1184,7 @@ impl Shared {
     /// A [`poisson`] count with the given mean, drawn from the node's CSPRNG
     /// as `crypto::random_poisson_duration` draws from `crypto::random_device`.
     fn poisson_draw(&self, mean: u64) -> u64 {
-        let mut rng = lock(&self.rng);
-        poisson(mean, || {
-            let mut b = [0u8; 8];
-            rng.fill(&mut b);
-            // 53 random bits, shifted off zero: a draw in (0, 1].
-            ((u64::from_le_bytes(b) >> 11) + 1) as f64 / (1u64 << 53) as f64
-        })
+        poisson_from(&mut lock(&self.rng), mean)
     }
 
     /// An embargo (`tx_pool.cpp`'s `embargo_duration`): whole seconds, Poisson
@@ -1113,12 +1205,23 @@ impl Shared {
         Duration::from_millis(250 * self.poisson_draw(mean))
     }
 
+    /// `network_zone::m_can_pingback`: whether a peer could reach this node
+    /// at the address the connection came from.
+    ///
+    /// False behind `--proxy`, where the address a peer sees is the proxy's.
+    /// A node that cannot be pinged back advertises no port and no RPC port,
+    /// and does not ping back the peers that reach it.
+    fn can_pingback(&self) -> bool {
+        self.cfg.proxy.is_none()
+    }
+
     fn node_data(&self) -> BasicNodeData {
+        let pingback = self.can_pingback();
         BasicNodeData {
             network_id: messages::network_id(self.cfg.network),
             peer_id: self.peer_id,
-            my_port: self.my_port,
-            rpc_port: self.cfg.rpc_port,
+            my_port: if pingback { self.my_port } else { 0 },
+            rpc_port: if pingback { self.cfg.rpc_port } else { 0 },
             rpc_credits_per_hash: 0,
             support_flags: SUPPORT_FLAG_FLUFFY_BLOCKS,
         }
@@ -1247,6 +1350,10 @@ impl Shared {
     /// fluffs it. A fluff is queued to every other peer and flushed on each
     /// one's Poisson timer.
     fn relay_txs(&self, from: Option<u64>, txs: TxBatch, how: TxRelay) {
+        if how == TxRelay::Forward {
+            self.hold_forwarded(txs);
+            return;
+        }
         let own = how == TxRelay::Local;
         // This node's own transaction already under an embargo has just gone
         // through a stem, sent by another thread that read the pool a moment
@@ -1264,10 +1371,32 @@ impl Shared {
         if txs.is_empty() {
             return;
         }
+        // `send_txs`: a transaction that did not come from a peer goes to an
+        // anonymity network when one is configured, and to no clearnet peer
+        // at all. One that cannot be sent is left unmarked, so the pool
+        // offers it again when a hidden connection turns up
+        // (`docs/ANONYMITY_NETWORKS.md`: "the transaction is kept for future
+        // broadcasting over an anonymity network").
+        if own && !self.zones.is_empty() {
+            match self.pick_zone() {
+                Some(zone) => {
+                    zone.send_txs(&txs);
+                }
+                None => wow_log::warn!(
+                    LOG,
+                    "cannot send {} transaction(s): the anonymity networks had no \
+                     outgoing connections",
+                    txs.len()
+                ),
+            }
+            return;
+        }
         let stem = match how {
             TxRelay::Local => true,
             TxRelay::Stem => !lock(&self.relay).fluffing,
             TxRelay::Fluff => false,
+            // Held above.
+            TxRelay::Forward => return,
         };
         if stem {
             // As `dandelionpp_notify` tries it: the stem, and when that finds
@@ -1291,6 +1420,46 @@ impl Shared {
             );
         }
         self.fluff(from, txs);
+    }
+
+    /// Hold transactions that arrived over an anonymity network until their
+    /// forward delay is up (`tx_pool.cpp`: `last_relayed_time = now +
+    /// random_poisson_seconds{forward_delay_average}()`).
+    ///
+    /// One already waiting keeps the deadline it has, so a pool that offers
+    /// it again does not push it further out.
+    fn hold_forwarded(&self, txs: TxBatch) {
+        if txs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut relay = lock(&self.relay);
+        for (id, blob) in txs {
+            if relay.forward.contains_key(&id) {
+                continue;
+            }
+            let wait = Duration::from_secs(self.poisson_draw(FORWARD_DELAY_AVERAGE_SECS));
+            relay.forward.insert(id, (now + wait, blob));
+        }
+    }
+
+    /// `send_txs`'s choice of anonymity network.
+    ///
+    /// With one zone, that one, whatever it can do right now -- the C++ sends
+    /// to `*m_network_zones.rbegin()` without looking. With more, i2p first,
+    /// preferring a zone whose noise channels are all connected, then one
+    /// with an outgoing connection at all.
+    fn pick_zone(&self) -> Option<&Arc<AnonZone>> {
+        if self.zones.len() <= 1 {
+            return self.zones.first();
+        }
+        self.zones
+            .iter()
+            .find(|z| {
+                let s = z.status();
+                s.has_noise && s.connections_filled
+            })
+            .or_else(|| self.zones.iter().find(|z| z.status().has_outgoing))
     }
 
     /// Send `txs` through the stem the epoch's map gives `from`, together,
@@ -1424,6 +1593,40 @@ impl Shared {
             );
         }
 
+        // What arrived over an anonymity network since the last tick. A
+        // forward waits; one whose sender set the fluff flag does not, and is
+        // fluffed on the public network as
+        // `handle_notify_new_transactions` fluffs it.
+        let mut arrived = TxBatch::new();
+        let mut fluffed = TxBatch::new();
+        for zone in &self.zones {
+            for (id, blob, how) in zone.take_arrived() {
+                match how {
+                    TxRelay::Fluff => fluffed.push((id, blob)),
+                    _ => arrived.push((id, blob)),
+                }
+            }
+        }
+        self.hold_forwarded(arrived);
+        self.relay_txs(None, fluffed, TxRelay::Fluff);
+
+        // Forwards whose delay is up: on through a public stem, as
+        // `relay_txpool_transactions` sends them
+        // (`relay_transactions(stem_req, source, zone::public_, stem)`).
+        let ready: TxBatch = {
+            let mut relay = lock(&self.relay);
+            let ids: Vec<Hash256> = relay
+                .forward
+                .iter()
+                .filter(|(_, (at, _))| *at <= now)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| relay.forward.remove(&id).map(|(_, blob)| (id, blob)))
+                .collect()
+        };
+        self.relay_txs(None, ready, TxRelay::Stem);
+
         // Embargoes that ran out without the transaction coming back fluffed.
         let expired: TxBatch = {
             let mut relay = lock(&self.relay);
@@ -1470,14 +1673,19 @@ impl Shared {
         // stemmed through the stem, the rest as fluff.
         let mut local = TxBatch::new();
         let mut public = TxBatch::new();
+        let mut waiting = TxBatch::new();
         for (id, blob, how) in self.core.due_for_relay() {
             match how {
                 TxRelay::Local => local.push((id, blob)),
                 TxRelay::Stem | TxRelay::Fluff => public.push((id, blob)),
+                // A forward the pool still holds: this process was restarted
+                // before its delay was up, so it starts a new one.
+                TxRelay::Forward => waiting.push((id, blob)),
             }
         }
         self.relay_txs(None, local, TxRelay::Local);
         self.relay_txs(None, public, TxRelay::Fluff);
+        self.hold_forwarded(waiting);
     }
 
     /// Announce a block to every synchronised peer but `except`: fluffy, with
@@ -1516,7 +1724,7 @@ impl Shared {
 // threads
 // ---------------------------------------------------------------------------
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panic elsewhere while holding a lock poisons it; the data is still
     // usable, and a node that stopped serving every peer over one panic would
     // be worse off.
@@ -1661,7 +1869,12 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
                 return;
             }
 
-            if req.node_data.my_port != 0 && req.node_data.my_port <= u32::from(u16::MAX) {
+            // `if(arg.node_data.my_port && zone.m_can_pingback)`: a node that
+            // dials out through a proxy does not ping anyone back.
+            let ping_back_it = req.node_data.my_port != 0
+                && req.node_data.my_port <= u32::from(u16::MAX)
+                && shared.can_pingback();
+            if ping_back_it {
                 let s = shared.clone();
                 let node = req.node_data.clone();
                 let seed = req.payload_data.pruning_seed;
@@ -1736,12 +1949,23 @@ fn ping_back(shared: Arc<Shared>, ip: IpAddr, node: BasicNodeData, pruning_seed:
 }
 
 /// Dial and handshake, returning the connection ready to run.
+///
+/// With `--proxy`, the socket comes from the proxy instead. The target is
+/// given to it as an address rather than a name: everything dialled here came
+/// from a peer list or from an option this node resolved at start, so there is
+/// nothing left to look up.
 fn dial(
     shared: &Shared,
     addr: SocketAddr,
 ) -> Result<(TcpStream, FrameReader, HandshakeResponse), String> {
-    let mut stream =
-        TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
+    let mut stream = match &shared.cfg.proxy {
+        Some(proxy) => {
+            let target = socks::Target::Ip(addr);
+            socks::connect(proxy, target, socks::CONNECT_TIMEOUT)
+                .map_err(|e| format!("through the proxy at {proxy}: {e}"))?
+        }
+        None => TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?,
+    };
     let _ = stream.set_nodelay(true);
     let body = messages::handshake_request(&shared.node_data(), &shared.core.sync_data());
     write_frame(

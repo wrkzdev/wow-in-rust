@@ -601,7 +601,10 @@ fn relay_of(method: RelayMethod) -> Option<TxRelay> {
         RelayMethod::Local => Some(TxRelay::Local),
         RelayMethod::Stem => Some(TxRelay::Stem),
         RelayMethod::Fluff | RelayMethod::Block => Some(TxRelay::Fluff),
-        RelayMethod::None | RelayMethod::Forward => None,
+        // A forward waits out its delay in the peer-to-peer layer and then
+        // goes on as a public stem.
+        RelayMethod::Forward => Some(TxRelay::Forward),
+        RelayMethod::None => None,
     }
 }
 
@@ -771,18 +774,24 @@ impl Core for NodeCore {
     }
 
     fn incoming_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
-        let verdicts = self.admit_txs(txs, fluff);
-        let accepted: Vec<Hash256> = verdicts
-            .iter()
-            .filter_map(|v| match v {
-                TxVerdict::Accepted { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        if !accepted.is_empty() {
-            self.announce_pool_txs(&accepted);
-        }
-        verdicts
+        let method = if fluff {
+            RelayMethod::Fluff
+        } else {
+            RelayMethod::Stem
+        };
+        self.take_txs(txs, method)
+    }
+
+    /// The relay method is `Forward` unless the sender fluffed
+    /// (`handle_notify_new_transactions`: `zone == public ? stem : forward`,
+    /// then `if (arg.dandelionpp_fluff) tx_relay = fluff`).
+    fn incoming_txs_anonymous(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
+        let method = if fluff {
+            RelayMethod::Fluff
+        } else {
+            RelayMethod::Forward
+        };
+        self.take_txs(txs, method)
     }
 
     fn pool_txs_except(&self, known: &HashSet<Hash256>) -> Vec<Vec<u8>> {
@@ -797,7 +806,13 @@ impl Core for NodeCore {
     fn tx_relayed(&self, ids: &[Hash256], how: TxRelay) {
         let method = match how {
             TxRelay::Stem => RelayMethod::Stem,
-            TxRelay::Local | TxRelay::Fluff => RelayMethod::Fluff,
+            TxRelay::Fluff => RelayMethod::Fluff,
+            // `on_transactions_relayed(txs, relay_method::local)`: sent over
+            // an anonymity network, and **still private**. Calling it fluffed
+            // would show it to everyone reading this node's pool when only
+            // one hidden peer has it.
+            TxRelay::Local => RelayMethod::Local,
+            TxRelay::Forward => RelayMethod::Forward,
         };
         // The guard ends with the statement: announcing reads the pool again.
         let public = lock(&self.pool).set_relayed(ids, method, unix_now());
@@ -938,14 +953,28 @@ impl NodeCore {
     /// One the pool holds privately is not "known" here. It goes to the pool
     /// again, which moves it on as far as this copy takes it -- to fluff, for
     /// a fluffed copy or a stem that looped back (`tx_memory_pool::add_tx`).
-    fn admit_txs(&self, txs: &[Vec<u8>], fluff: bool) -> Vec<TxVerdict> {
+    /// Transactions from a peer, taken into the pool as `method`, with
+    /// whatever became public announced.
+    fn take_txs(&self, txs: &[Vec<u8>], method: RelayMethod) -> Vec<TxVerdict> {
+        let verdicts = self.admit_txs(txs, method);
+        let accepted: Vec<Hash256> = verdicts
+            .iter()
+            .filter_map(|v| match v {
+                TxVerdict::Accepted { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        // Only a public transaction is announced; `announce_pool_txs` reads
+        // the pool again and leaves a private one alone.
+        if !accepted.is_empty() {
+            self.announce_pool_txs(&accepted);
+        }
+        verdicts
+    }
+
+    fn admit_txs(&self, txs: &[Vec<u8>], method: RelayMethod) -> Vec<TxVerdict> {
         let ctx = self.fee_context();
         let now = unix_now();
-        let method = if fluff {
-            RelayMethod::Fluff
-        } else {
-            RelayMethod::Stem
-        };
         let mut pool = lock(&self.pool);
         txs.iter()
             .map(|blob| {
@@ -998,6 +1027,8 @@ mod tests {
         assert_eq!(relay_of(RelayMethod::Stem), Some(TxRelay::Stem));
         assert_eq!(relay_of(RelayMethod::Fluff), Some(TxRelay::Fluff));
         assert_eq!(relay_of(RelayMethod::Block), Some(TxRelay::Fluff));
+        // One from an anonymity network: held, then stemmed in the clear.
+        assert_eq!(relay_of(RelayMethod::Forward), Some(TxRelay::Forward));
     }
 
     /// Only evidence of misbehaviour bans; this node's own limits do not.
