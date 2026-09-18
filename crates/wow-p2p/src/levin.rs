@@ -1103,7 +1103,8 @@ mod tests {
         // The largest body that still fits one frame, and the first that
         // does not.
         let body = vec![7u8; frame - HEADER_LEN];
-        assert_eq!(fragmented_notify(frame, 1, &body).map(|f| f.len()), Some(frame));
+        let one = fragmented_notify(frame, 1, &body).expect("one frame");
+        assert_eq!(one.len(), frame);
         let body = vec![7u8; frame - HEADER_LEN + 1];
         let two = fragmented_notify(frame, 1, &body).expect("two frames");
         assert_eq!(two.len(), 2 * frame);

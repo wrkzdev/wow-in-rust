@@ -180,7 +180,7 @@ impl std::fmt::Display for SocksError {
                 f.write_str("an empty host name cannot be sent to a proxy")
             }
             SocksError::BadHost { len } => {
-                write!(f, "a host name of {len} bytes does not fit a SOCKS5 request")
+                write!(f, "a host name of {len} bytes does not fit a request")
             }
         }
     }
@@ -517,12 +517,18 @@ mod tests {
         let script = vec![step(3, vec![4, METHOD_NONE])];
         let (addr, _sent) = fake_proxy(script, Vec::new());
         let e = dial(&plain(addr), target).expect_err("not version 5");
-        assert!(matches!(e, SocksError::UnexpectedVersion { found: 4 }), "{e}");
+        assert!(
+            matches!(e, SocksError::UnexpectedVersion { found: 4 }),
+            "{e}"
+        );
 
         let script = vec![step(3, vec![VERSION, METHOD_USERPASS])];
         let (addr, _sent) = fake_proxy(script, Vec::new());
         let e = dial(&plain(addr), target).expect_err("a method never offered");
-        assert!(matches!(e, SocksError::NoAcceptableMethod { found: 2 }), "{e}");
+        assert!(
+            matches!(e, SocksError::NoAcceptableMethod { found: 2 }),
+            "{e}"
+        );
 
         // RFC 1928's "no acceptable methods".
         let script = vec![step(3, vec![VERSION, 0xff])];
