@@ -558,6 +558,12 @@ impl Session {
                 self.state.transfers[n + offset].spent = *s != KeyImageStatus::Unspent;
             }
         }
+        // What the reference does next and this does not: for each output the
+        // node says is spent in a block, ask `/gettransactions` for the
+        // transaction that spent it and file a `confirmed_transfer_details`
+        // for it. That is history, not money: the balance here is already
+        // right, and a refresh finds the spends and records them the way every
+        // other spend is recorded ([`crate::history`]).
 
         // "accumulate outputs before the updated data", and then the updated
         // ones. A frozen output is left out of both, as it is left out of the
@@ -617,9 +623,8 @@ impl Session {
             if t.key_image.is_some_and(|known| known != k) {
                 wow_log::warn!(
                     "wallet.wallet2",
-                    "imported key image differs from previously known key image at index {}: \
-                     trusting imported one",
-                    n
+                    "imported key image differs from previously known key image at index {n}: \
+                     trusting imported one"
                 );
             }
             t.key_image = Some(k);
