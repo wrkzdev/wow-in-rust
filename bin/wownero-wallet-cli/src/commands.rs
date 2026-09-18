@@ -1239,7 +1239,7 @@ fn write_unsigned(
         return Ok(());
     }
 
-    write_file(UNSIGNED_FILENAME, &unsigned.blob)?;
+    write_export(session, UNSIGNED_FILENAME, &unsigned.blob)?;
     // The rings chosen while planning are kept, so a second attempt at the
     // same outputs hides them among the same decoys.
     save_after(session);
@@ -1256,7 +1256,7 @@ fn export_outputs(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let blob = session
         .export_outputs_to_file(all, 0, u32::MAX)
         .map_err(|e| format!("Error exporting outputs: {e}"))?;
-    write_file(&filename, &blob)?;
+    write_export(session, &filename, &blob)?;
     println!("Outputs exported to {filename}");
     Ok(())
 }
@@ -1282,7 +1282,7 @@ fn export_key_images(session: &mut Session, args: &[&str]) -> Result<(), String>
     let blob = session
         .export_key_images_to_file(all)
         .map_err(|e| format!("Error exporting key images: {e}"))?;
-    write_file(&filename, &blob)?;
+    write_export(session, &filename, &blob)?;
     println!("Signed key images exported to {filename}");
     Ok(())
 }
@@ -1356,7 +1356,7 @@ fn sign_transfer(session: &mut Session, args: &[&str]) -> Result<(), String> {
     let signed = session
         .sign_unsigned(&set)
         .map_err(|e| format!("Failed to sign transaction: {e}"))?;
-    write_file(SIGNED_FILENAME, &signed.blob)?;
+    write_export(session, SIGNED_FILENAME, &signed.blob)?;
     save_after(session);
 
     let txids: Vec<String> = signed
@@ -1376,7 +1376,7 @@ fn sign_transfer(session: &mut Session, args: &[&str]) -> Result<(), String> {
             } else {
                 format!("{SIGNED_FILENAME}_raw_{i}")
             };
-            write_file(&name, wow_crypto::hex::encode(blob).as_bytes())?;
+            write_export(session, &name, wow_crypto::hex::encode(blob).as_bytes())?;
             names.push(name);
         }
         println!("Transaction raw hex data exported to {}", names.join(", "));
@@ -1537,6 +1537,20 @@ fn one_file(args: &[&str], usage: &str) -> Result<String, String> {
 
 fn read_file(path: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("failed to read file {path}: {e}"))
+}
+
+/// Write one of these files, wrapped in PEM armour when the wallet is set to
+/// `export-format ascii`.
+///
+/// `wallet2::save_to_file` does the wrapping, not the `*_to_str` that made the
+/// bytes, which is why the RPC never wraps and this does. Reading needs no
+/// such switch: [`wow_wallet::cold::unwrap_ascii`] takes either.
+fn write_export(session: &Session, path: &str, data: &[u8]) -> Result<(), String> {
+    if session.export_ascii() {
+        write_file(path, &wow_wallet::cold::wrap_ascii(data))
+    } else {
+        write_file(path, data)
+    }
 }
 
 /// Write a file, refusing to overwrite one: `check_file_overwrite` asks, and a

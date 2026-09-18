@@ -326,7 +326,10 @@ impl ExportedKeyImages {
         address: &AccountPublicAddress,
         view_secret_key: &SecretKey,
     ) -> Result<ExportedKeyImages> {
-        let body = strip_magic(blob, KEY_IMAGE_EXPORT_MAGIC, "key image export")?;
+        // A wallet set to `export-format ascii` wraps the file in PEM
+        // armour; one set to binary does not, and this leaves it alone.
+        let blob = unwrap_ascii(blob);
+        let body = strip_magic(&blob, KEY_IMAGE_EXPORT_MAGIC, "key image export")?;
         let data = decrypt(body, view_secret_key, true)?;
 
         if data.len() < 4 {
@@ -563,7 +566,8 @@ impl ExportedOutputs {
         address: &AccountPublicAddress,
         view_secret_key: &SecretKey,
     ) -> Result<ExportedOutputs> {
-        let body = strip_magic(blob, OUTPUT_EXPORT_MAGIC, "output export")?;
+        let blob = unwrap_ascii(blob);
+        let body = strip_magic(&blob, OUTPUT_EXPORT_MAGIC, "output export")?;
         let data = decrypt(body, view_secret_key, true)?;
         let body = take_account_header(&data, address, "output export")?;
 
@@ -1130,8 +1134,9 @@ impl UnsignedTxSet {
 
     /// `parse_unsigned_tx_from_str`.
     pub fn from_file(blob: &[u8], view_secret_key: &SecretKey) -> Result<UnsignedTxSet> {
+        let blob = unwrap_ascii(blob);
         let body = strip_versioned_magic(
-            blob,
+            &blob,
             UNSIGNED_TX_MAGIC,
             "unsigned transfer set",
             TX_SET_VERSION,
@@ -1227,8 +1232,9 @@ impl SignedTxSet {
 
     /// `parse_tx_from_str`.
     pub fn from_file(blob: &[u8], view_secret_key: &SecretKey) -> Result<SignedTxSet> {
+        let blob = unwrap_ascii(blob);
         let body =
-            strip_versioned_magic(blob, SIGNED_TX_MAGIC, "signed transfer set", TX_SET_VERSION)?;
+            strip_versioned_magic(&blob, SIGNED_TX_MAGIC, "signed transfer set", TX_SET_VERSION)?;
         let data = decrypt(body, view_secret_key, true)?;
         let mut r = Reader::new(&data);
         let set = SignedTxSet::read(&mut r)?;
@@ -1257,6 +1263,104 @@ pub fn signed_txids(set: &SignedTxSet) -> Vec<Hash256> {
         .iter()
         .map(|p| crate::transfer::transaction_hash(&p.tx))
         .collect()
+}
+
+// -- the ASCII wrapper -----------------------------------------------------
+
+/// `ASCII_OUTPUT_MAGIC`. The name inside the PEM armour a wallet set to
+/// `export-format ascii` wraps these files in.
+pub const ASCII_MAGIC: &str = "WowneroAsciiDataV1";
+
+/// `wallet2::load_from_file`: unwrap the PEM armour, if there is any.
+///
+/// The reference looks for the magic *anywhere* in the file and only then
+/// unwraps, so a file that is not wrapped comes back untouched — which is what
+/// makes `export-format binary` and `ascii` both readable by the same reader.
+/// Every `from_file` below starts here.
+pub fn unwrap_ascii(blob: &[u8]) -> Vec<u8> {
+    let text = match std::str::from_utf8(blob) {
+        Ok(t) if t.contains(ASCII_MAGIC) => t,
+        _ => return blob.to_vec(),
+    };
+    let mut body = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("-----BEGIN") {
+            inside = true;
+            continue;
+        }
+        if line.starts_with("-----END") {
+            break;
+        }
+        if inside {
+            body.push_str(line);
+        }
+    }
+    base64_decode(&body).unwrap_or_else(|| blob.to_vec())
+}
+
+/// `wallet2::save_to_file` with `export-format ascii`: `PEM_write` with an
+/// empty header, which is the BEGIN line, base64 in 64-character lines, and
+/// the END line.
+pub fn wrap_ascii(blob: &[u8]) -> Vec<u8> {
+    let mut out = format!("-----BEGIN {ASCII_MAGIC}-----\n");
+    let encoded = base64_encode(blob);
+    for chunk in encoded.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {ASCII_MAGIC}-----\n"));
+    out.into_bytes()
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(BASE64[(n >> 18) as usize & 63] as char);
+        out.push(BASE64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = BASE64.iter().position(|t| *t == c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 fn strip_magic<'a>(blob: &'a [u8], magic: &[u8], what: &'static str) -> Result<&'a [u8]> {
@@ -1764,6 +1868,59 @@ mod tests {
             PendingTx::read(&mut r),
             Err(ColdError::Parse(wow_serialize::Error::InvalidValue(_)))
         ));
+    }
+
+    /// A wallet set to `export-format ascii` wraps its files in PEM armour,
+    /// and either form reads back.
+    #[test]
+    fn the_ascii_wrapper_round_trips() {
+        let set = ExportedOutputs {
+            offset: 0,
+            total: 2,
+            outputs: vec![sample_output(1), sample_output(2)],
+        };
+        let binary = set
+            .to_file(&address(), &view_key(), &mut rng())
+            .expect("export");
+        let ascii = wrap_ascii(&binary);
+
+        let text = std::str::from_utf8(&ascii).expect("ascii");
+        assert!(text.starts_with("-----BEGIN WowneroAsciiDataV1-----\n"));
+        assert!(text.ends_with("-----END WowneroAsciiDataV1-----\n"));
+        // `PEM_write` breaks the base64 at 64 characters.
+        for line in text.lines().skip(1) {
+            if line.starts_with("-----END") {
+                break;
+            }
+            assert!(line.len() <= 64, "{line}");
+        }
+
+        assert_eq!(unwrap_ascii(&ascii), binary);
+        // An unwrapped file is left exactly as it is: the reference looks for
+        // the magic first and only then unwraps.
+        assert_eq!(unwrap_ascii(&binary), binary);
+
+        // And the wrapped form goes straight into the reader.
+        assert_eq!(
+            ExportedOutputs::from_file(&ascii, &address(), &view_key()).expect("import"),
+            set
+        );
+    }
+
+    /// Base64, at every remainder.
+    #[test]
+    fn base64_round_trips_at_every_length() {
+        for n in 0..12usize {
+            let data: Vec<u8> = (0..n).map(|i| (i * 37 + 11) as u8).collect();
+            let encoded = base64_encode(&data);
+            assert_eq!(encoded.len(), data.len().div_ceil(3) * 4, "{n}");
+            assert_eq!(base64_decode(&encoded).expect("decode"), data, "{n}");
+        }
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(base64_decode("aGVsbG8=").expect("decode"), b"hello");
+        // Whitespace, which the PEM lines are full of, is skipped.
+        assert_eq!(base64_decode("aGVs\nbG8=").expect("decode"), b"hello");
+        assert_eq!(base64_decode("not base64!"), None);
     }
 
     /// The key image list is hex with a trailing space per entry, as

@@ -1225,6 +1225,23 @@ impl Session {
         }
     }
 
+    /// `m_export_format == ExportFormat::Ascii`: whether a file written for
+    /// the other half should be wrapped in PEM armour
+    /// ([`crate::cold::wrap_ascii`]).
+    ///
+    /// It is a *file* setting, not a format one: `save_to_file` wraps and
+    /// `export_outputs_to_str` does not, which is why the RPC's
+    /// `outputs_data_hex` is never wrapped and a file written by
+    /// `export_outputs` may be. Read from the keys file, where `set
+    /// export-format` puts it, and `Binary` (0) when it says nothing.
+    pub fn export_ascii(&self) -> bool {
+        self.keys_file
+            .settings
+            .get("export_format")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+    }
+
     /// Entropy for one operation, refused rather than substituted.
     fn entropy(&self) -> Result<Rng> {
         crate::entropy::seeded_rng().map_err(OfflineError::Entropy)
