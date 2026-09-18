@@ -123,6 +123,11 @@ pub struct Config {
     /// `--pad-transactions`: relayed transactions go out padded to a multiple
     /// of a kilobyte. Off by default, as in the C++.
     pub pad_transactions: bool,
+    /// `--proxy [socks5://[user:pass@]]ip:port`: dial every peer through it.
+    pub proxy: Option<wow_p2p::socks::Proxy>,
+    /// `--proxy-allow-dns-leaks`: with `--proxy`, allow a peer option to name
+    /// a host this node then resolves itself.
+    pub proxy_allow_dns_leaks: bool,
 
     // -- logging (`specs/09` §8) --
     /// `0`-`4` or `category:LEVEL,...`.
@@ -244,6 +249,8 @@ impl Default for Config {
             ban_list: None,
             keep_alt_blocks: false,
             pad_transactions: false,
+            proxy: None,
+            proxy_allow_dns_leaks: false,
             log_level: None,
             log_file: None,
             max_log_file_size: 104_850_000,
@@ -413,6 +420,14 @@ PEER-TO-PEER (specs/08)
     --keep-alt-blocks         keep alternative blocks across restarts
     --pad-transactions        pad relayed transactions to a multiple of 1 KiB,
                               against traffic volume analysis
+    --proxy [socks5://][user:pass@]<ip:port>
+                              dial every peer through this SOCKS5 proxy. The
+                              listener still takes incoming peers, but this
+                              node advertises no port and pings nobody back
+    --proxy-allow-dns-leaks   with --proxy, let --add-peer and friends name a
+                              host this node resolves itself. Without it they
+                              must be addresses, so no resolver is told whom
+                              this node is about to talk to
 
 LOGGING (specs/09 §8)
     --log-level <0-4 | category:LEVEL,...>                      (default: 0)
@@ -490,8 +505,8 @@ RPC METHODS SERVED   (R: not routed with --restricted-rpc)
                 json-minimal-txpool_add
 
 NOT YET IMPLEMENTED
-    Proxies, i2p/Tor, rate limits, pruning, bootstrap daemons,
-    background mining and extra messages in mined blocks are not built.
+    i2p/Tor, rate limits, pruning, bootstrap daemons, background mining
+    and extra messages in mined blocks are not built.
 
     Proof of work is checked for RandomWOW (major version 13 and up) and
     CryptoNight variant 1 (versions 7-8). Variants 2 and 4, which cover
@@ -512,7 +527,6 @@ NOT YET IMPLEMENTED
 /// Refused explicitly: accepting and ignoring them would make a node look
 /// configured when it is not.
 const NOT_IMPLEMENTED: &[(&str, &str)] = &[
-    ("--proxy", "connecting through a proxy is not implemented"),
     (
         "--tx-proxy",
         "the i2p/Tor transaction proxy is not implemented",
@@ -719,6 +733,7 @@ const FLAGS: &[&str] = &[
     "offline",
     "keep-alt-blocks",
     "pad-transactions",
+    "proxy-allow-dns-leaks",
     "non-interactive",
     "no-zmq",
     "disable-dns-checkpoints",
@@ -977,6 +992,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             }
             "--keep-alt-blocks" => cfg.keep_alt_blocks = true,
             "--pad-transactions" => cfg.pad_transactions = true,
+            "--proxy" => {
+                let v = take!(value(&mut it, &arg, "[socks5://][user:pass@]ip:port"));
+                let parsed = wow_p2p::socks::Proxy::parse(&v);
+                cfg.proxy = Some(take!(parsed.map_err(|e| format!("{arg}: {e}"))));
+            }
+            "--proxy-allow-dns-leaks" => cfg.proxy_allow_dns_leaks = true,
 
             "--log-level" => {
                 cfg.log_level = Some(take!(value(&mut it, &arg, "0-4 or category:LEVEL,...")));
@@ -1420,7 +1441,7 @@ mod tests {
             assert!(e.len() > opt.len() + 2, "{opt}: no reason given");
             assert!(e.contains(": "), "{opt}: {e}");
         }
-        assert!(err(&["--proxy"]).contains("proxy"));
+        assert!(err(&["--tx-proxy"]).contains("i2p/Tor"));
         assert!(err(&["--bg-mining-enable"]).contains("background mining"));
 
         // The RPC options are real now, so they must *not* be refused.
@@ -1811,6 +1832,30 @@ mod tests {
         assert!(err(&["--out-peers", "-5"]).contains("count"));
         assert!(err(&["--max-connections-per-ip", "0"]).contains("at least 1"));
         assert!(err(&["--p2p-bind-port", "70000"]).contains("port"));
+    }
+
+    /// `--proxy` is parsed here, so a value the SOCKS5 client cannot use is
+    /// refused before anything starts.
+    #[test]
+    fn the_proxy_options_parse() {
+        let c = run(&[]);
+        assert!(c.proxy.is_none() && !c.proxy_allow_dns_leaks);
+
+        let c = run(&["--proxy", "127.0.0.1:9050", "--proxy-allow-dns-leaks"]);
+        let proxy = c.proxy.expect("a proxy");
+        assert_eq!(proxy.address, "127.0.0.1:9050".parse().unwrap());
+        assert!(proxy.user.is_empty() && proxy.pass.is_empty());
+        assert!(c.proxy_allow_dns_leaks);
+
+        let c = run(&["--proxy", "socks5://bob:pw@[::1]:9050"]);
+        let proxy = c.proxy.expect("a proxy");
+        assert_eq!(proxy.address, "[::1]:9050".parse().unwrap());
+        assert_eq!((proxy.user.as_str(), proxy.pass.as_str()), ("bob", "pw"));
+
+        assert!(err(&["--proxy"]).contains("needs"));
+        assert!(err(&["--proxy", "socks4a://127.0.0.1:9050"]).contains("SOCKS5"));
+        let e = err(&["--proxy", "tor.example:9050"]);
+        assert!(e.starts_with("--proxy: "), "{e}");
     }
 
     /// The TLS options, with autodetect as the default and the key and

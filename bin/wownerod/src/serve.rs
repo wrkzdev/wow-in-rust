@@ -375,6 +375,43 @@ fn resolve_all(list: &[String], default_port: u16) -> Result<Vec<SocketAddr>, St
     Ok(out)
 }
 
+/// Whether `s` names an address rather than a host: `1.2.3.4`, `1.2.3.4:1`,
+/// `::1` or `[::1]:1`.
+fn is_address_literal(s: &str) -> bool {
+    s.parse::<SocketAddr>().is_ok() || s.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Refuse a peer option that would be resolved on this machine while
+/// `--proxy` is in force.
+///
+/// [`resolve_all`] asks this host's resolver, which would tell it whom the
+/// node is about to talk to -- the one thing the proxy is there to hide. The
+/// C++ guards the lookups it has the same way (`m_enable_dns_seed_nodes &=
+/// proxy_dns_leaks_allowed`); Wownero has no DNS seed nodes, so the lookups
+/// left to guard are the operator's own lists.
+fn check_no_dns_leaks(cfg: &Config) -> Result<(), String> {
+    if cfg.proxy.is_none() || cfg.proxy_allow_dns_leaks {
+        return Ok(());
+    }
+    let lists = [
+        ("--add-peer", &cfg.add_peers),
+        ("--add-priority-node", &cfg.priority_nodes),
+        ("--add-exclusive-node", &cfg.exclusive_nodes),
+        ("--seed-node", &cfg.seed_nodes),
+    ];
+    for (flag, list) in lists {
+        for entry in list {
+            if !is_address_literal(entry) {
+                return Err(format!(
+                    "{flag} {entry}: with --proxy, give an address rather than a name, \
+                     or pass --proxy-allow-dns-leaks to have this node resolve it here"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn start_p2p(cfg: &Config, core: Arc<NodeCore>) -> Result<Node, String> {
     let default_port = wow_p2p::messages::default_port(cfg.network);
     let mut p = wow_p2p::node::Config::new(cfg.network);
@@ -400,6 +437,8 @@ fn start_p2p(cfg: &Config, core: Arc<NodeCore>) -> Result<Node, String> {
         p.listen_v6 = Some(SocketAddr::new(ip6.into(), cfg.p2p_bind_port_ipv6));
     }
     p.require_ipv4 = !cfg.p2p_ignore_ipv4;
+    p.proxy = cfg.proxy.clone();
+    check_no_dns_leaks(cfg)?;
     p.external_port = cfg.p2p_external_port;
     p.hide_my_port = cfg.hide_my_port;
     p.out_peers = cfg.out_peers;
@@ -543,5 +582,41 @@ mod tests {
             vec!["[::1]:28080".parse().unwrap()]
         );
         assert!(resolve("not a host name!", 1).is_err());
+    }
+
+    /// Behind a proxy, a peer option naming a host is refused: resolving it
+    /// here would leak whom the node is about to reach. `--proxy-allow-dns-
+    /// leaks` says to do it anyway.
+    #[test]
+    fn a_proxied_node_refuses_to_resolve_a_peer_name() {
+        for literal in ["1.2.3.4", "1.2.3.4:34567", "::1", "[::1]:28080"] {
+            assert!(is_address_literal(literal), "{literal}");
+        }
+        for name in ["node.example", "node.example:34567", "x.onion:34567"] {
+            assert!(!is_address_literal(name), "{name}");
+        }
+
+        let mut cfg = Config {
+            add_peers: vec!["node.example".into()],
+            ..Config::default()
+        };
+        assert!(check_no_dns_leaks(&cfg).is_ok(), "no proxy, no rule");
+
+        cfg.proxy = Some(wow_p2p::socks::Proxy {
+            address: "127.0.0.1:9050".parse().unwrap(),
+            user: String::new(),
+            pass: String::new(),
+        });
+        let e = check_no_dns_leaks(&cfg).expect_err("a name behind a proxy");
+        assert!(e.starts_with("--add-peer node.example: "), "{e}");
+        assert!(e.contains("--proxy-allow-dns-leaks"), "{e}");
+
+        cfg.proxy_allow_dns_leaks = true;
+        assert!(check_no_dns_leaks(&cfg).is_ok(), "asked for anyway");
+
+        cfg.proxy_allow_dns_leaks = false;
+        cfg.add_peers = vec!["1.2.3.4:34567".into()];
+        cfg.seed_nodes = vec!["5.6.7.8".into()];
+        assert!(check_no_dns_leaks(&cfg).is_ok(), "addresses need no lookup");
     }
 }

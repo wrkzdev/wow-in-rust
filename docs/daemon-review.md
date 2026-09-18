@@ -72,7 +72,8 @@ Statuses:
 | `--out-peers`, `--in-peers`, `--max-connections-per-ip`; drop idle connections after 300 s | Done | |
 | Bans for bad proof of work and protocol violations; `--ban-list`; `get_bans`, `set_bans` | Done | `banned` added too. Only a failed verification bans a peer; this node's own gaps (such as an unimplemented CryptoNight variant) do not |
 | IPv6: `--p2p-use-ipv6`, `--p2p-bind-ipv6-address`, `--p2p-bind-port-ipv6`, `--p2p-ignore-ipv4` | Done | The IPv6 listener sets `IPV6_V6ONLY`, so it and the IPv4 listener can share a port ([`net.rs`](../crates/wow-p2p/src/net.rs)). `--p2p-bind-ipv6-address` defaults to `::`. IPv6 peers are dialled whether or not `--p2p-use-ipv6` is given, as in the C++ ([`tests/ipv6.rs`](../bin/wownerod/tests/ipv6.rs), [`tests/node.rs`](../crates/wow-p2p/tests/node.rs)) |
-| `--limit-rate-*`, `--proxy` | Open | Refused |
+| `--proxy` | Built, not yet run against a live proxy | Every outgoing connection is dialled through a SOCKS5 proxy written by hand ([`socks.rs`](../crates/wow-p2p/src/socks.rs), RFC 1928 with RFC 1929 for the password). The listener is untouched, but the node advertises `my_port` and `rpc_port` as 0 and pings nobody back, as `m_can_pingback = false` makes the C++ do. Two departures: only SOCKS5 is spoken, where the C++ also takes SOCKS 4 and 4a and reads a bare `ip:port` as 4a; and with `--proxy`, `--add-peer` and its companions must name an address rather than a host unless `--proxy-allow-dns-leaks` is given, since resolving one here would leak what the proxy hides |
+| `--limit-rate-*` | Open | Refused |
 | Blocking threads rather than an async runtime | Done as suggested | A reader and a writer thread per connection, with a bounded outbox |
 
 ## C. Relay and propagation
@@ -136,7 +137,8 @@ Statuses:
 
 **Daemon**
 
-* `--proxy`, `--tx-proxy` and `--anonymous-inbound` (i2p/Tor).
+* `--tx-proxy` and `--anonymous-inbound` (i2p/Tor). `--proxy` is built (see
+  B), but has not been run against a live proxy.
 * Rate limits (`--limit-rate*`).
 * Pruning, bootstrap daemons, RPC payments.
 * Background mining and extra messages in mined blocks.

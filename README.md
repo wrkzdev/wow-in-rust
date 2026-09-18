@@ -128,9 +128,11 @@ TLS, the ZMQ RPC and publisher — and the miner, on regtest.
 **Not built:** in the web wallet, a daemon login — a browser's `fetch` does
 not do HTTP Digest, so a node started with `--rpc-login` is out of reach from
 one; the other three front ends can log in. In the wallets, transaction
-proofs, key-image import/export and multiple accounts; in the daemon, proxies and i2p/Tor, rate limits, pruning,
+proofs, key-image import/export and multiple accounts; in the daemon, i2p/Tor,
+rate limits, pruning,
 bootstrap daemons, background mining, extra messages in mined blocks, and ZMQ
-over `ipc://` or with CURVE/PLAIN security. The daemon's `--help` names what is
+over `ipc://` or with CURVE/PLAIN security. `--proxy` is built but has only
+been exercised against a proxy written for its tests. The daemon's `--help` names what is
 missing rather than accepting options it cannot honour.
 [`docs/daemon-review.md`](docs/daemon-review.md) tracks the daemon review item
 by item, with the known gaps in what is built.

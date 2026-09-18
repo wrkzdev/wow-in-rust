@@ -58,6 +58,7 @@ use crate::messages::{
     SUPPORT_FLAG_FLUFFY_BLOCKS,
 };
 use crate::queue::{self, BlockQueue, SpanInfo};
+use crate::socks::{self, Proxy};
 use crate::sync::BatchSize;
 
 const LOG: &str = "net.p2p";
@@ -298,6 +299,13 @@ pub struct Config {
     /// `--pad-transactions`: relay transactions in messages padded to a
     /// multiple of a kilobyte, against traffic volume analysis.
     pub pad_transactions: bool,
+    /// `--proxy`: dial every outgoing connection through this SOCKS5 proxy.
+    ///
+    /// The listener is unaffected -- a node behind a proxy can still be
+    /// reached at a port it forwards -- but nothing it says advertises an
+    /// address any more, and it stops pinging back incoming peers, because
+    /// the address they see is the proxy's (`m_can_pingback`).
+    pub proxy: Option<Proxy>,
 }
 
 impl Config {
@@ -327,6 +335,7 @@ impl Config {
             ban_list: Vec::new(),
             rpc_port: 0,
             pad_transactions: false,
+            proxy: None,
         }
     }
 }
@@ -862,6 +871,9 @@ impl Node {
         });
 
         let mut threads = Vec::new();
+        if let Some(proxy) = &shared.cfg.proxy {
+            wow_log::info!(LOG, "dialling peers through the proxy at {proxy}");
+        }
         for listener in [listener, listener_v6].into_iter().flatten() {
             if let Ok(a) = listener.local_addr() {
                 wow_log::info!(LOG, "listening for peers on {a}");
@@ -1113,12 +1125,23 @@ impl Shared {
         Duration::from_millis(250 * self.poisson_draw(mean))
     }
 
+    /// `network_zone::m_can_pingback`: whether a peer could reach this node
+    /// at the address the connection came from.
+    ///
+    /// False behind `--proxy`, where the address a peer sees is the proxy's.
+    /// A node that cannot be pinged back advertises no port and no RPC port,
+    /// and does not ping back the peers that reach it.
+    fn can_pingback(&self) -> bool {
+        self.cfg.proxy.is_none()
+    }
+
     fn node_data(&self) -> BasicNodeData {
+        let pingback = self.can_pingback();
         BasicNodeData {
             network_id: messages::network_id(self.cfg.network),
             peer_id: self.peer_id,
-            my_port: self.my_port,
-            rpc_port: self.cfg.rpc_port,
+            my_port: if pingback { self.my_port } else { 0 },
+            rpc_port: if pingback { self.cfg.rpc_port } else { 0 },
             rpc_credits_per_hash: 0,
             support_flags: SUPPORT_FLAG_FLUFFY_BLOCKS,
         }
@@ -1661,7 +1684,12 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
                 return;
             }
 
-            if req.node_data.my_port != 0 && req.node_data.my_port <= u32::from(u16::MAX) {
+            // `if(arg.node_data.my_port && zone.m_can_pingback)`: a node that
+            // dials out through a proxy does not ping anyone back.
+            let ping_back_it = req.node_data.my_port != 0
+                && req.node_data.my_port <= u32::from(u16::MAX)
+                && shared.can_pingback();
+            if ping_back_it {
                 let s = shared.clone();
                 let node = req.node_data.clone();
                 let seed = req.payload_data.pruning_seed;
@@ -1736,12 +1764,23 @@ fn ping_back(shared: Arc<Shared>, ip: IpAddr, node: BasicNodeData, pruning_seed:
 }
 
 /// Dial and handshake, returning the connection ready to run.
+///
+/// With `--proxy`, the socket comes from the proxy instead. The target is
+/// given to it as an address rather than a name: everything dialled here came
+/// from a peer list or from an option this node resolved at start, so there is
+/// nothing left to look up.
 fn dial(
     shared: &Shared,
     addr: SocketAddr,
 ) -> Result<(TcpStream, FrameReader, HandshakeResponse), String> {
-    let mut stream =
-        TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
+    let mut stream = match &shared.cfg.proxy {
+        Some(proxy) => {
+            let target = socks::Target::Ip(addr);
+            socks::connect(proxy, target, socks::CONNECT_TIMEOUT)
+                .map_err(|e| format!("through the proxy at {proxy}: {e}"))?
+        }
+        None => TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?,
+    };
     let _ = stream.set_nodelay(true);
     let body = messages::handshake_request(&shared.node_data(), &shared.core.sync_data());
     write_frame(

@@ -13,6 +13,7 @@
 //! against.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,6 +26,7 @@ use wow_crypto::types::Hash256;
 use wow_p2p::addressbook::{AddressBook, BanTarget, STATE_FILENAME};
 use wow_p2p::messages::{BlockEntry, CoreSyncData};
 use wow_p2p::node::{BlockVerdict, ChainReply, Config, Core, Node, TxRelay, TxVerdict};
+use wow_p2p::socks::Proxy;
 use wow_p2p::sync::{self, ChainTip};
 use wow_p2p::{NodeIdentity, Peer};
 use wow_types::{Block, Network};
@@ -775,6 +777,104 @@ fn a_node_syncs_over_ipv6() {
             .iter()
             .any(|r| Some(r.addr) == b.local_addr_v6())
     });
+}
+
+/// A SOCKS5 proxy that connects where it is asked and then pumps bytes both
+/// ways, recording each address it was asked for.
+///
+/// It understands only what the node's client sends: version 5, no
+/// authentication, and a target given as an address.
+fn socks_proxy(seen: Arc<Mutex<Vec<SocketAddr>>>) -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the proxy");
+    let addr = listener.local_addr().expect("the proxy's address");
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(mut client) = client else {
+                continue;
+            };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut greeting = [0u8; 2];
+                let mut head = [0u8; 4];
+                let mut rest = [0u8; 6];
+                if client.read_exact(&mut greeting).is_err() {
+                    return;
+                }
+                let mut methods = vec![0u8; usize::from(greeting[1])];
+                if client.read_exact(&mut methods).is_err() {
+                    return;
+                }
+                if client.write_all(&[5, 0]).is_err() {
+                    return;
+                }
+                if client.read_exact(&mut head).is_err() {
+                    return;
+                }
+                // Only `ATYP = 1`: a peer list carries addresses, not names.
+                if head[3] != 1 || client.read_exact(&mut rest).is_err() {
+                    return;
+                }
+                let ip = std::net::Ipv4Addr::new(rest[0], rest[1], rest[2], rest[3]);
+                let port = u16::from_be_bytes([rest[4], rest[5]]);
+                let target = SocketAddr::from((ip, port));
+                let Ok(upstream) = std::net::TcpStream::connect(target) else {
+                    return;
+                };
+                seen.lock().unwrap().push(target);
+                if client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).is_err() {
+                    return;
+                }
+
+                let mut from_client = client.try_clone().expect("clone");
+                let mut to_upstream = upstream.try_clone().expect("clone");
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut from_client, &mut to_upstream);
+                });
+                let mut from_upstream = upstream;
+                let _ = std::io::copy(&mut from_upstream, &mut client);
+            });
+        }
+    });
+    addr
+}
+
+/// **The reason `--proxy` exists.** A node given one opens no connection of
+/// its own: it asks the proxy for every peer, and syncs the chain over what
+/// comes back. It also advertises no port, so the peer it reached cannot list
+/// it -- the address that peer sees is the proxy's.
+#[test]
+fn a_node_with_a_proxy_syncs_through_it() {
+    let t = template();
+    let genesis = make_block(&t, [0u8; 32], 0);
+    let a_core = MemCore::new(&genesis);
+    a_core.extend(20, &t);
+    let b_core = MemCore::new(&genesis);
+
+    let a = Node::start(config(Vec::new()), a_core.clone(), rng(1)).expect("start a");
+    let a_listens = a.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let proxy = socks_proxy(seen.clone());
+
+    let mut b_cfg = config(vec![a_listens]);
+    b_cfg.proxy = Some(Proxy {
+        address: proxy,
+        user: String::new(),
+        pass: String::new(),
+    });
+    let b = Node::start(b_cfg, b_core.clone(), rng(2)).expect("start b");
+
+    wait_until("the chain through the proxy", 60, || b_core.height() == 21);
+    assert_eq!(b_core.tip(), a_core.tip());
+    assert_eq!(seen.lock().unwrap().first(), Some(&a_listens));
+    assert_eq!(b.sync_status().outgoing, 1);
+
+    // Nothing `b` sent advertised a port, so no ping-back can have listed it.
+    std::thread::sleep(Duration::from_millis(500));
+    let b_listens = b.local_addr().unwrap();
+    assert!(
+        !a.peer_lists().0.iter().any(|r| r.addr == b_listens),
+        "a proxied node is not listed by the peers it reaches"
+    );
 }
 
 /// A peer that goes away mid-sync gives back what it had not delivered, and
