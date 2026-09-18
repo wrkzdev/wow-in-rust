@@ -954,7 +954,7 @@ impl Session {
                 src.real_output_in_tx_index,
             )
             .ok_or(OfflineError::NotOurs(n))?;
-            let secret_key = one_time_secret_key(
+            let secret_key = one_time_key_from(
                 account,
                 &derivation,
                 src.real_output_in_tx_index,
@@ -1275,7 +1275,12 @@ fn in_prime_order_subgroup(key_image: &KeyImage) -> bool {
 ///
 /// `generate_key_image_helper_precomp`: `Hs(D || i) + b`, plus the subaddress
 /// secret for anything but the main address.
-fn one_time_secret_key(
+///
+/// [`crate::refresh::one_time_secret_key`] is the same calculation from a
+/// [`Transfer`], which is what the send path has. Here there is no
+/// `Transfer` — the derivation has just been recovered from a transaction key
+/// a file carried — so it takes the pieces.
+fn one_time_key_from(
     account: &crate::AccountBase,
     derivation: &KeyDerivation,
     output_index: u64,
@@ -1310,7 +1315,7 @@ fn derive_for_output(
             .and_then(|k| wow_crypto::generate_key_derivation(k, view)),
     ];
     for d in candidates.into_iter().flatten() {
-        let secret = one_time_secret_key(account, &d, output_index, subaddress);
+        let secret = one_time_key_from(account, &d, output_index, subaddress);
         if wow_crypto::secret_key_to_public_key(&secret).as_ref() == Some(public_key) {
             return Some((d, secret));
         }
