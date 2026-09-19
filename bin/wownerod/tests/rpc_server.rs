@@ -190,6 +190,36 @@ fn post(port: u16, path: &str, body: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("bad JSON: {e}\n{body}"))
 }
 
+/// One response off a connection that stays open: the head, then exactly as
+/// many body bytes as `Content-Length` promised. Reading to the end of the
+/// stream is no use when the server is not going to close it.
+fn read_response(reader: &mut std::io::BufReader<TcpStream>) -> (String, String) {
+    use std::io::BufRead;
+
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "the server closed before the head was complete"
+        );
+        if line == "\r\n" {
+            break;
+        }
+        head.push_str(&line);
+    }
+    let len: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Length: "))
+        .expect("a Content-Length")
+        .trim()
+        .parse()
+        .expect("a number");
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).unwrap();
+    (head, String::from_utf8(body).expect("UTF-8"))
+}
+
 /// One raw HTTP exchange, returning the whole response text.
 fn raw(port: u16, request: &str) -> String {
     let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -236,7 +266,7 @@ fn browser_requests_are_refused_and_no_cors_header_is_sent() {
         d.port,
         &format!(
             "POST /get_height HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.com\r\n\
-             Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+             Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         ),
     );
@@ -247,7 +277,7 @@ fn browser_requests_are_refused_and_no_cors_header_is_sent() {
         d.port,
         &format!(
             "POST /get_height HTTP/1.1\r\nHost: 127.0.0.1\r\n\
-             Content-Length: {}\r\n\r\n{body}",
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         ),
     );
@@ -255,6 +285,70 @@ fn browser_requests_are_refused_and_no_cors_header_is_sent() {
     assert!(
         !from_a_client.contains("Access-Control-Allow-Origin"),
         "{from_a_client}"
+    );
+}
+
+/// Keep-alive, which `wallet2` needs for more than speed: epee's client
+/// retries a `401` on the same socket without reconnecting
+/// (`http_client.h`'s `invoke` loop), so a connection closed after the Digest
+/// challenge makes logging in impossible. HTTP/1.1 with no `Connection` header
+/// keeps the connection, as RFC 7230 §6.3 says.
+#[test]
+fn one_connection_answers_more_than_one_request() {
+    let d = start("keepalive", 1);
+    let mut s = TcpStream::connect(("127.0.0.1", d.port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut reader = std::io::BufReader::new(s.try_clone().unwrap());
+
+    let body = "{}";
+    let req = format!(
+        "POST /get_height HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+
+    for n in 0..3 {
+        s.write_all(req.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let (head, body) = read_response(&mut reader);
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "request {n}: {head}");
+        assert!(
+            head.contains("Connection: keep-alive"),
+            "request {n}: {head}"
+        );
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(v["status"], "OK", "request {n}");
+    }
+
+    // And `Connection: close` still ends it, which is what every other test
+    // here relies on.
+    let closing = format!(
+        "POST /get_height HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(closing.as_bytes()).unwrap();
+    s.flush().unwrap();
+    let (head, _) = read_response(&mut reader);
+    assert!(head.contains("Connection: close"), "{head}");
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    assert!(rest.is_empty(), "the connection should be done: {rest}");
+}
+
+/// `/get_transaction_pool_hashes.bin` is **JSON**, not epee: the one `.bin`
+/// path the reference maps with `MAP_URI_AUTO_JON2` rather than
+/// `MAP_URI_AUTO_BIN2`, and the one `wallet2` calls with `invoke_http_json`.
+/// Answering it in epee is read by the wallet as no connection at all
+/// (`docs/spec-deltas.md` §28).
+#[test]
+fn the_pool_hashes_bin_path_answers_json() {
+    let d = start("poolhashes", 1);
+    // `post` already asserts the content type is application/json.
+    let v = post(d.port, "/get_transaction_pool_hashes.bin", "{}");
+    assert_eq!(v["status"], "OK");
+    assert_eq!(
+        v["tx_hashes"], "",
+        "an empty pool is an empty blob string, not an array"
     );
 }
 

@@ -113,7 +113,11 @@ fn start(data_dir: &Path, port: u16, extra: &[&str]) -> Daemon {
     panic!("wownerod did not start listening");
 }
 
-const REQUEST: &[u8] = b"POST /get_height HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
+/// `Connection: close`, so that reading to the end of the stream is reading to
+/// the end of the answer. Without it the server keeps the connection, as
+/// HTTP/1.1 says to, and these helpers would sit out their read timeout.
+const REQUEST: &[u8] = b"POST /get_height HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\
+                         Connection: close\r\n\r\n{}";
 
 /// A plain request, returning what came back -- nothing, on a TLS-only port.
 fn plain(port: u16) -> String {

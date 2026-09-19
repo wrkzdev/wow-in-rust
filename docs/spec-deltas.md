@@ -1188,3 +1188,56 @@ layout section when choosing a crate.
 **Pinned by:** nothing, and it cannot be — a layout is not a behaviour. The
 README's layout listing names all fifteen and says which two are empty, which
 is the nearest thing to a check there is.
+
+---
+
+## 28. `/get_transaction_pool_hashes.bin` is JSON, despite the suffix
+
+**Spec:** `specs/11` §5 lists every path ending in `.bin` as epee portable
+storage — "Body and response are **epee portable storage**" — and
+`/get_transaction_pool_hashes.bin` is in that table.
+
+**Reality:** it is the one exception. Of the nine `.bin` paths in the
+reference's URI map, eight are `MAP_URI_AUTO_BIN2` and this one is not:
+
+```cpp
+// src/rpc/core_rpc_server.h
+MAP_URI_AUTO_BIN2("/get_outs.bin",                   on_get_outs_bin,  ...)
+MAP_URI_AUTO_BIN2("/get_output_distribution.bin",    on_get_output_distribution_bin, ...)
+MAP_URI_AUTO_JON2("/get_transaction_pool_hashes.bin", on_get_transaction_pool_hashes_bin, ...)
+```
+
+`MAP_URI_AUTO_JON2` parses the request with `load_t_from_json` and renders the
+answer with `store_t_to_json`, so a node answers this path in JSON and refuses
+an epee request outright — `MAP_URI_AUTO_BIN2`'s sibling returns `400 Bad
+Request` on a parse failure, and this one never sees epee as anything but
+malformed JSON. `wallet2` matches it:
+
+```cpp
+// src/wallet/wallet2.cpp, update_pool_state_by_pool_query
+bool r = epee::net_utils::invoke_http_json("/get_transaction_pool_hashes.bin", req, res, *m_http_client, rpc_timeout);
+```
+
+`invoke_http_json`, where every other `.bin` call in that file is
+`invoke_http_bin`.
+
+The answer is JSON with one field that is not: `tx_hashes` is a
+`KV_SERIALIZE_CONTAINER_POD_AS_BLOB`, so the packed 32-byte hashes go inside a
+JSON string as **raw bytes**, escaped only for `\b \f \n \r \t \v " \ /`
+(`transform_to_escape_sequence`). The result is not valid UTF-8 and not valid
+JSON, and only epee's own reader can read it back — a `\uXXXX` escape would not
+do, because `match_string2` decodes one into UTF-8 and any byte above `0x7f`
+would come back as two.
+
+**Why it matters:** it cost this node a wallet. Routing by the `.bin` suffix
+sent epee to a JSON caller, `wallet2` could not parse the reply, and it reports
+a reply it cannot parse as `no_connection_to_daemon` — so a node that was
+answering every other call correctly looked like a node that was not running,
+on every refresh. It cost the wallet side too: `wow-daemon-client` asked for
+this path in epee, which no C++ node would ever have answered.
+
+**Pinned by:** `wow_daemon_client::DaemonClient::get_pool_hashes`, which now
+asks `/get_transaction_pool_hashes` — the plain JSON endpoint beside it, which
+sends hex strings an ordinary parser can read — and, on the node's side,
+`wownerod::rpc::admin::pool_hashes_as_json` with
+`methods::a_blob_field_is_escaped_the_way_epee_escapes_one`.

@@ -38,6 +38,7 @@ pub mod mining;
 pub mod tls;
 
 use std::collections::HashMap;
+use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -62,6 +63,11 @@ pub const MAX_CONNECTIONS: usize = 100;
 pub const MAX_CONNECTIONS_PER_PUBLIC_IP: usize = 3;
 /// `DEFAULT_RPC_MAX_CONNECTIONS_PER_PRIVATE_IP`, which covers loopback.
 pub const MAX_CONNECTIONS_PER_PRIVATE_IP: usize = 25;
+
+/// How many requests one kept-alive connection may carry before it is closed
+/// anyway. The C++ caps nothing here; this is so a client cannot hold a thread
+/// and a slot under [`MAX_CONNECTIONS`] for as long as it keeps talking.
+const MAX_REQUESTS_PER_CONNECTION: usize = 10_000;
 
 /// JSON-RPC methods marked **R** (`specs/11` §4) that this node serves.
 const RESTRICTED_METHODS: &[&str] = &[
@@ -479,25 +485,78 @@ fn handle(server: &Server, tcp: TcpStream, restricted: bool, ip: IpAddr) {
         },
         None => tls::Stream::Plain(tcp),
     };
-    respond(server, &mut stream, restricted, ip);
+    serve(server, &mut stream, restricted, ip);
     stream.finish();
 }
 
+/// Answer requests on one connection until either side ends it.
+///
+/// Keep-alive is a requirement here rather than an optimisation: epee's client
+/// retries a `401` on the same socket without reconnecting, so a connection
+/// closed after the challenge makes HTTP Digest impossible ([`http`]). The
+/// reader is made once and outlives each request, because it may already hold
+/// the first bytes of the next one.
+fn serve(server: &Server, stream: &mut tls::Stream, restricted: bool, ip: IpAddr) {
+    let mut reader = BufReader::new(stream);
+    for _ in 0..MAX_REQUESTS_PER_CONNECTION {
+        if !respond(server, &mut reader, restricted, ip) {
+            return;
+        }
+    }
+    wow_log::debug!(
+        "daemon.rpc",
+        "{ip}: {MAX_REQUESTS_PER_CONNECTION} requests on one connection, closing it"
+    );
+}
+
+/// Whether an answer reached the client.
+///
+/// A short write used to be discarded, which left the caller with fewer bytes
+/// than the `Content-Length` it had been promised and nothing on this side to
+/// say so -- the same shape of failure as a cut reply from a C++ node, and as
+/// hard to read from the other end.
+fn sent(ip: IpAddr, path: &str, wrote: std::io::Result<()>) -> bool {
+    match wrote {
+        Ok(()) => true,
+        Err(e) => {
+            wow_log::debug!("daemon.rpc", "{ip}: {path}: the answer was not sent: {e}");
+            false
+        }
+    }
+}
+
 /// Read one request and answer it, over whichever stream the connection is.
-fn respond(server: &Server, stream: &mut tls::Stream, restricted: bool, ip: IpAddr) {
-    let req = match http::read_request(stream) {
+/// Returns whether the connection carries on.
+fn respond<S: Read + Write>(
+    server: &Server,
+    reader: &mut BufReader<S>,
+    restricted: bool,
+    ip: IpAddr,
+) -> bool {
+    let req = match http::read_request(reader) {
         Ok(r) => r,
-        Err(http::HttpError::Closed) => return,
+        Err(http::HttpError::Closed) => return false,
         Err(e) => {
             let body = json!({"status": "Failed", "error": e.to_string()}).to_string();
             let code = match e {
                 http::HttpError::BodyTooLarge { .. } => 413,
                 _ => 400,
             };
-            let _ = http::write_json(stream, code, &body);
-            return;
+            // Where a request stopped making sense the stream is at an unknown
+            // offset, so this answer is the connection's last whatever the
+            // request asked for.
+            sent(
+                ip,
+                "",
+                http::write_json(reader.get_mut(), code, &body, false),
+            );
+            return false;
         }
     };
+
+    // RFC 7230 §6.3. Every answer below carries this, and says `close` only
+    // when the client asked for it or this side has to.
+    let keep_alive = req.keep_alive();
 
     // A browser sends `Origin` with every cross-origin request -- including
     // the "simple" text/plain POST that needs no CORS preflight and still
@@ -514,8 +573,11 @@ fn respond(server: &Server, stream: &mut tls::Stream, restricted: bool, ip: IpAd
                 "error": "cross-origin requests are refused"
             })
             .to_string();
-            let _ = http::write_json(stream, 403, &body);
-            return;
+            return sent(
+                ip,
+                &req.path,
+                http::write_json(reader.get_mut(), 403, &body, keep_alive),
+            ) && keep_alive;
         }
         headers.push(("Access-Control-Allow-Origin", origin.to_string()));
         headers.push(("Access-Control-Allow-Credentials", "true".into()));
@@ -527,8 +589,11 @@ fn respond(server: &Server, stream: &mut tls::Stream, restricted: bool, ip: IpAd
                 "Access-Control-Allow-Headers",
                 "Authorization, Content-Type".into(),
             ));
-            let _ = http::write_json_with(stream, 200, "{}", &headers);
-            return;
+            return sent(
+                ip,
+                &req.path,
+                http::write_json_with(reader.get_mut(), 200, "{}", &headers, keep_alive),
+            ) && keep_alive;
         }
     }
 
@@ -536,8 +601,11 @@ fn respond(server: &Server, stream: &mut tls::Stream, restricted: bool, ip: IpAd
     // endpoints so they can be poked at from a browser.
     if req.method != "POST" && req.method != "GET" {
         let body = json!({"status": "Failed", "error": "use POST"}).to_string();
-        let _ = http::write_json_with(stream, 405, &body, &headers);
-        return;
+        return sent(
+            ip,
+            &req.path,
+            http::write_json_with(reader.get_mut(), 405, &body, &headers, keep_alive),
+        ) && keep_alive;
     }
 
     if let Some(login) = &server.login {
@@ -554,13 +622,49 @@ fn respond(server: &Server, stream: &mut tls::Stream, restricted: bool, ip: IpAd
             }
             headers.push(("WWW-Authenticate", login.challenge()));
             let body = json!({"status": "Unauthorized"}).to_string();
-            let _ = http::write_json_with(stream, 401, &body, &headers);
-            return;
+            // The challenge **must** keep the connection: epee sends its
+            // credentials on this very socket without reconnecting first.
+            return sent(
+                ip,
+                &req.path,
+                http::write_json_with(reader.get_mut(), 401, &body, &headers, keep_alive),
+            ) && keep_alive;
         }
     }
 
     methods::set_untrusted(!server.sync_status().synchronized);
     let path = req.path.split('?').next().unwrap_or("/");
+
+    // `/get_transaction_pool_hashes.bin` is **JSON**, not epee, despite the
+    // suffix it shares with the binary endpoints: the reference maps it with
+    // `MAP_URI_AUTO_JON2` where every other `.bin` path gets
+    // `MAP_URI_AUTO_BIN2` (`core_rpc_server.h`), and `wallet2` matches it with
+    // `invoke_http_json` (`update_pool_state_by_pool_query`). Routing it by the
+    // suffix answered epee bytes to a JSON caller; `load_t_from_json` cannot
+    // read those, and the wallet reports a reply it cannot parse as
+    // `no_connection_to_daemon` -- so a working node looked like an absent one
+    // on every refresh.
+    if path == admin::POOL_HASHES_BIN_PATH {
+        // A caller that sent epee gets epee back. This project's own wallets
+        // used to read the suffix at face value and ask in epee, so answering
+        // by what was asked keeps an upgraded node talking to a wallet that has
+        // not been upgraded with it. Everything else -- `wallet2` included --
+        // asks in JSON and gets JSON.
+        let wrote = if req.body.starts_with(&wow_serialize::epee::HEADER) {
+            let section = binary::pool_hashes_epee(server, restricted);
+            let body = wow_serialize::epee::to_bytes(&section).unwrap_or_else(|e| {
+                binary::error_response(&RpcError::new(
+                    methods::error::INTERNAL_ERROR,
+                    e.to_string(),
+                ))
+            });
+            http::write_binary_with(reader.get_mut(), 200, &body, &headers, keep_alive)
+        } else {
+            let body = admin::pool_hashes_as_json(server, restricted);
+            http::write_json_bytes_with(reader.get_mut(), 200, &body, &headers, keep_alive)
+        };
+        return sent(ip, path, wrote) && keep_alive;
+    }
 
     // The binary endpoints answer in epee, not JSON, so they branch before the
     // JSON writer (`specs/11` §5).
@@ -574,21 +678,33 @@ fn respond(server: &Server, stream: &mut tls::Stream, restricted: bool, ip: IpAd
             }),
             Err(e) => binary::error_response(&e),
         };
-        let _ = http::write_binary_with(stream, 200, &body, &headers);
-        return;
+        return sent(
+            ip,
+            path,
+            http::write_binary_with(reader.get_mut(), 200, &body, &headers, keep_alive),
+        ) && keep_alive;
     }
 
     let body = if path == "/json_rpc" {
         json_rpc(server, &req.body, restricted)
     } else {
-        direct(server, path, &req.body, restricted)
+        direct(server, path, &req.body, restricted).into_bytes()
     };
 
-    let _ = http::write_json_with(stream, 200, &body, &headers);
+    sent(
+        ip,
+        path,
+        http::write_json_bytes_with(reader.get_mut(), 200, &body, &headers, keep_alive),
+    ) && keep_alive
 }
 
 /// `POST /json_rpc` — the JSON-RPC 2.0 envelope (`specs/11` §1).
-fn json_rpc(server: &Server, body: &[u8], restricted: bool) -> String {
+///
+/// Bytes rather than a `String`, because two methods answer with a
+/// `KV_SERIALIZE_CONTAINER_POD_AS_BLOB`: a JSON string of raw bytes that no
+/// `serde_json::Value` can hold, so their results are rendered rather than
+/// built (`methods::object_with_blob`).
+fn json_rpc(server: &Server, body: &[u8], restricted: bool) -> Vec<u8> {
     let request: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return json!({
@@ -596,7 +712,8 @@ fn json_rpc(server: &Server, body: &[u8], restricted: bool) -> String {
             "id": "0",
             "error": {"code": methods::error::WRONG_PARAM, "message": format!("invalid JSON: {e}")}
         })
-        .to_string(),
+        .to_string()
+        .into_bytes(),
     };
 
     let id = request.get("id").cloned().unwrap_or(json!("0"));
@@ -605,13 +722,45 @@ fn json_rpc(server: &Server, body: &[u8], restricted: bool) -> String {
 
     // Not routed at all, so answered as a method that does not exist.
     if restricted && RESTRICTED_METHODS.contains(&method) {
-        return error_envelope(&id, &RpcError::unsupported(method));
+        return error_envelope(&id, &RpcError::unsupported(method)).into_bytes();
+    }
+
+    // The two that carry raw bytes, before the table that cannot express them.
+    match method {
+        "get_txpool_backlog" => {
+            return result_envelope(&id, &methods::txpool_backlog(server, restricted))
+        }
+        "get_output_distribution" => {
+            return match methods::output_distribution_json(
+                server.db(),
+                server.config(),
+                &params,
+                restricted,
+            ) {
+                Ok(result) => result_envelope(&id, &result),
+                Err(e) => error_envelope(&id, &e).into_bytes(),
+            }
+        }
+        _ => {}
     }
 
     match dispatch(server, method, &params, restricted) {
-        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
-        Err(e) => error_envelope(&id, &e),
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result})
+            .to_string()
+            .into_bytes(),
+        Err(e) => error_envelope(&id, &e).into_bytes(),
     }
+}
+
+/// A JSON-RPC envelope around a result that is already rendered.
+fn result_envelope(id: &Value, result: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(result.len() + 64);
+    out.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":");
+    out.extend_from_slice(id.to_string().as_bytes());
+    out.extend_from_slice(b",\"result\":");
+    out.extend_from_slice(result);
+    out.push(b'}');
+    out
 }
 
 fn error_envelope(id: &Value, e: &RpcError) -> String {
@@ -638,6 +787,11 @@ fn dispatch(server: &Server, method: &str, params: &Value, restricted: bool) -> 
         "get_version" => methods::get_version(server),
         "hard_fork_info" => methods::hard_fork_info(db, cfg, params),
         "get_fee_estimate" => methods::get_fee_estimate(server, params),
+        // RPC payment is not built, and the reference answers this whether or
+        // not it has one. Answering "no such method" is read by `wallet2` as a
+        // lost connection, not as a missing feature.
+        "rpc_access_info" => methods::rpc_access_info(),
+        "get_output_histogram" => methods::get_output_histogram(db, params, restricted),
 
         "get_block_hash" | "on_get_block_hash" | "on_getblockhash" => {
             methods::get_block_hash(db, params)

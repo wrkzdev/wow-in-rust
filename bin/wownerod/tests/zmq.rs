@@ -136,7 +136,8 @@ fn post(port: u16, path: &str, body: &Value) -> Value {
     let mut s = TcpStream::connect(localhost(port)).expect("connect");
     s.set_read_timeout(Some(TIMEOUT)).unwrap();
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
         body.len()
     );
     s.write_all(req.as_bytes()).unwrap();
