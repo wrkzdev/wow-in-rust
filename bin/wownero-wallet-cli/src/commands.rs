@@ -208,7 +208,7 @@ pub fn run_one(session: &mut Session, line: &str) -> Result<Outcome, String> {
             Ok(())
         }
         "version" => {
-            println!("wownero-wallet-cli {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", crate::VERSION);
             Ok(())
         }
         "exit" | "quit" | "q" => return Ok(Outcome::Quit),

@@ -319,10 +319,15 @@ pub enum ParseOutcome {
     Error(String),
 }
 
+/// The C++ release this build aims to be compatible with (`specs/00` §1):
+/// `wownero-project/wownero` tag `v0.11.4.0`, commit `9f4f22c72`. The Rust
+/// version above it is this project's own and no longer mirrors this number.
+pub const CPP_VERSION: &str = "0.11.4.0 \"Kunty Karen\"";
+
 pub const VERSION: &str = concat!(
     "wownerod ",
     env!("CARGO_PKG_VERSION"),
-    " (wownero-rs, tracking the C++ tree at 0.11.4.0 \"Kunty Karen\")"
+    " (wownero-rs, compatible with Wownero C++ 0.11.4.0 \"Kunty Karen\")"
 );
 
 pub fn help() -> String {

@@ -4,6 +4,10 @@
 > may have bugs that lose funds. Use it at your own risk, with amounts you can
 > afford to lose.**
 
+Version 1.0.1, compatible with the Wownero C++ tree at `0.11.4.0` "Kunty Karen".
+The version number is this project's own and no longer copies the C++ one; see
+the root [README](../README.md).
+
 Two front ends over the wallet library `wownero-wallet-cli` uses
 (`crates/wow-wallet`), with one interface, written with
 [egui](https://github.com/emilk/egui), shared between them:

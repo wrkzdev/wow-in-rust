@@ -4648,7 +4648,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wow-consensus"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "wow-crypto",
  "wow-randomwow",
@@ -4657,7 +4657,7 @@ dependencies = [
 
 [[package]]
 name = "wow-crypto"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "curve25519-dalek",
  "subtle",
@@ -4668,7 +4668,7 @@ dependencies = [
 
 [[package]]
 name = "wow-daemon-client"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "rustls",
  "serde_json",
@@ -4682,22 +4682,22 @@ dependencies = [
 
 [[package]]
 name = "wow-log"
-version = "0.11.4"
+version = "1.0.1"
 
 [[package]]
 name = "wow-randomwow"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "wow-serialize"
-version = "0.11.4"
+version = "1.0.1"
 
 [[package]]
 name = "wow-tls"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -4715,7 +4715,7 @@ dependencies = [
 
 [[package]]
 name = "wow-types"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "wow-crypto",
  "wow-serialize",
@@ -4723,7 +4723,7 @@ dependencies = [
 
 [[package]]
 name = "wow-wallet"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "curve25519-dalek",
  "libc",
@@ -4739,7 +4739,7 @@ dependencies = [
 
 [[package]]
 name = "wownero-wallet-gui"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "eframe",
@@ -4757,7 +4757,7 @@ dependencies = [
 
 [[package]]
 name = "wownero-wallet-web"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "eframe",
  "js-sys",

@@ -4,6 +4,21 @@ A Rust reimplementation of the Wownero suite — daemon, wallet CLI, wallet RPC,
 and a desktop and a web wallet — drop-in compatible with the C++ tree at version
 `0.11.4.0` "Kunty Karen".
 
+**This is version 1.0.1.** The number is this project's own. Up to `0.11.4` it
+copied the C++ release it tracks, which read as if the two were the same thing;
+they are not, and from 1.0.0 they move apart. What a build targets is printed by
+the binaries and written into every release archive's `BUILDINFO`:
+
+```console
+$ wownerod --version
+wownerod 1.0.1 (wownero-rs, compatible with Wownero C++ 0.11.4.0 "Kunty Karen")
+```
+
+`wownero-wallet-cli --version` and `wownero-wallet-rpc --version` say the same
+of themselves. The C++ tree meant is tag `v0.11.4.0`, commit `9f4f22c72`, and on
+the wire that means `CORE_RPC_VERSION` 3.15 and `WALLET_RPC_VERSION` 1.30 — the
+same numbers the C++ of that release reports.
+
 > [!WARNING]
 > **Unofficial, AI-assisted and experimental. Use it at your own risk.**
 >

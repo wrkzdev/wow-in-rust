@@ -1219,7 +1219,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "wow-consensus"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "hex",
  "wow-crypto",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "wow-core"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "wow-consensus",
  "wow-crypto",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "wow-crypto"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "curve25519-dalek",
  "hex",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "wow-daemon-client"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "rcgen",
  "rustls",
@@ -1270,11 +1270,11 @@ dependencies = [
 
 [[package]]
 name = "wow-log"
-version = "0.11.4"
+version = "1.0.1"
 
 [[package]]
 name = "wow-p2p"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "socket2",
  "wow-crypto",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "wow-randomwow"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "libc",
  "wow-crypto",
@@ -1294,22 +1294,22 @@ dependencies = [
 
 [[package]]
 name = "wow-rpc-server"
-version = "0.11.4"
+version = "1.0.1"
 
 [[package]]
 name = "wow-rpc-types"
-version = "0.11.4"
+version = "1.0.1"
 
 [[package]]
 name = "wow-serialize"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "hex",
 ]
 
 [[package]]
 name = "wow-storage"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "libc",
  "lmdb-master-sys",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "wow-tls"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "wow-types"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "hex",
  "wow-crypto",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "wow-wallet"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "curve25519-dalek",
  "libc",
@@ -1365,14 +1365,14 @@ dependencies = [
 
 [[package]]
 name = "wow-zmq"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "wow-log",
 ]
 
 [[package]]
 name = "wownero-wallet-cli"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "curve25519-dalek",
  "libc",
@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "wownero-wallet-rpc"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "curve25519-dalek",
  "serde_json",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "wownerod"
-version = "0.11.4"
+version = "1.0.1"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",

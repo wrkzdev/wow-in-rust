@@ -22,6 +22,9 @@ out=${OUT_DIR:-/out}
 : "${SOURCE_DATE_EPOCH:=315532800}"
 
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$src/Cargo.toml" | head -n1)
+# The C++ release these binaries aim to be compatible with. Its own number,
+# which the Rust version no longer mirrors, so BUILDINFO carries both.
+cpp_version='0.11.4.0 "Kunty Karen"'
 case $target in
   *windows*) exe=.exe ;;
   *) exe= ;;
@@ -39,6 +42,8 @@ install -m 0644 "$src/README.md" "$stage/"
 
 cat > "$stage/BUILDINFO" <<EOF
 name:      $name
+version:   $version
+compat:    Wownero C++ $cpp_version
 git:       $GIT_REV
 target:    $target
 rustc:     $(rustc -V)
