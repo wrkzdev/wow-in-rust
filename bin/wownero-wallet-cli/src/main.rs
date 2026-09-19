@@ -218,9 +218,19 @@ Whatever the options below leave out is asked for.
   --max-log-files <n>               rotated files to keep, default 50
   --command <cmd ...>               run one command and exit
   --help
+  --version
 
 A seed, key or password given as an option can be read from the process list
 by other users, and stays in the shell history. Leave it out to be asked.";
+
+/// `--version`. The number is this project's own; the C++ release named after
+/// it is the one this build aims to be compatible with (`specs/00` §1):
+/// `wownero-project/wownero` tag `v0.11.4.0`, commit `9f4f22c72`.
+pub(crate) const VERSION: &str = concat!(
+    "wownero-wallet-cli ",
+    env!("CARGO_PKG_VERSION"),
+    " (wownero-rs, compatible with Wownero C++ 0.11.4.0 \"Kunty Karen\")"
+);
 
 /// The options that name a new wallet and say what to restore it from, as the
 /// C++ wallet spells them.
@@ -244,6 +254,7 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
         };
         match arg.as_str() {
             "--help" | "-h" => return Err(USAGE.into()),
+            "--version" | "-V" => return Err(VERSION.into()),
             "--wallet-file" => {
                 o.wallet = Some(PathBuf::from(next("--wallet-file")?));
                 named_by.push("--wallet-file");
@@ -414,7 +425,7 @@ fn main() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(if e == USAGE { 0 } else { 1 });
+            std::process::exit(if e == USAGE || e == VERSION { 0 } else { 1 });
         }
     };
 
@@ -448,7 +459,7 @@ fn start_logging(o: &Options) -> Result<(), String> {
         .unwrap_or_else(|| wow_log::beside_program("wownero-wallet-cli.log"));
     wow_log::set_file(path.clone(), o.max_log_file_size, o.max_log_files, true)?;
     eprintln!("Logging to {}", path.display());
-    wow_log::info!("global", "wownero-wallet-cli {}", env!("CARGO_PKG_VERSION"));
+    wow_log::info!("global", "{VERSION}");
     // Safe to log only because `Options`' `Debug` redacts every secret.
     wow_log::debug!("global", "{o:?}");
     Ok(())
@@ -631,6 +642,22 @@ mod tests {
         let mut v = vec!["wownero-wallet-cli".to_string()];
         v.extend(args.iter().map(|s| s.to_string()));
         parse(v)
+    }
+
+    /// `--version` prints and exits 0, so packagers and scripts can read it.
+    /// The C++ release it names is what this build targets, not its own number.
+    #[test]
+    fn version_prints_and_names_the_cpp_release() {
+        for flag in ["--version", "-V"] {
+            match opts(&[flag]) {
+                Err(e) => {
+                    assert_eq!(e, VERSION);
+                    assert!(e.starts_with("wownero-wallet-cli "), "{e}");
+                    assert!(e.contains("Kunty Karen"), "{e}");
+                }
+                Ok(_) => panic!("{flag} should print, not run"),
+            }
+        }
     }
 
     #[test]

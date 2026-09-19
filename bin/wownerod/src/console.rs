@@ -236,7 +236,7 @@ pub fn run(server: &Server, cmd: Cmd) -> Result<String, String> {
         Cmd::Version => format!(
             "wownero-rs {} — a Rust reimplementation, compatible with the C++ tree at {}",
             env!("CARGO_PKG_VERSION"),
-            CPP_VERSION
+            crate::cli::CPP_VERSION
         ),
         Cmd::PrintBlock(what) => print_block(server, &what)?,
         Cmd::PrintTx(txid) => print_tx(server, &txid)?,
@@ -539,12 +539,10 @@ fn status(server: &Server) -> Result<String, String> {
         ("Pruned Node", "No".into()),
         ("Mining", mining),
         ("wownero-rs Version", env!("CARGO_PKG_VERSION").into()),
+        ("Compatible With", format!("Wownero C++ {}", crate::cli::CPP_VERSION)),
     ]);
     Ok(table(&rows))
 }
-
-/// The C++ release this build aims to be compatible with. `specs/00` §1.
-const CPP_VERSION: &str = "0.11.4.0 \"Kunty Karen\"";
 
 /// `print_block <height|id>` — one block's header.
 ///

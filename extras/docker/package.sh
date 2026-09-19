@@ -16,6 +16,8 @@ out=${OUT_DIR:-/out}
 : "${SOURCE_DATE_EPOCH:=315532800}"
 
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$src/Cargo.toml" | head -n1)
+# As docker/package.sh: the C++ release these wallets aim to be compatible with.
+cpp_version='0.11.4.0 "Kunty Karen"'
 staging=$(mktemp -d)
 
 case $kind in
@@ -53,6 +55,8 @@ esac
 install -m 0644 "$src/extras/README.md" "$stage/README.md"
 cat > "$stage/BUILDINFO" <<EOF
 name:      $name
+version:   $version
+compat:    Wownero C++ $cpp_version
 git:       $GIT_REV
 target:    $target
 rustc:     $(rustc -V)
