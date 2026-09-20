@@ -100,6 +100,16 @@ in a C toolchain.
 
 - Static files and nothing else: no server code, no proxy. Serve them from any
   web server, over https.
+- `index.html` names a build directory, `b/<version>-<digest>/`, and every
+  other file of that build lives inside it. Serve `index.html` with
+  `Cache-Control: no-store`, and everything under `b/` with
+  `max-age=31536000, immutable`: a name in there means one build and never
+  another. A cache holding some file under a name a later build reuses is
+  what breaks this wallet -- the page loads one build's `.wasm` against
+  another's wasm-bindgen glue, and says so as a `LinkError` about an
+  import that "requires a callable". When you put up a new build, leave the
+  old directory in place for a while: a page loaded a moment earlier is
+  still fetching from it.
 - Wallets are kept in the browser's IndexedDB, for that site only. The browser
   can clear it, so export each wallet's files (Settings, Wallet, Export files)
   and keep its seed phrase. The overview says when a wallet has not been
