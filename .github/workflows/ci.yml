@@ -106,10 +106,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: tests/crypto/tests.txt is intact
+      # SHA256SUMS names its files relative to tests/corpus, so the check has
+      # to run from there -- from the root every path in it is missing.
+      - name: tests/corpus/crypto/tests.txt is intact
+        working-directory: tests/corpus
         run: |
-          test "$(wc -l < tests/corpus/crypto/tests.txt)" -eq 5545
-          sha256sum -c tests/corpus/SHA256SUMS
+          test "$(wc -l < crypto/tests.txt)" -eq 5545
+          sha256sum -c SHA256SUMS
 
   # specs/15 §2.2: the real M1 round-trip gate needs ~10k mainnet blocks, which
   # are generated rather than committed. Enable this once a daemon is reachable
