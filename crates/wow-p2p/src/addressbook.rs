@@ -521,7 +521,7 @@ impl AddressBook {
         // Most recently seen first and, of equal `last_seen`, the latest to
         // arrive, as the C++ walks its time index from the end.
         let mut by_time: Vec<&Listed> = list.values().collect();
-        by_time.sort_by(|a, b| (b.rec.last_seen, b.seq).cmp(&(a.rec.last_seen, a.seq)));
+        by_time.sort_by_key(|a| std::cmp::Reverse((a.rec.last_seen, a.seq)));
 
         let mut hosts = HashSet::new();
         let peers: Vec<&PeerRecord> = by_time
@@ -538,7 +538,7 @@ impl AddressBook {
             .into_iter()
             .filter(|r| subnet_of(r.addr.ip()).is_none_or(|s| subnets.insert(s)))
             .collect();
-        one_per_subnet.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        one_per_subnet.sort_by_key(|a| std::cmp::Reverse(a.last_seen));
 
         let limit = if from_white {
             WHITE_CANDIDATES

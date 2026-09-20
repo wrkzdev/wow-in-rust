@@ -1579,15 +1579,13 @@ mod tests {
             for reply in replies {
                 // A kept socket that ends before a request is one the client
                 // let go of: its request is coming on a new connection.
-                let still_used =
-                    kept.take()
-                        .and_then(|mut s| if read_request(&mut s) { Some(s) } else { None });
+                let still_used = kept.take().filter(read_request);
                 let mut s = match still_used {
                     Some(s) => s,
                     None => {
                         accepted += 1;
-                        let mut s = listener.accept().expect("accept").0;
-                        if !read_request(&mut s) {
+                        let s = listener.accept().expect("accept").0;
+                        if !read_request(&s) {
                             return accepted;
                         }
                         s
@@ -1606,7 +1604,11 @@ mod tests {
     ///
     /// A reset counts as ended: a client that closes with some of a reply
     /// still unread resets the connection rather than ending it.
-    fn read_request(s: &mut std::net::TcpStream) -> bool {
+    /// Read one request off `s`, and say whether a whole one arrived.
+    ///
+    /// A shared reference is enough -- `impl Read for &TcpStream` -- and it is
+    /// what `Option::filter` hands a predicate.
+    fn read_request(mut s: &std::net::TcpStream) -> bool {
         let mut request = Vec::new();
         let mut chunk = [0u8; 1024];
         while !request.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1628,7 +1630,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             for _ in 0..2 {
                 let (mut s, _) = listener.accept().expect("accept");
-                assert!(read_request(&mut s), "a request");
+                assert!(read_request(&s), "a request");
                 s.write_all(OK).expect("write");
                 // Dropped here: closed, with the client still keeping it.
             }
@@ -1891,7 +1893,7 @@ mod tests {
             drop(s);
             for _ in 0..replies {
                 let (mut s, _) = listener.accept().expect("accept");
-                if read_request(&mut s) {
+                if read_request(&s) {
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
                 }
             }
@@ -2216,7 +2218,7 @@ mod tests {
             s.read_exact(&mut port).expect("port");
             s.write_all(&[5, reply_code, 0, 1, 10, 0, 0, 1, 0x1f, 0x90])
                 .expect("reply");
-            if reply_code == 0 && read_request(&mut s) {
+            if reply_code == 0 && read_request(&s) {
                 s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
                     .expect("answer");
             }

@@ -537,6 +537,15 @@ pub fn txpool_backlog(server: &super::Server, restricted: bool) -> Vec<u8> {
     object_with_blob(&base("OK", untrusted()), "backlog", &packed)
 }
 
+/// One amount's answer while it waits to be rendered: the fields `serde_json`
+/// can hold, the name of the field that holds raw bytes, and those bytes --
+/// empty and `None` when `binary: false` put the counts in `fields` already.
+type PendingDistribution = (
+    serde_json::Map<String, Value>,
+    &'static str,
+    Option<Vec<u8>>,
+);
+
 /// `get_output_distribution` over JSON-RPC (`specs/11` §4), as rendered JSON.
 ///
 /// The same answer as `/get_output_distribution.bin`, which is where a wallet
@@ -586,11 +595,7 @@ pub fn output_distribution_json(
 
     // Each entry is its ordinary fields and, for a binary answer, the one
     // field that is a string of bytes.
-    let mut entries: Vec<(
-        serde_json::Map<String, Value>,
-        &'static str,
-        Option<Vec<u8>>,
-    )> = Vec::with_capacity(amounts.len());
+    let mut entries: Vec<PendingDistribution> = Vec::with_capacity(amounts.len());
     for amount in amounts {
         let d = super::binary::distribution_for(db, cfg.network, amount, from, to, cumulative)?;
         let mut fields = serde_json::Map::new();

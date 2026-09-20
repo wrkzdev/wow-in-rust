@@ -346,7 +346,9 @@ impl ExportedKeyImages {
             return Err(ColdError::BadSize("key image export"));
         }
         let images = rest
-            .chunks_exact(RECORD)
+            .as_chunks::<RECORD>()
+            .0
+            .iter()
             .map(|c| SignedKeyImage {
                 key_image: KeyImage(c[..32].try_into().expect("32 bytes")),
                 signature: Signature::from_slice(&c[32..]).expect("64 bytes"),

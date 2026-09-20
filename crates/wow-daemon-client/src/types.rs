@@ -601,7 +601,9 @@ fn parse_txpool_backlog(raw: &[u8]) -> Result<Vec<BacklogEntry>> {
         return Err(DaemonError::BadField("backlog"));
     }
     Ok(blob
-        .chunks_exact(BACKLOG_ENTRY_BYTES)
+        .as_chunks::<BACKLOG_ENTRY_BYTES>()
+        .0
+        .iter()
         .map(|e| {
             let word = |i: usize| {
                 let mut b = [0u8; 8];
