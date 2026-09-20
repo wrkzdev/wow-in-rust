@@ -991,7 +991,9 @@ fn an_anonymous_inbound_zone_answers_a_handshake() {
 
     // Connect as the hidden service's daemon would, and handshake.
     let mut stream = std::net::TcpStream::connect(bind).expect("the zone's listener");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let theirs = BasicNodeData {
         network_id: messages::network_id(Network::Mainnet),
         peer_id: 1,
@@ -1013,7 +1015,10 @@ fn an_anonymous_inbound_zone_answers_a_handshake() {
             break HandshakeResponse::parse(&body).expect("a handshake response");
         }
     };
-    assert_eq!(answer.node_data.peer_id, 1, "every node in a zone is peer 1");
+    assert_eq!(
+        answer.node_data.peer_id, 1,
+        "every node in a zone is peer 1"
+    );
     assert_eq!(answer.node_data.my_port, 0);
     assert_eq!(answer.node_data.rpc_port, 0);
     assert_eq!(answer.node_data.support_flags, 0);

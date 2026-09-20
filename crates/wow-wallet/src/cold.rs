@@ -1238,8 +1238,12 @@ impl SignedTxSet {
     /// `parse_tx_from_str`.
     pub fn from_file(blob: &[u8], view_secret_key: &SecretKey) -> Result<SignedTxSet> {
         let blob = unwrap_ascii(blob);
-        let body =
-            strip_versioned_magic(&blob, SIGNED_TX_MAGIC, "signed transfer set", TX_SET_VERSION)?;
+        let body = strip_versioned_magic(
+            &blob,
+            SIGNED_TX_MAGIC,
+            "signed transfer set",
+            TX_SET_VERSION,
+        )?;
         let data = decrypt(body, view_secret_key, true)?;
         let mut r = Reader::new(&data);
         let set = SignedTxSet::read(&mut r)?;
@@ -1521,11 +1525,7 @@ mod tests {
         // version, pubkey, internal index, global index (300 = 0xac 0x02), tx
         // pubkey, flags, amount (128 = 0x80 0x01), no additional keys, major,
         // minor.
-        let expected = format!(
-            "01{}01ac02{}0c8001000005",
-            "aa".repeat(32),
-            "bb".repeat(32)
-        );
+        let expected = format!("01{}01ac02{}0c8001000005", "aa".repeat(32), "bb".repeat(32));
         assert_eq!(hex::encode(&bytes), expected);
 
         let mut r = Reader::new(&bytes);
@@ -1612,7 +1612,11 @@ mod tests {
 
         let data =
             decrypt(&file[KEY_IMAGE_EXPORT_MAGIC.len()..], &view_key(), true).expect("decrypt");
-        assert_eq!(&data[..4], &[0x04, 0x03, 0x02, 0x01], "little-endian offset");
+        assert_eq!(
+            &data[..4],
+            &[0x04, 0x03, 0x02, 0x01],
+            "little-endian offset"
+        );
         assert_eq!(data.len(), 4 + 64 + 2 * 96);
 
         assert_eq!(

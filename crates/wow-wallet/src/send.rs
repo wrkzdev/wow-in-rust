@@ -313,18 +313,15 @@ impl Session {
         let mut rng = crate::entropy::seeded_rng().map_err(SendError::Entropy)?;
 
         let plan = match (request.amount, &request.sweep_output) {
-            (Some(amount), _) => {
-                spend::plan(&self.state.transfers, &[amount], &options, &mut rng)
-            }
+            (Some(amount), _) => spend::plan(&self.state.transfers, &[amount], &options, &mut rng),
             (None, Some(k)) => spend::plan_sweep_single(&self.state.transfers, k, &options),
             (None, None) => spend::plan_sweep(&self.state.transfers, &options, &mut rng),
         }?;
         // "the tx uses funds from multiple accounts": never, the way the plans
         // pick, and refused rather than built if it ever did.
-        let account = plan
-            .inputs
-            .first()
-            .map_or(request.account, |&i| self.state.transfers[i].subaddress.major);
+        let account = plan.inputs.first().map_or(request.account, |&i| {
+            self.state.transfers[i].subaddress.major
+        });
         if plan
             .inputs
             .iter()
@@ -436,13 +433,10 @@ impl Session {
             wow_crypto::types::SubaddressIndex::new(account, 0),
         )
         .ok_or(SendError::Damaged("its change address does not derive"))?;
-        let dummy = crate::account::AccountBase::from_spend_key(
-            SecretKey(rng.random_scalar()),
-            0,
-        )
-        .ok_or_else(|| SendError::Entropy("cannot make an address for zero change".into()))?
-        .keys
-        .account_address;
+        let dummy = crate::account::AccountBase::from_spend_key(SecretKey(rng.random_scalar()), 0)
+            .ok_or_else(|| SendError::Entropy("cannot make an address for zero change".into()))?
+            .keys
+            .account_address;
 
         Ok(Planned {
             plan,

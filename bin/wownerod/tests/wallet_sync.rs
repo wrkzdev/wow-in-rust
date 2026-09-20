@@ -237,9 +237,15 @@ fn a_wallet_restored_above_zero_syncs_and_stays_synced() {
     let summary = w.refresh(&c, 20).expect("refresh");
     assert!(summary.caught_up);
     assert_eq!(summary.reorg_to, None);
-    assert_eq!(w.start_height, 0, "the hashes begin where every wallet's do");
+    assert_eq!(
+        w.start_height, 0,
+        "the hashes begin where every wallet's do"
+    );
     assert_eq!(w.hashes, hashes);
-    assert_eq!(w.refresh_from_height, 5, "and scanning began where it was restored");
+    assert_eq!(
+        w.refresh_from_height, 5,
+        "and scanning began where it was restored"
+    );
 
     let again = w.refresh_once(&c).expect("refresh again");
     assert!(again.caught_up);

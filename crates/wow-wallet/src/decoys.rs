@@ -858,8 +858,7 @@ where
     F: FnMut(&[u64]) -> Result<Vec<Member>, String>,
 {
     let available = offsets.last().copied().unwrap_or(0);
-    let key_images: Vec<wow_crypto::types::KeyImage> =
-        reals.iter().map(|r| r.key_image).collect();
+    let key_images: Vec<wow_crypto::types::KeyImage> = reals.iter().map(|r| r.key_image).collect();
     for _ in 0..SANITY_CHECK_ATTEMPTS {
         let known = db.get_rings(&key_images);
         let rings = get_outs(picker, rng, reals, ring_size, known.as_deref(), &mut fetch)?;
@@ -1315,9 +1314,7 @@ mod tests {
     }
 
     /// A daemon's answer where `locked` says which outputs are still locked.
-    fn daemon(
-        locked: impl Fn(u64) -> bool,
-    ) -> impl FnMut(&[u64]) -> Result<Vec<Member>, String> {
+    fn daemon(locked: impl Fn(u64) -> bool) -> impl FnMut(&[u64]) -> Result<Vec<Member>, String> {
         move |indices| {
             Ok(indices
                 .iter()
@@ -1353,8 +1350,7 @@ mod tests {
             calls.push(indices.to_vec());
             answer(indices)
         };
-        let rings = get_outs(&p, &mut Lcg(12), &reals, RING_SIZE, None, &mut fetch)
-            .expect("rings");
+        let rings = get_outs(&p, &mut Lcg(12), &reals, RING_SIZE, None, &mut fetch).expect("rings");
 
         assert_eq!(calls.len(), 1, "one call, not one per input or per round");
         let n = requested_outputs_count(RING_SIZE);
@@ -1414,8 +1410,15 @@ mod tests {
             asked.extend_from_slice(indices);
             answer(indices)
         };
-        let rings = get_outs(&p, &mut Lcg(77), &[real(20_000)], RING_SIZE, None, &mut fetch)
-            .expect("a ring");
+        let rings = get_outs(
+            &p,
+            &mut Lcg(77),
+            &[real(20_000)],
+            RING_SIZE,
+            None,
+            &mut fetch,
+        )
+        .expect("a ring");
 
         assert!(
             asked.iter().any(|&i| locked(i)),
@@ -1486,8 +1489,15 @@ mod tests {
             }
             Ok(members)
         };
-        let rings = get_outs(&p, &mut Lcg(9), &[real(20_000)], RING_SIZE, None, &mut torsioned)
-            .expect("a ring of the others");
+        let rings = get_outs(
+            &p,
+            &mut Lcg(9),
+            &[real(20_000)],
+            RING_SIZE,
+            None,
+            &mut torsioned,
+        )
+        .expect("a ring of the others");
         assert!(
             rings[0].0.indices.iter().all(|&i| !bad(i)),
             "{:?}",
@@ -1507,8 +1517,15 @@ mod tests {
             calls += 1;
             everything_else(indices)
         };
-        let e = get_outs(&p, &mut Lcg(4), &[real(20_000)], RING_SIZE, None, &mut fetch)
-            .expect_err("nothing to fill it with");
+        let e = get_outs(
+            &p,
+            &mut Lcg(4),
+            &[real(20_000)],
+            RING_SIZE,
+            None,
+            &mut fetch,
+        )
+        .expect_err("nothing to fill it with");
         assert_eq!(
             e,
             DecoyError::TooFewUnlocked {
@@ -1583,7 +1600,10 @@ mod tests {
     fn the_sanity_check_is_the_references() {
         let set = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
 
-        assert!(tx_sanity_check(&set(&[1, 2]), 10, 1_000_000), "10 is too few");
+        assert!(
+            tx_sanity_check(&set(&[1, 2]), 10, 1_000_000),
+            "10 is too few"
+        );
         assert!(tx_sanity_check(&set(&[1, 2]), 22, 9_999), "a young chain");
 
         let recent: Vec<u64> = (0..22).map(|i| 900_000 + i).collect();
@@ -1604,7 +1624,11 @@ mod tests {
         assert_eq!(median(&[7]), 7);
         assert_eq!(median(&[1, 2, 9]), 2);
         assert_eq!(median(&[1, 3, 4, 9]), 3);
-        assert_eq!(median(&[u64::MAX, u64::MAX]), u64::MAX, "without overflowing");
+        assert_eq!(
+            median(&[u64::MAX, u64::MAX]),
+            u64::MAX,
+            "without overflowing"
+        );
     }
 
     /// Rings that fail the sanity check are picked again, three times in all,
@@ -1626,8 +1650,16 @@ mod tests {
             calls += 1;
             answer(indices)
         };
-        let e = select_rings(&o, &p, &mut Lcg(8), &[real(4_000)], RING_SIZE, &mut db, fetch)
-            .expect_err("fails every time");
+        let e = select_rings(
+            &o,
+            &p,
+            &mut Lcg(8),
+            &[real(4_000)],
+            RING_SIZE,
+            &mut db,
+            fetch,
+        )
+        .expect_err("fails every time");
         assert_eq!(e, DecoyError::SanityCheckFailed(3));
         assert_eq!(calls, 3, "picked and asked for again each time");
         assert!(db.is_empty(), "a ring that failed is not kept");
@@ -1642,8 +1674,16 @@ mod tests {
             calls += 1;
             answer(indices)
         };
-        let rings = select_rings(&o, &p, &mut Lcg(8), &[real(39_000)], RING_SIZE, &mut db, fetch)
-            .expect("passes");
+        let rings = select_rings(
+            &o,
+            &p,
+            &mut Lcg(8),
+            &[real(39_000)],
+            RING_SIZE,
+            &mut db,
+            fetch,
+        )
+        .expect("passes");
         assert_eq!(calls, 1);
         assert_eq!(
             db.get(&real(39_000).key_image),

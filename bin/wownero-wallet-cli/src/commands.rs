@@ -384,7 +384,12 @@ fn balance(session: &mut Session) -> Result<(), String> {
     // `simplewallet`'s own note: a wallet that cannot compute key images
     // cannot tell a spent output from an unspent one, so its balance is
     // whatever it has ever received until the exchange below has happened.
-    if session.state.transfers.iter().any(|t| t.key_image.is_none()) {
+    if session
+        .state
+        .transfers
+        .iter()
+        .any(|t| t.key_image.is_none())
+    {
         println!(
             " (Some owned outputs have missing key images - export_outputs, import_outputs, \
              export_key_images, and import_key_images needed)"
@@ -493,9 +498,7 @@ fn set_daemon(session: &mut Session, args: &[&str]) -> Result<(), String> {
     if session.offline {
         // `simplewallet`'s own wording when a connection is asked for and
         // `--offline` was given.
-        return Err(
-            "wallet failed to connect to daemon, because it is set to offline mode".into(),
-        );
+        return Err("wallet failed to connect to daemon, because it is set to offline mode".into());
     }
     let address = args
         .first()
@@ -1490,9 +1493,7 @@ fn export_key_images(session: &mut Session, args: &[&str]) -> Result<(), String>
 /// wallet's whole output set.
 fn import_key_images(session: &mut Session, args: &[&str]) -> Result<(), String> {
     if !session.state.trusted_daemon {
-        return Err(
-            "this command requires a trusted daemon. Enable with --trusted-daemon".into(),
-        );
+        return Err("this command requires a trusted daemon. Enable with --trusted-daemon".into());
     }
     let filename = one_file(args, "usage: import_key_images <filename>")?;
     let blob = read_file(&filename)?;
@@ -1887,7 +1888,11 @@ fn ring_from_line(line: &str) -> Result<(wow_crypto::types::KeyImage, Vec<u64>, 
     let relative = match words.next() {
         Some("absolute") => false,
         Some("relative") => true,
-        _ => return Err(format!("Invalid ring type, expected relative or absolute: {line}")),
+        _ => {
+            return Err(format!(
+                "Invalid ring type, expected relative or absolute: {line}"
+            ))
+        }
     };
     let ring = words
         .map(str::parse::<u64>)

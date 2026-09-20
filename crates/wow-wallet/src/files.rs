@@ -834,7 +834,12 @@ pub mod cache {
 
         // Also added without a version bump: a cache from before has no rings.
         state.rings = Default::default();
-        for entry in v.get("rings").and_then(Value::as_array).into_iter().flatten() {
+        for entry in v
+            .get("rings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let key_image = entry
                 .get("key_image")
                 .and_then(Value::as_str)
@@ -1057,7 +1062,10 @@ mod tests {
             "the tip block, not the block count"
         );
         assert_eq!(s.keys_file.refresh_height(), 873_426);
-        assert_eq!(s.state.refresh_from_height, 873_426, "and scanning starts there");
+        assert_eq!(
+            s.state.refresh_from_height, 873_426,
+            "and scanning starts there"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

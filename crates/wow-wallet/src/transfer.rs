@@ -322,8 +322,8 @@ pub fn construct_with_change(
     let change_address = change.map(|c| c.address);
     let tx_secret = rng.scalar();
     let classified = classify_addresses(destinations, change_address);
-    let need_additional_keys = classified.subaddresses > 0
-        && (classified.standard > 0 || classified.subaddresses > 1);
+    let need_additional_keys =
+        classified.subaddresses > 0 && (classified.standard > 0 || classified.subaddresses > 1);
     let additional_secrets: Vec<Scalar> = if need_additional_keys {
         destinations.iter().map(|_| rng.scalar()).collect()
     } else {
@@ -333,8 +333,9 @@ pub fn construct_with_change(
     // ---- the payment id, real or dummy ----
     let encrypt_to = destination_view_key_pub(destinations, change_address);
     let encrypt = |pid: Hash8, view: &PublicKey| -> Result<Hash8> {
-        let derivation = wow_crypto::generate_key_derivation(view, &SecretKey(tx_secret.to_bytes()))
-            .ok_or(TransferError::BadKey)?;
+        let derivation =
+            wow_crypto::generate_key_derivation(view, &SecretKey(tx_secret.to_bytes()))
+                .ok_or(TransferError::BadKey)?;
         Ok(wow_crypto::keys::encrypt_payment_id(&pid, &derivation))
     };
     let encrypted_id = match (payment_id, &encrypt_to) {
@@ -1653,10 +1654,7 @@ mod tests {
     }
 
     /// Outputs for a plan: the payee, then change back to `me`.
-    fn pay(
-        them: AccountPublicAddress,
-        me: AccountPublicAddress,
-    ) -> impl Fn(&SpendPlan) -> Outputs {
+    fn pay(them: AccountPublicAddress, me: AccountPublicAddress) -> impl Fn(&SpendPlan) -> Outputs {
         move |p: &SpendPlan| Outputs {
             destinations: vec![
                 Destination {

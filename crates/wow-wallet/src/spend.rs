@@ -51,8 +51,8 @@ pub const MAX_OUTPUTS: usize = 16;
 /// At ring size 22 an input costs about 880 bytes, so this is a little over a
 /// hundred of them in one transaction.
 pub const fn default_weight_limit() -> u64 {
-    let upper =
-        constants::BLOCK_GRANTED_FULL_REWARD_ZONE_V5 / 2 - constants::COINBASE_BLOB_RESERVED_SIZE as u64;
+    let upper = constants::BLOCK_GRANTED_FULL_REWARD_ZONE_V5 / 2
+        - constants::COINBASE_BLOB_RESERVED_SIZE as u64;
     upper * 2 / 3
 }
 
@@ -636,9 +636,8 @@ pub fn plan(
         options.extra_size,
     ) as u64);
     let total_needed = needed_money.saturating_add(min_fee);
-    let subtotal = |per: &BTreeMap<u32, u64>| -> u64 {
-        indices.iter().filter_map(|m| per.get(m)).sum()
-    };
+    let subtotal =
+        |per: &BTreeMap<u32, u64>| -> u64 { indices.iter().filter_map(|m| per.get(m)).sum() };
     let (balance_subtotal, unlocked_subtotal) = (subtotal(&balance), subtotal(&unlocked));
     if total_needed > balance_subtotal.min(unlocked_subtotal)
         || min_fee > balance_subtotal.min(unlocked_subtotal)
@@ -661,7 +660,10 @@ pub fn plan(
         if !eligible(t, options, &indices) || outside_range(t, options) {
             continue;
         }
-        match groups.iter_mut().find(|(minor, _)| *minor == t.subaddress.minor) {
+        match groups
+            .iter_mut()
+            .find(|(minor, _)| *minor == t.subaddress.minor)
+        {
             Some((_, group)) => group.push(i),
             None => groups.push((t.subaddress.minor, vec![i])),
         }
@@ -957,7 +959,13 @@ pub fn plan_sweep(
 
     let mut selected: Vec<usize> = Vec::new();
     while !unused.is_empty() {
-        selected.push(pop_best_value(transfers, &mut unused, &selected, false, rng));
+        selected.push(pop_best_value(
+            transfers,
+            &mut unused,
+            &selected,
+            false,
+            rng,
+        ));
         // Two outputs: the destination, and change or its dummy.
         let weight = estimate_tx_weight(
             selected.len(),
@@ -1264,7 +1272,11 @@ mod tests {
             transfer(3_000_000_000, 500, 3),
         ];
         let p = plan(&transfers, &[5_000_000_000], &options(3), &mut seq()).expect("a plan");
-        assert_eq!(p.inputs, vec![2, 0], "the pair a block apart is passed over");
+        assert_eq!(
+            p.inputs,
+            vec![2, 0],
+            "the pair a block apart is passed over"
+        );
     }
 
     /// Inputs come from the account asked for only, the subaddress with the
@@ -1429,14 +1441,20 @@ mod tests {
         assert_eq!(seen.len(), 2, "either subaddress, at random");
 
         let p = plan_sweep(&transfers[..1], &options(3), &mut seq()).expect("a sweep");
-        assert_eq!(p.inputs, vec![0], "the main address when it is all there is");
+        assert_eq!(
+            p.inputs,
+            vec![0],
+            "the main address when it is all there is"
+        );
 
         // Named indices are swept together.
         let o = SpendOptions {
             subaddr_indices: vec![0, 2],
             ..options(3)
         };
-        let mut inputs = plan_sweep(&transfers, &o, &mut seq()).expect("a sweep").inputs;
+        let mut inputs = plan_sweep(&transfers, &o, &mut seq())
+            .expect("a sweep")
+            .inputs;
         inputs.sort_unstable();
         assert_eq!(inputs, vec![0, 2, 3]);
 

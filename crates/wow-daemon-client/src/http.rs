@@ -562,7 +562,10 @@ enum Plan {
     Plain,
     /// `strict`: the certificate must check out. `fallback`: plain HTTP will
     /// do if TLS does not.
-    Tls { strict: bool, fallback: bool },
+    Tls {
+        strict: bool,
+        fallback: bool,
+    },
 }
 
 impl Endpoint {
@@ -711,7 +714,10 @@ impl Endpoint {
                     .to_socket_addrs()
                     .map_err(|_| HttpError::BadAddress(self.address.clone()))?;
                 connect_any(addrs, self.connect_timeout).map_err(|e| {
-                    e.map_or_else(|| HttpError::BadAddress(self.address.clone()), HttpError::Io)
+                    e.map_or_else(
+                        || HttpError::BadAddress(self.address.clone()),
+                        HttpError::Io,
+                    )
                 })?
             }
             Some(proxy) => {
@@ -773,7 +779,10 @@ impl Endpoint {
     /// request sent again, once. Twice would mean the credentials are wrong,
     /// and a daemon blocks an address after three failures.
     fn exchange(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
-        let authorization = self.login.as_ref().and_then(|l| l.authorization("POST", path));
+        let authorization = self
+            .login
+            .as_ref()
+            .and_then(|l| l.authorization("POST", path));
         match self.exchange_once(path, content_type, body, authorization.as_deref()) {
             Err(HttpError::Unauthorized { challenge }) => {
                 let Some(login) = self.login.as_ref() else {
@@ -819,21 +828,20 @@ impl Endpoint {
         body: &[u8],
         authorization: Option<&str>,
     ) -> Result<Vec<u8>, HttpError> {
-        let held = self
-            .idle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let held = self.idle.lock().unwrap_or_else(|e| e.into_inner()).take();
         let reused = held.is_some();
         match self.exchange_on(held, path, content_type, body, authorization) {
             // A server that closed the kept connection while it sat idle is
             // most often seen as nothing to read, not as an I/O error: the
             // request writes into the socket without complaint, and the
             // server's FIN is already waiting behind it.
-            Err(HttpError::Io(_) | HttpError::Truncated { .. } | HttpError::Malformed(NO_REPLY))
-                if reused =>
-            {
-                wow_log::debug!(LOG, "{path}: the kept connection was gone; opening a new one");
+            Err(
+                HttpError::Io(_) | HttpError::Truncated { .. } | HttpError::Malformed(NO_REPLY),
+            ) if reused => {
+                wow_log::debug!(
+                    LOG,
+                    "{path}: the kept connection was gone; opening a new one"
+                );
                 self.exchange_on(None, path, content_type, body, authorization)
             }
             other => other,
@@ -1562,9 +1570,7 @@ mod tests {
     ///
     /// The count is the point: one accept for several requests is the whole
     /// claim being tested.
-    fn answer_several(
-        replies: Vec<&'static [u8]>,
-    ) -> (String, std::thread::JoinHandle<usize>) {
+    fn answer_several(replies: Vec<&'static [u8]>) -> (String, std::thread::JoinHandle<usize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("an address").to_string();
         let server = std::thread::spawn(move || {
@@ -1573,13 +1579,9 @@ mod tests {
             for reply in replies {
                 // A kept socket that ends before a request is one the client
                 // let go of: its request is coming on a new connection.
-                let still_used = kept.take().and_then(|mut s| {
-                    if read_request(&mut s) {
-                        Some(s)
-                    } else {
-                        None
-                    }
-                });
+                let still_used =
+                    kept.take()
+                        .and_then(|mut s| if read_request(&mut s) { Some(s) } else { None });
                 let mut s = match still_used {
                     Some(s) => s,
                     None => {
@@ -1634,7 +1636,9 @@ mod tests {
         let endpoint = plain(address);
         for _ in 0..2 {
             assert_eq!(
-                endpoint.post("/get_info", "application/json", b"").expect("ok"),
+                endpoint
+                    .post("/get_info", "application/json", b"")
+                    .expect("ok"),
                 b"hi"
             );
         }
@@ -1650,11 +1654,17 @@ mod tests {
         let endpoint = plain(address);
         for _ in 0..3 {
             assert_eq!(
-                endpoint.post("/get_info", "application/json", b"").expect("ok"),
+                endpoint
+                    .post("/get_info", "application/json", b"")
+                    .expect("ok"),
                 b"hi"
             );
         }
-        assert_eq!(server.join().expect("the server"), 1, "one connection, three calls");
+        assert_eq!(
+            server.join().expect("the server"),
+            1,
+            "one connection, three calls"
+        );
     }
 
     /// A server that says it is closing is believed, and the next call opens a
@@ -1667,7 +1677,9 @@ mod tests {
         let endpoint = plain(address);
         for _ in 0..2 {
             assert_eq!(
-                endpoint.post("/get_info", "application/json", b"").expect("ok"),
+                endpoint
+                    .post("/get_info", "application/json", b"")
+                    .expect("ok"),
                 b"hi"
             );
         }
@@ -1685,7 +1697,9 @@ mod tests {
         let endpoint = plain(address);
         for _ in 0..2 {
             assert_eq!(
-                endpoint.post("/get_info", "application/json", b"").expect("ok"),
+                endpoint
+                    .post("/get_info", "application/json", b"")
+                    .expect("ok"),
                 b"hi"
             );
         }
@@ -1938,8 +1952,7 @@ mod tests {
     fn enabled_takes_only_a_certificate_that_checks_out() {
         const REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
         let enabled = |port: u16, pins: Option<Pins>| {
-            let endpoint =
-                Endpoint::new(format!("127.0.0.1:{port}")).with_tls(TlsMode::Enabled);
+            let endpoint = Endpoint::new(format!("127.0.0.1:{port}")).with_tls(TlsMode::Enabled);
             match pins {
                 Some(pins) => endpoint.with_certificates(Certificates::Pinned(pins)),
                 None => endpoint,
@@ -2020,7 +2033,11 @@ mod tests {
             ..pinned.clone()
         })
         .expect("said");
-        assert_eq!(o.tls, TlsMode::Autodetect, "unless --daemon-ssl says otherwise");
+        assert_eq!(
+            o.tls,
+            TlsMode::Autodetect,
+            "unless --daemon-ssl says otherwise"
+        );
 
         let o = ConnectOptions::from_flags(&SslFlags {
             allow_any_cert: true,
@@ -2089,9 +2106,16 @@ mod tests {
     fn fingerprints_parse_with_or_without_separators() {
         let colons = ["ab"; 32].join(":");
         assert_eq!(parse_fingerprint(&colons).expect("colons"), [0xab; 32]);
-        assert_eq!(parse_fingerprint(&"AB ".repeat(32)).expect("spaces"), [0xab; 32]);
-        assert!(parse_fingerprint("abcd").expect_err("short").contains("32 bytes"));
-        assert!(parse_fingerprint("zz").expect_err("not hex").contains("not hex"));
+        assert_eq!(
+            parse_fingerprint(&"AB ".repeat(32)).expect("spaces"),
+            [0xab; 32]
+        );
+        assert!(parse_fingerprint("abcd")
+            .expect_err("short")
+            .contains("32 bytes"));
+        assert!(parse_fingerprint("zz")
+            .expect_err("not hex")
+            .contains("not hex"));
     }
 
     /// A daemon on this machine is local, and one anywhere else is not, the
@@ -2125,13 +2149,23 @@ mod tests {
         let p = Proxy::parse("127.0.0.1:9050").expect("host and port");
         assert_eq!(p.address, "127.0.0.1:9050");
         assert_eq!(p.login, None);
-        assert_eq!(Proxy::parse("9050").expect("port").address, "127.0.0.1:9050");
+        assert_eq!(
+            Proxy::parse("9050").expect("port").address,
+            "127.0.0.1:9050"
+        );
         let p = Proxy::parse("socks5://alice:s3cret@[::1]:1080").expect("the lot");
         assert_eq!(p.address, "[::1]:1080");
         assert_eq!(p.login, Some(("alice".into(), "s3cret".into())));
         assert!(!format!("{p:?}").contains("s3cret"), "{p:?}");
 
-        for bad in ["", "socks4://127.0.0.1:9050", "127.0.0.1", "127.0.0.1:0", ":9050", "@1"] {
+        for bad in [
+            "",
+            "socks4://127.0.0.1:9050",
+            "127.0.0.1",
+            "127.0.0.1:0",
+            ":9050",
+            "@1",
+        ] {
             assert!(Proxy::parse(bad).is_err(), "`{bad}` should be refused");
         }
 
@@ -2139,9 +2173,14 @@ mod tests {
         let p = Proxy::parse("9050").expect("port").isolated(&[0xab; 8]);
         assert_eq!(
             p.login,
-            Some(("wow-wallet-abababababababab".into(), "abababababababab".into()))
+            Some((
+                "wow-wallet-abababababababab".into(),
+                "abababababababab".into()
+            ))
         );
-        let p = Proxy::parse("bob:pw@9050").expect("login").isolated(&[1; 8]);
+        let p = Proxy::parse("bob:pw@9050")
+            .expect("login")
+            .isolated(&[1; 8]);
         assert_eq!(p.login, Some(("bob".into(), "pw".into())));
     }
 

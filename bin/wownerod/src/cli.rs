@@ -742,9 +742,9 @@ fn anonymous_inbound(v: &str) -> Result<AnonymousInbound, String> {
         if field.is_empty() {
             continue;
         }
-        let count: u32 = field.parse().map_err(|_| {
-            format!("--anonymous-inbound: `{field}` is not a connection count")
-        })?;
+        let count: u32 = field
+            .parse()
+            .map_err(|_| format!("--anonymous-inbound: `{field}` is not a connection count"))?;
         if count == 0 {
             return Err("--anonymous-inbound: a connection count of 0".into());
         }
@@ -2047,7 +2047,12 @@ mod tests {
         assert!(err(&["--tx-proxy", "tor,127.0.0.1:9050,1,2,3"]).contains("too many"));
         assert!(err(&["--tx-proxy", "tor,example.com:9050"]).contains("--tx-proxy"));
 
-        let twice = ["--tx-proxy", "tor,127.0.0.1:9050", "--tx-proxy", "tor,[::1]:1"];
+        let twice = [
+            "--tx-proxy",
+            "tor,127.0.0.1:9050",
+            "--tx-proxy",
+            "tor,[::1]:1",
+        ];
         assert!(err(&twice).contains("twice for tor"));
     }
 

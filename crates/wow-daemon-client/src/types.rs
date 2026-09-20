@@ -1286,7 +1286,10 @@ mod tests {
         raw.extend_from_slice(
             b"\",\r\n    \"credits\": 0,\r\n    \"status\": \"OK\",\r\n    \"top_hash\": \"\",\r\n    \"untrusted\": false\r\n  }\r\n}",
         );
-        assert!(serde_json::from_slice::<Json>(&raw).is_err(), "not JSON as it stands");
+        assert!(
+            serde_json::from_slice::<Json>(&raw).is_err(),
+            "not JSON as it stands"
+        );
         assert_eq!(parse_txpool_backlog(&raw).expect("parses"), entries);
 
         // An empty pool, with the field or without it.
@@ -1302,8 +1305,12 @@ mod tests {
             Err(DaemonError::Rpc { code: -32601, .. })
         ));
         let busy = br#"{"id": "0", "jsonrpc": "2.0", "result": {"status": "BUSY"}}"#;
-        assert!(matches!(parse_txpool_backlog(busy), Err(DaemonError::Status(_))));
-        let torn = br#"{"id": "0", "jsonrpc": "2.0", "result": {"backlog": "abc", "status": "OK"}}"#;
+        assert!(matches!(
+            parse_txpool_backlog(busy),
+            Err(DaemonError::Status(_))
+        ));
+        let torn =
+            br#"{"id": "0", "jsonrpc": "2.0", "result": {"backlog": "abc", "status": "OK"}}"#;
         assert!(matches!(
             parse_txpool_backlog(torn),
             Err(DaemonError::BadField("backlog"))

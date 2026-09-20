@@ -309,9 +309,11 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             "--trusted-daemon" | "--untrusted-daemon" => {
                 let trusted = arg == "--trusted-daemon";
                 if o.trusted_daemon.is_some_and(|t| t != trusted) {
-                    return Err("--trusted-daemon and --untrusted-daemon contradict each other; \
+                    return Err(
+                        "--trusted-daemon and --untrusted-daemon contradict each other; \
                                 give one"
-                        .into());
+                            .into(),
+                    );
                 }
                 o.trusted_daemon = Some(trusted);
             }
@@ -505,8 +507,12 @@ fn warn_untrusted(session: &session::Session) {
     ) {
         eprintln!("Using your own without SSL exposes your RPC traffic to monitoring");
     }
-    eprintln!("You are strongly encouraged to connect to the Wownero network using your own daemon");
-    eprintln!("If you or someone you trust are operating this daemon, you can use --trusted-daemon");
+    eprintln!(
+        "You are strongly encouraged to connect to the Wownero network using your own daemon"
+    );
+    eprintln!(
+        "If you or someone you trust are operating this daemon, you can use --trusted-daemon"
+    );
 }
 
 fn run(mut options: Options) -> Result<(), String> {
@@ -896,7 +902,10 @@ mod tests {
     /// `--trusted-daemon` and `--untrusted-daemon`, and not both.
     #[test]
     fn the_trust_options_parse() {
-        assert_eq!(opts(&["--wallet-file", "w"]).expect("ok").trusted_daemon, None);
+        assert_eq!(
+            opts(&["--wallet-file", "w"]).expect("ok").trusted_daemon,
+            None
+        );
         let o = opts(&["--wallet-file", "w", "--trusted-daemon"]).expect("ok");
         assert_eq!(o.trusted_daemon, Some(true));
         let o = opts(&["--wallet-file", "w", "--untrusted-daemon"]).expect("ok");
@@ -934,8 +943,8 @@ mod tests {
         .expect("parses");
         assert!(daemon_options(&any, "node.example:34568").is_ok());
 
-        let socks4 = opts(&["--wallet-file", "w", "--proxy", "socks4://127.0.0.1:9050"])
-            .expect("parses");
+        let socks4 =
+            opts(&["--wallet-file", "w", "--proxy", "socks4://127.0.0.1:9050"]).expect("parses");
         assert!(daemon_options(&socks4, "abc.onion:34568").is_err());
     }
 

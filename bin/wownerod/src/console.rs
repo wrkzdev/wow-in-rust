@@ -36,7 +36,10 @@ pub enum Cmd {
     HardForkInfo,
     PrintPool,
     Bans,
-    Ban { host: String, seconds: u64 },
+    Ban {
+        host: String,
+        seconds: u64,
+    },
     Unban(String),
     FlushTxpool(Option<String>),
     PopBlocks(u64),
@@ -44,7 +47,10 @@ pub enum Cmd {
     SetLog(String),
     OutPeers(u64),
     InPeers(u64),
-    StartMining { address: String, threads: usize },
+    StartMining {
+        address: String,
+        threads: usize,
+    },
     StopMining,
     MiningStatus,
     /// A height, or a block id as hex.
@@ -479,7 +485,11 @@ fn status(server: &Server) -> Result<String, String> {
     // operator watching a sync wants to know whether to come back in ten
     // minutes or tomorrow, and the height alone does not say.
     let rate = (height < target)
-        .then(|| server.core().and_then(crate::node::NodeCore::blocks_per_second))
+        .then(|| {
+            server
+                .core()
+                .and_then(crate::node::NodeCore::blocks_per_second)
+        })
         .flatten();
     let mut rows: Vec<(&str, String)> = vec![
         ("Local Height", height.to_string()),
@@ -539,7 +549,10 @@ fn status(server: &Server) -> Result<String, String> {
         ("Pruned Node", "No".into()),
         ("Mining", mining),
         ("wownero-rs Version", env!("CARGO_PKG_VERSION").into()),
-        ("Compatible With", format!("Wownero C++ {}", crate::cli::CPP_VERSION)),
+        (
+            "Compatible With",
+            format!("Wownero C++ {}", crate::cli::CPP_VERSION),
+        ),
     ]);
     Ok(table(&rows))
 }
@@ -611,7 +624,10 @@ fn print_tx(server: &Server, txid: &str) -> Result<String, String> {
         ]));
     }
 
-    let pooled = server.pool().get(&id).map(|e| (e.blob.len(), e.weight, e.fee));
+    let pooled = server
+        .pool()
+        .get(&id)
+        .map(|e| (e.blob.len(), e.weight, e.fee));
     match pooled {
         Some((size, weight, fee)) => Ok(table(&[
             ("State", "in the pool".into()),

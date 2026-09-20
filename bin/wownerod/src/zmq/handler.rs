@@ -1147,10 +1147,7 @@ mod tests {
 
     #[test]
     fn a_rejection_names_every_rule_broken() {
-        assert_eq!(
-            rejection_details(&Rejection::DoubleSpend),
-            "double spend"
-        );
+        assert_eq!(rejection_details(&Rejection::DoubleSpend), "double spend");
         assert_eq!(
             rejection_details(&Rejection::TxExtraTooBig { len: 2_000 }),
             "tx_extra too long"

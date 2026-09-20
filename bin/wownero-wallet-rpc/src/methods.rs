@@ -929,7 +929,12 @@ fn daemon_options(
         allowed_fingerprints: params
             .get("ssl_allowed_fingerprints")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default(),
         allow_any_cert: params
             .get("ssl_allow_any_cert")
@@ -1200,7 +1205,12 @@ fn build_and_send_inner(
             params
                 .get("subaddr_indices")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_u64).map(|i| i as u32).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_u64)
+                        .map(|i| i as u32)
+                        .collect()
+                })
                 .unwrap_or_default()
         };
 
@@ -1328,9 +1338,7 @@ fn spend_error(e: spend::SpendError) -> Error {
         | spend::SpendError::NoSuchOutput
         | spend::SpendError::OutputSpent
         | spend::SpendError::OutputLocked
-        | spend::SpendError::NothingToSpend => {
-            Error::new(errors::TX_NOT_POSSIBLE, e.to_string())
-        }
+        | spend::SpendError::NothingToSpend => Error::new(errors::TX_NOT_POSSIBLE, e.to_string()),
         // An exception from inside `transfer_selected_rct`, which
         // `handle_rpc_exception` reports under the transfer's default code.
         spend::SpendError::MultipleAccounts => {
@@ -1409,7 +1417,9 @@ fn relay_tx(session: &mut Session, params: &Value) -> MethodResult {
         tx,
         receive_time: now,
     };
-    session.state.note_pool_spends(std::slice::from_ref(&sent), now);
+    session
+        .state
+        .note_pool_spends(std::slice::from_ref(&sent), now);
     session.dirty = true;
     Ok(json!({ "tx_hash": wow_crypto::hex::encode(&id) }))
 }
@@ -1486,17 +1496,13 @@ fn import_key_images(session: &mut Session, params: &Value) -> MethodResult {
             .and_then(wow_crypto::hex::decode)
             .and_then(|b| <[u8; 32]>::try_from(b).ok())
             .map(wow_crypto::types::KeyImage)
-            .ok_or_else(|| {
-                Error::new(errors::WRONG_KEY_IMAGE, "failed to parse key image")
-            })?;
+            .ok_or_else(|| Error::new(errors::WRONG_KEY_IMAGE, "failed to parse key image"))?;
         let signature = entry
             .get("signature")
             .and_then(Value::as_str)
             .and_then(wow_crypto::hex::decode)
             .and_then(|b| wow_crypto::types::Signature::from_slice(&b))
-            .ok_or_else(|| {
-                Error::new(errors::WRONG_SIGNATURE, "failed to parse signature")
-            })?;
+            .ok_or_else(|| Error::new(errors::WRONG_SIGNATURE, "failed to parse signature"))?;
         images.push(wow_wallet::cold::SignedKeyImage {
             key_image,
             signature,
@@ -1712,8 +1718,7 @@ fn hex_param(params: &Value, name: &str) -> Result<Vec<u8>, Error> {
         .get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| Error::new(errors::BAD_HEX, format!("{name} is missing")))?;
-    wow_crypto::hex::decode(text)
-        .ok_or_else(|| Error::new(errors::BAD_HEX, "Failed to parse hex."))
+    wow_crypto::hex::decode(text).ok_or_else(|| Error::new(errors::BAD_HEX, "Failed to parse hex."))
 }
 
 /// Map a cold-signing failure to the code a client branches on.
@@ -1807,7 +1812,10 @@ mod tests {
             offline_error(E::NonzeroUnlockTime).code,
             errors::NONZERO_UNLOCK_TIME
         );
-        assert_eq!(offline_error(E::NoDaemon).code, errors::NO_DAEMON_CONNECTION);
+        assert_eq!(
+            offline_error(E::NoDaemon).code,
+            errors::NO_DAEMON_CONNECTION
+        );
         assert_eq!(
             offline_error(E::BadSignature(0, wow_crypto::types::KeyImage::ZERO)).code,
             errors::WRONG_SIGNATURE

@@ -244,7 +244,8 @@ fn the_whole_cold_signing_path() {
         .expect("export outputs");
     assert!(outputs_file.starts_with(wow_wallet::cold::OUTPUT_EXPORT_MAGIC));
     assert_eq!(
-        cold.import_outputs_from_file(&outputs_file).expect("import"),
+        cold.import_outputs_from_file(&outputs_file)
+            .expect("import"),
         1
     );
 
@@ -253,7 +254,9 @@ fn the_whole_cold_signing_path() {
 
     // 2. Key images back, as a file. The signature over each one is checked
     //    against the output's public key on the way in.
-    let images_file = cold.export_key_images_to_file(false).expect("export images");
+    let images_file = cold
+        .export_key_images_to_file(false)
+        .expect("export images");
     assert!(images_file.starts_with(wow_wallet::cold::KEY_IMAGE_EXPORT_MAGIC));
     let imported = watch
         .import_key_images_from_file(&images_file, false)
@@ -281,7 +284,9 @@ fn the_whole_cold_signing_path() {
         .unwrap_or(ring.len());
     ring.insert(real_index, real);
     assert_eq!(ring.len(), 22);
-    assert!(ring.windows(2).all(|w| w[0].global_index < w[1].global_index));
+    assert!(ring
+        .windows(2)
+        .all(|w| w[0].global_index < w[1].global_index));
 
     let cd = construction(&full, &payee, &t, mask, ring.clone(), real_index as u64);
     let unsigned = UnsignedTxSet {
@@ -316,11 +321,8 @@ fn the_whole_cold_signing_path() {
 
     // 5. The watch-only half reads it back, and what it reads verifies as a
     //    node would verify it.
-    let back = SignedTxSet::from_file(
-        &signed.blob,
-        &watch.keys_file.account.keys.view_secret_key,
-    )
-    .expect("parse signed");
+    let back = SignedTxSet::from_file(&signed.blob, &watch.keys_file.account.keys.view_secret_key)
+        .expect("parse signed");
     assert_eq!(back.ptx.len(), 1);
     assert_eq!(back.key_images, vec![key_image]);
 
@@ -369,12 +371,8 @@ fn the_whole_cold_signing_path() {
 
     // As does the sender, of its change -- and its key image reached the
     // watch-only half in the signed set, before the block did.
-    let my_table = SubaddressTable::new(
-        &full.keys.account_address,
-        &full.keys.view_secret_key,
-        1,
-        1,
-    );
+    let my_table =
+        SubaddressTable::new(&full.keys.account_address, &full.keys.view_secret_key, 1, 1);
     let mine = scan_transaction(
         tx,
         &ScanKeys {

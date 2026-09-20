@@ -632,8 +632,7 @@ impl WalletState {
         } else {
             self.start_height
         };
-        (target > base && (self.hashes.is_empty() || self.start_height > base))
-            .then_some(target)
+        (target > base && (self.hashes.is_empty() || self.start_height > base)).then_some(target)
     }
 
     /// One `gethashes.bin` toward [`fill_target`](Self::fill_target), as a
@@ -2820,8 +2819,7 @@ mod tests {
         let restore = chain.hashes[1_500];
         let blocks = daemon.blocks_asked.into_inner();
         assert_eq!(
-            blocks[0].0[0],
-            chain.hashes[1_023],
+            blocks[0].0[0], chain.hashes[1_023],
             "the first request goes by the last whole 1,024 blocks"
         );
         for (ids, start) in &blocks {

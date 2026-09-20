@@ -270,7 +270,10 @@ fn a_bulk_read_of_block_hashes_matches_reading_them_one_at_a_time() {
 
     assert_eq!(db.block_hashes(0, height).unwrap(), one_by_one);
     assert_eq!(db.block_hashes(2, 4).unwrap(), one_by_one[2..4]);
-    assert_eq!(db.block_hashes(height - 1, height).unwrap(), &one_by_one[4..]);
+    assert_eq!(
+        db.block_hashes(height - 1, height).unwrap(),
+        &one_by_one[4..]
+    );
 
     // An empty range is empty, not an error and not the whole chain.
     assert!(db.block_hashes(0, 0).unwrap().is_empty());

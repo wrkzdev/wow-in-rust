@@ -919,7 +919,12 @@ impl Node {
             rng.fill(&mut seed);
             let zone_rng = Rng::from_state(seed);
             let zone = zone_cfg.zone;
-            zones.push(AnonZone::start(zone_cfg, cfg.network, core.clone(), zone_rng)?);
+            zones.push(AnonZone::start(
+                zone_cfg,
+                cfg.network,
+                core.clone(),
+                zone_rng,
+            )?);
             wow_log::info!(LOG, "sending this node's own transactions over {zone}");
         }
 
@@ -1113,14 +1118,16 @@ impl Node {
     /// Send a transaction this node originated. It starts in the Dandelion++
     /// stem phase (`specs/08` §7.2).
     pub fn relay_transaction(&self, id: Hash256, blob: Vec<u8>) {
-        self.shared.relay_txs(None, vec![(id, blob)], TxRelay::Local);
+        self.shared
+            .relay_txs(None, vec![(id, blob)], TxRelay::Local);
     }
 
     /// Send a transaction the network already has to every peer, as the
     /// `relay_tx` RPC does for a public one: stemming it again would only
     /// look like a loop to the stem.
     pub fn fluff_transaction(&self, id: Hash256, blob: Vec<u8>) {
-        self.shared.relay_txs(None, vec![(id, blob)], TxRelay::Fluff);
+        self.shared
+            .relay_txs(None, vec![(id, blob)], TxRelay::Fluff);
     }
 
     /// Announce a block this node added itself, such as one submitted over
@@ -1854,11 +1861,8 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
             }
 
             let peers = shared.handshake_peers();
-            let resp = messages::handshake_response(
-                &shared.node_data(),
-                &shared.core.sync_data(),
-                &peers,
-            );
+            let resp =
+                messages::handshake_response(&shared.node_data(), &shared.core.sync_data(), &peers);
             if write_frame(
                 &mut stream,
                 Header::response(command::HANDSHAKE, resp.len() as u64, 1),

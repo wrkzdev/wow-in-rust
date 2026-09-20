@@ -473,8 +473,8 @@ impl Session {
         for (n, t) in transfers.iter().enumerate().skip(offset) {
             let secret = crate::refresh::one_time_secret_key(&self.keys_file.account, t)
                 .ok_or(OfflineError::WatchOnly)?;
-            let public =
-                wow_crypto::secret_key_to_public_key(&secret).ok_or(OfflineError::KeyMismatch(n))?;
+            let public = wow_crypto::secret_key_to_public_key(&secret)
+                .ok_or(OfflineError::KeyMismatch(n))?;
             if public != t.public_key {
                 return Err(OfflineError::KeyMismatch(n));
             }
@@ -542,11 +542,8 @@ impl Session {
             if !in_prime_order_subgroup(&signed.key_image) {
                 return Err(OfflineError::KeyImageDomain(n + offset, signed.key_image));
             }
-            if !cold::check_key_image_signature(
-                &signed.key_image,
-                &t.public_key,
-                &signed.signature,
-            ) {
+            if !cold::check_key_image_signature(&signed.key_image, &t.public_key, &signed.signature)
+            {
                 return Err(OfflineError::BadSignature(n + offset, signed.key_image));
             }
         }
@@ -754,8 +751,7 @@ impl Session {
                 .0
                 .cmp(&planned.inputs[a].key_image.0)
         });
-        let selected_transfers: Vec<u64> =
-            order.iter().map(|&n| plan.inputs[n] as u64).collect();
+        let selected_transfers: Vec<u64> = order.iter().map(|&n| plan.inputs[n] as u64).collect();
 
         let mut subaddr_indices: Vec<u32> = plan
             .inputs
@@ -896,8 +892,8 @@ impl Session {
             // Whatever of this transaction comes back to this wallet, so the
             // watch-only half learns the change output's key image before the
             // block arrives: `signed_txes.tx_key_images`.
-            for r in crate::scan::scan_transaction(&built.tx, &self.state.keys())
-                .unwrap_or_default()
+            for r in
+                crate::scan::scan_transaction(&built.tx, &self.state.keys()).unwrap_or_default()
             {
                 if let Some(k) = r.key_image {
                     signed.tx_key_images.push((r.public_key, k));
@@ -1438,12 +1434,7 @@ fn plan_from_pending(ptx: &PendingTx, held: usize) -> SpendPlan {
         .filter_map(|&i| usize::try_from(i).ok())
         .filter(|&i| i < held)
         .collect();
-    let sent: u64 = ptx
-        .construction_data
-        .dests
-        .iter()
-        .map(|d| d.amount)
-        .sum();
+    let sent: u64 = ptx.construction_data.dests.iter().map(|d| d.amount).sum();
     SpendPlan {
         inputs,
         amounts: vec![sent],
@@ -1717,8 +1708,7 @@ mod tests {
         // A different output's signature.
         let other = SecretKey(r.random_scalar());
         let other_public = wow_crypto::secret_key_to_public_key(&other).expect("P");
-        let other_image =
-            wow_crypto::generate_key_image(&other_public, &other).expect("an image");
+        let other_image = wow_crypto::generate_key_image(&other_public, &other).expect("an image");
         images.images[0].signature =
             cold::sign_key_image(&mut r, &other_image, &other_public, &other).expect("sign");
         assert!(matches!(
@@ -1892,9 +1882,7 @@ mod tests {
         );
         let cd = construction(&cold.keys_file.account, &t0, mask, payee, decoy);
 
-        let described = cold
-            .describe(std::slice::from_ref(&cd))
-            .expect("describe");
+        let described = cold.describe(std::slice::from_ref(&cd)).expect("describe");
         assert_eq!(described.txs.len(), 1);
         let d = &described.txs[0];
         assert_eq!(d.amount_in, 1_000_000);

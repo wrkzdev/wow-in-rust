@@ -286,7 +286,10 @@ mod tests {
         assert_eq!(c.user, "bob");
         assert_eq!(c.pass, "hun:ter2");
         assert!(Credentials::parse("nocolon").is_none());
-        assert!(Credentials::parse(":nouser").is_none(), "a user is required");
+        assert!(
+            Credentials::parse(":nouser").is_none(),
+            "a user is required"
+        );
         // An empty password is allowed: the daemon generates one and prints it,
         // and somebody will paste it back without the password part.
         assert_eq!(Credentials::parse("bob:").expect("parsed").pass, "");

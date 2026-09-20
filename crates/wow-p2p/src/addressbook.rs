@@ -530,10 +530,8 @@ impl AddressBook {
             .filter(|r| r.addr.ip().is_loopback() || hosts.insert(host_of(r.addr.ip())))
             .collect();
 
-        let mut subnets: HashSet<u32> = connected
-            .iter()
-            .filter_map(|a| subnet_of(a.ip()))
-            .collect();
+        let mut subnets: HashSet<u32> =
+            connected.iter().filter_map(|a| subnet_of(a.ip())).collect();
         let mut shuffled = peers.clone();
         shuffle(&mut shuffled, rand_below);
         let mut one_per_subnet: Vec<&PeerRecord> = shuffled
@@ -666,12 +664,7 @@ impl AddressBook {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let entries = |records: Vec<PeerRecord>| {
-            peer_list_value(
-                &records
-                    .iter()
-                    .map(PeerRecord::to_entry)
-                    .collect::<Vec<_>>(),
-            )
+            peer_list_value(&records.iter().map(PeerRecord::to_entry).collect::<Vec<_>>())
         };
         let mut s = Section::new();
         s.insert("version".into(), Value::U64(STATE_VERSION));
@@ -772,11 +765,7 @@ fn sorted(mut v: Vec<PeerRecord>) -> Vec<PeerRecord> {
 /// Drop entries from the front of the C++'s time order -- least recently
 /// seen, and of those the first to arrive -- until `m` fits, handing each to
 /// `evicted` (`trim_gray_peerlist`, `trim_white_peerlist`).
-fn trim(
-    m: &mut HashMap<SocketAddr, Listed>,
-    limit: usize,
-    mut evicted: impl FnMut(PeerRecord),
-) {
+fn trim(m: &mut HashMap<SocketAddr, Listed>, limit: usize, mut evicted: impl FnMut(PeerRecord)) {
     if m.len() <= limit {
         return;
     }

@@ -141,7 +141,10 @@ impl std::fmt::Debug for Options {
             )
             .field("disable_login", &self.disable_login)
             .field("daemon", &self.daemon)
-            .field("daemon_login", &self.daemon_login.as_ref().map(|_| "<redacted>"))
+            .field(
+                "daemon_login",
+                &self.daemon_login.as_ref().map(|_| "<redacted>"),
+            )
             .field("ssl", &self.ssl)
             .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
             .field("trusted_daemon", &self.trusted_daemon)
@@ -250,9 +253,11 @@ fn parse(args: Vec<String>) -> Result<Options, String> {
             "--trusted-daemon" | "--untrusted-daemon" => {
                 let trusted = arg == "--trusted-daemon";
                 if o.trusted_daemon.is_some_and(|t| t != trusted) {
-                    return Err("--trusted-daemon and --untrusted-daemon contradict each other; \
+                    return Err(
+                        "--trusted-daemon and --untrusted-daemon contradict each other; \
                                 give one"
-                        .into());
+                            .into(),
+                    );
                 }
                 o.trusted_daemon = Some(trusted);
             }

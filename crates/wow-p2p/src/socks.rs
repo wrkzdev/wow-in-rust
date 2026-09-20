@@ -135,18 +135,28 @@ impl std::fmt::Display for Proxy {
 pub enum SocksError {
     Io(std::io::Error),
     /// The proxy answered with something other than version 5.
-    UnexpectedVersion { found: u8 },
+    UnexpectedVersion {
+        found: u8,
+    },
     /// The proxy took none of the authentication methods offered.
-    NoAcceptableMethod { found: u8 },
+    NoAcceptableMethod {
+        found: u8,
+    },
     /// The proxy refused the user and password (RFC 1929).
     AuthFailure,
     /// The proxy refused the connection. RFC 1928 §6's reply codes.
-    Refused { code: u8 },
+    Refused {
+        code: u8,
+    },
     /// A reply this code cannot read -- an address type it never asked about.
-    BadReply { found: u8 },
+    BadReply {
+        found: u8,
+    },
     /// A host name SOCKS5 cannot carry: empty, or longer than its one length
     /// byte allows.
-    BadHost { len: usize },
+    BadHost {
+        len: usize,
+    },
 }
 
 impl std::fmt::Display for SocksError {
@@ -595,4 +605,3 @@ mod tests {
         assert!(e.to_string().contains("empty host name"));
     }
 }
-
