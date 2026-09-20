@@ -415,20 +415,28 @@ fn the_pool_endpoint_answers() {
 }
 
 /// A binary endpoint this node really does not serve still says so by name.
+///
+/// This asked for `/get_blocks_by_height.bin` until that arrived with the
+/// prune and pool work, and there is nothing to put in its place: all nine
+/// `MAP_URI_AUTO_BIN2` paths in `core_rpc_server.h` are served now. So the
+/// path here is one the reference does not have either -- what is being
+/// checked is that an unknown `.bin` comes back as an epee answer naming the
+/// path, rather than as a malformed body or a bare 404.
 #[test]
 fn an_unknown_binary_endpoint_reports_itself() {
     let (d, _) = start("unknownbin", 2);
     let c = client(d.port);
 
     let e = c
-        .binary(
-            "/get_blocks_by_height.bin",
-            &wow_serialize::epee::Section::new(),
-        )
+        .binary("/get_nothing.bin", &wow_serialize::epee::Section::new())
         .expect_err("not served");
     assert!(
         e.to_string().contains("not implemented"),
         "the error says what is missing: {e}"
+    );
+    assert!(
+        e.to_string().contains("/get_nothing.bin"),
+        "and which endpoint it was: {e}"
     );
 }
 
