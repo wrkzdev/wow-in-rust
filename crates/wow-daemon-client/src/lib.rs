@@ -162,8 +162,8 @@ impl DaemonClient {
                     message: err
                         .get("message")
                         .and_then(Json::as_str)
-                        .unwrap_or("no message")
-                        .to_string(),
+                        .map(printable)
+                        .unwrap_or_else(|| "no message".into()),
                 });
             }
         }
@@ -223,7 +223,7 @@ impl DaemonClient {
 fn check_status(v: &Json) -> Result<()> {
     match v.get("status").and_then(Json::as_str) {
         None | Some("OK") => Ok(()),
-        Some(other) => Err(DaemonError::Status(other.to_string())),
+        Some(other) => Err(DaemonError::Status(printable(other))),
     }
 }
 
@@ -231,8 +231,23 @@ fn check_binary_status(s: &Section) -> Result<()> {
     match s.get("status").and_then(|v| v.as_bytes()) {
         None => Ok(()),
         Some(b) if b == b"OK" => Ok(()),
-        Some(b) => Err(DaemonError::Status(String::from_utf8_lossy(b).into_owned())),
+        Some(b) => Err(DaemonError::Status(printable(&String::from_utf8_lossy(b)))),
     }
+}
+
+/// `s` with every control character replaced by `?`, for text a daemon wrote
+/// that is about to reach a terminal.
+///
+/// A node is not trusted to choose what a wallet's terminal does: an escape
+/// sequence in an error message or a `reason` could move the cursor, rewrite
+/// what was printed above it, or set the window title. The Wownero C++
+/// `print_version` dropped its `is_version_string_valid` filter and prints a
+/// remote node's `version` as it came; this is the filter for what a wallet
+/// here prints of a daemon's (`docs/cpp-findings.md` §23).
+pub fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// True when an error means "try again shortly" rather than "give up".
@@ -272,6 +287,19 @@ mod tests {
             code: -2,
             message: "too big height".into()
         }));
+    }
+
+    /// C0, DEL and C1 (whose 0x9B is a one-byte CSI) are all replaced;
+    /// printable text, including non-ASCII, is left alone.
+    #[test]
+    fn a_daemon_string_is_made_printable() {
+        assert_eq!(printable("too big height"), "too big height");
+        assert_eq!(printable("\u{1b}[2J\u{1b}]0;x\u{7}"), "?[2J?]0;x?");
+        assert_eq!(printable("a\u{7f}b\u{9b}c\nd\te"), "a?b?c?d?e");
+        assert_eq!(printable("énorme ✓"), "énorme ✓");
+
+        let e = check_status(&json!({"status": "\u{1b}[31mBUSY"})).expect_err("not OK");
+        assert!(matches!(e, DaemonError::Status(s) if s == "?[31mBUSY"));
     }
 
     #[test]

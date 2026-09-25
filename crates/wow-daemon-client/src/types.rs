@@ -591,8 +591,8 @@ fn parse_txpool_backlog(raw: &[u8]) -> Result<Vec<BacklogEntry>> {
             message: err
                 .get("message")
                 .and_then(Json::as_str)
-                .unwrap_or("no message")
-                .to_string(),
+                .map(crate::printable)
+                .unwrap_or_else(|| "no message".into()),
         });
     }
     let result = v.get("result").ok_or(DaemonError::Missing("result"))?;

@@ -532,7 +532,7 @@ fn set_daemon(session: &mut Session, args: &[&str]) -> Result<(), String> {
     if !info.nettype.is_empty() && info.nettype != expected {
         return Err(format!(
             "that daemon is on {}, but this is a {expected} wallet",
-            info.nettype
+            wow_daemon_client::printable(&info.nettype)
         ));
     }
 
@@ -1283,7 +1283,7 @@ fn send(
     } else {
         println!("The daemon rejected the transaction.");
         if !result.reason.is_empty() {
-            println!("  reason: {}", result.reason);
+            println!("  reason: {}", wow_daemon_client::printable(&result.reason));
         }
         for (flag, what) in [
             (result.double_spend, "an input was already spent"),
@@ -1298,7 +1298,7 @@ fn send(
                 println!("  {what}");
             }
         }
-        println!("  status: {}", result.status);
+        println!("  status: {}", wow_daemon_client::printable(&result.status));
         if result.double_spend {
             explain_double_spend(session, &relayed.noted_in_pool, plan);
         }
@@ -1622,9 +1622,9 @@ fn submit_transfer(session: &mut Session) -> Result<(), String> {
         } else {
             println!("The daemon rejected transaction {txid}.");
             if !result.reason.is_empty() {
-                println!("  reason: {}", result.reason);
+                println!("  reason: {}", wow_daemon_client::printable(&result.reason));
             }
-            println!("  status: {}", result.status);
+            println!("  status: {}", wow_daemon_client::printable(&result.status));
         }
     }
     Ok(())
