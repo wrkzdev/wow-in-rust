@@ -16,6 +16,7 @@
 //! length is never used to size an allocation.
 
 use std::io::{ErrorKind, Read};
+use std::time::Instant;
 
 use crate::levin::{Header, LevinError, Reassembler, Reassembly, HEADER_LEN, SIGNATURE};
 
@@ -85,10 +86,40 @@ impl FrameReader {
     /// reassembled and dummies discarded, so what comes out is always a real
     /// message.
     pub fn poll<R: Read>(&mut self, src: &mut R) -> Result<Option<(Header, Vec<u8>)>, FrameError> {
+        self.read_until(src, None)
+    }
+
+    /// [`FrameReader::poll`], but giving up at `deadline` even while bytes are
+    /// still arriving.
+    ///
+    /// `poll` returns `Ok(None)` only when a read times out, so a peer that
+    /// sends a byte a little more often than the socket's read timeout keeps
+    /// it reading for as long as it likes -- a deadline its caller checks
+    /// between polls is never reached. That is the C++'s handshake stall,
+    /// whose timer restarted on every partial read (fixed in Monero by an
+    /// absolute timeout, #11082). With this, the deadline holds whatever the
+    /// peer sends: `Ok(None)` once it has passed, and nothing buffered is
+    /// lost.
+    pub fn poll_before<R: Read>(
+        &mut self,
+        src: &mut R,
+        deadline: Instant,
+    ) -> Result<Option<(Header, Vec<u8>)>, FrameError> {
+        self.read_until(src, Some(deadline))
+    }
+
+    fn read_until<R: Read>(
+        &mut self,
+        src: &mut R,
+        deadline: Option<Instant>,
+    ) -> Result<Option<(Header, Vec<u8>)>, FrameError> {
         let mut chunk = vec![0u8; CHUNK];
         loop {
             if let Some(message) = self.take()? {
                 return Ok(Some(message));
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok(None);
             }
             match src.read(&mut chunk) {
                 Ok(0) => return Err(FrameError::Closed),
@@ -194,6 +225,53 @@ mod tests {
         let (h, body) = r.poll(&mut src).unwrap().expect("whole message");
         assert_eq!(h.command, 2002);
         assert_eq!(body, b"hello, peer");
+    }
+
+    /// A peer that sends one byte at a time, each well inside any read
+    /// timeout, so no read ever times out.
+    struct Drip {
+        bytes: Vec<u8>,
+        at: usize,
+        pause: std::time::Duration,
+    }
+
+    impl Read for Drip {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.pause);
+            match self.bytes.get(self.at) {
+                Some(b) => {
+                    out[0] = *b;
+                    self.at += 1;
+                    Ok(1)
+                }
+                None => Err(std::io::Error::from(ErrorKind::WouldBlock)),
+            }
+        }
+    }
+
+    /// A trickle does not stretch a deadline: `poll_before` gives up on time
+    /// though every read brought a byte, and keeps what it read.
+    #[test]
+    fn a_deadline_holds_against_a_trickle() {
+        let m = message(1001, &[7u8; 200]);
+        let mut src = Drip {
+            bytes: m,
+            at: 0,
+            pause: std::time::Duration::from_millis(1),
+        };
+        let mut r = FrameReader::new(levin::INITIAL_MAX_PACKET_SIZE);
+        let started = Instant::now();
+        let got = r
+            .poll_before(&mut src, started + std::time::Duration::from_millis(20))
+            .unwrap();
+        assert!(got.is_none(), "not a whole message by the deadline");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(src.at > 0 && src.at < src.bytes.len());
+
+        src.pause = std::time::Duration::ZERO;
+        let (h, body) = r.poll(&mut src).unwrap().expect("the rest follows");
+        assert_eq!(h.command, 1001);
+        assert_eq!(body, [7u8; 200]);
     }
 
     #[test]

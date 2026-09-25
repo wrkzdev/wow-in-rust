@@ -1773,6 +1773,10 @@ fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
 }
 
 /// Read one message within `timeout`.
+///
+/// An absolute deadline, however the bytes arrive: a peer dripping a message
+/// out a byte at a time held this with plain `poll` for as long as it cared
+/// to, the C++'s handshake stall (Monero #11082).
 fn read_one(
     stream: &mut TcpStream,
     reader: &mut FrameReader,
@@ -1783,7 +1787,7 @@ fn read_one(
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     loop {
-        match reader.poll(stream) {
+        match reader.poll_before(stream, deadline) {
             Ok(Some(m)) => return Ok(m),
             Ok(None) if Instant::now() >= deadline => return Err("timed out".into()),
             Ok(None) => {}
@@ -1820,7 +1824,9 @@ fn inbound(shared: Arc<Shared>, mut stream: TcpStream, addr: SocketAddr) {
         }
     }
 
-    let mut reader = FrameReader::new(levin::INITIAL_MAX_PACKET_SIZE);
+    // Only a handshake or a ping may come first, and neither is ever bigger
+    // than the C++'s cap for a handshake.
+    let mut reader = FrameReader::new(levin::HANDSHAKE_MAX_PACKET_SIZE);
     let Ok((header, body)) = read_one(&mut stream, &mut reader, HANDSHAKE_TIMEOUT) else {
         return;
     };
@@ -1925,7 +1931,7 @@ fn ping_back(shared: Arc<Shared>, ip: IpAddr, node: BasicNodeData, pruning_seed:
             &body,
         )
         .map_err(|e| e.to_string())?;
-        let mut reader = FrameReader::new(levin::INITIAL_MAX_PACKET_SIZE);
+        let mut reader = FrameReader::new(levin::HANDSHAKE_MAX_PACKET_SIZE);
         let (h, body) = read_one(&mut stream, &mut reader, HANDSHAKE_TIMEOUT)?;
         if h.command != command::PING || h.kind() != Kind::Response {
             return Ok(false);
@@ -1979,7 +1985,10 @@ fn dial(
     )
     .map_err(|e| e.to_string())?;
 
-    let mut reader = FrameReader::new(levin::INITIAL_MAX_PACKET_SIZE);
+    // The handshake's own cap until its answer is in, not the 100 MB the C++
+    // allows as soon as its request is out: nothing bigger can be an answer.
+    let mut reader = FrameReader::new(levin::HANDSHAKE_MAX_PACKET_SIZE);
+    // One absolute deadline for the whole answer, however it arrives.
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -1987,8 +1996,22 @@ fn dial(
             return Err("the handshake timed out".into());
         }
         let (h, body) = read_one(&mut stream, &mut reader, left)?;
-        if h.command != command::HANDSHAKE || h.kind() != Kind::Response {
+        // A request may come first -- the C++ asks a peer that advertised no
+        // support flags for them from inside its handshake handler, before
+        // its answer goes out -- so anything that is not a response is
+        // passed over, as before. The deadline and the size cap bound what
+        // that can cost.
+        if h.kind() != Kind::Response {
             continue;
+        }
+        // A response, though, can only be the handshake's. The C++ took any
+        // response to its handshake invoke, whatever its command, as the
+        // answer (fixed in Monero by #11103); here it ends the dial.
+        if h.command != command::HANDSHAKE {
+            return Err(format!(
+                "answered the handshake with a response to command {}",
+                h.command
+            ));
         }
         if h.return_code < 0 {
             return Err(format!("the handshake was refused ({})", h.return_code));

@@ -647,6 +647,13 @@ impl AddressBook {
     /// [`FAILED_ADDR_FORGET_SECONDS`] bans it for [`IP_BLOCKTIME`], and this
     /// returns true when that happens.
     pub fn record_failure(&mut self, ip: IpAddr, now: u64) -> bool {
+        // Counts whose hour has passed go, as `record_addr_failed`'s do. An
+        // entry below the ban threshold was otherwise only ever reset, never
+        // removed -- the C++'s `host_count` leak -- so a stranger cycling
+        // through addresses (one IPv6 /64 is plenty) grew the table without
+        // end, one malformed handshake at a time.
+        self.fails
+            .retain(|_, (_, first)| now.saturating_sub(*first) <= FAILED_ADDR_FORGET_SECONDS);
         let entry = self.fails.entry(ip).or_insert((0, now));
         if now.saturating_sub(entry.1) > FAILED_ADDR_FORGET_SECONDS {
             *entry = (0, now);
@@ -1122,6 +1129,20 @@ mod tests {
             !b.record_failure(other, FAILED_ADDR_FORGET_SECONDS + 1),
             "the earlier nine were forgotten"
         );
+    }
+
+    /// A failure count is dropped once its hour is over, not only reset when
+    /// the same address fails again: otherwise every address that ever sent
+    /// one bad handshake stayed in the table for good.
+    #[test]
+    fn stale_failure_counts_are_removed() {
+        let mut b = AddressBook::new(false);
+        for i in 0..100u8 {
+            b.record_failure(IpAddr::from([7, 7, 7, i]), 0);
+        }
+        assert_eq!(b.fails.len(), 100);
+        b.record_failure("8.8.8.8".parse().unwrap(), FAILED_ADDR_FORGET_SECONDS + 1);
+        assert_eq!(b.fails.len(), 1, "only the fresh count is left");
     }
 
     #[test]

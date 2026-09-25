@@ -600,6 +600,123 @@ fn a_banned_address_cannot_connect() {
     assert_eq!(a.bans().len(), 1);
 }
 
+/// A handshake request as a peer with `peer_id` would send it, framed.
+fn hello(core: &MemCore, peer_id: u64) -> Vec<u8> {
+    let theirs = BasicNodeData {
+        network_id: messages::network_id(Network::Mainnet),
+        peer_id,
+        my_port: 0,
+        rpc_port: 0,
+        rpc_credits_per_hash: 0,
+        // Set, so the node has no reason to ask for them and then drop a
+        // connection that never answered.
+        support_flags: messages::SUPPORT_FLAG_FLUFFY_BLOCKS,
+    };
+    let body = messages::handshake_request(&theirs, &core.sync_data());
+    encode(
+        &Header::request(command::HANDSHAKE, body.len() as u64),
+        &body,
+    )
+}
+
+/// One handshake a connection: a second on the same connection ends it, with
+/// no second peer list and no second ping-back, whatever peer id the first
+/// gave. The C++ refuses one only `if(context.peer_id)`, so a peer that
+/// handshook as peer 0 could handshake again and again (Monero #11156).
+#[test]
+fn a_second_handshake_on_one_connection_ends_it() {
+    let t = template();
+    let genesis = make_block(&t, [0u8; 32], 0);
+    let core = MemCore::new(&genesis);
+    let a = Node::start(config(Vec::new()), core.clone(), rng(1)).unwrap();
+
+    let mut stream = std::net::TcpStream::connect(a.local_addr().unwrap()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let request = hello(&core, 0);
+    stream.write_all(&request).expect("sent");
+
+    let mut reader = FrameReader::new(levin::DEFAULT_MAX_PACKET_SIZE);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "the node did not answer");
+        if let Some((h, _)) = reader.poll(&mut stream).expect("the answer") {
+            if h.command == command::HANDSHAKE {
+                break;
+            }
+        }
+    }
+    wait_until("the connection", 10, || a.connection_count() == 1);
+
+    stream.write_all(&request).expect("sent again");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "the connection stayed open");
+        match reader.poll(&mut stream) {
+            Ok(Some((h, _))) => assert_ne!(
+                h.command,
+                command::HANDSHAKE,
+                "a second handshake was answered"
+            ),
+            Ok(None) => {}
+            Err(_) => break,
+        }
+    }
+    wait_until("the node to let go", 10, || a.connection_count() == 0);
+}
+
+/// A handshake dripped in a byte at a time, each byte well inside the read
+/// timeout, is cut off at the handshake deadline rather than read for as long
+/// as bytes keep coming -- the C++'s stall, whose timer restarted on every
+/// partial read (Monero #11082).
+#[test]
+fn a_dripped_handshake_is_cut_off_at_the_deadline() {
+    let t = template();
+    let genesis = make_block(&t, [0u8; 32], 0);
+    let core = MemCore::new(&genesis);
+    let a = Node::start(config(Vec::new()), core.clone(), rng(1)).unwrap();
+
+    let mut stream = std::net::TcpStream::connect(a.local_addr().unwrap()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let request = hello(&core, 7);
+
+    let started = Instant::now();
+    let mut sent = 0;
+    let mut byte = [0u8; 1];
+    let cut_off = loop {
+        assert!(started.elapsed() < Duration::from_secs(60), "never cut off");
+        if sent < request.len() {
+            if stream.write_all(&request[sent..sent + 1]).is_err() {
+                break started.elapsed();
+            }
+            sent += 1;
+        }
+        // Waiting on a read paces the drip, and sees the node hang up.
+        match stream.read(&mut byte) {
+            Ok(0) => break started.elapsed(),
+            Ok(_) => panic!("answered after all {sent} bytes: the drip was never cut off"),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break started.elapsed(),
+        }
+    };
+    assert!(
+        sent < request.len(),
+        "the whole handshake went out first ({sent} bytes)"
+    );
+    assert!(
+        cut_off < Duration::from_secs(10),
+        "cut off after {cut_off:?}"
+    );
+    assert_eq!(a.connection_count(), 0);
+}
+
 /// Stopping closes the connections, remembers the outgoing ones as anchors,
 /// and saves the peer lists for the next run.
 #[test]

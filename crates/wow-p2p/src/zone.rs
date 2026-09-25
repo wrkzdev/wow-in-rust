@@ -1037,13 +1037,16 @@ fn inbound(shared: Arc<ZoneShared>, mut stream: TcpStream) {
         return;
     }
 
-    let mut reader = FrameReader::new(levin::INITIAL_MAX_PACKET_SIZE);
+    // A handshake is all that may come first, and the C++ caps one at 64 KiB.
+    let mut reader = FrameReader::new(levin::HANDSHAKE_MAX_PACKET_SIZE);
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let request = loop {
         if Instant::now() >= deadline {
             return;
         }
-        match reader.poll(&mut stream) {
+        // `poll_before`, so a handshake dripped in a byte at a time does not
+        // hold this thread past the deadline.
+        match reader.poll_before(&mut stream, deadline) {
             // A zone speaks nothing before a handshake, so anything else
             // ends the connection rather than waiting for one.
             Ok(Some((h, body))) => {
@@ -1122,7 +1125,7 @@ fn dial(
         .write_all(&encode(&header, &body))
         .map_err(|e| e.to_string())?;
 
-    let mut reader = FrameReader::new(levin::INITIAL_MAX_PACKET_SIZE);
+    let mut reader = FrameReader::new(levin::HANDSHAKE_MAX_PACKET_SIZE);
     stream
         .set_read_timeout(Some(READ_TICK))
         .map_err(|e| e.to_string())?;
@@ -1131,10 +1134,20 @@ fn dial(
         if Instant::now() >= deadline {
             return Err("the handshake timed out".into());
         }
-        match reader.poll(&mut stream) {
+        match reader.poll_before(&mut stream, deadline) {
             Ok(Some((h, body))) => {
-                if h.command != command::HANDSHAKE || h.kind() != Kind::Response {
+                // A request may come first: this zone advertises no support
+                // flags, and the C++ asks for them from inside its handshake
+                // handler, before its answer goes out.
+                if h.kind() != Kind::Response {
                     continue;
+                }
+                // A response can only be the handshake's (Monero #11103).
+                if h.command != command::HANDSHAKE {
+                    return Err(format!(
+                        "answered the handshake with a response to command {}",
+                        h.command
+                    ));
                 }
                 if h.return_code < 0 {
                     return Err(format!("the handshake was refused ({})", h.return_code));
@@ -1221,6 +1234,14 @@ fn run_connection(
 /// returns for a filtered command.
 fn handle(shared: &Arc<ZoneShared>, conn: &Arc<ZoneConn>, header: &Header, body: &[u8]) {
     match (header.kind(), header.command) {
+        // One handshake a connection, as the public zone has it (and Monero
+        // since #11156). In a zone every peer id is 1, so the C++'s
+        // `if(context.peer_id)` guard refuses a second one here too; this
+        // ends the connection rather than answer it as a filtered command.
+        (Kind::Request, command::HANDSHAKE) => {
+            wow_log::debug!(LOG, "{}: a second handshake", conn.peer);
+            conn.close();
+        }
         (Kind::Request, command::TIMED_SYNC) => {
             match TimedSync::parse(body) {
                 Ok(sync) => {

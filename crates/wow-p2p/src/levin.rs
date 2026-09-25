@@ -36,6 +36,15 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// completes.
 pub const INITIAL_MAX_PACKET_SIZE: u64 = 256 * 1024;
 
+/// `cryptonote_connection_context::get_max_bytes` for `COMMAND_HANDSHAKE`
+/// (and `COMMAND_TIMED_SYNC`): 64 KiB. The C++ applies the smaller of this and
+/// the packet limit to each message by its command, so a handshake request or
+/// response is never bigger than this whatever stage the connection is at. A
+/// connection that reads nothing but a handshake (or a ping, whose own cap is
+/// smaller still) reads with this as its limit rather than
+/// [`INITIAL_MAX_PACKET_SIZE`]. A full 250-entry peer list is well inside it.
+pub const HANDSHAKE_MAX_PACKET_SIZE: u64 = 64 * 1024;
+
 /// `LEVIN_DEFAULT_MAX_PACKET_SIZE` — 100 MB, after the handshake.
 pub const DEFAULT_MAX_PACKET_SIZE: u64 = 100_000_000;
 
@@ -657,6 +666,8 @@ mod tests {
         assert_eq!(INITIAL_MAX_PACKET_SIZE, 256 * 1024);
         assert_eq!(DEFAULT_MAX_PACKET_SIZE, 100_000_000);
         const _: () = assert!(INITIAL_MAX_PACKET_SIZE < DEFAULT_MAX_PACKET_SIZE);
+        assert_eq!(HANDSHAKE_MAX_PACKET_SIZE, 65_536);
+        const _: () = assert!(HANDSHAKE_MAX_PACKET_SIZE < INITIAL_MAX_PACKET_SIZE);
 
         let big = Header::notification(command::NEW_BLOCK, 1_000_000).write();
         // Accepted after the handshake...
