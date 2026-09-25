@@ -416,6 +416,361 @@ startup which range it is not verifying. `docs/spec-deltas.md` §23.
 
 ---
 
+## 14. `miner.cpp`: the vote is set after the header is signed
+
+**Severity:** latent (costs a found block now and then)
+
+`src/cryptonote_basic/miner.cpp`, in `worker_thread`:
+
+```cpp
+crypto::hash sig_data = get_sig_data(b);
+...
+crypto::generate_signature(sig_data, output_public_key, eph_secret_key, signature);
+b.signature = signature;
+b.vote = m_int_vote;           // after the signature it should be under
+```
+
+`vote` is serialized into the header that `get_sig_data` hashes; only
+`signature` is zeroed. `b` is copied from the template, whose vote is 0, each
+time the template changes, so with `--vote yes` or `--vote no` the first nonce
+tried after every refresh carries a signature over vote 0 and a header saying 1
+or 2. Later nonces are fine, because `b` keeps the vote from the one before.
+If that first nonce meets the target, the node rejects its own block ("Miner
+signature is invalid").
+
+- [ ] **C++ test:** set a template, run one iteration of the worker loop with
+      `m_int_vote = 1`, and check the signature against the resulting header.
+      The fix is to move `b.vote = m_int_vote` above `get_sig_data`.
+
+**Rust side:** `wownerod::miner::sign_header` sets the vote first;
+`a_signed_header_verifies_as_consensus_checks_it` signs with votes 0, 1 and 2.
+
+---
+
+## 15. `miner.cpp`: the signing key is never checked against the address
+
+**Severity:** latent (a miner that can never win)
+
+`miner::init` reads `--spendkey` with `hex_to_pod` and ignores its result,
+derives the view key as `keccak(spend)`, and never compares either with the
+address passed to `start_mining`. Without `--spendkey` the keys stay zero. In
+every one of those cases each block found carries a signature that does not
+verify against `vout[0]`'s key, the node rejects it, and the log still says a
+block was found. In a debug build `generate_signature`'s `assert(pub == t2)`
+aborts the daemon instead.
+
+- [ ] **C++ test:** `start_mining` at HF 18 with no `--spendkey`, and with the
+      key of a different address; both should be refused at start.
+
+**Rust side:** `wownerod::miner::Keys::new` refuses a key that is not the
+address's, and mining past HF 18 without one is refused
+(`a_spend_key_is_checked_against_the_address`,
+`mining_past_hf18_without_keys_is_refused`).
+
+---
+
+## 16. `core_rpc_server.cpp`: `generateblocks` cannot produce a valid block
+
+**Severity:** latent (regtest tooling)
+
+```cpp
+if (b.major_version >= HF_VERSION_BLOCK_HEADER_MINER_SIG)
+{
+    b.signature = {};
+    b.vote = 0;
+}
+```
+
+Regtest runs the newest fork from height 1, so every block needs a header
+signature, and `check_signature` rejects an all-zero one. Every
+`generateblocks` call finds a nonce and then fails in `submitblock`, which also
+means the Python functional tests that call it cannot pass.
+
+- [ ] **C++ test:** `generateblocks` on a fresh regtest daemon, expecting the
+      height to advance.
+
+**Rust side:** `rpc::mining::generateblocks` signs every attempt when the
+daemon has the address's `--spendkey` (`docs/daemon-review.md` E).
+
+---
+
+## 17. `blockchain.cpp`: `recalculate_difficulties` uses the tip's algorithm for every height
+
+**Severity:** latent on mainnet; live on testnet and stagenet
+
+```cpp
+uint8_t version = get_current_hard_fork_version();   // once, before the loop
+...
+for (uint64_t height = start_height; height <= top_height; ++height)
+{
+  uint64_t HEIGHT = m_db->height();                   // the tip, not `height`
+  if (version >= 20) recalculated_diff = next_difficulty_v6(..., HEIGHT, m_nettype);
+```
+
+`core::on_idle` runs it every seven days from the last matching difficulty
+checkpoint. Monero has one algorithm, so hoisting the version out of the loop
+cost nothing there; Wownero has six.
+
+- **Testnet and stagenet** have no difficulty checkpoints, so the run starts at
+  0. Blocks 1-720 were validated at difficulty 100 (the
+  `HEIGHT <= DIFFICULTY_WINDOW` branch); the rerun passes the tip height and
+  gets 1. The drift is "found" at height 1 and every cumulative difficulty is
+  rewritten about 100 times too low, after which the node asks for a
+  hundredth of the network's work.
+- **Mainnet** is safe only because everything after the last difficulty
+  checkpoint (838,800) is HF 20.
+
+- [ ] **C++ test:** run `recalculate_difficulties(0)` on a testnet chain past
+      height 720 and compare the stored cumulative difficulties before and
+      after.
+
+**Rust side:** not reproduced. Nothing calls
+`correct_block_cumulative_difficulties`, so the Rust node never rewrites
+stored difficulties.
+
+---
+
+## 18. `blockchain.cpp`: alternative-chain difficulty uses the main chain's version and height
+
+**Severity:** consensus (report, never "fix")
+
+`get_next_difficulty_for_alternative_chain` picks the algorithm and window with
+`get_current_hard_fork_version()` and passes `HEIGHT = m_db->height()`: both
+the main chain's, not the alternative block's. The main path uses the block
+being validated. So near a fork that changes the algorithm, or on testnet
+while the tip is past 720 and the alternative block is not, an alternative
+block is judged by different rules than the same block would be on the main
+path. All of mainnet's algorithm changes are behind checkpoints.
+
+- [ ] **C++ test:** on testnet, submit an alternative block at height 700 with
+      the tip at 800 and compare the difficulty it is checked against with the
+      one the main path used at 700.
+
+**Rust side:** reproduced, so a Rust node accepts the alternative blocks a C++
+node does. `wow_core::chain::Blockchain::alt_difficulty` used to pass the
+alternative block's height as `HEIGHT`; it now passes the main chain's,
+`specs/07` §7.
+
+---
+
+## 19. `abstract_tcp_server2.inl`: an RPC reply is cut while it is still being written
+
+**Severity:** latent (large replies to remote clients)
+
+The connection has one timer. `start_write` sets `wait_write = true` and never
+touches it; only `on_write` re-arms it, and that runs after the whole buffer
+has gone. An RPC reply is always one unchunked `async_write` (`send()`,
+`m_connection_type == e_connection_type_RPC ||`). So:
+
+- the first request on a new remote connection has 10 s
+  (`NEW_CONNECTION_TIMEOUT_REMOTE`) from accept for the handler and the whole
+  write together;
+- a reused keep-alive connection has whatever is left of its 5 minutes.
+
+When the timer fires, `interrupt()` closes the socket mid-body. A client sees
+a truncated reply, typically a big `get_blocks.bin`. Monero fixed it on
+2026-08-17 (`4979a1c57e28`, re-arming the timer in `start_write`; take it
+without the `NEW_CONNECTION_TIMEOUT_LOCAL` change that `b7d4144e` reverts).
+Even then the budget is capped at the default timeout, so a 100 MB reply to a
+client slower than about 330 KB/s is still cut; writing in pieces and
+re-arming after each would remove that.
+
+- [ ] **C++ test:** Monero's `slow_reader_is_not_dropped_mid_response`.
+
+**Rust side:** not reproduced. `rpc::http::WRITE_TIMEOUT` is `SO_SNDTIMEO`,
+which bounds each write call, so a client that keeps reading is never cut off.
+
+---
+
+## 20. `abstract_tcp_server2.inl`: the per-host connection map never shrinks
+
+**Severity:** latent (slow memory growth)
+
+```cpp
+static std::map<std::string, unsigned int> hosts;
+unsigned int &val = hosts[m_host];
+```
+
+Entries are never erased, and `get_default_timeout()`'s `host_count(0)` call
+inserts one too. Every distinct remote address ever seen, P2P or RPC, stays
+for the life of the process. Monero fixed it in `0bf3e67`.
+
+- [ ] **C++ test:** connect from many loopback addresses and check the map's
+      size after they close.
+
+**Rust side:** connections per address are counted from the live connection
+list, with no map. The same leak did exist in two failure-count maps, which
+only reset an address's stale count when that address failed again:
+`AddressBook::record_failure` (bad handshakes) and
+`rpc::auth::Login::record_failure` (failed RPC logins). Both now drop every
+count older than their window (`stale_failure_counts_are_removed`).
+
+---
+
+## 21. `http_protocol_handler.inl`: a pipelined request after a body waits for more bytes
+
+**Severity:** latent (no client here pipelines)
+
+```cpp
+case http_state_retriving_body:
+    return handle_retriving_query_body();
+```
+
+After the body is consumed and answered, this returns instead of going round
+the loop again, so a second request already sitting in `m_cache` is not
+parsed until another read arrives, which a client waiting for its answer
+never sends. The connection sits until the idle timeout. The no-body path also
+keeps answering pipelined requests after one that said `Connection: close`.
+
+- [ ] **C++ test:** send two POSTs with bodies in one segment and expect two
+      replies.
+
+**Rust side:** not reproduced: one buffered reader per connection, a body read
+by its `Content-Length` and no further, and nothing read after a
+`Connection: close` request (`rpc::http::pipelined_requests_are_read_in_turn`).
+
+---
+
+## 22. `core_rpc_server.cpp`: `add_aux_pow` writes merge-mining depth 0
+
+**Severity:** latent (merge mining with two or more chains)
+
+```cpp
+size_t merkle_tree_depth = 0;                                   // never updated
+res.merkle_tree_depth = cryptonote::encode_mm_depth(aux_pow.size(), nonce);
+if (!add_mm_merkle_root_to_tx_extra(b.miner_tx.extra, merkle_root, merkle_tree_depth))
+```
+
+The response reports the real depth and the coinbase carries 0, so aux chains
+that check the tag reject the proof. With one chain the encoded depth is 0 and
+it happens to work. Monero PR #9073 fixed it, together with widening the depth
+in `add_mm_merkle_root_to_tx_extra` to a varint. From HF 18 any template it
+returns also has to be re-signed by whoever mines it.
+
+- [ ] **C++ test:** `add_aux_pow` with two chains, then parse the returned
+      template's extra and compare the depth with the response's.
+
+**Rust side:** `add_aux_pow` is not implemented.
+
+---
+
+## 23. `core_rpc_server.cpp`: the restricted `get_info` gives out the exact build
+
+**Severity:** cosmetic (a scanning aid, and a console escape)
+
+Wownero removed Monero's `restricted ? "" :` from `on_get_info`, so a public
+node tells anyone its exact version and commit, while the restricted ZMQ
+`get_info` still blanks it. The same change removed the
+`is_version_string_valid` filter from the console's `version` command, which
+then prints whatever a remote daemon returns, terminal escape sequences
+included.
+
+- [ ] **C++ test:** `get_info` on a restricted port over HTTP and ZMQ, expecting
+      the same `version`.
+
+**Rust side:** `get_info` on a restricted listener returns an empty `version`
+over HTTP, as it already did over ZMQ (`the_restricted_port_leaves_out_what_is_restricted`).
+No wallet here reads it. The wallets print daemon-supplied text through
+`wow_daemon_client::printable`, which replaces control characters: RPC error
+messages, `status`, a rejected transaction's `reason`, and `nettype`.
+
+---
+
+## 24. `daemon_handler.cpp`: the restricted ZMQ histogram refuses `recent_cutoff = 0`
+
+**Severity:** cosmetic
+
+```cpp
+const clock::time_point cutoff{std::chrono::seconds{req.recent_cutoff}};
+if (now - cutoff > 3 days) ...  // refuse
+```
+
+HTTP (`on_get_output_histogram`) refuses only
+`recent_cutoff > 0 && recent_cutoff < now - 3 days`, so 0, "no cutoff", is
+served there and refused over ZMQ. A `recent_cutoff` above about 9.2e9 also
+overflows the seconds-to-nanoseconds conversion.
+
+- [ ] **C++ test:** restricted ZMQ `get_output_histogram` with
+      `recent_cutoff = 0`.
+
+**Rust side:** the ZMQ handler used to copy the ZMQ test; it now uses the HTTP
+one (`zmq::handler::recent_cutoff_too_old`,
+`restricted_mode_and_refused_configurations`).
+
+---
+
+## 25. `cryptonote_core.cpp`, `updates.cpp`: the update check is half rebranded
+
+**Severity:** latent (dormant: the domain list is empty)
+
+`core::check_updates` looks up `software = "monero"` while the RPC `update`
+handler uses `"wownero"`; `get_update_url`'s host is `""`, so a URL comes out
+relative; and the hash test `fields[3].size() != 64 && !alnum` (inherited, and
+still in Monero) accepts any 64-character non-hex string. Nothing runs today
+because `dns_urls` is empty, but all three fail the moment update domains are
+added back.
+
+- [ ] **C++ test:** `check_updates` against a stub resolver serving a Wownero
+      record.
+
+**Rust side:** `--check-updates` is refused as not implemented.
+
+---
+
+## 26. `tx_pool.cpp`: `prune` can leave the pool and its database out of step
+
+**Severity:** latent (needs a database error)
+
+```cpp
+LockedTXN lock(m_blockchain.get_db());
+while (...) { try {
+    if (!parse_and_validate_tx_prefix_from_blob(txblob, tx)) { MERROR(...); return; }
+    m_blockchain.remove_txpool_tx(txid);
+    reduce_txpool_weight(meta.weight);
+    remove_transaction_keyimages(tx, txid);
+    ...
+  } catch (const std::exception &e) { MERROR(...); return; } }
+lock.commit();
+```
+
+A `return` from the middle of the loop skips `commit()`, so `~LockedTXN`
+aborts the batch and puts back the transactions already pruned, whose weight
+and key images have already left memory. Those transactions are in the
+database but no longer guard their key images, and at the next start
+`insert_key_images` can find two transactions for one key image and refuse to
+start. `LockedTXN::commit()` swallowing a `batch_stop` failure after memory
+has changed has the same effect. `break` instead of `return` would commit what
+was done.
+
+- [ ] **C++ test:** make `get_txpool_tx_blob` throw on the second transaction
+      `prune` visits and compare the pool's key images with its database.
+
+**Rust side:** not reproduced: the pool lives in memory and is written only by
+`TxPool::save`, and every eviction goes through `TxPool::remove`. Eviction
+used to take `kept_by_block` transactions too, which `prune` skips; it no
+longer does (`eviction_frees_key_images_and_spares_kept_by_block`).
+
+---
+
+## 27. `db_lmdb.cpp`: a failed `do_resize` leaves new transactions blocked
+
+**Severity:** latent
+
+`do_resize` calls `mdb_txn_safe::prevent_new_txns()` first, and the
+`throw0`s on `m_write_txn != nullptr` or a failed `mdb_env_set_mapsize` leave
+before `allow_new_txns()`. Every later `mdb_txn_safe` then spins on
+`creation_gate`: the node hangs at full CPU instead of reporting the error.
+Separate from §3.
+
+- [ ] **C++ test:** make `mdb_env_set_mapsize` fail inside `do_resize` and
+      check that a read transaction can still be opened afterwards.
+
+**Rust side:** not reproduced: `raw::Env::resize` runs inside the gate's
+`exclusive` closure, and the gate is released whatever
+`mdb_env_set_mapsize` returns: an error comes back as the closure's value.
+
+---
+
 ## Not findings
 
 Recorded so they are not re-investigated:
