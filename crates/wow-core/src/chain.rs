@@ -554,11 +554,17 @@ impl<D: BlockchainDb> Blockchain<D> {
                 cumulative.push(l.data.cumulative_difficulty);
             }
         }
+        // `HEIGHT` is `m_db->height()` in the C++ here too: the main chain's
+        // height, not the alternative block's. It picks the testnet
+        // first-720-blocks branch and the v5 per-height overrides, so passing
+        // the block's own height would judge some alternative blocks
+        // differently from a C++ node (`specs/07` §7, `docs/cpp-findings.md`
+        // §18).
         Ok(next_difficulty(
             version,
             timestamps,
             cumulative,
-            height,
+            self.height(),
             self.network,
         ))
     }

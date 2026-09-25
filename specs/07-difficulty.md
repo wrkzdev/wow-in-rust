@@ -444,7 +444,8 @@ timestamps and cumulative difficulties by walking the alt chain back from the ti
 and then continuing into the main chain, and feeds them to the same six
 algorithms with the same selection logic (`get_current_hard_fork_version()` — the
 version of the *main chain's* next block). It uses the same
-`difficulty_blocks_count` derivation.
+`difficulty_blocks_count` derivation, and passes `HEIGHT = m_db->height()` — the
+main chain's height, not the alternative block's.
 
 ---
 
