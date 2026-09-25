@@ -393,6 +393,17 @@ impl TxPool {
     ///
     /// Lowest fee per weight first, which is the reverse of the template
     /// order — the pool keeps what a miner would take.
+    ///
+    /// A transaction that came back out of a replaced block is never evicted,
+    /// as `tx_memory_pool::prune` skips `kept_by_block`: it is in the pool
+    /// because the chain it was mined in lost, and dropping it for weight
+    /// could leave a payment the network had already confirmed nowhere.
+    ///
+    /// Each eviction goes through [`TxPool::remove`], which takes the weight
+    /// and the key images out with the entry. There is no store to keep in
+    /// step here -- the pool is written only by [`TxPool::save`] -- so none of
+    /// `prune`'s half-done states (a database rolled back under a pool that
+    /// was not, key images freed for a transaction still held) can arise.
     pub fn evict_to_fit(&mut self) -> usize {
         if self.weight <= self.max_weight {
             return 0;
@@ -400,6 +411,7 @@ impl TxPool {
         let mut order: Vec<(Hash256, f64)> = self
             .by_id
             .iter()
+            .filter(|(_, e)| !e.kept_by_block())
             .map(|(id, e)| (*id, fee_rate(e)))
             .collect();
         order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1492,6 +1504,36 @@ mod tests {
         assert_eq!(pool.weight(), 0);
         assert!(pool.spent.is_empty(), "the key image is spendable again");
         assert!(pool.remove(&id(1)).is_none());
+    }
+
+    /// Eviction takes the worst-paying transaction's weight and key images
+    /// with it, and spares one that came back out of a replaced block however
+    /// little it pays (`prune`'s `kept_by_block` skip).
+    #[test]
+    fn eviction_frees_key_images_and_spares_kept_by_block() {
+        let mut pool = TxPool::new();
+        pool.set_max_weight(200);
+        pool.by_id.insert(id(1), entry(10, 100, 0));
+        let mut kept = entry(0, 100, 0);
+        kept.relay = RelayMethod::Block;
+        pool.by_id.insert(id(2), kept);
+        pool.by_id.insert(id(3), entry(1_000, 100, 0));
+        for n in 1..=3 {
+            pool.spent.insert(KeyImage([n; 32]), id(n));
+        }
+        pool.weight = 300;
+
+        assert_eq!(pool.evict_to_fit(), 1);
+        assert!(!pool.contains(&id(1)), "the worst-paying one goes");
+        assert!(pool.contains(&id(2)), "kept_by_block stays, paying nothing");
+        assert!(pool.contains(&id(3)));
+        assert_eq!(pool.weight(), 200);
+        assert!(
+            !pool.spent.contains_key(&KeyImage([1; 32])),
+            "freed with it"
+        );
+        assert_eq!(pool.spent.len(), 2);
+        assert_eq!(pool.evict_to_fit(), 0, "it fits now");
     }
 
     /// Every rejection names itself, and every flag `specs/11` §3.1 requires is

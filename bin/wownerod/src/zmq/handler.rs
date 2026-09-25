@@ -111,6 +111,19 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a restricted `get_output_histogram` refuses `recent_cutoff`.
+///
+/// `0` is "no cutoff" and is served. The C++ ZMQ handler
+/// (`DaemonHandler::handle(GetOutputHistogram)`) tests
+/// `now - recent_cutoff > 3 days` and so refuses `0` -- the value a caller
+/// sends when it wants no recent column at all -- while the C++ HTTP handler
+/// (`on_get_output_histogram`) and `rpc::methods::get_output_histogram` test
+/// `recent_cutoff > 0 && recent_cutoff < now - 3 days`. This follows HTTP, so
+/// one node answers the same request the same way on both.
+fn recent_cutoff_too_old(recent_cutoff: u64, now: u64) -> bool {
+    recent_cutoff > 0 && recent_cutoff < now.saturating_sub(RESTRICTED_HISTOGRAM_CUTOFF_SECS)
+}
+
 /// The methods, over the node the HTTP RPC serves.
 pub struct Handler {
     server: Arc<Server>,
@@ -541,9 +554,7 @@ impl Handler {
                 "Restricted RPC will not serve histograms on the whole blockchain. Use your own node.",
             );
         }
-        if self.restricted
-            && unix_now().saturating_sub(recent_cutoff) > RESTRICTED_HISTOGRAM_CUTOFF_SECS
-        {
+        if self.restricted && recent_cutoff_too_old(recent_cutoff, unix_now()) {
             return failed("Recent cutoff is too old");
         }
 
@@ -1143,6 +1154,25 @@ mod tests {
             true,
         );
         assert_eq!(r["result"]["height"], 7);
+    }
+
+    /// Restricted, `recent_cutoff = 0` is no cutoff and is served, as over
+    /// HTTP; a real cutoff older than three days is refused.
+    #[test]
+    fn a_zero_recent_cutoff_is_no_cutoff_not_a_stale_one() {
+        let now = 1_700_000_000;
+        assert!(!recent_cutoff_too_old(0, now), "0 is no cutoff");
+        assert!(recent_cutoff_too_old(1, now));
+        assert!(recent_cutoff_too_old(
+            now - RESTRICTED_HISTOGRAM_CUTOFF_SECS - 1,
+            now
+        ));
+        assert!(
+            !recent_cutoff_too_old(now - RESTRICTED_HISTOGRAM_CUTOFF_SECS, now),
+            "exactly three days is allowed, as `<` is strict"
+        );
+        assert!(!recent_cutoff_too_old(now, now));
+        assert!(!recent_cutoff_too_old(5, 0), "a clock at 0 refuses nothing");
     }
 
     #[test]

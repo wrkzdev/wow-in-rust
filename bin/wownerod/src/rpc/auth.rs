@@ -166,10 +166,13 @@ impl Login {
         }
         let now = Instant::now();
         let mut fails = lock(&self.fails);
+        // Forget every stale count, not only this address's: an address that
+        // failed once or twice and never came back would otherwise stay here
+        // for good, and one caller cycling through addresses -- an IPv6 /64
+        // has plenty -- could grow the map without bound. The C++ `host_count`
+        // map in `abstract_tcp_server2.inl` has that leak.
+        fails.retain(|_, (_, first)| now.duration_since(*first) <= FAIL_WINDOW);
         let entry = fails.entry(ip).or_insert((0, now));
-        if now.duration_since(entry.1) > FAIL_WINDOW {
-            *entry = (0, now);
-        }
         entry.0 += 1;
         if entry.0 >= FAILS_BEFORE_BLOCK {
             fails.remove(&ip);

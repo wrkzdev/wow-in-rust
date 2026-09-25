@@ -483,6 +483,20 @@ fn restricted_mode_and_refused_configurations() {
         e["error"]["message"],
         "Restricted RPC can only get output distribution for rct outputs. Use your own node."
     );
+    // `recent_cutoff = 0` is no cutoff, served as over HTTP; the C++ ZMQ path
+    // refuses it as "too old".
+    let histogram = |recent_cutoff: u64| {
+        call(
+            &d,
+            "get_output_histogram",
+            json!({"amounts": [1], "min_count": 0, "max_count": 0,
+                   "unlocked": false, "recent_cutoff": recent_cutoff}),
+        )
+    };
+    let r = histogram(0);
+    assert!(r.get("error").is_none(), "0 is no cutoff: {r}");
+    assert!(r["result"]["histogram"].is_array(), "{r}");
+    assert_eq!(histogram(1)["error"]["message"], "Recent cutoff is too old");
     let info = &call(&d, "get_info", json!({}))["result"]["info"];
     assert_eq!(info["version"], "", "restricted hides the version: {info}");
     assert_eq!(call(&d, "get_height", json!({}))["result"]["height"], 1);

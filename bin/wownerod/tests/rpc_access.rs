@@ -274,6 +274,7 @@ fn the_restricted_port_leaves_out_what_is_restricted() {
     assert_eq!(info["rpc_connections_count"], 0);
     assert_eq!(info["height_without_bootstrap"], 0);
     assert_eq!(info["free_space"], u64::MAX);
+    assert_eq!(info["version"], "", "as over ZMQ: {info}");
     assert_eq!(
         info["database_size"].as_u64().unwrap() % (5 << 30),
         0,
@@ -283,6 +284,7 @@ fn the_restricted_port_leaves_out_what_is_restricted() {
     let info: serde_json::Value = serde_json::from_str(&body).expect("JSON");
     assert_eq!(info["restricted"], false, "{info}");
     assert_ne!(info["start_time"], 0);
+    assert_ne!(info["version"], "", "{info}");
 
     // And it caps what one call may ask, in `status` as the C++ answers.
     let hashes = vec![format!("\"{}\"", "00".repeat(32)); 101].join(",");

@@ -192,8 +192,8 @@ pub(crate) fn internal(e: impl std::fmt::Display) -> RpcError {
 /// says (`core_rpc_server::on_get_info`): only the public pool transactions
 /// are counted, and what tells one node from another or says how it is
 /// connected -- its start time, its peer, RPC and alternative block counts,
-/// its peer lists -- is zero, its free space the largest number there is and
-/// its database size rounded up to the next 5 GiB.
+/// its peer lists -- is zero, its free space the largest number there is,
+/// its database size rounded up to the next 5 GiB and its `version` empty.
 pub fn get_info(server: &super::Server, restricted: bool) -> RpcResult {
     let db = server.db();
     let cfg = server.config();
@@ -294,7 +294,14 @@ pub fn get_info(server: &super::Server, restricted: bool) -> RpcResult {
     );
     m.insert("was_bootstrap_ever_used".into(), json!(false));
     m.insert("update_available".into(), json!(false));
-    m.insert("version".into(), json!(crate::cli::VERSION));
+    // Empty on a restricted listener, as Monero's `on_get_info` and this
+    // node's ZMQ `get_info` have it. Wownero's C++ blanks it on ZMQ only and
+    // hands the exact build to anyone on the public port, which tells a scan
+    // which nodes run a release with a known bug. No wallet here reads it.
+    m.insert(
+        "version".into(),
+        json!(if restricted { "" } else { crate::cli::VERSION }),
+    );
     m.insert("synchronized".into(), json!(sync.synchronized));
     m.insert("busy_syncing".into(), json!(sync.busy_syncing));
     // The listener's, not `--restricted-rpc`'s: a restricted second port on

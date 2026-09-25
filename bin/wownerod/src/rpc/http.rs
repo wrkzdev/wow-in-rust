@@ -1,9 +1,9 @@
 //! A minimal HTTP/1.1 server.
 //!
 //! `specs/11-daemon-rpc.md` §1. Only what the RPC surface needs: `POST` with a
-//! `Content-Length` body, and a JSON response. No chunked encoding and no
-//! pipelining. TLS is below this layer: it reads and writes whatever stream it
-//! is handed, plain or `super::tls`'s.
+//! `Content-Length` body, and a JSON response. No chunked encoding. TLS is
+//! below this layer: it reads and writes whatever stream it is handed, plain
+//! or `super::tls`'s.
 //!
 //! # Keep-alive
 //!
@@ -19,6 +19,17 @@
 //! The rules are RFC 7230 §6.3: HTTP/1.1 keeps the connection unless
 //! `Connection: close` says otherwise, HTTP/1.0 closes it unless
 //! `Connection: keep-alive` says otherwise.
+//!
+//! # Pipelining
+//!
+//! Not asked for by any client here, but not broken either, as it is in the
+//! C++. Requests are read one after another off the one buffered reader the
+//! connection keeps, and a body is read by its `Content-Length` and no
+//! further, so whatever arrived behind it -- the next request, in the same
+//! segment -- stays in the buffer for the next [`read_request`] instead of
+//! waiting for more bytes that the client is not going to send. And the
+//! answer to a request that says `Connection: close` is the connection's
+//! last: nothing pipelined behind it is read, let alone answered.
 //!
 //! # This faces the network
 //!
@@ -41,8 +52,16 @@ pub const MAX_CONTENT_LENGTH: usize = 1_048_576;
 /// constant for. Without one a peer could send headers forever.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 
-/// How long a single request may take to arrive, and its answer to leave. Set
-/// on the socket by the caller, since a TLS stream has no socket of its own.
+/// How long the socket may make no progress, reading or writing. Set on the
+/// socket by the caller, since a TLS stream has no socket of its own.
+///
+/// These are `SO_RCVTIMEO` / `SO_SNDTIMEO`: they bound each read and each
+/// write call, not a request or an answer as a whole. A client still taking
+/// the bytes of a long answer, however slowly, is never cut off; only one that
+/// takes nothing for this long is. The C++ is different: its connection timer
+/// is not extended while it writes, so a large answer to a remote client is
+/// cut at whatever remains of that timer. Nothing here runs a clock over the
+/// whole answer, or over the time a handler takes to build it.
 ///
 /// On a kept-alive connection this is also how long an idle client holds its
 /// thread and its slot under the connection caps.
@@ -514,6 +533,42 @@ mod tests {
             !keeps(b"POST /x HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n"),
             "close anywhere in the list wins"
         );
+    }
+
+    /// **Pipelining.** A second request in the same segment as a first with
+    /// a body is read from what the reader already holds, not waited for,
+    /// and each keeps its own `Connection` answer.
+    #[test]
+    fn pipelined_requests_are_read_in_turn() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            // One write, so both arrive together.
+            let _ = s.write_all(
+                b"POST /a HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi\
+                  POST /b HTTP/1.1\r\nConnection: close\r\nContent-Length: 3\r\n\r\nbye",
+            );
+            let _ = s.flush();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        let mut reader = BufReader::new(stream);
+        let first = read_request(&mut reader).expect("the first");
+        assert_eq!(
+            (first.path.as_str(), first.body.as_slice()),
+            ("/a", &b"hi"[..])
+        );
+        assert!(first.keep_alive());
+        let second = read_request(&mut reader).expect("the second, already buffered");
+        assert_eq!(
+            (second.path.as_str(), second.body.as_slice()),
+            ("/b", &b"bye"[..])
+        );
+        assert!(!second.keep_alive(), "the last the connection serves");
+        let _ = client.join();
     }
 
     #[test]
